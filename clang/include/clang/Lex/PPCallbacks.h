@@ -363,6 +363,23 @@ public:
                        SourceRange Range) {
   }
 
+  /// Hook called for an identifier in an \#if or \#elif expression that has
+  /// no macro definition, and so is taken as 0 without being expanded.
+  ///
+  /// No other callback reports these. The identifier is not the operand of
+  /// \#ifdef/\#ifndef or of the 'defined' operator, so none of Ifdef, Ifndef
+  /// or Defined fires; and because it is undefined there is nothing to
+  /// expand, so MacroExpands does not fire either. A consumer that needs to
+  /// know every macro a directive's outcome depended on -- including the
+  /// ones it depended on being *absent* -- cannot see these without this
+  /// hook. "#if HAVE_FEATURE" against an undefined HAVE_FEATURE is the
+  /// ordinary autoconf idiom, so this is a common case, not a corner one.
+  ///
+  /// Only fires where the value is live: an identifier in a subexpression
+  /// that cannot affect the result (the right-hand side of a short-circuited
+  /// '&&', say) did not influence the outcome and is not reported.
+  virtual void UndefinedIdentifierInDirective(const Token &IdentifierTok) {}
+
   /// Hook called when a '__has_embed' directive is read.
   virtual void HasEmbed(SourceLocation Loc, StringRef FileName, bool IsAngled,
                         OptionalFileEntryRef File) {}
@@ -689,6 +706,11 @@ public:
                SourceRange Range) override {
     First->Defined(MacroNameTok, MD, Range);
     Second->Defined(MacroNameTok, MD, Range);
+  }
+
+  void UndefinedIdentifierInDirective(const Token &IdentifierTok) override {
+    First->UndefinedIdentifierInDirective(IdentifierTok);
+    Second->UndefinedIdentifierInDirective(IdentifierTok);
   }
 
   void SourceRangeSkipped(SourceRange Range, SourceLocation EndifLoc) override {

@@ -258,6 +258,12 @@ static bool EvaluateValue(PPValue &Result, Token &PeekTok, DefinedTracker &DT,
         // preprocessor keywords and it wasn't macro expanded, it turns
         // into a simple 0
         if (ValueLive) {
+          // The identifier influenced this directive's outcome by being
+          // undefined, and no other callback reports it -- see
+          // PPCallbacks::UndefinedIdentifierInDirective.
+          if (PPCallbacks *Callbacks = PP.getPPCallbacks())
+            Callbacks->UndefinedIdentifierInDirective(PeekTok);
+
           unsigned DiagID = II->getName() == "true"
                                 ? diag::warn_pp_undef_true_identifier
                                 : diag::warn_pp_undef_identifier;

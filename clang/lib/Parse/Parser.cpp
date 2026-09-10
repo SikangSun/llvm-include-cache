@@ -75,6 +75,7 @@ Parser::Parser(Preprocessor &pp, Sema &actions, bool skipFunctionBodies)
   PP.addCommentHandler(CommentSemaHandler.get());
 
   PP.setCodeCompletionHandler(*this);
+  PP.setDeclBoundaryObserver(*this);
 
   Actions.ParseTypeFromStringCallback =
       [this](StringRef TypeStr, StringRef Context, SourceLocation IncludeLoc) {
@@ -476,6 +477,8 @@ Parser::~Parser() {
   PP.removeCommentHandler(CommentSemaHandler.get());
 
   PP.clearCodeCompletionHandler();
+
+  PP.clearDeclBoundaryObserver();
 
   DestroyTemplateIds();
 }

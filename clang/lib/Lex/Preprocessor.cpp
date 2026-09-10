@@ -35,6 +35,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/CodeCompletionHandler.h"
+#include "clang/Lex/DeclBoundaryObserver.h"
 #include "clang/Lex/ExternalPreprocessorSource.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LexDiagnostic.h"
@@ -1662,6 +1663,8 @@ CommentHandler::~CommentHandler() = default;
 EmptylineHandler::~EmptylineHandler() = default;
 
 CodeCompletionHandler::~CodeCompletionHandler() = default;
+
+DeclBoundaryObserver::~DeclBoundaryObserver() = default;
 
 void Preprocessor::createPreprocessingRecord() {
   if (Record)

@@ -32,6 +32,7 @@
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
+#include "clang/Sema/NameClassificationObserver.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
@@ -184,6 +185,25 @@ TemplateNameKind Sema::isTemplateName(Scope *S,
                                       TemplateTy &TemplateResult,
                                       bool &MemberOfUnknownSpecialization,
                                       bool Disambiguation) {
+  TemplateNameKind Result = isTemplateNameImpl(
+      S, SS, hasTemplateKeyword, Name, ObjectTypePtr, EnteringContext,
+      TemplateResult, MemberOfUnknownSpecialization, Disambiguation);
+  // Only a plain identifier names something a later compile could resolve
+  // differently; operator-function-ids and the like are not looked up by name.
+  if (NameClassObserver && Name.getKind() == UnqualifiedIdKind::IK_Identifier)
+    NameClassObserver->recordTemplateNameQuery(Name.Identifier, Result);
+  return Result;
+}
+
+TemplateNameKind Sema::isTemplateNameImpl(Scope *S,
+                                          CXXScopeSpec &SS,
+                                          bool hasTemplateKeyword,
+                                          const UnqualifiedId &Name,
+                                          ParsedType ObjectTypePtr,
+                                          bool EnteringContext,
+                                          TemplateTy &TemplateResult,
+                                          bool &MemberOfUnknownSpecialization,
+                                          bool Disambiguation) {
   assert(getLangOpts().CPlusPlus && "No template names in C!");
 
   DeclarationName TName;
@@ -331,6 +351,15 @@ TemplateNameKind Sema::isTemplateName(Scope *S,
 bool Sema::isDeductionGuideName(Scope *S, const IdentifierInfo &Name,
                                 SourceLocation NameLoc, CXXScopeSpec &SS,
                                 ParsedTemplateTy *Template /*=nullptr*/) {
+  bool Result = isDeductionGuideNameImpl(S, Name, NameLoc, SS, Template);
+  if (NameClassObserver)
+    NameClassObserver->recordDeductionGuideNameQuery(&Name, Result);
+  return Result;
+}
+
+bool Sema::isDeductionGuideNameImpl(Scope *S, const IdentifierInfo &Name,
+                                    SourceLocation NameLoc, CXXScopeSpec &SS,
+                                    ParsedTemplateTy *Template) {
   // We could use redeclaration lookup here, but we don't need to: the
   // syntactic form of a deduction guide is enough to identify it even
   // if we can't look up the template name at all.

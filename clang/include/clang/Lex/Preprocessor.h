@@ -68,6 +68,7 @@ namespace clang {
 
 class CodeCompletionHandler;
 class CommentHandler;
+class DeclBoundaryObserver;
 class DirectoryEntry;
 class EmptylineHandler;
 class ExternalPreprocessorSource;
@@ -318,6 +319,12 @@ public:
 private:
   /// The code-completion handler.
   CodeCompletionHandler *CodeComplete = nullptr;
+
+  /// The declaration-boundary observer, registered by whatever Parser is
+  /// currently driving this Preprocessor, if any (there is none while only
+  /// preprocessing, e.g. -E mode, or before the Parser has been
+  /// constructed).
+  DeclBoundaryObserver *DeclBoundary = nullptr;
 
   /// The file that we're performing code-completion for, if any.
   const FileEntry *CodeCompletionFile = nullptr;
@@ -1611,6 +1618,22 @@ public:
   /// Clear out the code completion handler.
   void clearCodeCompletionHandler() {
     CodeComplete = nullptr;
+  }
+
+  /// Set the declaration-boundary observer to the given object.
+  void setDeclBoundaryObserver(DeclBoundaryObserver &Observer) {
+    DeclBoundary = &Observer;
+  }
+
+  /// Retrieve the current declaration-boundary observer, or nullptr if
+  /// none is registered (e.g. no Parser is driving this Preprocessor).
+  DeclBoundaryObserver *getDeclBoundaryObserver() const {
+    return DeclBoundary;
+  }
+
+  /// Clear out the declaration-boundary observer.
+  void clearDeclBoundaryObserver() {
+    DeclBoundary = nullptr;
   }
 
   /// Hook used by the lexer to invoke the "included file" code

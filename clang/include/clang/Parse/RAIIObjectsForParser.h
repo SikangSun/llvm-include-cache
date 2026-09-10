@@ -328,6 +328,31 @@ namespace clang {
     ~ParsingOpenACCDirectiveRAII() { restore(); }
   };
 
+  /// Marks the parser as being in the middle of parsing one declaration
+  /// group (from decl-specifiers through the terminating ';' or the '{' of
+  /// a function body), so that Parser::isAtDeclarationBoundary() reads
+  /// false for the whole span -- including between the comma-separated
+  /// declarators of a single declaration, a position no balanced-delimiter
+  /// depth reflects. Constructed once at the top of ParseDeclGroup; RAII
+  /// scope exit covers all of that function's several early-return paths
+  /// automatically.
+  class ParsingDeclGroupRAII {
+    Parser &P;
+    bool OldVal;
+
+  public:
+    ParsingDeclGroupRAII(Parser &P, bool Value = true)
+        : P(P), OldVal(P.InDeclGroup) {
+      P.InDeclGroup = Value;
+    }
+
+    /// This can be used to restore the state early, before the dtor
+    /// is run.
+    void restore() { P.InDeclGroup = OldVal; }
+
+    ~ParsingDeclGroupRAII() { restore(); }
+  };
+
   /// RAII object that makes '>' behave either as an operator
   /// or as the closing angle bracket for a template argument list.
   class GreaterThanIsOperatorScope {

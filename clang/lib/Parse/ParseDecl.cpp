@@ -2129,6 +2129,12 @@ Parser::DeclGroupPtrTy Parser::ParseDeclGroup(ParsingDeclSpec &DS,
                                               ParsedTemplateInfo &TemplateInfo,
                                               SourceLocation *DeclEnd,
                                               ForRangeInit *FRI) {
+  // Covers the whole declaration -- including between comma-separated
+  // declarators, a position no balanced-delimiter depth reflects -- so
+  // that isAtDeclarationBoundary() reads false throughout. RAII scope
+  // exit clears this on every one of this function's return paths.
+  ParsingDeclGroupRAII InDeclGroupRAII(*this);
+
   // Parse the first declarator.
   // Consume all of the attributes from `Attrs` by moving them to our own local
   // list. This ensures that we will not attempt to interpret them as statement

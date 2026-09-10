@@ -31,6 +31,7 @@ add_clang_library(clangLex
   ScratchBuffer.cpp
   TokenConcatenation.cpp
   TokenLexer.cpp
+  TransitiveClosureTracker.cpp
 
   LINK_LIBS
   clangBasic

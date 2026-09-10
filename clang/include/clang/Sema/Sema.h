@@ -145,6 +145,7 @@ enum class LangAS : unsigned int;
 class LocalInstantiationScope;
 class LookupResult;
 class MangleNumberingContext;
+class NameClassificationObserver;
 typedef ArrayRef<IdentifierLoc> ModuleIdPath;
 class ModuleLoader;
 class MultiLevelTemplateArgumentList;
@@ -3597,6 +3598,12 @@ public:
   /// determine whether the name refers to a type. If so, returns an
   /// opaque pointer (actually a QualType) corresponding to that
   /// type. Otherwise, returns NULL.
+  ///
+  /// This is a thin wrapper around getTypeNameImpl() that additionally
+  /// reports the outcome to the registered NameClassificationObserver, if
+  /// any (see setNameClassificationObserver()). The split exists so the
+  /// report happens at one return point rather than getTypeNameImpl's own
+  /// ~24 internal ones.
   ParsedType getTypeName(const IdentifierInfo &II, SourceLocation NameLoc,
                          Scope *S, CXXScopeSpec *SS = nullptr,
                          bool isClassName = false, bool HasTrailingDot = false,
@@ -3607,6 +3614,17 @@ public:
                          ImplicitTypenameContext AllowImplicitTypename =
                              ImplicitTypenameContext::No,
                          IdentifierInfo **CorrectedII = nullptr);
+
+  /// The implementation of getTypeName(). Call getTypeName() instead --
+  /// calling this directly bypasses symbol-dependency observation.
+  ParsedType getTypeNameImpl(const IdentifierInfo &II, SourceLocation NameLoc,
+                             Scope *S, CXXScopeSpec *SS, bool isClassName,
+                             bool HasTrailingDot, ParsedType ObjectType,
+                             bool IsCtorOrDtorName,
+                             bool WantNontrivialTypeSourceInfo,
+                             bool IsClassTemplateDeductionContext,
+                             ImplicitTypenameContext AllowImplicitTypename,
+                             IdentifierInfo **CorrectedII);
 
   /// isTagName() - This method is called *for error recovery purposes only*
   /// to determine if the specified name is a valid tag name ("struct foo").  If
@@ -3783,10 +3801,48 @@ public:
   /// disambiguate the name.
   ///
   /// \param CCC The correction callback, if typo correction is desired.
+  ///
+  /// This is a thin wrapper around ClassifyNameImpl() that additionally
+  /// reports the result to the currently-registered
+  /// NameClassificationObserver, if any (see setNameClassificationObserver()
+  /// below) -- a hook for the AST-cache tier's symbol-dependency tracking.
+  /// A single wrapper at the one call boundary all ~5 real call sites
+  /// already share is deliberately used instead of instrumenting
+  /// ClassifyNameImpl's own ~20 internal return points directly.
   NameClassification ClassifyName(Scope *S, CXXScopeSpec &SS,
                                   IdentifierInfo *&Name, SourceLocation NameLoc,
                                   const Token &NextToken,
                                   CorrectionCandidateCallback *CCC = nullptr);
+
+  /// The actual classification logic; see ClassifyName's documentation.
+  /// Not called directly outside of ClassifyName itself.
+  NameClassification ClassifyNameImpl(Scope *S, CXXScopeSpec &SS,
+                                      IdentifierInfo *&Name,
+                                      SourceLocation NameLoc,
+                                      const Token &NextToken,
+                                      CorrectionCandidateCallback *CCC);
+
+  /// Set the name-classification observer to the given object. See
+  /// ClassifyName().
+  void setNameClassificationObserver(NameClassificationObserver &Observer) {
+    NameClassObserver = &Observer;
+  }
+
+  /// Retrieve the current name-classification observer, or nullptr if
+  /// none is registered.
+  NameClassificationObserver *getNameClassificationObserver() const {
+    return NameClassObserver;
+  }
+
+  /// Clear out the name-classification observer.
+  void clearNameClassificationObserver() { NameClassObserver = nullptr; }
+
+private:
+  /// The name-classification observer, if any. See
+  /// setNameClassificationObserver().
+  NameClassificationObserver *NameClassObserver = nullptr;
+
+public:
 
   /// Act on the result of classifying a name as an undeclared (ADL-only)
   /// non-type declaration.
@@ -11426,6 +11482,12 @@ public:
                      AssumedTemplateKind *ATK = nullptr,
                      bool AllowTypoCorrection = true);
 
+  /// Determine whether \p Name is a template name, which resolves whether a
+  /// following '<' opens a template-argument list or is a less-than operator.
+  ///
+  /// This is a thin wrapper around isTemplateNameImpl() that additionally
+  /// reports the outcome to the registered NameClassificationObserver, if any
+  /// (see setNameClassificationObserver()).
   TemplateNameKind isTemplateName(Scope *S, CXXScopeSpec &SS,
                                   bool hasTemplateKeyword,
                                   const UnqualifiedId &Name,
@@ -11433,6 +11495,17 @@ public:
                                   TemplateTy &Template,
                                   bool &MemberOfUnknownSpecialization,
                                   bool Disambiguation = false);
+
+  /// The implementation of isTemplateName(). Call isTemplateName() instead --
+  /// calling this directly bypasses symbol-dependency observation.
+  TemplateNameKind isTemplateNameImpl(Scope *S, CXXScopeSpec &SS,
+                                      bool hasTemplateKeyword,
+                                      const UnqualifiedId &Name,
+                                      ParsedType ObjectType,
+                                      bool EnteringContext,
+                                      TemplateTy &Template,
+                                      bool &MemberOfUnknownSpecialization,
+                                      bool Disambiguation);
 
   /// Try to resolve an undeclared template name as a type template.
   ///
@@ -11446,9 +11519,20 @@ public:
 
   /// Determine whether a particular identifier might be the name in a C++1z
   /// deduction-guide declaration.
+  ///
+  /// This is a thin wrapper around isDeductionGuideNameImpl() that
+  /// additionally reports the outcome to the registered
+  /// NameClassificationObserver, if any.
   bool isDeductionGuideName(Scope *S, const IdentifierInfo &Name,
                             SourceLocation NameLoc, CXXScopeSpec &SS,
                             ParsedTemplateTy *Template = nullptr);
+
+  /// The implementation of isDeductionGuideName(). Call
+  /// isDeductionGuideName() instead -- calling this directly bypasses
+  /// symbol-dependency observation.
+  bool isDeductionGuideNameImpl(Scope *S, const IdentifierInfo &Name,
+                                SourceLocation NameLoc, CXXScopeSpec &SS,
+                                ParsedTemplateTy *Template);
 
   bool DiagnoseUnknownTemplateName(const IdentifierInfo &II,
                                    SourceLocation IILoc, Scope *S,

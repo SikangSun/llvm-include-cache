@@ -16,6 +16,7 @@
 #include "clang/Basic/OpenACCKinds.h"
 #include "clang/Basic/OperatorPrecedence.h"
 #include "clang/Lex/CodeCompletionHandler.h"
+#include "clang/Lex/DeclBoundaryObserver.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaCodeCompletion.h"
@@ -168,7 +169,7 @@ enum class CXX11AttributeKind {
 /// been read.
 ///
 /// \nosubgrouping
-class Parser : public CodeCompletionHandler {
+class Parser : public CodeCompletionHandler, public DeclBoundaryObserver {
   // Table of Contents
   // -----------------
   // 1. Parsing (Parser.cpp)
@@ -537,6 +538,17 @@ private:
 
   unsigned short ParenCount = 0, BracketCount = 0, BraceCount = 0;
   unsigned short MisplacedModuleBeginCount = 0;
+
+  friend class ParsingDeclGroupRAII;
+
+  /// True for the full span of ParseDeclGroup's parse of one declaration
+  /// (from decl-specifiers through the terminating ';' or the '{' of a
+  /// function body), including while positioned between the comma-
+  /// separated declarators of a single declaration (e.g. between "a," and
+  /// "b" in "int a, b;"). Unlike ParenCount/BracketCount/BraceCount, that
+  /// position is not reflected by any balanced-delimiter depth, so it
+  /// needs its own signal for isAtDeclarationBoundary() to be correct.
+  bool InDeclGroup = false;
 
   /// Actions - These are the callbacks we invoke as we parse various constructs
   /// in the file.
@@ -1091,6 +1103,13 @@ private:
                                  unsigned ArgumentIndex) override;
   void CodeCompleteIncludedFile(llvm::StringRef Dir, bool IsAngled) override;
   void CodeCompleteNaturalLanguage() override;
+
+  //===--------------------------------------------------------------------===//
+  // Declaration-boundary query, for the header-cache splice decision.
+  bool isAtDeclarationBoundary() const override {
+    return ParenCount == 0 && BracketCount == 0 && BraceCount == 0 &&
+           !InDeclGroup;
+  }
 
   ///@}
 

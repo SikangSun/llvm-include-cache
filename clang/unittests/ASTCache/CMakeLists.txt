@@ -1,0 +1,22 @@
+add_clang_unittest(ASTCacheTests
+  ASTCacheDependencyTrackerTest.cpp
+  CacheProtocolTest.cpp
+  DependencySerializationTest.cpp
+  EndToEndTest.cpp
+  SymbolDependencyTest.cpp
+
+  CLANG_LIBS
+  clangAST
+  clangASTCache
+  clangBasic
+  clangFrontend
+  clangLex
+  clangSema
+  clangSerialization
+  clangTooling
+  LINK_LIBS
+  LLVMTestingAnnotations
+  LLVMTestingSupport
+  LLVM_COMPONENTS
+  Support
+  )

@@ -44,6 +44,7 @@
 #include "clang/Sema/DelayedDiagnostic.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
+#include "clang/Sema/NameClassificationObserver.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
@@ -280,6 +281,37 @@ ParsedType Sema::getTypeName(const IdentifierInfo &II, SourceLocation NameLoc,
                              bool IsClassTemplateDeductionContext,
                              ImplicitTypenameContext AllowImplicitTypename,
                              IdentifierInfo **CorrectedII) {
+  ParsedType Result = getTypeNameImpl(
+      II, NameLoc, S, SS, isClassName, HasTrailingDot, ObjectTypePtr,
+      IsCtorOrDtorName, WantNontrivialTypeSourceInfo,
+      IsClassTemplateDeductionContext, AllowImplicitTypename, CorrectedII);
+  if (NameClassObserver) {
+    // Extraction runs only when an observer is registered, so an ordinary
+    // compile pays one null check and nothing else.
+    std::string TypeName;
+    NameClassificationObserver::QueryContext Ctx;
+    Ctx.QueryLoc = NameLoc;
+    if (Result) {
+      QualType QT = GetTypeFromParser(Result);
+      TypeName = QT.getCanonicalType().getAsString();
+      Ctx.ResolvedTypeName = TypeName;
+      if (const TypedefType *TT = QT->getAs<TypedefType>())
+        Ctx.ResolvedLoc = TT->getDecl()->getLocation();
+      else if (const TagType *TT = QT->getAs<TagType>())
+        Ctx.ResolvedLoc = TT->getDecl()->getLocation();
+    }
+    NameClassObserver->recordTypeNameQuery(&II, static_cast<bool>(Result), Ctx);
+  }
+  return Result;
+}
+
+ParsedType Sema::getTypeNameImpl(
+    const IdentifierInfo &II, SourceLocation NameLoc, Scope *S,
+    CXXScopeSpec *SS, bool isClassName, bool HasTrailingDot,
+    ParsedType ObjectTypePtr, bool IsCtorOrDtorName,
+    bool WantNontrivialTypeSourceInfo, bool IsClassTemplateDeductionContext,
+    ImplicitTypenameContext AllowImplicitTypename,
+    IdentifierInfo **CorrectedII) {
   bool IsImplicitTypename = !isClassName && !IsCtorOrDtorName;
   // FIXME: Consider allowing this outside C++1z mode as an extension.
   bool AllowDeducedTemplate = IsClassTemplateDeductionContext &&
@@ -896,11 +928,40 @@ static bool isTagTypeWithMissingTag(Sema &SemaRef, LookupResult &Result,
   return false;
 }
 
+NameClassificationObserver::~NameClassificationObserver() = default;
+
 Sema::NameClassification Sema::ClassifyName(Scope *S, CXXScopeSpec &SS,
                                             IdentifierInfo *&Name,
                                             SourceLocation NameLoc,
                                             const Token &NextToken,
                                             CorrectionCandidateCallback *CCC) {
+  NameClassification Result =
+      ClassifyNameImpl(S, SS, Name, NameLoc, NextToken, CCC);
+  // Name may have been reassigned by typo correction inside the impl above
+  // -- report the final, possibly-corrected identifier.
+  if (NameClassObserver) {
+    std::string TypeName;
+    NameClassificationObserver::QueryContext Ctx;
+    Ctx.QueryLoc = NameLoc;
+    if (Result.getKind() == NameClassificationKind::Type) {
+      QualType QT = GetTypeFromParser(Result.getType());
+      TypeName = QT.getCanonicalType().getAsString();
+      Ctx.ResolvedTypeName = TypeName;
+      if (const TypedefType *TT = QT->getAs<TypedefType>())
+        Ctx.ResolvedLoc = TT->getDecl()->getLocation();
+      else if (const TagType *TT = QT->getAs<TagType>())
+        Ctx.ResolvedLoc = TT->getDecl()->getLocation();
+    }
+    NameClassObserver->recordClassification(Name, Result, Ctx);
+  }
+  return Result;
+}
+
+Sema::NameClassification Sema::ClassifyNameImpl(Scope *S, CXXScopeSpec &SS,
+                                                 IdentifierInfo *&Name,
+                                                 SourceLocation NameLoc,
+                                                 const Token &NextToken,
+                                                 CorrectionCandidateCallback *CCC) {
   DeclarationNameInfo NameInfo(Name, NameLoc);
   ObjCMethodDecl *CurMethod = getCurMethodDecl();
 

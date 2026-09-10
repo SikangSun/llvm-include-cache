@@ -2699,7 +2699,8 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
     TheModuleLoader.HadFatalFailure = true;
     return ImportAction::Failure;
   }
-
+  // Cache: request cache right here!!!
+  
   // If all is good, enter the new file!
   if (EnterSourceFile(FID, CurDir, FilenameTok.getLocation(),
                       IsFirstIncludeOfFile))
