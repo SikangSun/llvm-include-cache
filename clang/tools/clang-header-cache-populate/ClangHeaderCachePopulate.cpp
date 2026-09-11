@@ -6,14 +6,19 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Compiles each named header on its own and, if a daemon is running, pushes
-// the result to it. With -dry-run it pushes nothing and only reports, which
-// answers the question worth asking before any of the rest of the machinery
-// matters: what fraction of real headers can be cached at all, and why the
-// others cannot.
+// Builds saved copies of headers and, if a daemon is running, pushes them.
+// With -dry-run it pushes nothing and only reports how many headers could be
+// saved, how large the results and records are, and why the rest could not.
 //
 // Usage:
-//   clang-header-cache-populate [options] <header>... [-- <compiler args>]
+//   clang-header-cache-populate [options] <header>...
+//   clang-header-cache-populate [options] -job <file>
+//
+// A header that relies on its includer -- redis's anet.h uses uint32_t and
+// never includes <stdint.h> -- needs the context the real build gave it. Pass
+// the files to put in front of it, in order, with -context. A compile that
+// misses on a header writes the same information to a job file, read here
+// with -job.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,7 +38,7 @@ using namespace clang::ast_cache;
 static cl::OptionCategory Category("clang-header-cache-populate options");
 
 static cl::list<std::string> Headers(cl::Positional, cl::desc("<header>..."),
-                                     cl::OneOrMore, cl::cat(Category));
+                                     cl::ZeroOrMore, cl::cat(Category));
 
 /// Repeatable rather than a trailing "-- args" list: cl::ConsumeAfter takes
 /// over the positional list and leaves only the first header behind.
@@ -43,13 +48,25 @@ static cl::list<std::string>
                           "-Xcc -DFOO=1. Repeatable."),
                  cl::value_desc("arg"), cl::cat(Category));
 
+static cl::list<std::string>
+    ContextFiles("context",
+                 cl::desc("A file to put in front of each header, as the real "
+                          "build had it. Repeatable; order is kept."),
+                 cl::value_desc("file"), cl::cat(Category));
+
+static cl::opt<std::string>
+    JobFile("job",
+            cl::desc("Read headers, flags, and context from a job file "
+                     "written by a compile that missed"),
+            cl::value_desc("file"), cl::cat(Category));
+
 static cl::opt<std::string>
     SocketPath("socket", cl::desc("Daemon socket; ignored with -dry-run"),
                cl::init(DefaultSocketPath), cl::cat(Category));
 
 static cl::opt<bool>
     DryRun("dry-run",
-           cl::desc("Report what would be cached without contacting a daemon"),
+           cl::desc("Report what would be saved without contacting a daemon"),
            cl::init(false), cl::cat(Category));
 
 static cl::opt<bool> ListDeclines("list-declines",
@@ -65,8 +82,8 @@ struct Totals {
   uint64_t ResultBytes = 0;
   uint64_t RecordBytes = 0;
   unsigned Conditional = 0, Value = 0, Symbol = 0, Inclusion = 0;
-  /// Decline reasons, counted. The distribution is the actual finding here:
-  /// it says which limitation is costing the most coverage.
+  /// Decline reasons, counted. The distribution is the actual finding: it
+  /// says which limitation costs the most coverage.
   std::map<std::string, unsigned> Reasons;
 };
 
@@ -74,13 +91,15 @@ void report(const Totals &T, unsigned Total) {
   auto pct = [&](unsigned N) { return Total ? (100.0 * N / Total) : 0.0; };
 
   outs() << "\n" << Total << " headers\n"
-         << "  cacheable   " << T.Produced << format("  (%.1f%%)\n", pct(T.Produced))
-         << "  declined    " << T.Declined << format("  (%.1f%%)\n", pct(T.Declined))
-         << "  failed      " << T.Failed << format("  (%.1f%%)\n", pct(T.Failed));
+         << "  saved       " << T.Produced
+         << format("  (%.1f%%)\n", pct(T.Produced)) << "  declined    "
+         << T.Declined << format("  (%.1f%%)\n", pct(T.Declined))
+         << "  failed      " << T.Failed
+         << format("  (%.1f%%)\n", pct(T.Failed));
 
   if (T.Produced) {
-    outs() << "\nper cacheable header, mean:\n"
-           << format("  stored result   %8.1f KiB\n",
+    outs() << "\nper saved header, mean:\n"
+           << format("  saved copy      %8.1f KiB\n",
                      T.ResultBytes / 1024.0 / T.Produced)
            << format("  record          %8.1f bytes\n",
                      double(T.RecordBytes) / T.Produced)
@@ -93,7 +112,7 @@ void report(const Totals &T, unsigned Total) {
   }
 
   if (!T.Reasons.empty()) {
-    outs() << "\nwhy headers were declined:\n";
+    outs() << "\nwhy headers were not saved:\n";
     for (const auto &KV : T.Reasons)
       outs() << format("  %5u  ", KV.second) << KV.first << "\n";
   }
@@ -106,10 +125,39 @@ int main(int argc, char **argv) {
   cl::HideUnrelatedOptions(Category);
   cl::ParseCommandLineOptions(
       argc, argv,
-      "Compiles each header on its own and stores the result.\n\n"
-      "With -dry-run, reports how many headers are cacheable and why the\n"
-      "rest are not, without needing a daemon.\n\n"
-      "Pass the build's own flags with -Xcc, e.g. -Xcc -I. -Xcc -DHAVE_X=1\n");
+      "Builds saved copies of headers and stores them in the daemon.\n\n"
+      "With -dry-run, reports how many headers could be saved and why the\n"
+      "rest could not, without needing a daemon.\n\n"
+      "Pass the build's own flags with -Xcc, e.g. -Xcc -I. -Xcc -DHAVE_X=1,\n"
+      "and the files the build had included before a header with -context.\n");
+
+  std::vector<ProduceRequest> Requests;
+  if (!JobFile.empty()) {
+    if (!Headers.empty() || !ContextFiles.empty() || !CompilerArgs.empty()) {
+      errs() << "-job cannot be combined with headers, -context, or -Xcc: the "
+                "job file carries all three\n";
+      return 1;
+    }
+    Expected<std::vector<ProduceRequest>> Jobs = readJobFile(JobFile);
+    if (!Jobs) {
+      errs() << "cannot use job file " << JobFile << ": "
+             << toString(Jobs.takeError()) << "\n";
+      return 1;
+    }
+    Requests = std::move(*Jobs);
+  } else {
+    for (const std::string &H : Headers) {
+      ProduceRequest R;
+      R.HeaderPath = H;
+      R.Args.assign(CompilerArgs.begin(), CompilerArgs.end());
+      R.Context.assign(ContextFiles.begin(), ContextFiles.end());
+      Requests.push_back(std::move(R));
+    }
+  }
+  if (Requests.empty()) {
+    errs() << "nothing to do: name headers, or pass -job <file>\n";
+    return 1;
+  }
 
   std::unique_ptr<raw_socket_stream> Conn;
   if (!DryRun) {
@@ -125,8 +173,8 @@ int main(int argc, char **argv) {
   }
 
   Totals T;
-  for (const std::string &H : Headers) {
-    ProduceResult R = produceHeader(H, CompilerArgs);
+  for (const ProduceRequest &Req : Requests) {
+    ProduceResult R = produceHeader(Req);
 
     switch (R.Stat) {
     case ProduceResult::Status::Produced: {
@@ -139,17 +187,19 @@ int main(int argc, char **argv) {
 
       SmallVector<char, 0> Msg;
       encodePushRequest(R.Push, Msg);
-      // The record's size is what a LOOKUP reply carries per candidate, so
-      // it is worth reporting separately from the stored result.
+      // A LOOKUP reply carries one record per candidate, so the record's
+      // size is worth reporting separately from the saved copy's.
       T.RecordBytes += Msg.size() - R.Push.Data.size();
 
       if (Conn) {
         if (!sendMessage(*Conn, Msg)) {
-          errs() << "lost the daemon connection while pushing " << H << "\n";
+          errs() << "lost the daemon connection while pushing "
+                 << Req.HeaderPath << "\n";
           return 1;
         }
         if (!receiveMessage(*Conn)) {
-          errs() << "no acknowledgment from the daemon for " << H << "\n";
+          errs() << "no acknowledgment from the daemon for " << Req.HeaderPath
+                 << "\n";
           return 1;
         }
       }
@@ -159,16 +209,17 @@ int main(int argc, char **argv) {
       ++T.Declined;
       ++T.Reasons[R.Reason];
       if (ListDeclines)
-        outs() << "declined  " << H << "  -- " << R.Reason << "\n";
+        outs() << "declined  " << Req.HeaderPath << "  -- " << R.Reason
+               << "\n";
       break;
     case ProduceResult::Status::Failed:
       ++T.Failed;
       ++T.Reasons["FAILED: " + R.Reason];
-      errs() << "failed    " << H << "  -- " << R.Reason << "\n";
+      errs() << "failed    " << Req.HeaderPath << "  -- " << R.Reason << "\n";
       break;
     }
   }
 
-  report(T, Headers.size());
+  report(T, Requests.size());
   return 0;
 }

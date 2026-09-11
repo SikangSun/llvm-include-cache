@@ -70,6 +70,10 @@ its Sema, which the daemon does not have.
 
 ## Trying it
 
+Every compile involved, cached or not, runs with
+`-fmodules -fno-implicit-module-maps`: a saved copy is a module, and only a
+compile with modules on can load one. See DECISIONS.md §2.8.
+
 Build the two tools:
 
 ```
@@ -84,10 +88,25 @@ clang-header-cache-populate -dry-run -list-declines \
     src/*.h
 ```
 
-This reports how many headers could be cached, the mean size of a saved result
+This reports how many headers could be saved, the mean size of a saved copy
 and of a record, and — for the ones that could not — why. Pass the project's
 own compile flags with `-Xcc`; a missing `-I` shows up as a header that
-"does not compile on its own."
+"does not compile in this context."
+
+A header that relies on its includer needs the context the real build gave
+it. redis's `anet.h` uses `uint32_t` and never includes `<stdint.h>`, because
+everything that includes `anet.h` has included `<stdint.h>` already. Pass the
+files to put in front of a header, in order, with `-context`:
+
+```
+clang-header-cache-populate -dry-run -Xcc -Isrc \
+    -context /path/to/stdint.h src/anet.h
+```
+
+A compile that misses on a header writes the same three things — the header,
+its flags, and the files it had already included — to a job file, which the
+tool reads with `-job <file>`. See DECISIONS.md §2.9 for why the context is
+compiled into the saved copy but kept hidden from the compile that loads it.
 
 With a daemon running, drop `-dry-run` and results are stored:
 

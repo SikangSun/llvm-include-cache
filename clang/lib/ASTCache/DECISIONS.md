@@ -5,7 +5,7 @@ observation hooks in Lex/Parse/Sema are shaped the way they are. Each entry
 records what was decided, the reason, and what was rejected — the reasons are
 the part that doesn't survive in the code.
 
-Last updated 2026-09-05.
+Last updated 2026-09-11.
 
 ---
 
@@ -157,10 +157,25 @@ compile knowing which module it is building, so per-header ownership cannot be
 reconstructed afterwards; an ordinary compile would have to carry it
 throughout. One redundant parse is cheaper.
 
-The cost is a scope limit: the header must compile on its own. One that assumes
-its includer already provided something fails in isolation and is declined —
-which is the same self-containment the piggyback design would have needed
-anyway, discovered earlier and more cleanly.
+**Corrected 2026-09-11.** This section used to say the cost was a scope
+limit: that a header had to compile on its own, and one relying on its includer
+would be declined. That was wrong. Every header in a working build compiles —
+otherwise the build stops — so every one is cacheable. Needing something from
+the includer (redis's `anet.h` uses `uint32_t` and never includes
+`<stdint.h>`) is a dependency, recorded like any other. What was missing was
+context: the producer compiled each header with nothing in front of it. Given
+the context the real build had, `anet.h` is saved and its record carries 38
+symbol dependencies. See 2.9.
+
+The import-graph objection above applies to the piggyback design only. It is
+an objection to building an import graph *during an ordinary compile*, which
+never knows it is building a module. A separate producer compile does know, so
+saved copies could import each other the way ordinary Clang modules do: each
+holding only its own header's declarations and naming the saved copies it
+needs loaded first. That would shrink saved copies — today `server.h`'s
+contains a full copy of `stdio.h`, which is why it is 528 KB — but it is not
+needed for correctness, since duplicate declarations from two saved copies are
+merged on load as they are for any two modules. Deferred as an optimization.
 
 ### 2.2 Module shape, not PCH shape
 
@@ -250,6 +265,119 @@ listed as exclusions at first. The genuinely varying ones are `__COUNTER__`,
 `__INCLUDE_LEVEL__`, `__BASE_FILE__`, and the wall-clock trio `__DATE__`,
 `__TIME__`, `__TIMESTAMP__`.
 
+**Update 2026-09-11.** The exclusion above was never implemented, and a test
+shows the result is worse than a miss. A header containing
+
+    int counter_a = __COUNTER__;
+    int counter_b = __COUNTER__;
+
+is saved with *no* dependency recorded for `__COUNTER__`, so a saved copy
+holding 0 and 1 would be served to a compile whose counter is already at 7.
+Decided instead of declining: record where each such value lands in the parsed
+header, and after loading, rewrite those values from the loading compile's own
+state. `__COUNTER__` must also advance the loading compile's counter by the
+number of uses in the header, or a later `__COUNTER__` collides. Not yet
+implemented.
+
+### 2.8 Every compile runs with `-fmodules -fno-implicit-module-maps`
+
+Decided 2026-09-11. Applies to both the cached build and the uncached
+baseline, so the two are compared under the same flags.
+
+A saved copy is a module, and only a compile with modules on can load one.
+`Modules` is `NotCompatible` in `LangOptions.def`, so the AST reader rejects a
+mismatch outright. Tested with a saved copy built under the loading compile's
+own flags:
+
+    error: modules semantics was enabled in precompiled file 'M.pcm'
+           but is currently disabled
+
+The reason for the check: inside a module, every declaration is labelled with
+the module that owns it, and stays hidden until that module is imported. With
+modules off, an `#include` is purely textual and has no import step, so
+nothing could ever reveal those declarations. The reader refuses the file
+before reading any of them.
+
+`-fmodules` alone would also make Clang look for `module.modulemap` files next
+to headers and turn every header those files cover into a module — Clang ships
+one for its own builtin headers — which changes the build being measured.
+`-fno-implicit-module-maps` stops that. On a file including `<stddef.h>` and
+`<stdio.h>`: zero modules built, every header stays textual.
+
+Cost of the mode itself (`-fsyntax-only`, best of three, debug build of
+clang): redis `object.c` 3025 → 3030 ms, `server.c` 4705 → 4759 ms. redis
+`sds.c` and `object.c` compile unchanged under it.
+
+The alternative, patching the reader to skip the check, would leave module
+ownership labels on declarations in a compile with no machinery to interpret
+them. Not attempted.
+
+### 2.9 Context: what the producer compiles in front of a header
+
+Decided 2026-09-11.
+
+The producer compiles a header after the files that the compile which missed on
+it had already included, in order, with that compile's own flags. Nothing
+about the context is chosen by policy: every population request comes from an
+actual miss, so the context is whatever that compile really had. A saved copy
+built in some other context is not wrong either — its record describes that
+context, and it simply never matches here. Stored variants converge on the
+ones the build actually uses.
+
+Macro state needs no special handling. redis's `fmacros.h` defines
+`_GNU_SOURCE`, which changes what `<string.h>` declares. `fmacros.h` is in the
+list, so `_GNU_SOURCE` is defined when `<string.h>` is compiled, and the record
+for `<string.h>` says so.
+
+**The context is compiled into the saved copy but kept hidden.** The saved
+copy is a module with two submodules:
+
+    module __hc_<hash> {
+      explicit module context { header "<wrapper including each context file>" }
+      module target { header "<wrapper including the header>" export * }
+    }
+
+A loading compile makes only `target` visible. This is a soundness
+requirement. A textual `#include "foo.h"` adds foo.h's declarations to what is
+visible and nothing else. If the context's declarations became visible too,
+loading foo.h's saved copy into a file that never included `<stdio.h>` would
+declare everything in `<stdio.h>` there. foo.h's own references into its
+context — a type foo.h uses, a macro foo.h tests, a guard that suppressed one
+of foo.h's `#include`s — are covered by foo.h's record, which the loading
+compile checks against its own state.
+
+**Only headers included directly by a `.c` file are populated.** A header
+reached from inside another header is saved as part of that other header's
+copy. The only way to reproduce "partway through `a.h`" would be to include
+all of `a.h`, and if `a.h` includes `b.h`, that compiles `b.h` inside the
+hidden context submodule and leaves the visible one empty. The producer
+detects this and declines. (An earlier experiment showed `b.h`'s declarations
+do end up in such a copy. True — but in the hidden part, which is exactly what
+makes the copy unusable.)
+
+The context goes in through a generated wrapper header rather than `-include`
+flags. `-include` lists are among the preprocessor options the reader
+validates on load (`checkPreprocessorOptions`); keeping context out of them
+means the saved copy's options are exactly the compile's own.
+
+The one thing no list of files reproduces is a declaration written directly in
+the `.c` file above the `#include`:
+
+    typedef int T;
+    #include "h.h"      // h.h uses T
+
+`T` is in no header, so the producer's compile fails, nothing is stored, and
+that header misses in that context. About 3% of `.c` files have anything at
+all before their first `#include` (redis 4/126, sqlite 3/125, curl 0/44). A
+miss, never a wrong answer. Since nothing is stored, every later compile
+re-queues the same failing request; having the daemon remember the failure is
+a later fix.
+
+Each saved copy is built under a module name hashed from its header, flags,
+and context (`__hc_` + 16 hex digits of xxh3). Two modules with the same name
+cannot both be loaded into one compile, so the single fixed name used before
+would have made loading two saved copies together impossible.
+
 ---
 
 ## 3. Things that turned out to be wrong
@@ -280,6 +408,16 @@ Kept because the reasoning that produced them is likely to recur.
 - **"25,027 tests passing" was Clang's own regression suite**, not evidence
   about this work. At the time the cache had six tests of its own.
 
+- **Cacheability percentages measured the producer, not the headers.** 42% of
+  curl's and 71% of redis's headers were reported cacheable, with the rest
+  presented as not self-contained. The declines were the producer compiling
+  each header with nothing in front of it. See 2.1 and 2.9.
+
+- **The producer read its results after they were freed.** It consulted the
+  dependency tracker and the Sema observer after `ExecuteAction` returned, by
+  which point both are destroyed. It worked by luck. Results are now copied
+  out while the compile is still running.
+
 ---
 
 ## 4. Open
@@ -288,7 +426,27 @@ Kept because the reasoning that produced them is likely to recur.
   as provenance after `#pragma push_macro`/`pop_macro`. Fix agreed (record the
   popped macro as a value dependency), not written.
 - Token tier ships a duplicate payload when a header is re-included.
-- Nothing reads a cache. No hit path, no daemon, no measurements.
+- No hit path: nothing inside the compiler asks the cache at an `#include`
+  yet. The daemon, protocol, producer, and the client's matching exist and are
+  tested.
+- `__COUNTER__` and the other translation-unit-varying builtins are saved
+  wrong today; see 2.7.
+- Loading a saved copy must leave the includer as a textual include would:
+  the guard macro defined and the file marked as included, so a second
+  `#include` of the same header is skipped. Not written.
+- A population request whose context cannot be reproduced fails every time it
+  is retried; the daemon should remember the failure.
+- **Replaying context by absolute path breaks `#include_next`.** The wrappers
+  write `#include "/abs/path/h.h"`. `#include_next` inside a header reached
+  that way cannot tell where in the search path it stands, so it searches from
+  the start. Clang's own `<stdint.h>` does `#include_next <stdint.h>` to reach
+  glibc's; by absolute path it finds itself again, its guard is already
+  defined, and `uint32_t` is never declared. Found by the `anet.h` smoke test
+  (context `<stdint.h>`, declined: unknown type name 'uint32_t'). The target
+  wrapper has the same flaw, and there it can produce a wrong copy rather than
+  a decline. Fix proposed, not written: record each include as written
+  (`<stdint.h>` or `"anet.h"`) and replay it with the `.c` file's directory
+  first on the quoted search path.
 - Correctness will be established by building the benchmark projects with the
   mechanism enabled and running each project's own test suite. This bounds risk
   over the code those suites exercise; it does not establish that the record is
