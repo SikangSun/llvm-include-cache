@@ -279,6 +279,12 @@ state. `__COUNTER__` must also advance the loading compile's counter by the
 number of uses in the header, or a later `__COUNTER__` collides. Not yet
 implemented.
 
+**Update 2026-09-11 (2).** Until the backfill exists, the producer declines a
+header that expands any of the six inside its own text: a miss, never a wrong
+answer. Expansions in the context do not count; the context's declarations
+stay hidden from the loading compile, so its counter values never reach it.
+The backfill is still the plan.
+
 ### 2.8 Every compile runs with `-fmodules -fno-implicit-module-maps`
 
 Decided 2026-09-11. Applies to both the cached build and the uncached
@@ -483,6 +489,41 @@ determines the output, dropping the duplicate needs no guess about fit. It
 needs a new protocol message (a claim on K, answered "go ahead" or "in
 flight"), and a correct first population comes first.
 
+### 2.12 Assumption: no source file changes during a complete build
+
+The evaluation builds each benchmark from a clean tree and runs its tests. No
+source file or header changes while that build runs, and none changes between
+the build that saved a copy and a build that loads it. After editing any
+source, restart the daemon so the cache starts empty.
+
+Clang checks this anyway. Every saved copy lists the files it was built from
+with their sizes and modification times, and loading a copy whose header was
+edited since stops the compile with "fatal error: file '...' has been modified
+since the module file '...' was built". Under the assumption that never
+happens. Handling edits -- treating an out-of-date copy as a miss (the
+reader's `ARR_OutOfDate` mode) and replacing the stale copy in the daemon -- is
+out of scope.
+
+### 2.13 The hit path: what is settled
+
+- **Turned on by an environment variable**, `CLANG_HEADER_CACHE=<daemon
+  socket>`. Works with any build system without editing its flags. A compile
+  with the variable unset behaves exactly as before.
+- **Saved copies load from memory.** The bytes stay in the daemon's shared
+  memory. `ModuleManager::addInMemoryBuffer` registers them under a name no
+  file has (`/__hc_memory/<module>.pcm`), and `CompilerInstance::loadModuleFile`
+  loads them: `ModuleManager::addModule` takes registered bytes before trying
+  the disk (`ModuleManager.cpp:182`). `LoadTest` does this partway through a
+  compile, after the compile parsed the context header itself, and the loaded
+  declarations then work with the compile's own types.
+- **What Clang already provides**, checked by hand with copies in the
+  producer's layout: a loaded `draw(struct point *)` accepts the compile's own
+  `struct point`; two loaded copies whose contexts share a header agree on its
+  types; the context stays hidden (`u32` without `types.h` gives "missing
+  '#include'"); a second `#include` of the header is skipped, for both an
+  include guard and `#pragma once`; the `.c` file can define functions the copy
+  declares.
+
 ---
 
 ## 3. Things that turned out to be wrong
@@ -540,8 +581,16 @@ Kept because the reasoning that produced them is likely to recur.
 - No hit path: nothing inside the compiler asks the cache at an `#include`
   yet. The daemon, protocol, producer, and the client's matching exist and are
   tested.
-- `__COUNTER__` and the other translation-unit-varying builtins are saved
-  wrong today; see 2.7.
+- `__COUNTER__` and the other translation-unit-varying builtins: declined for
+  now (2.7). The backfill -- rewrite each value on load from the loading
+  compile's own state, and advance its counter -- is still to write.
+- **Saved copies cannot be loaded as produced.** A copy lists every file it
+  was built from, including the three the producer generates in a temporary
+  directory (the two wrappers and the module map), and the reader checks that
+  each one exists when loading. The producer deletes that directory, so a load
+  fails with "could not find file '.../__hc_context.h'". Fix under discussion:
+  embed those three files' text in the copy (`-fmodules-embed-file=`, tested
+  by hand).
 - Loading a saved copy must leave the includer as a textual include would:
   the guard macro defined and the file marked as included, so a second
   `#include` of the same header is skipped. Not written.

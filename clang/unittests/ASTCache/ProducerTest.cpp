@@ -241,6 +241,35 @@ TEST_F(ProducerTest, AReplayThatOpensADifferentFileIsDeclined) {
   EXPECT_TRUE(Unchecked.produced()) << Unchecked.Reason;
 }
 
+TEST_F(ProducerTest, AHeaderThatReadsTheCounterIsDeclined) {
+  // A saved copy holding __COUNTER__'s values 0 and 1 would be wrong in a
+  // compile whose counter is already at 7. Until the backfill rewrites such
+  // values on load (DECISIONS.md 2.7), the header is not saved.
+  std::string Direct = write("direct.h", "int a = __COUNTER__;\n");
+  ProduceResult D = produceHeader(request(Direct));
+  EXPECT_EQ(D.Stat, ProduceResult::Status::Declined) << D.Reason;
+  EXPECT_NE(D.Reason.find("__COUNTER__"), std::string::npos) << D.Reason;
+
+  // Through a macro the context defines: the counter is still read inside
+  // the header.
+  std::string Ctx = write("ctx.h", "#define NEXT_ID __COUNTER__\n");
+  std::string Indirect = write("indirect.h", "int b = NEXT_ID;\n");
+  ProduceResult I = produceHeader(request(Indirect, {Ctx}));
+  EXPECT_EQ(I.Stat, ProduceResult::Status::Declined) << I.Reason;
+
+  // The context reading the counter does not matter: the context's
+  // declarations stay hidden, and the header never reads the counter.
+  std::string CtxReads = write("ctx_reads.h", "int c = __COUNTER__;\n");
+  std::string Plain = write("plain.h", "int d;\n");
+  ProduceResult P = produceHeader(request(Plain, {CtxReads}));
+  EXPECT_TRUE(P.produced()) << P.Reason;
+
+  // __LINE__ is the header's own line number in every compile.
+  std::string Line = write("line.h", "int e = __LINE__;\n");
+  ProduceResult L = produceHeader(request(Line));
+  EXPECT_TRUE(L.produced()) << L.Reason;
+}
+
 TEST_F(ProducerTest, TwoHeadersGetTwoModuleNames) {
   // Two modules with the same name cannot both be loaded into one compile,
   // so two saved copies loaded together must never share a name.

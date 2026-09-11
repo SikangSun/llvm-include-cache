@@ -21,6 +21,7 @@
 #include "clang/Options/OptionUtils.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaConsumer.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -67,7 +68,17 @@ struct ProduceOutcome {
   /// Non-empty says which replayed #include opened a different file than the
   /// compile being reproduced did.
   std::string ReplayMismatch;
+  /// Non-empty names a builtin whose value depends on the compile that
+  /// includes the header, expanded inside the target.
+  std::string VaryingBuiltin;
 };
+
+/// Builtins whose value depends on the compile that includes the header
+/// rather than on the header. DECISIONS.md 2.7 has the reasoning, including
+/// why __LINE__ and __FILE__ are not here.
+constexpr llvm::StringLiteral TranslationUnitVaryingBuiltins[] = {
+    "__COUNTER__", "__INCLUDE_LEVEL__", "__BASE_FILE__",
+    "__DATE__",    "__TIME__",          "__TIMESTAMP__"};
 
 /// Rides alongside the module writer to observe Sema, which the dependency
 /// tracker cannot: the tracker is a PPCallbacks and sees only the
@@ -179,12 +190,31 @@ private:
 
 /// Tells the observer when the target header is entered and left, and whether
 /// the target was reached through the context rather than through the target
-/// wrapper.
+/// wrapper. Also notes a translation-unit-varying builtin expanded inside the
+/// target.
 class TargetWatcher : public PPCallbacks {
 public:
   TargetWatcher(SourceManager &SM, const FileEntry *Target,
-                const FileEntry *TargetWrapper, ProducerObserver &Obs)
-      : SM(SM), Target(Target), TargetWrapper(TargetWrapper), Obs(Obs) {}
+                const FileEntry *TargetWrapper, ProducerObserver &Obs,
+                std::string &VaryingBuiltin)
+      : SM(SM), Target(Target), TargetWrapper(TargetWrapper), Obs(Obs),
+        VaryingBuiltin(VaryingBuiltin) {}
+
+  void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
+                    SourceRange, const MacroArgs *) override {
+    // Only the target's text counts. The context's declarations stay hidden
+    // from the loading compile, so a counter value the context used never
+    // reaches it. The target part is everything from the target wrapper on,
+    // headers the target includes among it.
+    if (!InTargetPart || !VaryingBuiltin.empty())
+      return;
+    const MacroInfo *MI = MD.getMacroInfo();
+    if (!MI || !MI->isBuiltinMacro())
+      return;
+    llvm::StringRef Name = MacroNameTok.getIdentifierInfo()->getName();
+    if (llvm::is_contained(TranslationUnitVaryingBuiltins, Name))
+      VaryingBuiltin = Name.str();
+  }
 
   void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                    SrcMgr::CharacteristicKind, FileID PrevFID) override {
@@ -212,6 +242,7 @@ private:
   const FileEntry *Target;
   const FileEntry *TargetWrapper;
   ProducerObserver &Obs;
+  std::string &VaryingBuiltin;
   bool InTargetPart = false;
 };
 
@@ -326,7 +357,8 @@ public:
 
     auto Obs = std::make_unique<ProducerObserver>(Tracker, Outcome);
     PP.addPPCallbacks(std::make_unique<TargetWatcher>(
-        CI.getSourceManager(), Target, TargetWrapper, *Obs));
+        CI.getSourceManager(), Target, TargetWrapper, *Obs,
+        Outcome.VaryingBuiltin));
 
     std::vector<std::unique_ptr<ASTConsumer>> Consumers;
     // The observer goes first so that it reads Sema's state before the writer
@@ -605,6 +637,13 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   if (!O.Unrepresentable.empty())
     return declined("compiled under, or leaves, #pragma " + O.Unrepresentable +
                     " in a state a record cannot carry");
+  // A saved copy holding __COUNTER__'s values 0 and 1 would be wrong in a
+  // compile whose counter is already at 7. Declined until the backfill, which
+  // rewrites such values on load, exists.
+  if (!O.VaryingBuiltin.empty())
+    return declined("expands " + O.VaryingBuiltin +
+                    ", whose value depends on the compile that includes the "
+                    "header; not saved until the backfill exists");
   // A frame is dropped when the tracker could not describe it soundly, so a
   // missing record means the header used something untracked -- currently a
   // C++ construct. That must cost a miss, never a wrong hit.
