@@ -360,6 +360,41 @@ flags. `-include` lists are among the preprocessor options the reader
 validates on load (`checkPreprocessorOptions`); keeping context out of them
 means the saved copy's options are exactly the compile's own.
 
+**Each `#include` is replayed the way the compile found its file.** For
+`#include <...>` the compiler searches an ordered list of directories. On this
+machine:
+
+    1. .../build_dev/lib/clang/22/include
+    2. /usr/local/include
+    3. /usr/include/x86_64-linux-gnu
+    4. /usr/include
+
+`#include <stdint.h>` takes the first match, Clang's `stdint.h` in directory 1,
+and remembers it came from directory 1. Clang's `stdint.h` then says
+`#include_next <stdint.h>`: search again starting after directory 1. That finds
+glibc's `/usr/include/stdint.h`, which declares `uint32_t`.
+
+The first version replayed `#include "/abs/.../include/stdint.h"`. A file
+opened by path was found in no directory, so its `#include_next` searches from
+directory 1, finds Clang's `stdint.h` again (guarded, so empty), and glibc's
+is never read. The `anet.h` smoke test was declined with "unknown type name
+'uint32_t'".
+
+A resolved path says which file; `#include_next` also needs where in the list
+it was found, and the compiler only learns that by searching. So each entry of
+a request records two things (`IncludeRef`):
+
+- **the text as written** (`<stdint.h>`, `"hiredis.h"`), used to replay the
+  include, so the producer searches the same list (the request carries the
+  same `-I` flags);
+- **the file opened**, used to check the replay: if the replay opens a
+  different file, the producer declines.
+
+A file the compile found without searching -- next to the `.c` file (Clang
+leaves the found-in directory unset there, `HeaderSearch.cpp:1035`), or by an
+absolute path -- is replayed by its absolute path, which is also found without
+searching, so `#include_next` inside it starts from the top in both compiles.
+
 The one thing no list of files reproduces is a declaration written directly in
 the `.c` file above the `#include`:
 
@@ -377,6 +412,76 @@ Each saved copy is built under a module name hashed from its header, flags,
 and context (`__hc_` + 16 hex digits of xxh3). Two modules with the same name
 cannot both be loaded into one compile, so the single fixed name used before
 would have made loading two saved copies together impossible.
+
+### 2.10 Population runs on a thread during the compile; what is left at exit goes to a detached process
+
+A compile that misses queues a `ProduceRequest` for a producer thread in the
+same process. The thread starts at the first miss, produces saved copies while
+the compile continues, and pushes each to the daemon as it finishes. When the
+compile is done (`cc1_main.cpp`, after `ExecuteCompilerInvocation`), the
+requests the thread has not finished -- including the one it is partway
+through, which restarts from scratch -- are written to a job file and handed
+to a detached `clang-header-cache-populate -job <file>`. The compile never
+waits for population.
+
+Why a thread: the first saved copy exists sooner. Measured on redis (best of
+5): producing `server.h` takes 2.6 s; `object.c` compiles in about 3.0 s. With
+population only at exit, `server.h`'s copy exists about 5.6 s after `object.c`
+starts; with the thread, about 2.7 s. Every compile that reaches
+`#include "server.h"` in between hits instead of missing, and 61 of redis's
+126 `.c` files begin with that line.
+
+Why the handoff is still needed: one production can take nearly as long as
+the whole compile. Producing `functions.h` (context: `server.h`) takes 2.6 s,
+although `functions.h` itself parses in about 10 ms, because the producer
+re-parses the context. `object.c` has six direct includes, so on an empty
+cache its queue holds roughly 15 s of work against a 3 s compile (estimated
+from two measured productions). The thread gets further when the compile
+spends longer after its last `#include` -- code generation and optimization
+run after parsing.
+
+Accepted costs:
+
+- A crash in the producer thread kills the user's compile; a crash in a
+  detached process would not. `llvm::CrashRecoveryContext` is a partial guard.
+- The thread must be stopped before the process exits: cc1 exits without
+  freeing memory, and a `std::thread` still running at exit aborts the process.
+- CPU: under `make -jN` every core is busy, so a production takes CPU from
+  other compiles whether it runs on the thread or in the detached process.
+
+Considered: population only in a detached process at exit (the earlier plan;
+the first copy arrives later); a detached process started at the first miss
+and fed through a pipe (early first copy and crash isolation, no handoff).
+The pipe version is the fallback if producer crashes in the thread turn out to
+matter in the evaluation.
+
+### 2.11 Duplicate productions are not deduplicated, for now
+
+Two compiles that miss on the same header with the same flags and context each
+produce an identical saved copy. The module name -- a hash of header, flags,
+and context -- covers everything the producer's output depends on except file
+contents, which do not change during a build. In a cold `make -jN` of redis,
+each of the 61 files beginning with `#include "server.h"` that starts before
+the first copy is saved spends 2.6 s producing the same copy.
+
+Considered and rejected: the daemon marks a header "in progress" when the
+first request arrives, and other compiles wait for the result instead of
+parsing the header themselves.
+
+1. Waiting costs more than parsing. Producing is parse the context + parse the
+   header + write the file; the waiting compile's own work is only parsing the
+   header. A compile waiting on the copy of `functions.h` could wait 2.6 s to
+   save 10 ms.
+2. The copy may not fit the waiting compile: different flags, a different
+   context, a `#define` or declaration in its `.c` file above the `#include`,
+   or the production declines.
+
+Deferred: the useful half. The daemon records "production in flight for
+key K"; a compile that misses with the same key parses the header normally
+and does not queue a second production. No compile waits, and because the key
+determines the output, dropping the duplicate needs no guess about fit. It
+needs a new protocol message (a claim on K, answered "go ahead" or "in
+flight"), and a correct first population comes first.
 
 ---
 
@@ -404,6 +509,12 @@ Kept because the reasoning that produced them is likely to recur.
   half exists: `SocketCachePayloadSink::send` writes a length-prefixed payload
   and never reads. `deserialize` is written but has no caller. The token tier
   can record and ship; nothing reads any of it back.
+
+- **Context was replayed by absolute path, which broke `#include_next`.** A
+  resolved path names the file but not where in the search list it was found.
+  Found by the `anet.h` smoke test; fixed in 2.9. The first proposed fix
+  replaced the path with the spelling; the right fix keeps both, the path to
+  check the replay against.
 
 - **"25,027 tests passing" was Clang's own regression suite**, not evidence
   about this work. At the time the cache had six tests of its own.
@@ -436,17 +547,6 @@ Kept because the reasoning that produced them is likely to recur.
   `#include` of the same header is skipped. Not written.
 - A population request whose context cannot be reproduced fails every time it
   is retried; the daemon should remember the failure.
-- **Replaying context by absolute path breaks `#include_next`.** The wrappers
-  write `#include "/abs/path/h.h"`. `#include_next` inside a header reached
-  that way cannot tell where in the search path it stands, so it searches from
-  the start. Clang's own `<stdint.h>` does `#include_next <stdint.h>` to reach
-  glibc's; by absolute path it finds itself again, its guard is already
-  defined, and `uint32_t` is never declared. Found by the `anet.h` smoke test
-  (context `<stdint.h>`, declined: unknown type name 'uint32_t'). The target
-  wrapper has the same flaw, and there it can produce a wrong copy rather than
-  a decline. Fix proposed, not written: record each include as written
-  (`<stdint.h>` or `"anet.h"`) and replay it with the `.c` file's directory
-  first on the quoted search path.
 - Correctness will be established by building the benchmark projects with the
   mechanism enabled and running each project's own test suite. This bounds risk
   over the code those suites exercise; it does not establish that the record is

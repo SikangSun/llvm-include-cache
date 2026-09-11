@@ -16,9 +16,11 @@
 //
 // A header that relies on its includer -- redis's anet.h uses uint32_t and
 // never includes <stdint.h> -- needs the context the real build gave it. Pass
-// the files to put in front of it, in order, with -context. A compile that
-// misses on a header writes the same information to a job file, read here
-// with -job.
+// what to put in front of it, in order, with -context: a path, or an #include
+// spelling such as '<stdint.h>'. A spelling is replayed as written, so that
+// #include_next inside the file searches as it did in the real build. A
+// compile that misses on a header writes the same information to a job file,
+// read here with -job.
 //
 //===----------------------------------------------------------------------===//
 
@@ -50,9 +52,10 @@ static cl::list<std::string>
 
 static cl::list<std::string>
     ContextFiles("context",
-                 cl::desc("A file to put in front of each header, as the real "
-                          "build had it. Repeatable; order is kept."),
-                 cl::value_desc("file"), cl::cat(Category));
+                 cl::desc("What to put in front of each header, as the real "
+                          "build had it: a path, or an #include spelling "
+                          "such as '<stdint.h>'. Repeatable; order is kept."),
+                 cl::value_desc("file-or-spelling"), cl::cat(Category));
 
 static cl::opt<std::string>
     JobFile("job",
@@ -148,9 +151,18 @@ int main(int argc, char **argv) {
   } else {
     for (const std::string &H : Headers) {
       ProduceRequest R;
-      R.HeaderPath = H;
+      R.Header.Path = H;
       R.Args.assign(CompilerArgs.begin(), CompilerArgs.end());
-      R.Context.assign(ContextFiles.begin(), ContextFiles.end());
+      for (const std::string &C : ContextFiles) {
+        IncludeRef I;
+        // Nothing here resolves a spelling, so the file it opens is not
+        // checked; a job file from a real compile carries both.
+        if (StringRef(C).starts_with("<") || StringRef(C).starts_with("\""))
+          I.Spelled = C;
+        else
+          I.Path = C;
+        R.Context.push_back(std::move(I));
+      }
       Requests.push_back(std::move(R));
     }
   }
@@ -194,12 +206,12 @@ int main(int argc, char **argv) {
       if (Conn) {
         if (!sendMessage(*Conn, Msg)) {
           errs() << "lost the daemon connection while pushing "
-                 << Req.HeaderPath << "\n";
+                 << Req.Header.Path << "\n";
           return 1;
         }
         if (!receiveMessage(*Conn)) {
-          errs() << "no acknowledgment from the daemon for " << Req.HeaderPath
-                 << "\n";
+          errs() << "no acknowledgment from the daemon for "
+                 << Req.Header.Path << "\n";
           return 1;
         }
       }
@@ -209,13 +221,14 @@ int main(int argc, char **argv) {
       ++T.Declined;
       ++T.Reasons[R.Reason];
       if (ListDeclines)
-        outs() << "declined  " << Req.HeaderPath << "  -- " << R.Reason
+        outs() << "declined  " << Req.Header.Path << "  -- " << R.Reason
                << "\n";
       break;
     case ProduceResult::Status::Failed:
       ++T.Failed;
       ++T.Reasons["FAILED: " + R.Reason];
-      errs() << "failed    " << Req.HeaderPath << "  -- " << R.Reason << "\n";
+      errs() << "failed    " << Req.Header.Path << "  -- " << R.Reason
+             << "\n";
       break;
     }
   }

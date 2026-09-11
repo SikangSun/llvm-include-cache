@@ -96,12 +96,17 @@ own compile flags with `-Xcc`; a missing `-I` shows up as a header that
 A header that relies on its includer needs the context the real build gave
 it. redis's `anet.h` uses `uint32_t` and never includes `<stdint.h>`, because
 everything that includes `anet.h` has included `<stdint.h>` already. Pass the
-files to put in front of a header, in order, with `-context`:
+includes to put in front of a header, in order, with `-context`:
 
 ```
 clang-header-cache-populate -dry-run -Xcc -Isrc \
-    -context /path/to/stdint.h src/anet.h
+    -context '<stdint.h>' src/anet.h
 ```
+
+Write a header found through the include path the way the source writes it
+(`'<stdint.h>'`), not as its resolved path: Clang's `stdint.h` reaches glibc's
+with `#include_next`, which only works when the compiler found the file by
+searching (DECISIONS.md §2.9).
 
 A compile that misses on a header writes the same three things — the header,
 its flags, and the files it had already included — to a job file, which the

@@ -46,10 +46,18 @@ protected:
   ProduceRequest request(const std::string &Header,
                          std::vector<std::string> Context = {}) {
     ProduceRequest R;
-    R.HeaderPath = Header;
+    R.Header.Path = Header;
     R.Args = {"-std=c17"};
-    R.Context = std::move(Context);
+    for (std::string &C : Context)
+      R.Context.push_back(IncludeRef{"", std::move(C)});
     return R;
+  }
+
+  /// Makes \p Name a directory inside the test directory; returns its path.
+  std::string mkdir(llvm::StringRef Name) {
+    std::string P = Dir + "/" + Name.str();
+    EXPECT_FALSE(llvm::sys::fs::create_directory(P));
+    return P;
   }
 
   std::string Dir;
@@ -152,19 +160,85 @@ TEST_F(ProducerTest, ModuleNamesAreUniquePerRequestAndStable) {
   EXPECT_EQ(moduleNameFor(Base).rfind("__hc_", 0), 0u);
 
   ProduceRequest OtherHeader = Base;
-  OtherHeader.HeaderPath = "/x/g.h";
+  OtherHeader.Header.Path = "/x/g.h";
   ProduceRequest OtherContext = Base;
-  OtherContext.Context = {"/x/other.h"};
+  OtherContext.Context = {IncludeRef{"", "/x/other.h"}};
   ProduceRequest OtherArgs = Base;
   OtherArgs.Args.push_back("-DX=1");
   // Same characters, split differently across fields.
   ProduceRequest Resplit = Base;
-  Resplit.Context = {"/x/ctx", ".h"};
+  Resplit.Context = {IncludeRef{"", "/x/ctx"}, IncludeRef{"", ".h"}};
+  // Same file, replayed through the include path instead of by its path.
+  ProduceRequest OtherSpelling = Base;
+  OtherSpelling.Context = {IncludeRef{"<ctx.h>", "/x/ctx.h"}};
 
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherHeader));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherContext));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherArgs));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(Resplit));
+  EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherSpelling));
+}
+
+TEST_F(ProducerTest, IncludeNextWorksOnlyWhenTheContextIsReplayedAsWritten) {
+  // The shape of Clang's <stdint.h>. first/n.h is found first on the include
+  // path and hands over to second/n.h with #include_next, which searches the
+  // include path again starting after first/. second/n.h declares the type.
+  std::string First = mkdir("first"), Second = mkdir("second");
+  std::string N = write("first/n.h", "#ifndef FIRST_N_H\n#define FIRST_N_H\n"
+                                     "#include_next <n.h>\n#endif\n");
+  write("second/n.h", "typedef unsigned int n_t;\n");
+  std::string Use = write("use.h", "n_t get(void);\n");
+
+  ProduceRequest AsWritten = request(Use);
+  AsWritten.Args.push_back("-I" + First);
+  AsWritten.Args.push_back("-I" + Second);
+  AsWritten.Context = {IncludeRef{"<n.h>", N}};
+  ProduceResult R = produceHeader(AsWritten);
+  EXPECT_TRUE(R.produced()) << R.Reason;
+
+  // Opened by its path, first/n.h was found in no include directory, so its
+  // #include_next searches from the start, finds first/n.h again, and the
+  // guard makes that a no-op. second/n.h is never read; n_t is undeclared.
+  ProduceRequest ByPath = AsWritten;
+  ByPath.Context = {IncludeRef{"", N}};
+  ProduceResult P = produceHeader(ByPath);
+  EXPECT_EQ(P.Stat, ProduceResult::Status::Declined) << P.Reason;
+}
+
+TEST_F(ProducerTest, AReplayThatOpensADifferentFileIsDeclined) {
+  // Both directories have n.h and first/ is searched first, so <n.h> opens
+  // first/n.h here. A request saying <n.h> opened second/n.h came from a
+  // compile with some other search order; a copy built here would describe
+  // a compile that never happened.
+  std::string First = mkdir("first"), Second = mkdir("second");
+  std::string InFirst = write("first/n.h", "int in_first;\n");
+  std::string InSecond = write("second/n.h", "int in_second;\n");
+  std::string H = write("h.h", "int h;\n");
+  auto searchBoth = [&](ProduceRequest R) {
+    R.Args.push_back("-I" + First);
+    R.Args.push_back("-I" + Second);
+    return R;
+  };
+
+  ProduceRequest Ctx = searchBoth(request(H));
+  Ctx.Context = {IncludeRef{"<n.h>", InSecond}};
+  ProduceResult RC = produceHeader(Ctx);
+  EXPECT_EQ(RC.Stat, ProduceResult::Status::Declined) << RC.Reason;
+  EXPECT_NE(RC.Reason.find("opened"), std::string::npos) << RC.Reason;
+
+  ProduceRequest Target = searchBoth(request(InSecond));
+  Target.Header.Spelled = "<n.h>";
+  ProduceResult RT = produceHeader(Target);
+  EXPECT_EQ(RT.Stat, ProduceResult::Status::Declined) << RT.Reason;
+  EXPECT_NE(RT.Reason.find("opened"), std::string::npos) << RT.Reason;
+
+  // The file the spelling really finds is fine, and so is no path at all.
+  Ctx.Context = {IncludeRef{"<n.h>", InFirst}};
+  ProduceResult Right = produceHeader(Ctx);
+  EXPECT_TRUE(Right.produced()) << Right.Reason;
+  Ctx.Context = {IncludeRef{"<n.h>", ""}};
+  ProduceResult Unchecked = produceHeader(Ctx);
+  EXPECT_TRUE(Unchecked.produced()) << Unchecked.Reason;
 }
 
 TEST_F(ProducerTest, TwoHeadersGetTwoModuleNames) {
@@ -188,9 +262,13 @@ TEST_F(ProducerTest, MissingFilesFail) {
 }
 
 TEST_F(ProducerTest, JobFilesRoundTrip) {
-  ProduceRequest J1 = request("/x/h.h", {"/x/fmacros.h", "/x/stdio.h"});
+  ProduceRequest J1 = request("/x/h.h", {"/x/fmacros.h"});
   J1.Args.push_back("-DMSG=hello world"); // spaces inside a value survive
+  J1.Context.push_back({"<stdint.h>", "/usr/lib/clang/22/include/stdint.h"});
+  J1.Context.push_back({"\"my dir/x.h\"", "/x/my dir/x.h"});
+  J1.Context.push_back({"<stdio.h>", ""}); // spelling, unchecked
   ProduceRequest J2 = request("/x/g.h");
+  J2.Header.Spelled = "<g.h>";
   J2.Args.clear();
 
   std::string Path = Dir + "/jobs.txt";
@@ -199,10 +277,10 @@ TEST_F(ProducerTest, JobFilesRoundTrip) {
   llvm::Expected<std::vector<ProduceRequest>> Back = readJobFile(Path);
   ASSERT_THAT_EXPECTED(Back, llvm::Succeeded());
   ASSERT_EQ(Back->size(), 2u);
-  EXPECT_EQ((*Back)[0].HeaderPath, J1.HeaderPath);
+  EXPECT_EQ((*Back)[0].Header, J1.Header);
   EXPECT_EQ((*Back)[0].Args, J1.Args);
   EXPECT_EQ((*Back)[0].Context, J1.Context);
-  EXPECT_EQ((*Back)[1].HeaderPath, J2.HeaderPath);
+  EXPECT_EQ((*Back)[1].Header, J2.Header);
   EXPECT_TRUE((*Back)[1].Args.empty());
   EXPECT_TRUE((*Back)[1].Context.empty());
 }
@@ -213,18 +291,36 @@ TEST_F(ProducerTest, JobFilesRejectWhatTheyCannotRepresent) {
   EXPECT_THAT_EXPECTED(encodeJobs({Bad}), llvm::Failed())
       << "a line break would silently split one argument into two";
 
+  ProduceRequest BadSpelling = request("/x/h.h");
+  BadSpelling.Context.push_back({"<stdint.h", "/x/stdint.h"});
+  EXPECT_THAT_EXPECTED(encodeJobs({BadSpelling}), llvm::Failed());
+  ProduceRequest PathLikeSpelling = request("/x/h.h");
+  PathLikeSpelling.Context.push_back({"", "<odd>.h"});
+  EXPECT_THAT_EXPECTED(encodeJobs({PathLikeSpelling}), llvm::Failed())
+      << "would read back as a spelling";
+
+  const std::string Magic = "clang-header-cache-jobs 2\n";
   EXPECT_THAT_EXPECTED(decodeJobs("not a job file\n"), llvm::Failed());
   EXPECT_THAT_EXPECTED(
-      decodeJobs("clang-header-cache-jobs 1\njob\nheader /x/h.h\n"),
+      decodeJobs("clang-header-cache-jobs 1\njob\nheader /x/h.h\nend\n"),
       llvm::Failed())
+      << "version 1 had no spellings";
+  EXPECT_THAT_EXPECTED(decodeJobs(Magic + "job\nheader /x/h.h\n"),
+                       llvm::Failed())
       << "a job with no end line";
-  EXPECT_THAT_EXPECTED(
-      decodeJobs("clang-header-cache-jobs 1\njob\narg -DX\nend\n"),
-      llvm::Failed())
+  EXPECT_THAT_EXPECTED(decodeJobs(Magic + "job\narg -DX\nend\n"),
+                       llvm::Failed())
       << "a job with no header";
-  EXPECT_THAT_EXPECTED(decodeJobs("clang-header-cache-jobs 1\njob\n"
-                                  "header /x/h.h\nbogus line\nend\n"),
-                       llvm::Failed());
+  EXPECT_THAT_EXPECTED(
+      decodeJobs(Magic + "job\nheader /x/h.h\nbogus line\nend\n"),
+      llvm::Failed());
+  EXPECT_THAT_EXPECTED(decodeJobs(Magic + "job\nheader <g.h>\nend\n"),
+                       llvm::Failed())
+      << "a header needs a path";
+  EXPECT_THAT_EXPECTED(
+      decodeJobs(Magic + "job\nheader /x/h.h\ncontext <stdint.h\nend\n"),
+      llvm::Failed())
+      << "an unterminated spelling";
 }
 
 } // namespace

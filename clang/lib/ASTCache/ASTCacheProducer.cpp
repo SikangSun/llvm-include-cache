@@ -35,6 +35,21 @@ using namespace clang::ast_cache;
 
 namespace {
 
+/// The text a replayed #include writes after `#include`.
+std::string replayText(const IncludeRef &I) {
+  return I.Spelled.empty() ? "\"" + I.Path + "\"" : I.Spelled;
+}
+
+/// `<name>` or `"name"`, as it appears after #include. The closing character
+/// cannot occur inside the name: the lexer ends the name there.
+bool validSpelling(llvm::StringRef S) {
+  if (S.size() < 3 || S.find_first_of("\n\r") != llvm::StringRef::npos)
+    return false;
+  char Close = S.front() == '<' ? '>' : S.front() == '"' ? '"' : '\0';
+  return Close && S.back() == Close &&
+         S.drop_front().drop_back().find(Close) == llvm::StringRef::npos;
+}
+
 /// What the compile learned about the target header, copied out while the
 /// compile is still running. The tracker, Sema, and the AST consumers are all
 /// destroyed before ExecuteAction returns, so nothing may be read from any of
@@ -49,6 +64,9 @@ struct ProduceOutcome {
   PragmaSnapshot Entry, Exit;
   /// Non-empty names a pragma whose state a record cannot carry.
   std::string Unrepresentable;
+  /// Non-empty says which replayed #include opened a different file than the
+  /// compile being reproduced did.
+  std::string ReplayMismatch;
 };
 
 /// Rides alongside the module writer to observe Sema, which the dependency
@@ -197,12 +215,72 @@ private:
   bool InTargetPart = false;
 };
 
+/// Checks that each replayed #include opened the file the compile being
+/// reproduced opened. A spelling such as <stdint.h> is resolved again by
+/// searching, and the search can land elsewhere -- say the -I flags are in a
+/// different order. A copy built from a different file would describe a
+/// compile that never happened.
+class ReplayChecker : public PPCallbacks {
+public:
+  struct Expectation {
+    /// Null: not checked.
+    const FileEntry *Want;
+    /// The replayed text and the expected path, for the decline message.
+    std::string Text;
+    std::string WantPath;
+  };
+
+  ReplayChecker(SourceManager &SM, const FileEntry *ContextWrapper,
+                const FileEntry *TargetWrapper,
+                std::vector<Expectation> Context, Expectation Target,
+                std::string &Mismatch)
+      : SM(SM), ContextWrapper(ContextWrapper), TargetWrapper(TargetWrapper),
+        Context(std::move(Context)), Target(std::move(Target)),
+        Mismatch(Mismatch) {}
+
+  void InclusionDirective(SourceLocation HashLoc, const Token &, StringRef,
+                          bool, CharSourceRange, OptionalFileEntryRef File,
+                          StringRef, StringRef, const Module *, bool,
+                          SrcMgr::CharacteristicKind) override {
+    OptionalFileEntryRef In = SM.getFileEntryRefForID(SM.getFileID(HashLoc));
+    if (!In)
+      return;
+    // The context wrapper holds one #include line per context entry, in
+    // order. This callback fires even when an include guard turns the
+    // #include into a no-op, so the count stays in step.
+    const Expectation *E = nullptr;
+    if (&In->getFileEntry() == ContextWrapper) {
+      if (NextContext < Context.size())
+        E = &Context[NextContext++];
+    } else if (&In->getFileEntry() == TargetWrapper) {
+      E = &Target;
+    }
+    // A file that was not found at all is reported by the compile itself.
+    if (!E || !E->Want || !File || !Mismatch.empty())
+      return;
+    if (&File->getFileEntry() != E->Want)
+      Mismatch = "replaying #include " + E->Text + " opened " +
+                 File->getName().str() +
+                 ", but the compile being reproduced opened " + E->WantPath;
+  }
+
+private:
+  SourceManager &SM;
+  const FileEntry *ContextWrapper;
+  const FileEntry *TargetWrapper;
+  std::vector<Expectation> Context;
+  Expectation Target;
+  std::string &Mismatch;
+  size_t NextContext = 0;
+};
+
 /// Builds a module from the generated module map, with the tracker, the Sema
-/// observer, and the target watcher attached.
+/// observer, the target watcher, and the replay checker attached.
 class ProducerAction : public GenerateModuleFromModuleMapAction {
 public:
-  ProducerAction(std::string TargetPath, std::string TargetWrapperPath)
-      : TargetPath(std::move(TargetPath)),
+  ProducerAction(const ProduceRequest &Req, std::string ContextWrapperPath,
+                 std::string TargetWrapperPath)
+      : Req(Req), ContextWrapperPath(std::move(ContextWrapperPath)),
         TargetWrapperPath(std::move(TargetWrapperPath)) {}
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
@@ -213,10 +291,23 @@ public:
       return nullptr;
 
     FileManager &FM = CI.getFileManager();
-    OptionalFileEntryRef Target = FM.getOptionalFileRef(TargetPath);
-    OptionalFileEntryRef Wrapper = FM.getOptionalFileRef(TargetWrapperPath);
-    if (!Target || !Wrapper)
+    auto entry = [&](llvm::StringRef P) -> const FileEntry * {
+      OptionalFileEntryRef F = FM.getOptionalFileRef(P);
+      return F ? &F->getFileEntry() : nullptr;
+    };
+    const FileEntry *Target = entry(Req.Header.Path);
+    const FileEntry *ContextWrapper = entry(ContextWrapperPath);
+    const FileEntry *TargetWrapper = entry(TargetWrapperPath);
+    if (!Target || !ContextWrapper || !TargetWrapper)
       return nullptr;
+
+    std::vector<ReplayChecker::Expectation> Context;
+    for (const IncludeRef &C : Req.Context) {
+      const FileEntry *Want = nullptr;
+      if (!C.Path.empty() && !(Want = entry(C.Path)))
+        return nullptr;
+      Context.push_back({Want, replayText(C), C.Path});
+    }
 
     // Attached here rather than in BeginSourceFileAction, which the base class
     // keeps private. This still runs during BeginSourceFile, before the parser
@@ -226,10 +317,16 @@ public:
     ASTCacheDependencyTracker &Tracker = *OwnedTracker;
     PP.addPPCallbacks(std::move(OwnedTracker));
 
+    PP.addPPCallbacks(std::make_unique<ReplayChecker>(
+        CI.getSourceManager(), ContextWrapper, TargetWrapper,
+        std::move(Context),
+        ReplayChecker::Expectation{Target, replayText(Req.Header),
+                                   Req.Header.Path},
+        Outcome.ReplayMismatch));
+
     auto Obs = std::make_unique<ProducerObserver>(Tracker, Outcome);
     PP.addPPCallbacks(std::make_unique<TargetWatcher>(
-        CI.getSourceManager(), &Target->getFileEntry(),
-        &Wrapper->getFileEntry(), *Obs));
+        CI.getSourceManager(), Target, TargetWrapper, *Obs));
 
     std::vector<std::unique_ptr<ASTConsumer>> Consumers;
     // The observer goes first so that it reads Sema's state before the writer
@@ -242,7 +339,8 @@ public:
   ProduceOutcome Outcome;
 
 private:
-  std::string TargetPath;
+  ProduceRequest Req;
+  std::string ContextWrapperPath;
   std::string TargetWrapperPath;
 };
 
@@ -302,6 +400,23 @@ bool writableInInclude(llvm::StringRef P) {
   return P.find_first_of("\"\n\r") == llvm::StringRef::npos;
 }
 
+/// Normalizes \p I's path and checks that \p I can be replayed. Returns what
+/// is wrong, if anything.
+std::optional<std::string> prepare(IncludeRef &I, llvm::StringRef What) {
+  if (!I.Spelled.empty() && !validSpelling(I.Spelled))
+    return "not an #include spelling: " + I.Spelled;
+  if (I.Path.empty())
+    return std::nullopt;
+  if (std::error_code EC = normalize(I.Path))
+    return ("resolving " + What + " path: " + EC.message()).str();
+  if (!llvm::sys::fs::exists(I.Path))
+    return ("no such " + What + ": " + I.Path).str();
+  // The path itself goes into the replay only when there is no spelling.
+  if (I.Spelled.empty() && !writableInInclude(I.Path))
+    return "path cannot be written into an #include: " + I.Path;
+  return std::nullopt;
+}
+
 llvm::Error writeFile(llvm::StringRef Path, llvm::StringRef Text) {
   std::error_code EC;
   llvm::raw_fd_ostream OS(Path, EC);
@@ -323,11 +438,17 @@ std::string clang::ast_cache::moduleNameFor(const ProduceRequest &Req) {
     Key += Value;
     Key.push_back('\0');
   };
-  add("header", Req.HeaderPath);
+  // The replayed text as well as the path: <stdint.h> and its resolved path
+  // replay differently (see IncludeRef::Spelled), so they are different
+  // requests.
+  add("header", replayText(Req.Header));
+  add("header-path", Req.Header.Path);
   for (const std::string &A : Req.Args)
     add("arg", A);
-  for (const std::string &C : Req.Context)
-    add("context", C);
+  for (const IncludeRef &C : Req.Context) {
+    add("context", replayText(C));
+    add("context-path", C.Path);
+  }
 
   std::string Name;
   {
@@ -339,20 +460,15 @@ std::string clang::ast_cache::moduleNameFor(const ProduceRequest &Req) {
 
 ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   ProduceRequest Req = In;
-  if (std::error_code EC = normalize(Req.HeaderPath))
-    return failed("resolving header path: " + EC.message());
-  if (!llvm::sys::fs::exists(Req.HeaderPath))
-    return failed("no such file: " + Req.HeaderPath);
-  if (!writableInInclude(Req.HeaderPath))
-    return failed("path cannot be written into an #include: " +
-                  Req.HeaderPath);
-  for (std::string &C : Req.Context) {
-    if (std::error_code EC = normalize(C))
-      return failed("resolving context path: " + EC.message());
-    if (!llvm::sys::fs::exists(C))
-      return failed("no such context file: " + C);
-    if (!writableInInclude(C))
-      return failed("path cannot be written into an #include: " + C);
+  if (Req.Header.Path.empty())
+    return failed("the request names no header file");
+  if (std::optional<std::string> Problem = prepare(Req.Header, "file"))
+    return failed(*Problem);
+  for (IncludeRef &C : Req.Context) {
+    if (C.Spelled.empty() && C.Path.empty())
+      return failed("a context entry has neither a spelling nor a file");
+    if (std::optional<std::string> Problem = prepare(C, "context file"))
+      return failed(*Problem);
   }
 
   std::string Name = moduleNameFor(Req);
@@ -373,10 +489,13 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   // -include flags. -include lists are among the preprocessor options the
   // AST reader validates when a saved copy is loaded; keeping context out of
   // them means the saved copy's options are exactly the compile's own.
+  //
+  // Each #include is replayed the way the compile being reproduced found its
+  // file; IncludeRef::Spelled says why a path is not enough.
   std::string ContextText;
-  for (const std::string &C : Req.Context)
-    ContextText += "#include \"" + C + "\"\n";
-  std::string TargetText = "#include \"" + Req.HeaderPath + "\"\n";
+  for (const IncludeRef &C : Req.Context)
+    ContextText += "#include " + replayText(C) + "\n";
+  std::string TargetText = "#include " + replayText(Req.Header) + "\n";
 
   std::string MapText;
   {
@@ -465,14 +584,19 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   CI.createVirtualFileSystem(VFS);
   CI.createFileManager();
 
-  ProducerAction Action(Req.HeaderPath, std::string(TargetWrapper));
+  ProducerAction Action(Req, std::string(ContextWrapper),
+                        std::string(TargetWrapper));
   bool Ok = CI.ExecuteAction(Action);
+  const ProduceOutcome &O = Action.Outcome;
+  // Checked first: when a replay opened a different file, any error that
+  // followed is a consequence, and the mismatch is what to report.
+  if (!O.ReplayMismatch.empty())
+    return declined(O.ReplayMismatch);
   if (!Ok || Diags->hasErrorOccurred())
     return declined("does not compile in this context: " +
                     (Collector->First.empty() ? std::string("(no diagnostic)")
                                               : Collector->First));
 
-  const ProduceOutcome &O = Action.Outcome;
   if (!O.TargetEntered)
     return failed("the header was never entered");
   if (O.ReachedThroughContext)
@@ -495,7 +619,7 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   ProduceResult R;
   R.Stat = ProduceResult::Status::Produced;
   R.ModuleName = Name;
-  R.Push.Filename = Req.HeaderPath;
+  R.Push.Filename = Req.Header.Path;
   R.Push.Deps = O.Deps;
   R.Push.Deps.Entry = O.Entry;
   R.Push.Deps.Exit = O.Exit;
@@ -507,10 +631,33 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
 // Job files
 //===----------------------------------------------------------------------===//
 
-static constexpr llvm::StringLiteral JobFileMagic = "clang-header-cache-jobs 1";
+static constexpr llvm::StringLiteral JobFileMagic = "clang-header-cache-jobs 2";
 
 static llvm::Error jobError(const llvm::Twine &Msg) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
+}
+
+/// Splits a header or context value into its optional spelling and its path.
+static llvm::Expected<IncludeRef> parseRef(llvm::StringRef V, size_t LineNo) {
+  IncludeRef I;
+  if (!V.starts_with("<") && !V.starts_with("\"")) {
+    I.Path = V.str();
+    return I;
+  }
+  char Close = V.front() == '<' ? '>' : '"';
+  size_t End = V.find(Close, 1);
+  if (End == llvm::StringRef::npos)
+    return jobError("line " + llvm::Twine(LineNo) + ": unterminated spelling");
+  I.Spelled = V.take_front(End + 1).str();
+  if (!validSpelling(I.Spelled))
+    return jobError("line " + llvm::Twine(LineNo) +
+                    ": not an #include spelling: " + I.Spelled);
+  llvm::StringRef Rest = V.drop_front(End + 1);
+  if (!Rest.empty() && !Rest.consume_front(" "))
+    return jobError("line " + llvm::Twine(LineNo) +
+                    ": expected a space after the spelling");
+  I.Path = Rest.str();
+  return I;
 }
 
 llvm::Expected<std::string>
@@ -518,26 +665,49 @@ clang::ast_cache::encodeJobs(llvm::ArrayRef<ProduceRequest> Jobs) {
   auto oneLine = [](llvm::StringRef V) {
     return V.find_first_of("\n\r") == llvm::StringRef::npos;
   };
+  // parseRef tells a spelling from a path by the first character, so a path
+  // cannot start the way a spelling does.
+  auto ref = [&](const IncludeRef &I,
+                 llvm::StringRef What) -> llvm::Expected<std::string> {
+    if (I.Spelled.empty() && I.Path.empty())
+      return jobError("a " + What + " entry has neither a spelling nor a file");
+    if (!oneLine(I.Spelled) || !oneLine(I.Path))
+      return jobError(What + " contains a line break: " + I.Spelled + " " +
+                      I.Path);
+    if (!I.Spelled.empty() && !validSpelling(I.Spelled))
+      return jobError("not an #include spelling: " + I.Spelled);
+    if (llvm::StringRef(I.Path).starts_with("<") ||
+        llvm::StringRef(I.Path).starts_with("\""))
+      return jobError(What + " path starts like a spelling: " + I.Path);
+    if (I.Spelled.empty())
+      return I.Path;
+    return I.Path.empty() ? I.Spelled : I.Spelled + " " + I.Path;
+  };
 
   std::string Out;
   llvm::raw_string_ostream OS(Out);
   OS << JobFileMagic << "\n";
   for (const ProduceRequest &J : Jobs) {
-    if (J.HeaderPath.empty())
+    if (J.Header.Path.empty())
       return jobError("a job has no header");
-    if (!oneLine(J.HeaderPath))
-      return jobError("header path contains a line break: " + J.HeaderPath);
+    llvm::Expected<std::string> Header = ref(J.Header, "header");
+    if (!Header)
+      return Header.takeError();
     for (const std::string &A : J.Args)
       if (!oneLine(A))
         return jobError("argument contains a line break: " + A);
-    for (const std::string &C : J.Context)
-      if (!oneLine(C))
-        return jobError("context path contains a line break: " + C);
+    std::vector<std::string> Context;
+    for (const IncludeRef &C : J.Context) {
+      llvm::Expected<std::string> V = ref(C, "context");
+      if (!V)
+        return V.takeError();
+      Context.push_back(std::move(*V));
+    }
 
-    OS << "job\n" << "header " << J.HeaderPath << "\n";
+    OS << "job\n" << "header " << *Header << "\n";
     for (const std::string &A : J.Args)
       OS << "arg " << A << "\n";
-    for (const std::string &C : J.Context)
+    for (const std::string &C : Context)
       OS << "context " << C << "\n";
     OS << "end\n";
   }
@@ -564,7 +734,7 @@ clang::ast_cache::decodeJobs(llvm::StringRef Text) {
     if (L == "end") {
       if (!Cur)
         return jobError("line " + llvm::Twine(I + 1) + ": end with no job");
-      if (Cur->HeaderPath.empty())
+      if (Cur->Header.Path.empty())
         return jobError("line " + llvm::Twine(I + 1) + ": job has no header");
       Jobs.push_back(std::move(*Cur));
       Cur.reset();
@@ -573,13 +743,23 @@ clang::ast_cache::decodeJobs(llvm::StringRef Text) {
     if (!Cur)
       return jobError("line " + llvm::Twine(I + 1) + ": field outside a job");
     if (L.consume_front("header ")) {
-      if (!Cur->HeaderPath.empty())
+      if (!Cur->Header.Path.empty())
         return jobError("line " + llvm::Twine(I + 1) + ": second header");
-      Cur->HeaderPath = L.str();
+      llvm::Expected<IncludeRef> R = parseRef(L, I + 1);
+      if (!R)
+        return R.takeError();
+      if (R->Path.empty())
+        return jobError("line " + llvm::Twine(I + 1) + ": header has no path");
+      Cur->Header = std::move(*R);
     } else if (L.consume_front("arg ")) {
       Cur->Args.push_back(L.str());
     } else if (L.consume_front("context ")) {
-      Cur->Context.push_back(L.str());
+      llvm::Expected<IncludeRef> R = parseRef(L, I + 1);
+      if (!R)
+        return R.takeError();
+      if (R->Spelled.empty() && R->Path.empty())
+        return jobError("line " + llvm::Twine(I + 1) + ": empty context");
+      Cur->Context.push_back(std::move(*R));
     } else {
       return jobError("line " + llvm::Twine(I + 1) + ": unrecognised: " + L);
     }
