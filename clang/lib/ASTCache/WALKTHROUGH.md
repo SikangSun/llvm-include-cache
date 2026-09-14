@@ -11,7 +11,8 @@ where the AST tier reuses something from it.
 
 Scope of the whole design: **C only**. C++ overload sets are out.
 
-Everything here is against upstream `ca7933e47`. Line counts are from
+Everything here is against upstream `ca7933e47`; §11 maps every file to the
+commits that changed it. Line counts are from
 `git diff --stat ca7933e47..HEAD`.
 
 ---
@@ -23,8 +24,9 @@ previously parsed `anet.h` instead of parsing the text again. To do that
 safely, three things must exist: a way to **record** what a parse of `anet.h`
 depended on (§4), a way to **build and store** that parsed form (§5, §6), and
 a way to **check** at a later `#include` that the recorded dependencies still
-hold (§6.4). All three exist and are tested. The fourth part — the compiler
-actually asking the cache at an `#include` — does not exist yet (§8).
+hold (§6.4). All three exist and are tested. The fourth part — the compiler asking
+the cache at an `#include` — exists as of `ab65051ab` (§6.6). What remains is
+filling the cache from inside a compile (§8).
 
 ---
 
@@ -40,21 +42,17 @@ that nothing inside the compiler calls yet.
   either reports on it (`-dry-run`) or pushes it to the daemon.
 - `clang-header-cache-daemon`: holds pushed PCMs in a shared memory region and
   answers lookups by header path.
-- 57 unit tests.
+- The hit path, when `CLANG_HEADER_CACHE` names a daemon socket (§6.6,
+  `ab65051ab`). Unset, nothing is installed.
+- 61 unit tests.
 
-**Present but not wired into any compile:**
+**Changed by the hit path (`ab65051ab`):** `Parser::isAtDeclarationBoundary()`
+and `CacheClient` now have a real caller, and `clang/lib/Lex/PPDirectives.cpp`
+asks the hook at the top of `case Enter:` (the original marker comment, lower
+down, is untouched).
 
-- `Parser::isAtDeclarationBoundary()` — implemented, but **called by nothing**
-  (`grep` finds only its definition and a doc comment). It is there for the
-  hit path to use.
-- `clang/lib/ASTCache/CacheClient.cpp` — the "does this stored entry apply to
-  my compile" logic. Only the tests call it.
-- `clang/lib/Lex/PPDirectives.cpp:2702` — the entire change to this file is a
-  marker comment, `// Cache: request cache right here!!!`, at the point where
-  a hit would be served. No code queries anything there.
-
-**Does not exist at all:** the hit path, the miss path, deferred population
-from inside a compile, and the `__COUNTER__` backfill (§8).
+**Does not exist at all:** the miss path, population from inside a compile,
+and the `__COUNTER__` backfill (§8).
 
 ---
 
@@ -119,7 +117,12 @@ Why `InDeclGroup` exists separately: in `int a, b;` an `#include` between
 `a,` and `b;` touches none of the three nesting counters, so without the flag
 the preprocessor would think that point was a safe boundary.
 
-**Nothing calls this yet.** The hit path will.
+The hit path (§6.6) asks it at every eligible `#include`. Its first real
+use exposed that it rejected almost everything: `InDeclGroup` was held while
+the terminating `;` was consumed, and because the parser reads one token
+ahead, consuming that `;` processes the `#include` on the next line with the
+flag still set. `ParseDeclGroup` now restores the flag before the `;` and
+before a function body (`ab65051ab`).
 
 ### 3.4 What an identifier currently means
 
@@ -371,7 +374,7 @@ with a hundred conditional dependencies usually fails on one of them, and the
 symbol checks are the only ones costing a name lookup. With no `Sema`
 available, everything is rejected.
 
-Nothing in the compiler calls this yet.
+The hit path (§6.6) calls it.
 
 ### 6.5 `clang/tools/clang-header-cache-populate/` (238 + 13)
 
@@ -381,9 +384,46 @@ flags with `-Xcc`, the context with `-context` (a path, or a spelling such as
 and reports without needing a daemon: how many headers were saved, the mean
 size of a PCM and of a record, and a tally of why the rest were declined.
 
+### 6.6 The hit path (`ab65051ab`)
+
+- **`clang/include/clang/Lex/HeaderCacheHook.h` (new)** — one method,
+  `Module *tryServe(FileEntryRef, SourceLocation)`, modelled on
+  `DeclBoundaryObserver`. Null means "enter the file as usual".
+- **`clang/include/clang/Lex/Preprocessor.h` (+14) and
+  `clang/lib/Lex/Preprocessor.cpp` (+7)** — the preprocessor owns the hook.
+- **`clang/lib/Lex/PPDirectives.cpp` (+11)** — asked at the top of
+  `case Enter:`, before the include-depth check and before a FileID is made.
+  A returned module takes the same two lines as `case Import:`, so the parser
+  and Sema learn of it through the ordinary annotation token.
+- **`clang/include/clang/ASTCache/HeaderCacheServer.h` and
+  `clang/lib/ASTCache/HeaderCacheServer.cpp` (new)** — the implementation.
+  Three gates with no socket traffic (the `#include` is in the main file, at a
+  declaration boundary, and Sema exists), the lookup name normalised the way
+  the producer writes it, one lookup, load from shared memory, pragma replay.
+- **`clang/include/clang/Frontend/CompilerInstance.h` (+11),
+  `clang/lib/Frontend/CompilerInstance.cpp` (+3), `clang/tools/driver/cc1_main.cpp`
+  (+6), `clang/tools/driver/CMakeLists.txt` (+1)** — a callback slot filled by
+  cc1, because `clangASTCache` depends on `clangFrontend` and the dependency
+  cannot also run the other way.
+- **`clang/lib/Parse/ParseDecl.cpp` (+10) and
+  `clang/include/clang/Parse/RAIIObjectsForParser.h` (+6)** — the boundary
+  fix described in §3.3.
+
+`CLANG_HEADER_CACHE_STATS=1` prints one line when the main file ends — not
+from a destructor, because cc1 runs with `-disable-free` and destructors never
+run.
+
+**First hit on a real benchmark file.** redis `anet.c`, compiled from `src/`
+with the real `clang`, after producing `anet.h` in the context of the 16
+includes `anet.c` has before it: `header cache: 1 hits / 18 lookups`. The
+daemon agrees (`lookups 18 (1 with entries)`), and the object file's
+disassembly is identical to an uncached compile's, all 1,517 lines. 19 direct
+includes gave 18 lookups because `<string.h>` had already been read through an
+earlier header, so Clang skipped it before the hook is asked.
+
 ---
 
-## 7. Tests — 57, all passing
+## 7. Tests — 61, all passing
 
 `clang/unittests/ASTCache/` (plus `CMakeLists.txt`, 24 lines, and one line in
 `clang/unittests/CMakeLists.txt`).
@@ -397,23 +437,22 @@ size of a PCM and of a record, and a tally of why the rest were declined.
 | `EndToEndTest.cpp` (346) | 7 | Push through a real socket, then reject the entry on each kind of mismatch in turn, and choose correctly between variants. |
 | `ProducerTest.cpp` (355) | 12 | Context makes an otherwise unbuildable header buildable; a context macro becomes a conditional dependency; pragma entry state is the header's, not the compile's; a header reached through its own context is declined; module names are unique and stable; `#include_next` works only when the context is replayed as written; a replay that opens a different file is declined; a header reading `__COUNTER__` is declined; job files round-trip. |
 | `LoadTest.cpp` (216) | 1 | A PCM is loaded from bytes in memory, under a name no file has, partway through a compile that already parsed the context header itself — and its declarations then work with that compile's own types. |
+| `HitTest.cpp` | 4 | A stored header is served without the file being opened; an `#include` right after a function definition is served while one inside a body is not; a header the compile names relatively is still found; an entry whose record does not match is not used. |
 
 ---
 
 ## 8. What does not exist yet
 
-1. **The hit path.** Nothing asks the cache at an `#include`. The marker
-   comment in `PPDirectives.cpp` is the only trace in the compiler.
-2. **The miss path.** Nothing builds a request when a header is not found in
+1. **The miss path.** Nothing builds a request when a header is not found in
    the cache.
-3. **Population from inside a compile.** Decided but unwritten: a thread
+2. **Population from inside a compile.** Decided but unwritten: a thread
    started at the first miss, with whatever it has not finished handed to a
    detached `clang-header-cache-populate -job` when the compile exits.
-4. **The `__COUNTER__` backfill.** Such headers are declined today. The plan
+3. **The `__COUNTER__` backfill.** Such headers are declined today. The plan
    is to record where each varying value landed and rewrite it on load.
-5. **Loading the context's guard state.** A hit must leave the compile as a
+4. **Loading the context's guard state.** A hit must leave the compile as a
    textual include would.
-6. **The token tier's server half.** The token tier can record and ship;
+5. **The token tier's server half.** The token tier can record and ship;
    nothing reads its payloads back.
 
 Known gaps in the record itself are listed in DECISIONS.md §3 and §4. The
@@ -445,6 +484,11 @@ Kept because each one is a mistake that could recur.
 - **A comment claimed the target could be entered before `Sema` existed.**
   `Parser::Initialize` calls `Actions.Initialize()` before its first
   `ConsumeToken()`, so it cannot; the fallback that remains is defensive.
+- **The declaration-boundary check rejected almost every `#include`** (§3.3,
+  fixed in `ab65051ab`).
+- **The first redis run missed every lookup:** the producer stores absolute
+  paths and redis names `anet.h` relatively. The daemon's count gave it away,
+  `lookups 18 (0 with entries)`; fixed in `ab65051ab`.
 
 ---
 
@@ -453,3 +497,92 @@ Kept because each one is a mistake that could recur.
 - `DECISIONS.md` — why each choice was made, and what was rejected.
 - `README.md` — how to run the tools.
 - This file — what exists.
+
+---
+
+## 11. Commit map
+
+Every commit since upstream, oldest first. Linked ones are on
+`github.com/SikangSun/llvm-include-cache`, branch `header-cache`; the ones
+marked local have not been pushed.
+
+| Commit | What it did |
+|---|---|
+| [`91182dc08`](https://github.com/SikangSun/llvm-include-cache/commit/91182dc08708b524cf29cae785aa38ce8fa0414a) | [clang] Per-header compilation cache: observation layer and AST tier |
+| [`a5a384e19`](https://github.com/SikangSun/llvm-include-cache/commit/a5a384e19b83b6dbbf5ccbd0058ee4a3dbbe72e8) | [clang] Header cache: producer replays context into a hidden submodule |
+| [`ea53c042d`](https://github.com/SikangSun/llvm-include-cache/commit/ea53c042db80c37d0f716e8dd7ab2def6ab5d54a) | [clang] Header cache: replay each include the way the compile found its file |
+| [`f976d8fd4`](https://github.com/SikangSun/llvm-include-cache/commit/f976d8fd40648c2967f60567e2f0f31fa445198b) | [clang] Header cache: decline TU-varying builtins; test loading from memory |
+| [`95232c6b6`](https://github.com/SikangSun/llvm-include-cache/commit/95232c6b69c0525d65e5d03a90208291491a2de0) | [clang] Header cache: store the producer's generated files in the saved copy |
+| `7032a4b76` (local) | [clang] Header cache: a file-by-file walkthrough of what was built |
+| `26a28d8ea` (local) | [clang] Header cache: shelve the read-set argument for the record |
+| `ab65051ab` (local) | [clang] Header cache: serve an #include from the cache (the hit path) |
+
+Which commits changed each file, oldest first:
+
+| File | Commits |
+|---|---|
+| `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/ASTCacheProducer.h` | `91182dc08` `a5a384e19` `ea53c042d` |
+| `clang/include/clang/ASTCache/ByteStream.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/CacheDaemon.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/CacheProtocol.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/HeaderCacheServer.h` | `ab65051ab` |
+| `clang/include/clang/ASTCache/MacroTokens.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/PragmaStateCheck.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/SharedRegion.h` | `91182dc08` |
+| `clang/include/clang/Frontend/CompilerInstance.h` | `ab65051ab` |
+| `clang/include/clang/Lex/DeclBoundaryObserver.h` | `91182dc08` |
+| `clang/include/clang/Lex/HeaderCacheHook.h` | `ab65051ab` |
+| `clang/include/clang/Lex/PPCallbacks.h` | `91182dc08` |
+| `clang/include/clang/Lex/Preprocessor.h` | `91182dc08` `ab65051ab` |
+| `clang/include/clang/Lex/TransitiveClosureTracker.h` | `91182dc08` |
+| `clang/include/clang/Parse/Parser.h` | `91182dc08` |
+| `clang/include/clang/Parse/RAIIObjectsForParser.h` | `91182dc08` `ab65051ab` |
+| `clang/include/clang/Sema/NameClassificationObserver.h` | `91182dc08` |
+| `clang/include/clang/Sema/Sema.h` | `91182dc08` |
+| `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/ASTCacheProducer.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` |
+| `clang/lib/ASTCache/CMakeLists.txt` | `91182dc08` `ab65051ab` |
+| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/CacheDaemon.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/CacheProtocol.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` |
+| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/FORMALIZATION.md` | `26a28d8ea` |
+| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` |
+| `clang/lib/ASTCache/MacroTokens.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/PragmaStateCheck.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/README.md` | `91182dc08` `a5a384e19` `ea53c042d` |
+| `clang/lib/ASTCache/SharedRegion.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` |
+| `clang/lib/CMakeLists.txt` | `91182dc08` |
+| `clang/lib/Frontend/CompilerInstance.cpp` | `ab65051ab` |
+| `clang/lib/Lex/CMakeLists.txt` | `91182dc08` |
+| `clang/lib/Lex/PPDirectives.cpp` | `91182dc08` `ab65051ab` |
+| `clang/lib/Lex/PPExpressions.cpp` | `91182dc08` |
+| `clang/lib/Lex/Preprocessor.cpp` | `91182dc08` `ab65051ab` |
+| `clang/lib/Lex/TransitiveClosureTracker.cpp` | `91182dc08` |
+| `clang/lib/Parse/ParseDecl.cpp` | `91182dc08` `ab65051ab` |
+| `clang/lib/Parse/Parser.cpp` | `91182dc08` |
+| `clang/lib/Sema/SemaDecl.cpp` | `91182dc08` |
+| `clang/lib/Sema/SemaTemplate.cpp` | `91182dc08` |
+| `clang/tools/CMakeLists.txt` | `91182dc08` |
+| `clang/tools/clang-header-cache-daemon/CMakeLists.txt` | `91182dc08` |
+| `clang/tools/clang-header-cache-daemon/ClangHeaderCacheDaemon.cpp` | `91182dc08` |
+| `clang/tools/clang-header-cache-populate/CMakeLists.txt` | `91182dc08` |
+| `clang/tools/clang-header-cache-populate/ClangHeaderCachePopulate.cpp` | `91182dc08` `a5a384e19` `ea53c042d` |
+| `clang/tools/driver/CMakeLists.txt` | `ab65051ab` |
+| `clang/tools/driver/cc1_main.cpp` | `ab65051ab` |
+| `clang/unittests/ASTCache/ASTCacheDependencyTrackerTest.cpp` | `91182dc08` |
+| `clang/unittests/ASTCache/CMakeLists.txt` | `91182dc08` `a5a384e19` `f976d8fd4` `ab65051ab` |
+| `clang/unittests/ASTCache/CacheProtocolTest.cpp` | `91182dc08` |
+| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` |
+| `clang/unittests/ASTCache/EndToEndTest.cpp` | `91182dc08` |
+| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` |
+| `clang/unittests/ASTCache/LoadTest.cpp` | `f976d8fd4` `95232c6b6` |
+| `clang/unittests/ASTCache/ProducerTest.cpp` | `a5a384e19` `ea53c042d` `f976d8fd4` |
+| `clang/unittests/ASTCache/SymbolDependencyTest.cpp` | `91182dc08` |
+| `clang/unittests/CMakeLists.txt` | `91182dc08` |
