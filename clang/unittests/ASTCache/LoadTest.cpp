@@ -179,10 +179,7 @@ TEST_F(LoadTest, ASavedCopyLoadsFromMemoryPartwayThroughACompile) {
 
   ProduceRequest Req;
   Req.Header.Path = Use;
-  // The producer deletes the files it generates, and a copy otherwise needs
-  // them on disk to load (DECISIONS.md section 4). Embedding every input
-  // sidesteps that here; this test is about loading from memory.
-  Req.Args = {"-std=c17", "-Xclang", "-fmodules-embed-all-files"};
+  Req.Args = {"-std=c17"};
   Req.Context = {IncludeRef{"", Types}};
   ProduceResult P = produceHeader(Req);
   ASSERT_TRUE(P.produced()) << P.Reason;
@@ -193,7 +190,9 @@ TEST_F(LoadTest, ASavedCopyLoadsFromMemoryPartwayThroughACompile) {
 
   // The compile parses types.h itself, then loads use.h's copy where the
   // #include "use.h" would be, then uses use.h's declarations and macro with
-  // its own struct point.
+  // its own struct point. Including types.h textually also covers the
+  // producer's generated files: without those embedded in the copy, a compile
+  // that touches a header the copy contains fails to load it (2.9).
   std::string Body =
       "void f(void) { struct point p; draw(&p); u32 n = count(); (void)n;\n"
       "               int ok = USE_OK; (void)ok; }\n";

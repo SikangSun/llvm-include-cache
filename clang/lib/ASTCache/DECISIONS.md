@@ -419,6 +419,24 @@ and context (`__hc_` + 16 hex digits of xxh3). Two modules with the same name
 cannot both be loaded into one compile, so the single fixed name used before
 would have made loading two saved copies together impossible.
 
+**The three generated files are stored inside the saved copy.** The producer
+writes them into a temporary directory and deletes that directory when it is
+done, but the saved copy records them as the files its declarations were
+reached through. A compile that later touches a header the saved copy also
+contains -- the normal case, since the context is exactly what the `.c` file
+had already included -- goes to the saved copy for that header, ends up
+needing a wrapper on disk, and dies with "malformed or corrupted precompiled
+file: could not find file '.../__hc_context.h'". Each of the three is passed
+as `-fmodules-embed-file=`, which marks the file transient
+(`FrontendAction.cpp:988`) so the writer stores its text in the saved copy; on
+load, a transient input file missing from disk becomes a virtual file built
+from that text (`ASTReader.cpp:2849`). Cost on redis `anet.h` with
+`<stdint.h>` as context: 116,744 -> 117,036 bytes, +292 bytes or +0.25%, which
+is the 418 bytes of generated text minus what the bitstream packs away.
+Embedding every input file instead (`-fmodules-embed-all-files`) would store
+the text of `<stdint.h>` and everything under it: 170,640 bytes, +46%, for no
+gain.
+
 ### 2.10 Population runs on a thread during the compile; what is left at exit goes to a detached process
 
 A compile that misses queues a `ProduceRequest` for a producer thread in the
@@ -557,6 +575,15 @@ Kept because the reasoning that produced them is likely to recur.
   replaced the path with the spelling; the right fix keeps both, the path to
   check the replay against.
 
+- **The unloadable-copy failure was blamed on the wrong check.** The first
+  diagnosis said the reader validates every input file when a saved copy is
+  loaded. That validation is skipped for explicitly loaded module files
+  (`ASTReader.cpp:3202`). The failure comes from a later read, and which read
+  is still unpinned: a compile that includes a header the saved copy also
+  contains fails, one that never touches such a header does not. Embedding
+  ended the dependence on those files being on disk, so the exact path stopped
+  mattering.
+
 - **"25,027 tests passing" was Clang's own regression suite**, not evidence
   about this work. At the time the cache had six tests of its own.
 
@@ -584,13 +611,6 @@ Kept because the reasoning that produced them is likely to recur.
 - `__COUNTER__` and the other translation-unit-varying builtins: declined for
   now (2.7). The backfill -- rewrite each value on load from the loading
   compile's own state, and advance its counter -- is still to write.
-- **Saved copies cannot be loaded as produced.** A copy lists every file it
-  was built from, including the three the producer generates in a temporary
-  directory (the two wrappers and the module map), and the reader checks that
-  each one exists when loading. The producer deletes that directory, so a load
-  fails with "could not find file '.../__hc_context.h'". Fix under discussion:
-  embed those three files' text in the copy (`-fmodules-embed-file=`, tested
-  by hand).
 - Loading a saved copy must leave the includer as a textual include would:
   the guard macro defined and the file marked as included, so a second
   `#include` of the same header is skipped. Not written.

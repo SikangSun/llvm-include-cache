@@ -588,6 +588,17 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
       "-fmodule-name=" + Name,
       "-Xclang",
       "-emit-module",
+      // The three files below live in a directory this function deletes. A
+      // saved copy records them as the files its declarations were reached
+      // through, so a compile that later touches a header the copy also
+      // contains needs them on disk and dies with "could not find file".
+      // Embedding stores their text in the copy instead.
+      "-Xclang",
+      "-fmodules-embed-file=" + std::string(ContextWrapper),
+      "-Xclang",
+      "-fmodules-embed-file=" + std::string(TargetWrapper),
+      "-Xclang",
+      "-fmodules-embed-file=" + std::string(MapPath),
       // Without -c the driver appends a link step and fails on a .pcm.
       "-c",
       "-x",
