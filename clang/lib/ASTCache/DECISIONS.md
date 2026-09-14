@@ -541,6 +541,34 @@ out of scope.
   '#include'"); a second `#include` of the header is skipped, for both an
   include guard and `#pragma once`; the `.c` file can define functions the copy
   declares.
+- **How the hit path is wired.** `HeaderCacheHook` (`clang/Lex`) is a
+  one-method interface, owned by the `Preprocessor`, asked at the top of
+  `case Enter:` in `HandleHeaderIncludeOrImport` -- before the include-depth
+  check and before a FileID is created. A non-null answer takes the same two
+  lines as `case Import:`: make the module visible, return `ModuleImport`, so
+  the parser and Sema learn of it through the ordinary annotation token. The
+  implementation (`HeaderCacheServer.cpp`) asks only for `#include`s written
+  in the main file, only at a declaration boundary, and only once Sema
+  exists. It is installed from `cc1_main.cpp` through
+  `CompilerInstance::setPreprocessorCreatedCallback`, because `clangASTCache`
+  depends on `clangFrontend` and the dependency cannot also run the other
+  way.
+- **Lookups use the producer's spelling of the path.** The producer stores
+  entries under an absolute, dot-free path; the hit path turns the compile's
+  name for the file into the same form (`FileManager::makeAbsolutePath`, then
+  `remove_dots`) before asking. Symlinks are not resolved on either side, so
+  two spellings through different symlinks still miss.
+- **`CLANG_HEADER_CACHE_STATS` prints one line when the main file ends:**
+  hits, lookups, candidates rejected, and `#include`s skipped because they were
+  not at a declaration boundary. The region path is not configurable from the
+  environment; the compile always maps the default region, so the daemon must
+  use it.
+- **First hit on a real benchmark file.** redis `anet.c`, compiled from its own
+  directory with `-std=gnu11 -O2`, after producing `anet.h` in the context of
+  `anet.c`'s 16 includes before it: `1 hits / 18 lookups` (19 direct includes;
+  `<string.h>` had already been read through another header, so Clang skipped
+  it before the hook is asked). The object file's disassembly is identical to
+  an uncached compile's, all 1,517 lines.
 
 ---
 
@@ -583,6 +611,28 @@ Kept because the reasoning that produced them is likely to recur.
   contains fails, one that never touches such a header does not. Embedding
   ended the dependence on those files being on disk, so the exact path stopped
   mattering.
+
+- **The declaration-boundary check rejected almost every `#include`.**
+  `InDeclGroup` was held for the whole of `ParseDeclGroup`, including while
+  the terminating `;` was consumed. The parser reads one token ahead, so
+  consuming that `;` lexes the next token -- and when the next line is an
+  `#include`, the preprocessor processes it right then, with the flag still
+  set. Every `#include` that follows a declaration read as being inside it;
+  so did one after a function definition, whose closing `}` is also consumed
+  inside `ParseDeclGroup`. Nothing had ever called the check, so nothing had
+  noticed. Found by the first hit-path test: `use.h` was never even looked
+  up. Fixed by restoring the flag before the `;` and before a function body.
+
+- **The first redis run missed every lookup.** The producer stores absolute
+  paths; redis compiles `anet.c` from its own directory, so the compile named
+  the header `anet.h`. The daemon's own count gave it away -- `lookups 18 (0
+  with entries)`. The unit tests had passed because they used absolute paths
+  throughout. Fixed by normalising the lookup name; `HitTest` now covers a
+  relatively named header.
+
+- **The stats line was printed from a destructor that never runs.** cc1 runs
+  with `-disable-free`, so the preprocessor that owns the hit path is never
+  destroyed. The line is now printed when the main file ends.
 
 - **"25,027 tests passing" was Clang's own regression suite**, not evidence
   about this work. At the time the cache had six tests of its own.

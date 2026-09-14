@@ -9,6 +9,7 @@ add_clang_library(clangASTCache
   CacheDaemon.cpp
   CacheProtocol.cpp
   DependencySerialization.cpp
+  HeaderCacheServer.cpp
   MacroTokens.cpp
   PragmaStateCheck.cpp
   SharedRegion.cpp

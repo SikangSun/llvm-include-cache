@@ -544,6 +544,9 @@ void CompilerInstance::createPreprocessor(TranslationUnitKind TUKind) {
 
   if (GetDependencyDirectives)
     PP->setDependencyDirectivesGetter(*GetDependencyDirectives);
+
+  if (PreprocessorCreated)
+    PreprocessorCreated(*this);
 }
 
 std::string CompilerInstance::getSpecificModuleCachePath(StringRef ModuleHash) {

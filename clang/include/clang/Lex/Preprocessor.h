@@ -70,6 +70,7 @@ class CodeCompletionHandler;
 class CommentHandler;
 class DeclBoundaryObserver;
 class DirectoryEntry;
+class HeaderCacheHook;
 class EmptylineHandler;
 class ExternalPreprocessorSource;
 class FileEntry;
@@ -325,6 +326,11 @@ private:
   /// preprocessing, e.g. -E mode, or before the Parser has been
   /// constructed).
   DeclBoundaryObserver *DeclBoundary = nullptr;
+
+  /// Serves an #include from a cache of parsed headers instead of entering
+  /// the file, when one is installed. Owned: the object implementing it is
+  /// built above this layer and has nowhere else to live.
+  std::unique_ptr<HeaderCacheHook> HeaderCache;
 
   /// The file that we're performing code-completion for, if any.
   const FileEntry *CodeCompletionFile = nullptr;
@@ -1635,6 +1641,14 @@ public:
   void clearDeclBoundaryObserver() {
     DeclBoundary = nullptr;
   }
+
+  /// Install a hook that can serve an #include from a cache of already-parsed
+  /// headers. \see HeaderCacheHook
+  void setHeaderCacheHook(std::unique_ptr<HeaderCacheHook> Hook);
+
+  /// The installed header-cache hook, or nullptr when no cache is in use,
+  /// which is the ordinary case.
+  HeaderCacheHook *getHeaderCacheHook() const { return HeaderCache.get(); }
 
   /// Hook used by the lexer to invoke the "included file" code
   /// completion point.

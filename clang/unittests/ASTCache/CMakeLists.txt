@@ -3,6 +3,7 @@ add_clang_unittest(ASTCacheTests
   CacheProtocolTest.cpp
   DependencySerializationTest.cpp
   EndToEndTest.cpp
+  HitTest.cpp
   LoadTest.cpp
   ProducerTest.cpp
   SymbolDependencyTest.cpp

@@ -36,6 +36,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/CodeCompletionHandler.h"
 #include "clang/Lex/DeclBoundaryObserver.h"
+#include "clang/Lex/HeaderCacheHook.h"
 #include "clang/Lex/ExternalPreprocessorSource.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LexDiagnostic.h"
@@ -1665,6 +1666,12 @@ EmptylineHandler::~EmptylineHandler() = default;
 CodeCompletionHandler::~CodeCompletionHandler() = default;
 
 DeclBoundaryObserver::~DeclBoundaryObserver() = default;
+
+HeaderCacheHook::~HeaderCacheHook() = default;
+
+void Preprocessor::setHeaderCacheHook(std::unique_ptr<HeaderCacheHook> Hook) {
+  HeaderCache = std::move(Hook);
+}
 
 void Preprocessor::createPreprocessingRecord() {
   if (Record)

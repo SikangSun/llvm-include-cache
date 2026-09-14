@@ -59,6 +59,7 @@ setup_host_tool(clang CLANG clang_exe clang_target)
 clang_target_link_libraries(clang
   PRIVATE
   clangBasic
+  clangASTCache
   clangCodeGen
   clangDriver
   clangFrontend

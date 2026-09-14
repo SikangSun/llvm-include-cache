@@ -336,6 +336,12 @@ namespace clang {
   /// depth reflects. Constructed once at the top of ParseDeclGroup; RAII
   /// scope exit covers all of that function's several early-return paths
   /// automatically.
+  ///
+  /// ParseDeclGroup restores it early in two places: before consuming the
+  /// terminating ';', and before a function body. The parser reads one token
+  /// ahead, so the token after a declaration is lexed while that ';' or the
+  /// body's closing '}' is being consumed. An #include there is after the
+  /// declaration, and must not read as inside it.
   class ParsingDeclGroupRAII {
     Parser &P;
     bool OldVal;

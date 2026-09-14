@@ -2236,6 +2236,12 @@ Parser::DeclGroupPtrTy Parser::ParseDeclGroup(ParsingDeclSpec &DS,
                 << FixItHint::CreateRemoval(DS.getStorageClassSpecLoc());
             DS.ClearStorageClassSpecs();
           }
+          // The declaration part ends at the body's '{'. Inside the body the
+          // brace depth guards isAtDeclarationBoundary(); the flag must not
+          // outlive the closing '}', because consuming it lexes the next
+          // token, and an #include there sits after the definition.
+          InDeclGroupRAII.restore();
+
           Decl *TheDecl = nullptr;
 
           if (TemplateInfo.Kind == ParsedTemplateKind::ExplicitInstantiation) {
@@ -2429,6 +2435,10 @@ Parser::DeclGroupPtrTy Parser::ParseDeclGroup(ParsingDeclSpec &DS,
 
   if (DeclEnd)
     *DeclEnd = Tok.getLocation();
+
+  // Every declarator is done. Consuming the ';' lexes the next token, and an
+  // #include there sits after this declaration, not inside it.
+  InDeclGroupRAII.restore();
 
   if (ExpectSemi && ExpectAndConsumeSemi(
                         Context == DeclaratorContext::File

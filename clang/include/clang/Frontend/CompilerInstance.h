@@ -733,6 +733,14 @@ public:
   /// and replace any existing one with it.
   void createPreprocessor(TranslationUnitKind TUKind);
 
+  /// Called at the end of createPreprocessor, with the new Preprocessor in
+  /// place. cc1 uses this to install the header cache, which cannot be done
+  /// from here: the cache library depends on this one.
+  using PreprocessorCreatedCallback = void (*)(CompilerInstance &);
+  void setPreprocessorCreatedCallback(PreprocessorCreatedCallback CB) {
+    PreprocessorCreated = CB;
+  }
+
   void setDependencyDirectivesGetter(
       std::unique_ptr<DependencyDirectivesGetter> Getter) {
     GetDependencyDirectives = std::move(Getter);
@@ -863,6 +871,9 @@ public:
   }
 
   void createASTReader();
+
+  /// \see setPreprocessorCreatedCallback
+  PreprocessorCreatedCallback PreprocessorCreated = nullptr;
 
   bool loadModuleFile(StringRef FileName,
                       serialization::ModuleFile *&LoadedModuleFile);

@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/ASTCache/HeaderCacheServer.h"
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Basic/Stack.h"
 #include "clang/Basic/TargetOptions.h"
@@ -293,6 +294,11 @@ int cc1_main(ArrayRef<const char *> Argv, const char *Argv0, void *MainAddr) {
     Clang->getDiagnosticClient().finish();
     return 1;
   }
+
+  // With CLANG_HEADER_CACHE set, an #include can be served from a cache of
+  // already-parsed headers. Installed here because CompilerInstance cannot
+  // reach the cache library.
+  Clang->setPreprocessorCreatedCallback(clang::ast_cache::installHeaderCacheHook);
 
   // Execute the frontend actions.
   {

@@ -1,0 +1,45 @@
+//===--- HeaderCacheHook.h - Serving an #include from a cache ----*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// Lets a compile serve an #include from a cache of already-parsed headers
+// instead of entering the file.
+//
+// Deciding whether a stored parse fits this compile reads the live symbol
+// table, and loading one goes through the module reader; both live above the
+// Lex layer. So the preprocessor knows only this interface, and whatever
+// installs an implementation comes from outside (clang/lib/ASTCache).
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_CLANG_LEX_HEADERCACHEHOOK_H
+#define LLVM_CLANG_LEX_HEADERCACHEHOOK_H
+
+#include "clang/Basic/FileEntry.h"
+#include "clang/Basic/SourceLocation.h"
+
+namespace clang {
+
+class Module;
+
+class HeaderCacheHook {
+public:
+  virtual ~HeaderCacheHook();
+
+  /// Called where the preprocessor is about to enter \p File, with
+  /// \p IncludeLoc the location of the #include's filename token.
+  ///
+  /// Returning a module makes that module's declarations stand in for the
+  /// file's contents, and the file is never entered. Returning null -- the
+  /// ordinary answer -- enters the file as usual, so a cache that holds
+  /// nothing suitable costs only the time it took to decide that.
+  virtual Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc) = 0;
+};
+
+} // namespace clang
+
+#endif // LLVM_CLANG_LEX_HEADERCACHEHOOK_H

@@ -24,6 +24,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Lex/CodeCompletionHandler.h"
+#include "clang/Lex/HeaderCacheHook.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LexDiagnostic.h"
 #include "clang/Lex/LiteralSupport.h"
@@ -2674,6 +2675,16 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
   }
 
   case Enter:
+    // A stored parse of this header can stand in for entering it. On a hit
+    // the file is never opened, and the loaded module's declarations reach
+    // the compile exactly as an imported header's would, through the arm
+    // above.
+    if (HeaderCacheHook *Hook = getHeaderCacheHook()) {
+      if (Module *Cached = Hook->tryServe(*File, FilenameTok.getLocation())) {
+        makeModuleVisible(Cached, EndLoc);
+        return {ImportAction::ModuleImport, Cached};
+      }
+    }
     break;
   }
 
