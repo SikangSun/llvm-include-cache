@@ -25,8 +25,9 @@ safely, three things must exist: a way to **record** what a parse of `anet.h`
 depended on (§4), a way to **build and store** that parsed form (§5, §6), and
 a way to **check** at a later `#include` that the recorded dependencies still
 hold (§6.4). All three exist and are tested. The fourth part — the compiler asking
-the cache at an `#include` — exists as of `ab65051ab` (§6.6). What remains is
-filling the cache from inside a compile (§8).
+the cache at an `#include` — exists as of `ab65051ab` (§6.6). As of
+`1291faa49` the record covers every identifier the header read, not only its
+macros (§3.5). What remains is filling the cache from inside a compile (§8).
 
 ---
 
@@ -44,12 +45,16 @@ that nothing inside the compiler calls yet.
   answers lookups by header path.
 - The hit path, when `CLANG_HEADER_CACHE` names a daemon socket (§6.6,
   `ab65051ab`). Unset, nothing is installed.
-- 61 unit tests.
+- 80 unit tests.
 
 **Changed by the hit path (`ab65051ab`):** `Parser::isAtDeclarationBoundary()`
 and `CacheClient` now have a real caller, and `clang/lib/Lex/PPDirectives.cpp`
 asks the hook at the top of `case Enter:` (the original marker comment, lower
 down, is untouched).
+
+**Changed by syntactic dependencies (`1291faa49`):** the lexers report each
+identifier at the expansion decision to an `ExpansionCandidateObserver` when
+one is registered (§3.5). None is registered in an ordinary compile.
 
 **Does not exist at all:** the miss path, population from inside a compile,
 and the `__COUNTER__` backfill (§8).
@@ -136,7 +141,10 @@ before a function body (`ab65051ab`).
   `ClassifyName` each become a thin wrapper around a renamed `…Impl` holding
   the original body, reporting once at the wrapper's single return.
 - **`clang/lib/Sema/SemaTemplate.cpp` (+29 lines)** — the same for
-  `isTemplateName` and `isDeductionGuideName`.
+  `isTemplateName` and `isDeductionGuideName`. **C++ only, not needed for the
+  C scope:** C never calls either, and the tracker poisons the frame if one
+  fires (DECISIONS 1.11). Of the four queries, C needs `getTypeName` and
+  `ClassifyName`.
 
 Why wrappers and not edits at each `return`: `getTypeName` has 24 return
 points across 321 lines and `ClassifyName` 22 across ~390. Editing each one
@@ -153,18 +161,53 @@ header from caching instead.
 
 Cost to an ordinary compile: one null check per call.
 
+### 3.5 Every identifier considered for expansion (`1291faa49`)
+
+- **`clang/include/clang/Lex/ExpansionCandidateObserver.h` (50 lines, new)** —
+  one method, `expansionCandidate(const Token &)`, called for each identifier
+  at the point where the preprocessor decides whether to expand it.
+- **`clang/include/clang/Lex/Preprocessor.h` (+39 lines)** — the observer
+  pointer and its set/get/clear; `noteExpansionCandidate`, inline and one
+  pointer test; and `refreshIdentifier`, which brings a name up to date after
+  a module load before anyone asks whether it is a macro.
+- **`clang/lib/Lex/Preprocessor.cpp` (+11 lines)** — the out-of-line half,
+  which skips identifiers read with expansion off: a macro's own name in
+  `#define`, the operand of `#ifdef` or `defined()`.
+- **`clang/lib/Lex/Lexer.cpp` (+2 lines)** — text read from a file
+  (`LexIdentifierContinue`) and clang-scan-deps' minimized sources
+  (`LexDependencyDirectiveToken`).
+- **`clang/lib/Lex/TokenLexer.cpp` (+5 −2 lines)** — tokens coming out of a
+  macro's body, a `##` result included.
+- **`clang/lib/Lex/PPMacroExpansion.cpp` (+6 lines)** — a macro whose whole
+  body is one token, which `HandleMacroExpandedIdentifier` returns without a
+  token lexer.
+
+Why it was needed: an earlier `#define` can turn any identifier in a header
+into something else — zmalloc.c's `#define malloc tc_malloc`, qemu's
+`#define inline __attribute__((gnu_inline))` — so every identifier the header
+reads is a dependency, macro or not. A name that is not a macro passes the
+expansion check without calling anything, so no existing callback saw it
+(DECISIONS 1.12).
+
+The fourth site was found by a failing test: `#define ALLOC grab_impl` is the
+commonest macro shape there is, and `grab_impl` went unrecorded. It is a
+pointer on `Preprocessor`, not a `PPCallbacks` method, because an ordinary
+compile always has callbacks attached and a new one would put a chain of
+virtual calls on every identifier. Measured with no observer set: redis
+`object.c` 3,070 → 3,084 ms, `server.c` 4,943 → 4,919 ms, within noise.
+
 ---
 
 ## 4. The data model, and collecting it
 
-### 4.1 `clang/include/clang/ASTCache/DependencyRecord.h` (143 lines)
+### 4.1 `clang/include/clang/ASTCache/DependencyRecord.h` (157 lines)
 
 What a parsed header can depend on, in five pieces:
 
 | Struct | Records |
 |---|---|
 | `ConditionalDependency` | A macro whose *definedness* was tested, and the answer. |
-| `ValueDependency` | A macro that was *expanded*, and its replacement list as text. |
+| `SyntacticDependency` | An identifier the preprocessor considered for expansion inside the header, and what it had to be: *not a macro*, or a macro with exactly this replacement list (DECISIONS 1.12). |
 | `SymbolDependency` | An identifier a grammar-ambiguity query asked about, which query, and the answer — including the resolved type's canonical spelling. |
 | `InclusionDependency` | An `#include` that did nothing because the file was already included (`#pragma once`, `#import`). |
 | `PragmaSnapshot` | Pragma state, twice: `Entry`, the state the header was compiled under, and `Exit`, the state the header leaves behind. |
@@ -178,17 +221,23 @@ Design notes worth knowing: `SymbolDependency::Classification` mirrors
 **only if its definition lies outside the header's own closure** — a macro
 defined and used inside the same header can never vary.
 
-### 4.2 `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` (207) and `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` (322)
+### 4.2 `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` (236) and `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` (332)
 
-A `PPCallbacks` that also implements `NameClassificationObserver`, so one
-object collects preprocessor facts and Sema facts.
+A `PPCallbacks` that also implements `ExpansionCandidateObserver` and
+`NameClassificationObserver`, so one object collects the preprocessor's, the
+lexer's and Sema's facts.
 
 The important design point is that it keeps a **stack of frames**, one per
 file entered, not one set per translation unit. Headers nest, and the same
 macro expansion has a different answer at each level: a macro defined in `a.h`
 and used in the `b.h` that `a.h` includes is a real dependency of `b.h` and
-not one of `a.h`, whose own text fixes it. So each expansion is asked the
-provenance question once per open frame.
+not one of `a.h`, whose own text fixes it. So each sighting of a name is
+asked the provenance question once per open frame.
+
+**First sighting decides.** A frame records a name the first time it sees it
+and never again. A header that uses `BUF` and then defines it depended on
+`BUF` not being a macro at that use, so it records NotAMacro; one that defines
+`BUF` first does not depend on the includer for it, and records nothing.
 
 An earlier flat version got this wrong twice: it asked the question once per
 translation unit, and it treated the main `.c` file as internal to everything,
@@ -205,7 +254,7 @@ must not. Missing entirely means a miss.
 One function that turns a macro's replacement list into a string. It is its
 own file because two sides must produce byte-identical output: the tracker
 when recording, and the client when checking a stored record against a live
-macro. If those two ever drifted, every value dependency would compare
+macro. If those two ever drifted, every ExpandsTo dependency would compare
 unequal and nothing would ever hit — a failure that looks exactly like the
 cache simply not helping.
 
@@ -221,10 +270,11 @@ Serialization does not solve this on its own:
 `ASTWriter::WritePackPragmaOptions` returns early while a module is being
 written, so the PCM carries no pragma state in either direction.
 
-### 4.5 `clang/include/clang/ASTCache/ByteStream.h` (133), `DependencySerialization.h` (53) and `.cpp` (117)
+### 4.5 `clang/include/clang/ASTCache/ByteStream.h` (133), `DependencySerialization.h` (65) and `.cpp` (150)
 
-A flat byte encoding for `HeaderDependencySet`, and the little-endian
-primitives under it.
+A flat byte encoding for `HeaderDependencySet`, the little-endian primitives
+under it, and the NUL-separated list a record's NotAMacro names travel as
+(§6.3).
 
 Two properties matter. Strings are length-prefixed, not NUL-terminated,
 because a serialized replacement list contains NULs by construction — they
@@ -238,7 +288,7 @@ managed to read would produce a partial record, which is the unsafe direction
 
 ## 5. Building a PCM for one header
 
-### 5.1 `clang/include/clang/ASTCache/ASTCacheProducer.h` (194) and `clang/lib/ASTCache/ASTCacheProducer.cpp` (838)
+### 5.1 `clang/include/clang/ASTCache/ASTCacheProducer.h` (194) and `clang/lib/ASTCache/ASTCacheProducer.cpp` (840)
 
 This is the largest piece, and the one that changed most often.
 
@@ -346,17 +396,19 @@ was fully written. The size is fixed generously at creation because growing a
 mapping can move it, which would invalidate every offset already handed out.
 The backing file is sparse, so reserved space costs nothing.
 
-### 6.2 `clang/include/clang/ASTCache/CacheProtocol.h` (141) and `.cpp` (211)
+### 6.2 `clang/include/clang/ASTCache/CacheProtocol.h` (149) and `.cpp` (215)
 
 Two request types: `LOOKUP(filename)`, answered with every entry stored under
 that name, each carrying its dependency record and where its bytes sit in the
 region; and `PUSH(filename, record, data)`, answered with an acknowledgment.
+A lookup reply carries each record without its NotAMacro names, and says
+where in the region those names sit (§6.3).
 
 The daemon never interprets a record. Deciding which entry fits needs the
 compile's live macro table and Sema, which the daemon does not have and could
 not be sent cheaply.
 
-### 6.3 `clang/include/clang/ASTCache/CacheDaemon.h` (115) and `.cpp` (166), plus `clang/tools/clang-header-cache-daemon/` (95 + 13)
+### 6.3 `clang/include/clang/ASTCache/CacheDaemon.h` (118) and `.cpp` (181), plus `clang/tools/clang-header-cache-daemon/` (95 + 13)
 
 A filename → entries table over the region. No state survives a restart, by
 choice: this is a proof of concept, and the daemon is not restarted during an
@@ -365,18 +417,29 @@ is tested without any socket. One thread per connection, blocking reads, no
 timeout — after a compile finishes its lookups it spends a long time in code
 generation without touching the socket, and a parked thread costs nothing.
 
-### 6.4 `clang/include/clang/ASTCache/CacheClient.h` (112) and `.cpp` (192)
+On a push the daemon moves the record's NotAMacro names — several hundred for
+a system header — into the region, so they stay out of every lookup reply,
+and keeps the entry only if both the names and the PCM were written.
+
+### 6.4 `clang/include/clang/ASTCache/CacheClient.h` (118) and `.cpp` (236)
 
 The judgement: given a stored record and the live compile, does the entry
 apply? Checks run cheapest first and stop at the first mismatch — conditional,
-then value, then inclusion, then symbol, then pragma entry state. A header
-with a hundred conditional dependencies usually fails on one of them, and the
-symbol checks are the only ones costing a name lookup. With no `Sema`
-available, everything is rejected.
+then the ExpandsTo syntactic dependencies, then inclusion, then the NotAMacro
+names, then symbol, then pragma entry state. A header with a hundred
+conditional dependencies usually fails on one of them, and the symbol checks
+are the only ones costing a name lookup. With no `Sema` available, everything
+is rejected.
+
+Every name is refreshed (`Preprocessor::refreshIdentifier`) before it is
+asked about. A hit earlier in the compile loads a module, which can define a
+name the compile had already seen, and until the identifier is updated its
+macro bit still says it is not a macro. The conditional check had this bug
+before the syntactic one existed; `1291faa49` fixes both.
 
 The hit path (§6.6) calls it.
 
-### 6.5 `clang/tools/clang-header-cache-populate/` (238 + 13)
+### 6.5 `clang/tools/clang-header-cache-populate/` (253 + 13)
 
 The command-line front end to the producer: headers as arguments, the build's
 flags with `-Xcc`, the context with `-context` (a path, or a spelling such as
@@ -411,7 +474,7 @@ size of a PCM and of a record, and a tally of why the rest were declined.
 
 `CLANG_HEADER_CACHE_STATS=1` prints one line when the main file ends — not
 from a destructor, because cc1 runs with `-disable-free` and destructors never
-run.
+run — followed, as of `1291faa49`, by one line per rejection reason.
 
 **First hit on a real benchmark file.** redis `anet.c`, compiled from `src/`
 with the real `clang`, after producing `anet.h` in the context of the 16
@@ -421,23 +484,32 @@ disassembly is identical to an uncached compile's, all 1,517 lines. 19 direct
 includes gave 18 lookups because `<string.h>` had already been read through an
 earlier header, so Clang skipped it before the hook is asked.
 
+**With syntactic dependencies (`1291faa49`).** Each `.c` file's direct
+includes built in the context of the ones before them: `anet.c` served 6 of
+18, `sds.c` 1 of 9, `object.c` 3 of 6, with identical assembly each time and
+no candidate rejected for a syntactic reason. Every rejection was a
+conditional recorded defined and live undefined: macros glibc sets for itself
+(`__need_size_t`), which conditionals record without a provenance filter
+(DECISIONS 1.5), and `_BSD_SOURCE` from `fmacros.h`, whose `#define`s do not
+take effect after a hit because macro replay is not built yet.
+
 ---
 
-## 7. Tests — 61, all passing
+## 7. Tests — 80, all passing
 
 `clang/unittests/ASTCache/` (plus `CMakeLists.txt`, 24 lines, and one line in
 `clang/unittests/CMakeLists.txt`).
 
 | File | Tests | What it pins down |
 |---|---|---|
-| `ASTCacheDependencyTrackerTest.cpp` (289) | 13 | Provenance: an internally defined macro is not a dependency; one from the includer is; a sub-header's macro is internal to its parent; a conditional is recorded at every open level; `#if UNDEFINED > 5` is recorded; a guard-suppressed `#include` is recorded. |
-| `SymbolDependencyTest.cpp` (179) | 4 | The `T * p;` ambiguity: a typedef from the includer is a dependency; one the header declares itself is not; the resolved type's identity is recorded, not just "it was a type"; a typedef from a sub-header is internal to the parent. |
-| `DependencySerializationTest.cpp` (157) | 8 | An empty set and a full set round-trip; embedded NULs survive; truncation, a version mismatch, trailing bytes and an out-of-range classification are all rejected rather than partially decoded; a corrupt count does not size an allocation. |
-| `CacheProtocolTest.cpp` (220) | 12 | Message framing (length prefix, round trip, wrong kind, truncation) and daemon behaviour: a miss is clean, every variant comes back, identical pushes are discarded, distinct headers do not collide, stored bytes come back exactly, an out-of-range offset reads as nothing, garbage closes the connection. |
-| `EndToEndTest.cpp` (346) | 7 | Push through a real socket, then reject the entry on each kind of mismatch in turn, and choose correctly between variants. |
+| `ASTCacheDependencyTrackerTest.cpp` (399) | 20 | Provenance: an internally defined macro is not a dependency; one from the includer is; a sub-header's macro is internal to its parent; a conditional is recorded at every open level; `#if UNDEFINED > 5` is recorded; a guard-suppressed `#include` is recorded. Syntactic: a plain name, a keyword, a `##` result and a name from an outside macro's body are recorded; the first sighting decides; names read with expansion off are not recorded; a child records a name its parent saw first. |
+| `SymbolDependencyTest.cpp` (180) | 4 | The `T * p;` ambiguity: a typedef from the includer is a dependency; one the header declares itself is not; the resolved type's identity is recorded, not just "it was a type"; a typedef from a sub-header is internal to the parent. |
+| `DependencySerializationTest.cpp` (204) | 11 | An empty set and a full set round-trip; embedded NULs survive; an unknown syntactic state and a damaged name list are rejected; NotAMacro names move into the list; truncation, a version mismatch, trailing bytes and an out-of-range classification are all rejected rather than partially decoded; a corrupt count does not size an allocation. |
+| `CacheProtocolTest.cpp` (267) | 14 | Message framing (length prefix, round trip, wrong kind, truncation, where the NotAMacro names are) and daemon behaviour: the names are kept in the region, a miss is clean, every variant comes back, identical pushes are discarded, distinct headers do not collide, stored bytes come back exactly, an out-of-range offset reads as nothing, garbage closes the connection. |
+| `EndToEndTest.cpp` (347) | 7 | Push through a real socket, then reject the entry on each kind of mismatch in turn, and choose correctly between variants. |
 | `ProducerTest.cpp` (355) | 12 | Context makes an otherwise unbuildable header buildable; a context macro becomes a conditional dependency; pragma entry state is the header's, not the compile's; a header reached through its own context is declined; module names are unique and stable; `#include_next` works only when the context is replayed as written; a replay that opens a different file is declined; a header reading `__COUNTER__` is declined; job files round-trip. |
 | `LoadTest.cpp` (216) | 1 | A PCM is loaded from bytes in memory, under a name no file has, partway through a compile that already parsed the context header itself — and its declarations then work with that compile's own types. |
-| `HitTest.cpp` | 4 | A stored header is served without the file being opened; an `#include` right after a function definition is served while one inside a body is not; a header the compile names relatively is still found; an entry whose record does not match is not used. |
+| `HitTest.cpp` (548) | 11 | A stored header is served without the file being opened; an `#include` right after a function definition is served while one inside a body is not; a header the compile names relatively is still found; an entry whose record does not match is not used. Not served when the includer makes a name the header read as plain text into a macro — a plain name, a keyword, a pasted name, a name from an outside macro's body; served when the header defines the name before using it; a conditional and a syntactic check both see a macro an earlier hit defined. |
 
 ---
 
@@ -450,9 +522,13 @@ earlier header, so Clang skipped it before the hook is asked.
    detached `clang-header-cache-populate -job` when the compile exits.
 3. **The `__COUNTER__` backfill.** Such headers are declined today. The plan
    is to record where each varying value landed and rewrite it on load.
-4. **Loading the context's guard state.** A hit must leave the compile as a
-   textual include would.
-5. **The token tier's server half.** The token tier can record and ship;
+4. **Macro replay on load.** A hit must apply the header's `#define`s and
+   `#undef`s to the live compile; module macro visibility is not the same.
+5. **Loading the context's guard state.** A hit must leave the compile as a
+   textual include would, `#pragma once` and `#import` marks included.
+6. **Folding by parse time** (DECISIONS 2.15). The 226 us cutoff is decided;
+   how the producer keeps a header out of its parent's PCM is not approved.
+7. **The token tier's server half.** The token tier can record and ship;
    nothing reads its payloads back.
 
 Known gaps in the record itself are listed in DECISIONS.md §3 and §4. The
@@ -489,6 +565,13 @@ Kept because each one is a mistake that could recur.
 - **The first redis run missed every lookup:** the producer stores absolute
   paths and redis names `anet.h` relatively. The daemon's count gave it away,
   `lookups 18 (0 with entries)`; fixed in `ab65051ab`.
+- **Syntactic names were first collected at the wrong hook.**
+  `Preprocessor::LookUpIdentifierInfo` misses a name that comes out of an
+  outside macro's body: with `#define ALLOC grab_impl` outside the header,
+  `grab_impl` was looked up when that `#define` was read. Replaced by the
+  expansion-decision sites (§3.5) before `1291faa49`.
+- **A stale macro bit let the conditional check pass wrongly** after an
+  earlier hit (§6.4); fixed in `1291faa49`.
 
 ---
 
@@ -502,9 +585,9 @@ Kept because each one is a mistake that could recur.
 
 ## 11. Commit map
 
-Every commit since upstream, oldest first. Linked ones are on
-`github.com/SikangSun/llvm-include-cache`, branch `header-cache`; the ones
-marked local have not been pushed.
+Every commit since upstream, oldest first, all on
+`github.com/SikangSun/llvm-include-cache`, branch `header-cache`. The commit
+that last refreshed this file is not listed in its own table.
 
 | Commit | What it did |
 |---|---|
@@ -513,57 +596,64 @@ marked local have not been pushed.
 | [`ea53c042d`](https://github.com/SikangSun/llvm-include-cache/commit/ea53c042db80c37d0f716e8dd7ab2def6ab5d54a) | [clang] Header cache: replay each include the way the compile found its file |
 | [`f976d8fd4`](https://github.com/SikangSun/llvm-include-cache/commit/f976d8fd40648c2967f60567e2f0f31fa445198b) | [clang] Header cache: decline TU-varying builtins; test loading from memory |
 | [`95232c6b6`](https://github.com/SikangSun/llvm-include-cache/commit/95232c6b69c0525d65e5d03a90208291491a2de0) | [clang] Header cache: store the producer's generated files in the saved copy |
-| `7032a4b76` (local) | [clang] Header cache: a file-by-file walkthrough of what was built |
-| `26a28d8ea` (local) | [clang] Header cache: shelve the read-set argument for the record |
-| `ab65051ab` (local) | [clang] Header cache: serve an #include from the cache (the hit path) |
+| [`7032a4b76`](https://github.com/SikangSun/llvm-include-cache/commit/7032a4b76765506386f053df56aa4ba271b22622) | [clang] Header cache: a file-by-file walkthrough of what was built |
+| [`26a28d8ea`](https://github.com/SikangSun/llvm-include-cache/commit/26a28d8ea4e47d907adf320ab9935b04803d9bf8) | [clang] Header cache: shelve the read-set argument for the record |
+| [`ab65051ab`](https://github.com/SikangSun/llvm-include-cache/commit/ab65051ab35c09641ab79a65feef251a707cc761) | [clang] Header cache: serve an #include from the cache (the hit path) |
+| [`6996c31c7`](https://github.com/SikangSun/llvm-include-cache/commit/6996c31c77bf3f6458e35a37503395836d23f79d) | [clang] Header cache: walkthrough covers the hit path; add a commit map |
+| [`1291faa49`](https://github.com/SikangSun/llvm-include-cache/commit/1291faa49476645f91a02ae8a8e4cbd87f89b62d) | [clang] Header cache: syntactic dependencies |
 
 Which commits changed each file, oldest first:
 
 | File | Commits |
 |---|---|
-| `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` | `91182dc08` `1291faa49` |
 | `clang/include/clang/ASTCache/ASTCacheProducer.h` | `91182dc08` `a5a384e19` `ea53c042d` |
-| `clang/include/clang/ASTCache/ByteStream.h` | `91182dc08` |
-| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` |
-| `clang/include/clang/ASTCache/CacheDaemon.h` | `91182dc08` |
-| `clang/include/clang/ASTCache/CacheProtocol.h` | `91182dc08` |
-| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` |
-| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/ByteStream.h` | `91182dc08` `1291faa49` |
+| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` `1291faa49` |
+| `clang/include/clang/ASTCache/CacheDaemon.h` | `91182dc08` `1291faa49` |
+| `clang/include/clang/ASTCache/CacheProtocol.h` | `91182dc08` `1291faa49` |
+| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` `1291faa49` |
+| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` `1291faa49` |
 | `clang/include/clang/ASTCache/HeaderCacheServer.h` | `ab65051ab` |
-| `clang/include/clang/ASTCache/MacroTokens.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/MacroTokens.h` | `91182dc08` `1291faa49` |
 | `clang/include/clang/ASTCache/PragmaStateCheck.h` | `91182dc08` |
 | `clang/include/clang/ASTCache/SharedRegion.h` | `91182dc08` |
 | `clang/include/clang/Frontend/CompilerInstance.h` | `ab65051ab` |
 | `clang/include/clang/Lex/DeclBoundaryObserver.h` | `91182dc08` |
+| `clang/include/clang/Lex/ExpansionCandidateObserver.h` | `1291faa49` |
 | `clang/include/clang/Lex/HeaderCacheHook.h` | `ab65051ab` |
 | `clang/include/clang/Lex/PPCallbacks.h` | `91182dc08` |
-| `clang/include/clang/Lex/Preprocessor.h` | `91182dc08` `ab65051ab` |
+| `clang/include/clang/Lex/Preprocessor.h` | `91182dc08` `ab65051ab` `1291faa49` |
 | `clang/include/clang/Lex/TransitiveClosureTracker.h` | `91182dc08` |
 | `clang/include/clang/Parse/Parser.h` | `91182dc08` |
 | `clang/include/clang/Parse/RAIIObjectsForParser.h` | `91182dc08` `ab65051ab` |
 | `clang/include/clang/Sema/NameClassificationObserver.h` | `91182dc08` |
 | `clang/include/clang/Sema/Sema.h` | `91182dc08` |
-| `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/ASTCacheProducer.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` |
+| `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` | `91182dc08` `1291faa49` |
+| `clang/lib/ASTCache/ASTCacheProducer.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `1291faa49` |
 | `clang/lib/ASTCache/CMakeLists.txt` | `91182dc08` `ab65051ab` |
-| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/CacheDaemon.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/CacheProtocol.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` |
-| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` `1291faa49` |
+| `clang/lib/ASTCache/CacheDaemon.cpp` | `91182dc08` `1291faa49` |
+| `clang/lib/ASTCache/CacheProtocol.cpp` | `91182dc08` `1291faa49` |
+| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` `1291faa49` |
+| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` `1291faa49` |
 | `clang/lib/ASTCache/FORMALIZATION.md` | `26a28d8ea` |
-| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` |
+| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` `1291faa49` |
 | `clang/lib/ASTCache/MacroTokens.cpp` | `91182dc08` |
+| `clang/lib/ASTCache/NEXT.md` | `1291faa49` |
 | `clang/lib/ASTCache/PragmaStateCheck.cpp` | `91182dc08` |
 | `clang/lib/ASTCache/README.md` | `91182dc08` `a5a384e19` `ea53c042d` |
 | `clang/lib/ASTCache/SharedRegion.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` |
+| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` `6996c31c7` this commit |
 | `clang/lib/CMakeLists.txt` | `91182dc08` |
 | `clang/lib/Frontend/CompilerInstance.cpp` | `ab65051ab` |
 | `clang/lib/Lex/CMakeLists.txt` | `91182dc08` |
+| `clang/lib/Lex/Lexer.cpp` | `1291faa49` |
 | `clang/lib/Lex/PPDirectives.cpp` | `91182dc08` `ab65051ab` |
 | `clang/lib/Lex/PPExpressions.cpp` | `91182dc08` |
-| `clang/lib/Lex/Preprocessor.cpp` | `91182dc08` `ab65051ab` |
+| `clang/lib/Lex/PPMacroExpansion.cpp` | `1291faa49` |
+| `clang/lib/Lex/Preprocessor.cpp` | `91182dc08` `ab65051ab` `1291faa49` |
+| `clang/lib/Lex/TokenLexer.cpp` | `1291faa49` |
 | `clang/lib/Lex/TransitiveClosureTracker.cpp` | `91182dc08` |
 | `clang/lib/Parse/ParseDecl.cpp` | `91182dc08` `ab65051ab` |
 | `clang/lib/Parse/Parser.cpp` | `91182dc08` |
@@ -573,16 +663,16 @@ Which commits changed each file, oldest first:
 | `clang/tools/clang-header-cache-daemon/CMakeLists.txt` | `91182dc08` |
 | `clang/tools/clang-header-cache-daemon/ClangHeaderCacheDaemon.cpp` | `91182dc08` |
 | `clang/tools/clang-header-cache-populate/CMakeLists.txt` | `91182dc08` |
-| `clang/tools/clang-header-cache-populate/ClangHeaderCachePopulate.cpp` | `91182dc08` `a5a384e19` `ea53c042d` |
+| `clang/tools/clang-header-cache-populate/ClangHeaderCachePopulate.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `1291faa49` |
 | `clang/tools/driver/CMakeLists.txt` | `ab65051ab` |
 | `clang/tools/driver/cc1_main.cpp` | `ab65051ab` |
-| `clang/unittests/ASTCache/ASTCacheDependencyTrackerTest.cpp` | `91182dc08` |
+| `clang/unittests/ASTCache/ASTCacheDependencyTrackerTest.cpp` | `91182dc08` `1291faa49` |
 | `clang/unittests/ASTCache/CMakeLists.txt` | `91182dc08` `a5a384e19` `f976d8fd4` `ab65051ab` |
-| `clang/unittests/ASTCache/CacheProtocolTest.cpp` | `91182dc08` |
-| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` |
-| `clang/unittests/ASTCache/EndToEndTest.cpp` | `91182dc08` |
-| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` |
+| `clang/unittests/ASTCache/CacheProtocolTest.cpp` | `91182dc08` `1291faa49` |
+| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` `1291faa49` |
+| `clang/unittests/ASTCache/EndToEndTest.cpp` | `91182dc08` `1291faa49` |
+| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` `1291faa49` |
 | `clang/unittests/ASTCache/LoadTest.cpp` | `f976d8fd4` `95232c6b6` |
 | `clang/unittests/ASTCache/ProducerTest.cpp` | `a5a384e19` `ea53c042d` `f976d8fd4` |
-| `clang/unittests/ASTCache/SymbolDependencyTest.cpp` | `91182dc08` |
+| `clang/unittests/ASTCache/SymbolDependencyTest.cpp` | `91182dc08` `1291faa49` |
 | `clang/unittests/CMakeLists.txt` | `91182dc08` |
