@@ -347,6 +347,8 @@ public:
     auto OwnedTracker = std::make_unique<ASTCacheDependencyTracker>(PP);
     ASTCacheDependencyTracker &Tracker = *OwnedTracker;
     PP.addPPCallbacks(std::move(OwnedTracker));
+    // The tracker lives as long as PP, which now owns it.
+    PP.setExpansionCandidateObserver(Tracker);
 
     PP.addPPCallbacks(std::make_unique<ReplayChecker>(
         CI.getSourceManager(), ContextWrapper, TargetWrapper,

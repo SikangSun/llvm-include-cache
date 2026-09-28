@@ -70,6 +70,7 @@ class CodeCompletionHandler;
 class CommentHandler;
 class DeclBoundaryObserver;
 class DirectoryEntry;
+class ExpansionCandidateObserver;
 class HeaderCacheHook;
 class EmptylineHandler;
 class ExternalPreprocessorSource;
@@ -318,6 +319,9 @@ public:
   const char *getCheckPoint(FileID FID, const char *Start) const;
 
 private:
+  /// The out-of-line half of noteExpansionCandidate.
+  void reportExpansionCandidate(const Token &Identifier);
+
   /// The code-completion handler.
   CodeCompletionHandler *CodeComplete = nullptr;
 
@@ -326,6 +330,10 @@ private:
   /// preprocessing, e.g. -E mode, or before the Parser has been
   /// constructed).
   DeclBoundaryObserver *DeclBoundary = nullptr;
+
+  /// Told about every identifier that reaches the macro-expansion decision,
+  /// when one is registered. Null in an ordinary compile.
+  ExpansionCandidateObserver *ExpansionCandidates = nullptr;
 
   /// Serves an #include from a cache of parsed headers instead of entering
   /// the file, when one is installed. Owned: the object implementing it is
@@ -1380,6 +1388,16 @@ public:
 
   void setPreprocessToken(bool Preprocess) { PreprocessToken = Preprocess; }
 
+  /// Bring \p II up to date with any module loaded since it was last used.
+  /// A macro query reads the identifier's macro bit as it stands, and after a
+  /// module load that bit can be stale until the identifier is updated.
+  /// HandleIdentifier does this on the way in; a caller asking about a name
+  /// without lexing it has to do it itself.
+  void refreshIdentifier(const IdentifierInfo &II) const {
+    if (II.isOutOfDate())
+      updateOutOfDateIdentifier(II);
+  }
+
   bool isMacroDefined(StringRef Id) {
     return isMacroDefined(&Identifiers.get(Id));
   }
@@ -1641,6 +1659,18 @@ public:
   void clearDeclBoundaryObserver() {
     DeclBoundary = nullptr;
   }
+
+  /// Register \p Observer to be told about every identifier that reaches the
+  /// macro-expansion decision. \see ExpansionCandidateObserver
+  void setExpansionCandidateObserver(ExpansionCandidateObserver &Observer) {
+    ExpansionCandidates = &Observer;
+  }
+
+  ExpansionCandidateObserver *getExpansionCandidateObserver() const {
+    return ExpansionCandidates;
+  }
+
+  void clearExpansionCandidateObserver() { ExpansionCandidates = nullptr; }
 
   /// Install a hook that can serve an #include from a cache of already-parsed
   /// headers. \see HeaderCacheHook
@@ -2425,6 +2455,15 @@ public:
   /// \returns true if we actually computed a token, false if we need to
   /// lex again.
   bool HandleIdentifier(Token &Identifier);
+
+  /// Called wherever \p Identifier reaches the macro-expansion decision: in
+  /// the lexers just before HandleIdentifier would be consulted, and in
+  /// HandleMacroExpandedIdentifier for a one-token replacement. Kept inline
+  /// and to one pointer test, because it runs for every identifier token.
+  void noteExpansionCandidate(const Token &Identifier) {
+    if (LLVM_UNLIKELY(ExpansionCandidates != nullptr))
+      reportExpansionCandidate(Identifier);
+  }
 
   /// Callback invoked when the lexer hits the end of the current file.
   ///

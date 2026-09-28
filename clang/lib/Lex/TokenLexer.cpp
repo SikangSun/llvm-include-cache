@@ -712,8 +712,11 @@ bool TokenLexer::Lex(Token &Tok) {
       PP.HandlePoisonedIdentifier(Tok);
     }
 
-    if (!DisableMacroExpansion && II->isHandleIdentifierCase())
-      return PP.HandleIdentifier(Tok);
+    if (!DisableMacroExpansion) {
+      PP.noteExpansionCandidate(Tok);
+      if (II->isHandleIdentifierCase())
+        return PP.HandleIdentifier(Tok);
+    }
   }
 
   // Otherwise, return a normal token.

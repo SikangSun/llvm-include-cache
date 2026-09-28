@@ -16,7 +16,7 @@
 // lets the encoding be tested on its own.
 //
 // Every string is length-prefixed rather than NUL-terminated, because
-// ValueDependency::TokenSequence contains embedded NULs by construction --
+// SyntacticDependency::TokenSequence contains embedded NULs by construction --
 // they are its token separator.
 //
 //===----------------------------------------------------------------------===//
@@ -36,7 +36,7 @@ namespace ast_cache {
 /// version it does not know declines the whole block rather than guessing:
 /// a misparsed dependency set is a dependency set with the wrong contents,
 /// which is exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 2;
+constexpr uint32_t DependencyEncodingVersion = 3;
 
 /// Appends the encoding of \p Deps to \p Out.
 void encodeDependencySet(const HeaderDependencySet &Deps,
@@ -46,6 +46,18 @@ void encodeDependencySet(const HeaderDependencySet &Deps,
 /// version mismatch, a truncated buffer, or any length that runs past the
 /// end -- never a partially populated set.
 std::optional<HeaderDependencySet> decodeDependencySet(llvm::StringRef Data);
+
+/// Removes every NotAMacro syntactic dependency from \p Deps and returns their
+/// names as one list: each name followed by a NUL. These are the bulk of a
+/// record -- several hundred for a system header -- so the daemon keeps them
+/// in the shared region and a lookup reply carries only where they are.
+std::string extractNotAMacroNames(HeaderDependencySet &Deps);
+
+/// The names in a list built by extractNotAMacroNames. std::nullopt for a list
+/// that does not end in a NUL or holds an empty name, so a damaged list cannot
+/// pass as a shorter one.
+std::optional<llvm::SmallVector<llvm::StringRef, 0>>
+splitNameList(llvm::StringRef List);
 
 } // namespace ast_cache
 } // namespace clang

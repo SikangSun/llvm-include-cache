@@ -42,7 +42,8 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
       // handful of names a header actually depends on.
       Resp.Entries.reserve(It->second.size());
       for (const StoredEntry &E : It->second)
-        Resp.Entries.push_back({E.Deps, E.Offset, E.Length});
+        Resp.Entries.push_back(
+            {E.Deps, E.Offset, E.Length, E.NamesOffset, E.NamesLength});
     }
   }
 
@@ -55,6 +56,12 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const PushRequest &Req) {
   llvm::SmallVector<char, 256> Encoded;
   encodeDependencySet(Req.Deps, Encoded);
   llvm::StringRef EncodedRef(Encoded.data(), Encoded.size());
+
+  // The names the record requires not to be macros are several hundred for a
+  // system header. They go into the region beside the stored result, so a
+  // lookup reply carries where they are instead of the names themselves.
+  HeaderDependencySet Kept = Req.Deps;
+  std::string Names = extractNotAMacroNames(Kept);
 
   {
     std::lock_guard<std::mutex> Lock(Mutex);
@@ -73,14 +80,22 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const PushRequest &Req) {
       }
     }
 
-    if (std::optional<uint64_t> Offset = Region.append(Req.Data)) {
+    // An entry is recorded only with its names. Kept without them, it would
+    // match compiles that define those names as macros.
+    std::optional<uint64_t> NamesAt =
+        Names.empty() ? std::optional<uint64_t>(0) : Region.append(Names);
+    std::optional<uint64_t> Offset =
+        NamesAt ? Region.append(Req.Data) : std::nullopt;
+    if (NamesAt && Offset) {
       StoredEntry E;
-      E.Deps = Req.Deps;
+      E.Deps = std::move(Kept);
       E.EncodedDeps = EncodedRef.str();
       E.Offset = *Offset;
       E.Length = Req.Data.size();
+      E.NamesOffset = *NamesAt;
+      E.NamesLength = Names.size();
       Entries.push_back(std::move(E));
-      Counters.BytesStored += Req.Data.size();
+      Counters.BytesStored += Req.Data.size() + Names.size();
       ++Counters.Entries;
       Counters.Headers = Table.size();
     }

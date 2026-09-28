@@ -11,7 +11,9 @@
 //   LOOKUP(filename)
 //     -> every entry stored under that filename, each carrying the dependency
 //        record it was built against and where its stored result sits in the
-//        shared region.
+//        shared region. The names the record requires not to be macros --
+//        most of it, by size -- are in the region too, and the reply says
+//        where rather than carrying them.
 //
 //   PUSH(filename, record, data)
 //     -> a bare acknowledgment.
@@ -62,9 +64,14 @@ enum class MessageKind : uint8_t {
 /// A stored result the daemon knows about: what it was built against, and
 /// where to find it. Offset and Length address the shared region, not a file.
 struct CacheEntryRef {
+  /// The record, less its NotAMacro syntactic dependencies.
   HeaderDependencySet Deps;
   uint64_t Offset = 0;
   uint64_t Length = 0;
+  /// Where those NotAMacro names sit in the shared region, as a list built by
+  /// extractNotAMacroNames. A zero length means the record has none.
+  uint64_t NamesOffset = 0;
+  uint64_t NamesLength = 0;
 };
 
 struct LookupRequest {
@@ -79,6 +86,7 @@ struct LookupResponse {
 
 struct PushRequest {
   std::string Filename;
+  /// The whole record. The daemon moves its NotAMacro names into the region.
   HeaderDependencySet Deps;
   /// The serialized parsed header. Copied into the shared region by the
   /// daemon, so it crosses the socket once.

@@ -35,7 +35,9 @@ HeaderDependencySet makeFullSet() {
   D.Conditional.push_back({"NDEBUG", false});
   // Embedded NULs are the token separator the tracker writes, so this is the
   // ordinary case, not an edge case.
-  D.Value.push_back({"BUFSZ", std::string("\0" "1024" "\0", 6)});
+  D.Syntactic.push_back({"BUFSZ", SyntacticDependency::State::ExpandsTo,
+                         std::string(1, '\0') + "1024" + '\0'});
+  D.Syntactic.push_back({"malloc", SyntacticDependency::State::NotAMacro, ""});
   D.Symbol.push_back({"T", SymbolClassification::Type, "long"});
   D.Symbol.push_back({"count", SymbolClassification::NonType, ""});
   D.Inclusion.push_back({"/usr/include/stdio.h",
@@ -49,10 +51,11 @@ void expectEqual(const HeaderDependencySet &A, const HeaderDependencySet &B) {
     EXPECT_EQ(A.Conditional[I].MacroName, B.Conditional[I].MacroName);
     EXPECT_EQ(A.Conditional[I].WasDefined, B.Conditional[I].WasDefined);
   }
-  ASSERT_EQ(A.Value.size(), B.Value.size());
-  for (size_t I = 0; I != A.Value.size(); ++I) {
-    EXPECT_EQ(A.Value[I].MacroName, B.Value[I].MacroName);
-    EXPECT_EQ(A.Value[I].TokenSequence, B.Value[I].TokenSequence);
+  ASSERT_EQ(A.Syntactic.size(), B.Syntactic.size());
+  for (size_t I = 0; I != A.Syntactic.size(); ++I) {
+    EXPECT_EQ(A.Syntactic[I].Name, B.Syntactic[I].Name);
+    EXPECT_EQ(A.Syntactic[I].Required, B.Syntactic[I].Required);
+    EXPECT_EQ(A.Syntactic[I].TokenSequence, B.Syntactic[I].TokenSequence);
   }
   ASSERT_EQ(A.Symbol.size(), B.Symbol.size());
   for (size_t I = 0; I != A.Symbol.size(); ++I) {
@@ -85,15 +88,59 @@ TEST(DependencySerializationTest, FullSetRoundTrips) {
 
 TEST(DependencySerializationTest, EmbeddedNulsSurvive) {
   // TokenSequence is length-prefixed precisely because it is not NUL-free; a
-  // NUL-terminated encoding would silently truncate every value dependency
-  // to its first token, which still decodes and still compares equal to a
-  // different macro.
+  // NUL-terminated encoding would silently truncate every ExpandsTo
+  // dependency to its first token, which still decodes and still compares
+  // equal to a different macro.
   HeaderDependencySet D;
-  D.Value.push_back({"M", std::string("\0a\0b\0", 5)});
+  D.Syntactic.push_back(
+      {"M", SyntacticDependency::State::ExpandsTo, std::string("\0a\0b\0", 5)});
   auto Decoded = decodeDependencySet(encode(D));
   ASSERT_TRUE(Decoded.has_value());
-  ASSERT_EQ(Decoded->Value.size(), 1u);
-  EXPECT_EQ(Decoded->Value[0].TokenSequence, std::string("\0a\0b\0", 5));
+  ASSERT_EQ(Decoded->Syntactic.size(), 1u);
+  EXPECT_EQ(Decoded->Syntactic[0].TokenSequence, std::string("\0a\0b\0", 5));
+}
+
+TEST(DependencySerializationTest, UnknownSyntacticStateIsRejected) {
+  // A state byte this build does not know must not decode as one it does:
+  // read as NotAMacro, a record meant to require a macro would require the
+  // opposite.
+  HeaderDependencySet D;
+  D.Syntactic.push_back({"M", SyntacticDependency::State::NotAMacro, ""});
+  std::string Data = encode(D);
+  // version, conditional count, syntactic count, name length, "M", state.
+  const size_t StateAt = 4 + 4 + 4 + 4 + 1;
+  ASSERT_GT(Data.size(), StateAt);
+  ASSERT_EQ(Data[StateAt], 0);
+  Data[StateAt] = 7;
+  EXPECT_FALSE(decodeDependencySet(Data).has_value());
+}
+
+TEST(DependencySerializationTest, NotAMacroNamesMoveIntoTheList) {
+  HeaderDependencySet D = makeFullSet();
+  D.Syntactic.push_back({"long", SyntacticDependency::State::NotAMacro, ""});
+  std::string List = extractNotAMacroNames(D);
+
+  // Only the names left; everything else stays in the record.
+  ASSERT_EQ(D.Syntactic.size(), 1u);
+  EXPECT_EQ(D.Syntactic[0].Name, "BUFSZ");
+  EXPECT_EQ(D.Conditional.size(), 2u);
+
+  auto Names = splitNameList(List);
+  ASSERT_TRUE(Names.has_value());
+  ASSERT_EQ(Names->size(), 2u);
+  EXPECT_EQ((*Names)[0], "malloc");
+  EXPECT_EQ((*Names)[1], "long");
+  EXPECT_TRUE(splitNameList("").has_value()) << "no names is a valid list";
+  EXPECT_TRUE(splitNameList("")->empty());
+}
+
+TEST(DependencySerializationTest, DamagedNameListIsRejected) {
+  // Same rule as the record: a list that lost its tail must not read as a
+  // shorter list, which would check fewer names than the record requires.
+  // Lengths are explicit: a literal's own terminating NUL would otherwise
+  // complete the list.
+  EXPECT_FALSE(splitNameList(llvm::StringRef("malloc\0lon", 10)).has_value());
+  EXPECT_FALSE(splitNameList(llvm::StringRef("malloc\0\0", 8)).has_value());
 }
 
 TEST(DependencySerializationTest, TruncationIsRejectedNotPartiallyDecoded) {

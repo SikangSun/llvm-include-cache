@@ -26,6 +26,7 @@
 
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/SharedRegion.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
@@ -84,7 +85,10 @@ struct Totals {
   unsigned Failed = 0;
   uint64_t ResultBytes = 0;
   uint64_t RecordBytes = 0;
-  unsigned Conditional = 0, Value = 0, Symbol = 0, Inclusion = 0;
+  uint64_t NameBytes = 0;
+  unsigned Conditional = 0, Symbol = 0, Inclusion = 0;
+  /// Syntactic dependencies, and how many of them are NotAMacro names.
+  unsigned Syntactic = 0, NotAMacro = 0;
   /// Decline reasons, counted. The distribution is the actual finding: it
   /// says which limitation costs the most coverage.
   std::map<std::string, unsigned> Reasons;
@@ -104,12 +108,15 @@ void report(const Totals &T, unsigned Total) {
     outs() << "\nper saved header, mean:\n"
            << format("  saved copy      %8.1f KiB\n",
                      T.ResultBytes / 1024.0 / T.Produced)
-           << format("  record          %8.1f bytes\n",
-                     double(T.RecordBytes) / T.Produced)
-           << format("  dependencies    %8.1f conditional, %.1f value, "
-                     "%.1f symbol, %.1f inclusion\n",
+           << format("  record          %8.1f bytes in a lookup reply, "
+                     "%.1f bytes of names in the region\n",
+                     double(T.RecordBytes) / T.Produced,
+                     double(T.NameBytes) / T.Produced)
+           << format("  dependencies    %8.1f conditional, %.1f syntactic "
+                     "(%.1f not a macro), %.1f symbol, %.1f inclusion\n",
                      double(T.Conditional) / T.Produced,
-                     double(T.Value) / T.Produced,
+                     double(T.Syntactic) / T.Produced,
+                     double(T.NotAMacro) / T.Produced,
                      double(T.Symbol) / T.Produced,
                      double(T.Inclusion) / T.Produced);
   }
@@ -193,15 +200,23 @@ int main(int argc, char **argv) {
       ++T.Produced;
       T.ResultBytes += R.Push.Data.size();
       T.Conditional += R.Push.Deps.Conditional.size();
-      T.Value += R.Push.Deps.Value.size();
+      T.Syntactic += R.Push.Deps.Syntactic.size();
+      for (const SyntacticDependency &D : R.Push.Deps.Syntactic)
+        T.NotAMacro += D.Required == SyntacticDependency::State::NotAMacro;
       T.Symbol += R.Push.Deps.Symbol.size();
       T.Inclusion += R.Push.Deps.Inclusion.size();
 
+      // A LOOKUP reply carries one record per candidate, less its NotAMacro
+      // names, which the daemon keeps in the region; both sizes are worth
+      // reporting separately from the saved copy's.
+      HeaderDependencySet InReply = R.Push.Deps;
+      T.NameBytes += extractNotAMacroNames(InReply).size();
+      SmallVector<char, 0> Encoded;
+      encodeDependencySet(InReply, Encoded);
+      T.RecordBytes += Encoded.size();
+
       SmallVector<char, 0> Msg;
       encodePushRequest(R.Push, Msg);
-      // A LOOKUP reply carries one record per candidate, so the record's
-      // size is worth reporting separately from the saved copy's.
-      T.RecordBytes += Msg.size() - R.Push.Data.size();
 
       if (Conn) {
         if (!sendMessage(*Conn, Msg)) {

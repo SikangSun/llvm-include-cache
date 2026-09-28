@@ -29,6 +29,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
+#include <iterator>
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -48,6 +49,12 @@ public:
     OS << "header cache: " << S.Hits << " hits / " << S.Lookups
        << " lookups, " << S.CandidatesRejected << " candidates rejected, "
        << SkippedAtBoundary << " not at a declaration boundary\n";
+    // Which check rejected is what separates "nothing matched" from "the
+    // cache is checking the wrong thing".
+    for (unsigned R = 1; R != std::size(S.RejectedFor); ++R)
+      if (S.RejectedFor[R])
+        OS << "  rejected: " << S.RejectedFor[R] << " x "
+           << describe(static_cast<MismatchReason>(R)) << "\n";
   }
 
   Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc) override {

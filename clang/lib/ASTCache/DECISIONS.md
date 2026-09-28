@@ -5,7 +5,7 @@ observation hooks in Lex/Parse/Sema are shaped the way they are. Each entry
 records what was decided, the reason, and what was rejected — the reasons are
 the part that doesn't survive in the code.
 
-Last updated 2026-09-11.
+Last updated 2026-09-25.
 
 ---
 
@@ -52,8 +52,8 @@ file, each with its own closure and its own record.
 
 ### 1.5 Conditionals are recorded with no provenance filter
 
-Value dependencies are filtered — a macro whose `#define` sits inside the
-frame's own closure is not recorded. Conditionals are not filtered, even
+Syntactic dependencies are filtered (1.12) — a macro whose `#define` sits
+inside the frame's own closure is not recorded. Conditionals are not filtered, even
 though the same refinement would apply.
 
 Over-recording is always safe: it can only make validation re-check something
@@ -120,10 +120,95 @@ built it. The record stores the canonical spelling of what it resolved to.
 
 C's ambiguity surface is exactly two of the four hooks — `ClassifyName` (via
 `TryAnnotateName`, which is not `CPlusPlus`-guarded) and `getTypeName`. The
-other two sit after the C early-exit in
-`TryAnnotateTypeOrScopeTokenAfterScopeSpec`. C++ overload sets are a
+parser never asks the other two in C: `isTemplateName` sits after the C
+early-exit in `TryAnnotateTypeOrScopeTokenAfterScopeSpec` (`Parser.cpp:2062`)
+or in C++-only parsing, and `isDeductionGuideName` needs C++17
+(`ParseDecl.cpp:3881`) or C++-only parsing. C++ overload sets are a
 substantially harder problem and are deferred; reaching a C++-only query
 poisons the frame (1.6) rather than recording something unvalidated.
+
+Not crucial to the C scope (marked 2026-09-25), built and kept: the
+`isTemplateName`/`isDeductionGuideName` wrappers, their two observer
+methods, and the `Template` value of `SymbolClassification`. Nothing the C
+scope depends on waits for them, and no C work should be spent on them.
+
+### 1.12 Syntactic dependencies: every identifier considered for expansion
+
+The dependency kinds are organised by the stage that produces them (2026-09-17).
+Preprocessor: conditional, with inclusion as the case Clang skips the I/O for,
+and pragma, both state and stack. Lexer: *syntactic*. Parser: symbolic. A
+syntactic dependency is an identifier the preprocessor considered for macro
+expansion while processing the header, with the macro state it had the first
+time -- *not a macro*, or *expands to exactly these tokens*. The old value
+dependency (a name an outside `#define` made a macro) and the implicit one (a
+name the includer could make a macro) are its two states, not two categories.
+Approved with the corrections below on 2026-09-18 and built as
+`SyntacticDependency`, replacing `ValueDependency`.
+
+It is not exotic and cannot be declined. Counting each project's macro names
+against the 1,922 symbols libc exports: git 150, postgres 99, FFmpeg 52, php-src
+50, redis 42, openssl 35, qemu 31, curl 27, sqlite 23, cpython 17, nginx 0.
+Object-like definitions account for 286 of those and function-like for 275, so
+the pattern is not a fringe of the function-override case. Keywords get
+redefined too -- qemu `block/iscsi.c:56` defines `inline` as
+`__attribute__((gnu_inline))`, includes one header, and undefines it on the next
+line, which means the same header has two valid parses in one build; sqlite's
+public `sqlite3.h:315` defines `double` as `sqlite3_int64` under
+`SQLITE_OMIT_FLOATING_POINT`.
+
+Collection. The lexers report each identifier where it reaches the expansion
+decision, just before `HandleIdentifier` would be consulted:
+`Lexer::LexIdentifierContinue` for text read from a file, `TokenLexer::Lex` for
+tokens coming out of a macro -- a `##` result included -- and
+`Lexer::LexDependencyDirectiveToken` for clang-scan-deps' minimized sources.
+A fourth site is not in a lexer: `Preprocessor::HandleMacroExpandedIdentifier`
+expands a macro whose whole replacement is one token without a `TokenLexer`,
+after `isTrivialSingleTokenExpansion` has checked that the token is not itself
+a macro. That check is an expansion decision, so the token is reported there.
+Found by a failing test, not by reading: `#define ALLOC grab_impl` is the
+commonest macro shape there is, and `grab_impl` was going unrecorded.
+They report only while expansion is enabled, so a macro's own name in
+`#define`, the operand of `#ifdef` or `defined()`, and the operands of `##` are
+not candidates; `JOIN(mal,loc)` records `malloc` and neither `mal` nor `loc`.
+The receiver is one `ExpansionCandidateObserver` pointer on `Preprocessor`, not
+a `PPCallbacks` method: an ordinary compile always has callbacks attached, and a
+new callback would add a chain of virtual calls to every identifier of every
+compile, where an unset pointer costs one test.
+
+First sighting decides. In each open frame, the first time a name is seen: not
+a macro records NotAMacro; a macro defined outside that frame's closure records
+ExpandsTo with its replacement tokens; a macro defined inside records nothing.
+A header that uses `BUF` and then defines it depended on `BUF` not being a
+macro at that use; one that defines `BUF` first does not depend on the includer
+at all. One false rejection remains: a header that `#undef`s an outside macro
+and then uses the name records NotAMacro, and is rejected wherever the includer
+defines it. That costs hits, not correctness.
+
+Transport and check. The NotAMacro names -- several hundred for a system
+header -- are moved by the daemon into the shared region as a NUL-separated
+list, which `CacheEntryRef` addresses by offset and length; the rest of the
+record travels in the reply. The client interns each name and calls
+`Preprocessor::isMacroDefined`, which reads `IdentifierInfo::hasMacroDefinition`
+first and consults module visibility only when that bit is set: the bit alone
+is also set for a module's macro that is not visible, and every compile here
+runs with modules (2.8). An entry whose list cannot be read is rejected, and
+the daemon does not store an entry whose list it could not store.
+
+Rejected: walking the live macro table, which holds 4,486 entries by the end of
+redis `server.h` against a header's ~500 names, and needs an index built per
+include in either direction. Rejected: a sorted array of name hashes, which
+would let the client reject without interning -- interning costs lookups in a
+table Clang maintains regardless, and loading the copy repeats them anyway.
+
+Rejected after first being written here: hooking
+`Preprocessor::LookUpIdentifierInfo`. It misses a name that comes out of an
+outside macro's body. With `#define ALLOC grab_impl` outside the header,
+`grab_impl` was looked up when that `#define` was read; an includer that later
+defines `grab_impl` changes the header unseen, while the check on `ALLOC`'s
+tokens still passes. Rejected at the same time: deciding at hit time whether a
+colliding macro's definition lies inside the recorded closure. Recording the
+state at first sighting settles that during population, and removes the false
+rejection of a header that defines a name before using it.
 
 ---
 
@@ -176,6 +261,11 @@ needs loaded first. That would shrink saved copies — today `server.h`'s
 contains a full copy of `stdio.h`, which is why it is 528 KB — but it is not
 needed for correctness, since duplicate declarations from two saved copies are
 merged on load as they are for any two modules. Deferred as an optimization.
+
+**Not approved.** On 2026-09-02 the user wrote "now that we are going without
+the subcompilation route", and no later message approved going back. The
+separate compile was nevertheless built and recorded here as decided. Open
+again as of 2026-09-15; see the first entry of section 3.
 
 ### 2.2 Module shape, not PCH shape
 
@@ -572,9 +662,122 @@ out of scope.
 
 ---
 
+### 2.14 The compiler asks only about headers the shared region lists
+
+Decided 2026-09-18. The daemon keeps a list of headers worth asking about in the
+shared region. At an `#include`, the compiler checks the list in memory; a header
+not on it is parsed as usual, with no socket traffic at all.
+
+Asking costs more than most headers do. One Unix-socket round trip on this
+machine is 12-15 us before any decoding, and one PCM load about 226 us, while
+the median header parses its own text in 44 us (257,262 parses across redis,
+nginx, git, FFmpeg and qemu). 77.0% of parses cost less than one load, yet the
+other 23.0% hold 98.5% of header parse time. For the light majority both answers
+lose: a hit loads slower than parsing, and a miss pays the round trip and parses
+anyway.
+
+The list names headers, not headers to skip. A header the daemon has not listed
+has no saved copy worth serving, so asking about it could only return a miss; a
+fresh build therefore parses everything locally and pays nothing extra. The list
+is small: 51 headers for nginx up to 778 for qemu, 35 KB of paths at most.
+
+Membership comes from observation. A compile that parses a header times it with
+two clock reads between its `FileChanged` events -- how `SemaPPCallbacks`
+(`Sema.cpp:180`) times files for `-ftime-trace` -- and reports the times at the
+end of the compile, off the critical path. One observation predicts well: 93.8%
+of a header's later parses land on the same side of the load line as its first
+(91.4% weighted by time), and listing every header whose first parse was heavy
+covers 90.0% of later parse time.
+
+The list only decides whether to ask. Every candidate an answer returns still
+goes through the full record check, so a stale list costs time and never
+correctness.
+
+Publication keeps the region append-only: the daemon appends each new version
+of the list and then atomically stores its offset in a fixed slot, and a reader
+loads that slot with acquire ordering. Older versions stay readable to anyone
+still holding their offset. The daemon republishes only when membership changes.
+
+Rejected: predicting weight from file size, which `stat` gives for free at a
+miss. Its rank correlation with parse time is 0.51, and every threshold either
+lists mostly light headers (1 KB: 71.9% light) or misses most of the heavy time
+(16 KB: 54.4% captured). Rejected: a list of headers to parse locally, which
+still pays the round trip for every header not yet on it. Rejected: a copy of
+the list synced over the socket, which needs a sync step and can lag; the region
+is already mapped by every client.
+
+Not decided: putting each listed header's candidates (record and stored-result
+offsets) in the region too, which would remove the socket from lookups entirely.
+
+### 2.15 Folding: a fixed parse-time cutoff decides which headers get their own PCM
+
+Decided 2026-09-25: whether a header is folded into its parent's PCM or gets
+a PCM of its own depends on how long the header takes to process, compared
+against one fixed number. Not on its line count, and not on how many parents
+it has -- a header with very many parents is the one case worth a second look,
+and the trade-off there is to be measured, not assumed.
+
+Folding happens when the parent's PCM is built; two existing PCM files cannot
+be merged. The producer already folds everything, since it compiles a header
+as text and every header that one includes is parsed into the same PCM. So
+the work is the other direction: keeping a header out of its parent's PCM.
+
+The cutoff is the cost of one PCM load, 226 us (release clang-18; 2.14). A
+header whose processing costs less folds into its parent; one that costs more
+gets its own PCM, which the parent refers to. This is the same line 2.14 draws
+for the ask-list, so one number decides both: a header worth asking about is a
+header worth its own PCM. Across 257,262 parses in five projects, 77.0% fall
+below it and fold, and the 23.0% above it hold 98.5% of parse time.
+
+The time compared is the header's own text plus everything folded into it, so
+it is computed bottom-up: a child below the line adds its time to its parent's.
+It comes from the timing 2.14 already takes -- two clock reads between
+`FileChanged` events -- and the first observation stands in for later ones
+(93.8% land on the same side of the line). The cutoff has to be read on the
+same kind of build that took the timings; a debug clang parses several
+times slower, so its timings would put far more headers above the line and
+fold far fewer.
+
+Still proposed, not approved: how the producer keeps a header out (list it as
+its own module in the generated module map and pass its PCM with
+`-fmodule-file=`); falling back to folding when the child has no PCM yet or its
+record does not match at the include; copying into the parent's record the
+part of the child's record the parent's own text does not settle, since a
+referenced child's text never passes the tracker; and always folding a header
+that is included more than once under different macros (Clang's `stddef.h`
+with `__need_size_t`), since a PCM holds one version of it.
+
+Deferred as an optimization: a dynamic cutoff (section 4).
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
+
+- **PCM was adopted without stating what it cannot do.** 2.2 compared PCH
+  and PCM only on when a file may be loaded. The property that decides fit
+  went unstated: a PCM can refer outside itself only to other PCMs, never to
+  declarations the loading compile parsed as text. Our model is a header plus
+  references to whatever its includer already has -- a dependency. To fit, each
+  saved copy carried its whole context in a hidden submodule. Measured on qemu
+  `hw/arm/virt.c` (2026-09-14, release clang-18): 68 PCMs, 460 MiB, 128 s of
+  compile time to produce, and loading them fails (clang-18: "`CacheType` must
+  be defined before it is used"; our clang 22: assertion at
+  `IdentifierResolver.cpp:85`). One PCM for the whole file: 9.1 MiB, 0.84 s,
+  identical machine code. This should have been stated before 2.2 was adopted.
+  Direction as of 2026-09-15: treat Clang's serialization code as a library to
+  reuse parts of, not its module format as our storage format.
+
+- **The conditional check read stale macro state after a hit.** A hit loads
+  a module, and every identifier that module mentions and the compile had
+  already seen is marked out of date (`ASTReader.cpp:4941`); its macro bit
+  stays as it was until something updates it. Lexing does
+  (`HandleIdentifier`), but `Preprocessor::isMacroDefined` does not. So
+  `main.c` that tested `FEATURE`, then took `a.h` -- which defines it -- from
+  the cache, then reached `b.h`, matched `b.h`'s record "FEATURE undefined" and
+  was served the wrong parse. Found 2026-09-18 while adding the syntactic
+  check, which had the same hole; both now refresh the identifier first
+  (`Preprocessor::refreshIdentifier`), and `HitTest` fails for each check
+  with the refresh removed.
 
 - **"Sound by construction" was false.** The provenance check (a macro is a
   dependency only if its definition lies outside the header's closure) was
@@ -653,11 +856,21 @@ Kept because the reasoning that produced them is likely to recur.
 
 - The `pop_macro` hole: a macro's textual definition location is not trustworthy
   as provenance after `#pragma push_macro`/`pop_macro`. Fix agreed (record the
-  popped macro as a value dependency), not written.
+  popped macro as an ExpandsTo syntactic dependency), not written.
 - Token tier ships a duplicate payload when a header is re-included.
-- No hit path: nothing inside the compiler asks the cache at an `#include`
-  yet. The daemon, protocol, producer, and the client's matching exist and are
-  tested.
+- A compile keeps producing a request whose saved copy it has already
+  rejected. redis `setcpuaffinity.c` line 27 is `#define _GNU_SOURCE`, before
+  `#include <stdlib.h>`. The producer replays only `#include` lines, so it
+  compiles `<stdlib.h>` without `_GNU_SOURCE`, and the record says
+  `_GNU_SOURCE` was not defined. The compile has it defined, rejects the saved
+  copy, and queues the same request again, which produces the same bytes.
+  Skip considered and deferred (2026-09-14): the lookup reply names each
+  rejected candidate's module, and a compile does not queue a request whose
+  `moduleNameFor` equals one of them. Safe because the same request always
+  produces the same bytes (2.11) and a stored entry is never rewritten after
+  it is written. The fix for the example itself is to replay the `.c` file's
+  own `#define`/`#undef` lines in the context -- a separate design, not yet
+  proposed.
 - `__COUNTER__` and the other translation-unit-varying builtins: declined for
   now (2.7). The backfill -- rewrite each value on load from the loading
   compile's own state, and advance its counter -- is still to write.
@@ -666,6 +879,93 @@ Kept because the reasoning that produced them is likely to recur.
   `#include` of the same header is skipped. Not written.
 - A population request whose context cannot be reproduced fails every time it
   is retried; the daemon should remember the failure.
+- Overlap the lookup round trip with the work around it. `receiveMessage`
+  blocks by design and a Unix-socket round trip costs tens of microseconds,
+  once per `#include`. `HandleIncludeDirective` resolves the filename, then
+  stats the filesystem across every `-I` path, then checks the guard, and only
+  then decides what to do. Sending the request once the filename resolves and
+  reading the reply at the decision point hides the round trip behind work the
+  compiler performs regardless. There is nothing to precompute while waiting:
+  `hasMacroDefinition` is a bit Clang already maintains (1.12).
+- Batch the lookups: one request naming many headers, one reply, one round
+  trip. Partly superseded by 2.14, which removes the round trip for every
+  header the region does not list. The compiler cannot know its own includes in advance, since conditionals
+  gate them, but the daemon can -- it has already seen which headers a given
+  main file asked for, and in what order, on an earlier build, so predicting
+  from that history needs no compiler change. Pairs with the client-side mirror
+  deferred earlier.
+- A dynamic fold decision, replacing 2.15's fixed cutoff. Measure both sides
+  in real compiles -- each header's parse time and each PCM's load time, which
+  grows with the number of PCMs already loaded -- and fold where parsing is
+  cheaper. The user and a labmate disagree on what the criterion should be;
+  measured times on both sides settle it. Deferred 2026-09-25 as hard to build
+  now.
+- Fold small headers and single-parent headers into their includer's saved
+  copy instead of giving them their own. Superseded as a rule by 2.15, which
+  decides by processing time, not by size or parent count; the measurements
+  below still stand. Each extra PCM costs about 250 us to
+  load (release clang-18), rising to 400 us at 300 PCMs because in C every
+  identifier lookup visits every loaded PCM (`ASTReader.cpp:9206`). A header of
+  ~20 declarations parses in about 220 us, so below that size a separate copy
+  loses to plain parsing: 100 small headers took 78 ms as separate PCMs, 52 ms
+  as text, 52 ms folded into one. A header with one parent folds with no
+  duplication -- 65.7% of redis's shared headers, 52.6% of git's -- though one
+  parent is a property of a build, not of a header. Large headers with many
+  parents keep their own copy, since folding them duplicates them everywhere.
+  Duplicate-merge cost not yet isolated. Scripts:
+  `scratch/loadtime/{synth,real}.py`, `benchmarks/ctxvariety.py`.
+- Most misses on redis are false rejections from conditionals, not from the
+  syntactic check. Measured 2026-09-18, each `.c` file's direct includes built
+  in the context of the includes before them: anet.c served 6 of 18, sds.c 1
+  of 9, object.c 3 of 6, with identical assembly each time and no candidate
+  rejected for a syntactic reason. Every rejection was a conditional recorded
+  "defined" and live "undefined". Most were transient macros a header sets for
+  itself -- glibc `#define`s `__need_size_t` or
+  `__GLIBC_INTERNAL_STARTING_HEADER_IMPLEMENTATION`, includes a header that
+  tests and `#undef`s it -- which 1.5 records without a provenance filter, so
+  no includer can ever match. The rest was `_BSD_SOURCE` from `fmacros.h`,
+  served from the cache, not being defined afterwards: macro effects are not
+  replayed yet. The 1.5 filter was deferred as an efficiency improvement; this
+  is its cost.
+- A cheaper syntactic check, adapted from Bothner's GCC compile server (2003,
+  §8.2). Proposed 2026-09-22, not approved, not built. The check in 1.12 asks
+  "is this a macro here?" for every NotAMacro name of a saved copy, about 500
+  lookups per hit. Bothner checks at the `#define` instead of at the include.
+  The daemon keeps one build-wide set of every name any saved copy uses as a
+  plain name, in the shared region. Each time the compile makes a name a macro
+  -- `#define`, `#pragma pop_macro`, builtins, all through
+  `Preprocessor::appendMacroDirective` -- it looks the name up in that set and,
+  on a match, adds it to a short list of its own. Before serving a saved copy,
+  it checks only the short list against that copy's names. The file a
+  `#define` sits in plays no part: a `-DUSE_X` that switches on
+  `#define grab other` inside a header is caught the same way as one in the
+  `.c` file. A copy stored after the compile started has names the set did not
+  hold when the compile's earlier `#define`s were looked up; a counter the
+  daemon bumps on every addition, read at startup, sends such copies to the
+  full check.
+
+  Measured over every `.c` file of five projects with their real flags
+  (`scratch/names/union3.py`): the set is 6,749 names in 94 KB (nginx) to
+  238,507 in 5.1 MB (qemu), still growing at qemu's last file. The short list
+  is ~600 names per `.c` file -- no saving -- because glibc writes
+  `#define _CS_PATH _CS_PATH` after about 500 enum constants and
+  `#define stdin stdin` to satisfy the standard's "is a macro". Such a macro
+  still yields the token it replaced, so the saved copy parsed the same
+  tokens; leaving these out gives median 9 (FFmpeg) to 114 (qemu). Whether the
+  conditional check alone covers `#ifdef` on such a name is not verified.
+
+  An empty `#define X` needs no rule of its own. It is a flag or an include
+  guard, whose name appears only in `#ifdef`/`#ifndef`, never as a plain name
+  in a header, so it never enters the set and is never checked: across all
+  7,000+ `.c` files, 5 names in qemu and none elsewhere, each an unrelated
+  coincidence (`audio/mixeng.c`'s `#define SIGNED` flag against the enum
+  constant `SIGNED` in a hexagon header it never includes). A rule to ignore
+  empty `#define`s is rejected anyway: a header that did use such a name as a
+  plain name would lose that token, and the set lookup catches it at no cost.
+
+  Whether any of this is worth building depends on what the 500 lookups cost
+  now, which is not measured; in C each lookup visits every loaded PCM
+  (`ASTReader.cpp:9206`).
 - Correctness will be established by building the benchmark projects with the
   mechanism enabled and running each project's own test suite. This bounds risk
   over the code those suites exercise; it does not establish that the record is

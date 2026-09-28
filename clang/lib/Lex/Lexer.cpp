@@ -2023,6 +2023,7 @@ bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
 
   // Finally, now that we know we have an identifier, pass this off to the
   // preprocessor, which may macro expand it or something.
+  PP->noteExpansionCandidate(Result);
   if (II->isHandleIdentifierCase())
     return PP->HandleIdentifier(Result);
 
@@ -4587,6 +4588,7 @@ bool Lexer::LexDependencyDirectiveToken(Token &Result) {
     Result.setRawIdentifierData(TokPtr);
     if (!isLexingRawMode()) {
       const IdentifierInfo *II = PP->LookUpIdentifierInfo(Result);
+      PP->noteExpansionCandidate(Result);
       if (II->isHandleIdentifierCase())
         return PP->HandleIdentifier(Result);
     }

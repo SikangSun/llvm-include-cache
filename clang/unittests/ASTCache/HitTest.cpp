@@ -171,6 +171,30 @@ protected:
     return CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
   }
 
+  /// Builds \p Header after the files in \p Context, as a compile that
+  /// included them first would, and stores the result.
+  void store(const std::string &Header,
+             const std::vector<std::string> &Context = {}) {
+    ProduceRequest Req;
+    Req.Header.Path = Header;
+    Req.Args = {"-std=c17"};
+    for (const std::string &C : Context)
+      Req.Context.push_back(IncludeRef{"", C});
+    ProduceResult P = produceHeader(Req);
+    ASSERT_TRUE(P.produced()) << P.Reason;
+    auto Writer = client();
+    ASSERT_TRUE(Writer);
+    ASSERT_TRUE(Writer->push(P.Push));
+  }
+
+  /// Whether compiling \p Main read \p Header rather than taking it from the
+  /// cache.
+  bool reads(const std::string &Main, const std::string &Header) {
+    std::set<std::string> Entered;
+    EXPECT_TRUE(compile(Main, Entered)) << Main << " did not compile";
+    return Entered.count(Header) != 0;
+  }
+
   std::string Dir, SocketPath, RegionPath;
   std::unique_ptr<CacheDaemon> Daemon;
   std::thread Server;
@@ -314,6 +338,211 @@ TEST_F(HitTest, AHeaderIsNotServedWhenTheRecordDoesNotMatch) {
   ASSERT_TRUE(compile(Main, Entered));
   EXPECT_TRUE(Entered.count(H))
       << "FEATURE is undefined here, so the stored entry must not be used";
+}
+
+// The next four are the silent miscompiles the syntactic record exists for.
+// In each, the stored parse was built where a name was not a macro, and the
+// includer has since made it one. No macro is tested inside the header, and
+// in the first three none is expanded there either, so before the record
+// existed every one of them was served, and the program called the wrong
+// function. Each first checks that the header is served without the #define,
+// so that "read" below cannot be down to some other mismatch.
+
+TEST_F(HitTest, NotServedWhenTheIncluderMakesANameAMacro) {
+  std::string Lib = write("lib.h", "#ifndef LIB_H\n#define LIB_H\n"
+                                   "void *malloc(unsigned long n);\n"
+                                   "static inline void *grab(unsigned long n) "
+                                   "{ return malloc(n); }\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Lib));
+
+  std::string Plain =
+      write("plain.c", "#include \"" + Lib +
+                           "\"\n"
+                           "void *f(void) { return grab(8); }\n");
+  EXPECT_FALSE(reads(Plain, Lib)) << "control: nothing redefines malloc";
+
+  std::string Renamed =
+      write("renamed.c", "void *my_malloc(unsigned long n);\n"
+                         "#define malloc my_malloc\n"
+                         "#include \"" +
+                             Lib +
+                             "\"\n"
+                             "void *f(void) { return grab(8); }\n");
+  EXPECT_TRUE(reads(Renamed, Lib))
+      << "grab must call my_malloc, which only reading lib.h gives";
+}
+
+TEST_F(HitTest, NotServedWhenTheIncluderMakesAKeywordAMacro) {
+  std::string Kw = write("kw.h", "#ifndef KW_H\n#define KW_H\n"
+                                 "static inline unsigned width(void) "
+                                 "{ return sizeof(long); }\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Kw));
+
+  std::string Plain =
+      write("plain.c", "#include \"" + Kw +
+                           "\"\n"
+                           "unsigned f(void) { return width(); }\n");
+  EXPECT_FALSE(reads(Plain, Kw)) << "control: long is still long";
+
+  std::string Redefined = write("redefined.c", "#define long int\n"
+                                               "#include \"" +
+                                                   Kw +
+                                                   "\"\n"
+                                                   "unsigned f(void) "
+                                                   "{ return width(); }\n");
+  EXPECT_TRUE(reads(Redefined, Kw)) << "width must return sizeof(int) here";
+}
+
+TEST_F(HitTest, NotServedWhenTheIncluderMakesAPastedNameAMacro) {
+  // paste.h never spells malloc; JOIN builds it.
+  std::string Decl =
+      write("decl.h", "#ifndef DECL_H\n#define DECL_H\n"
+                      "void *malloc(unsigned long n);\n#endif\n");
+  std::string Paste =
+      write("paste.h", "#ifndef PASTE_H\n#define PASTE_H\n"
+                       "#define JOIN(a, b) a##b\n"
+                       "static inline void *grab2(unsigned long n) "
+                       "{ return JOIN(mal, loc)(n); }\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Paste, {Decl}));
+
+  std::string Plain =
+      write("plain.c", "#include \"" + Decl +
+                           "\"\n"
+                           "#include \"" +
+                           Paste +
+                           "\"\n"
+                           "void *f(void) { return grab2(8); }\n");
+  EXPECT_FALSE(reads(Plain, Paste)) << "control: nothing redefines malloc";
+
+  std::string Renamed =
+      write("renamed.c", "#include \"" + Decl +
+                             "\"\n"
+                             "void *my_malloc(unsigned long n);\n"
+                             "#define malloc my_malloc\n"
+                             "#include \"" +
+                             Paste +
+                             "\"\n"
+                             "void *f(void) { return grab2(8); }\n");
+  EXPECT_TRUE(reads(Renamed, Paste))
+      << "the pasted malloc is rescanned and becomes my_malloc";
+}
+
+TEST_F(HitTest, NotServedWhenANameFromAnOutsideMacroBecomesAMacro) {
+  // ALLOC is defined outside get.h and still expands to exactly grab_impl, so
+  // the check on ALLOC passes. What changed is grab_impl itself, which get.h
+  // never spells but which is rescanned inside it.
+  std::string Outside =
+      write("outside.h", "#ifndef OUTSIDE_H\n#define OUTSIDE_H\n"
+                         "void *grab_impl(unsigned long n);\n"
+                         "#define ALLOC grab_impl\n#endif\n");
+  std::string Get = write("get.h", "#ifndef GET_H\n#define GET_H\n"
+                                   "static inline void *get(unsigned long n) "
+                                   "{ return ALLOC(n); }\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Get, {Outside}));
+
+  std::string Plain =
+      write("plain.c", "#include \"" + Outside +
+                           "\"\n"
+                           "#include \"" +
+                           Get +
+                           "\"\n"
+                           "void *f(void) { return get(8); }\n");
+  EXPECT_FALSE(reads(Plain, Get)) << "control: grab_impl is not a macro";
+
+  std::string Renamed =
+      write("renamed.c", "#include \"" + Outside +
+                             "\"\n"
+                             "void *other(unsigned long n);\n"
+                             "#define grab_impl other\n"
+                             "#include \"" +
+                             Get +
+                             "\"\n"
+                             "void *f(void) { return get(8); }\n");
+  EXPECT_TRUE(reads(Renamed, Get)) << "get must call other here";
+}
+
+TEST_F(HitTest, ServedWhenTheHeaderDefinesTheNameBeforeUsingIt) {
+  // The includer's BUF can never reach buf.h's use of it: buf.h's own #define
+  // replaces it first. Rejecting here would cost a hit for nothing.
+  std::string Buf = write("buf.h", "#ifndef BUF_H\n#define BUF_H\n"
+                                   "#define BUF 16\nextern char buf[BUF];\n"
+                                   "#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Buf));
+
+  std::string Main =
+      write("main.c", "#define BUF 8\n"
+                      "#include \"" +
+                          Buf +
+                          "\"\n"
+                          "int f(void) { return (int)sizeof buf; }\n");
+  EXPECT_FALSE(reads(Main, Buf));
+}
+
+// A hit loads a module, and a module that defines a name the compile has
+// already seen leaves that name's identifier out of date: its macro bit still
+// says "not a macro" until something updates it. Lexing does that on the way
+// in. The checks on the next #include ask about names without lexing them, so
+// they have to do it themselves, or a later entry is matched against the
+// state from before the hit.
+
+TEST_F(HitTest, AConditionalSeesAMacroFromAnEarlierHit) {
+  std::string A = write("a.h", "#ifndef A_H\n#define A_H\n#define FEATURE 1\n"
+                               "int a_decl;\n#endif\n");
+  std::string B = write("b.h", "#ifndef B_H\n#define B_H\n#ifdef FEATURE\n"
+                               "int with_feature(void);\n#endif\n"
+                               "int always(void);\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(A));
+  ASSERT_NO_FATAL_FAILURE(store(B));
+
+  std::string Plain =
+      write("plain.c", "#include \"" + B +
+                           "\"\n"
+                           "int g(void) { return always(); }\n");
+  EXPECT_FALSE(reads(Plain, B)) << "control: FEATURE is defined nowhere";
+
+  // main.c mentions FEATURE first, so its identifier exists before a.h loads.
+  std::string Main =
+      write("main.c", "#ifdef FEATURE\n#endif\n"
+                      "#include \"" +
+                          A +
+                          "\"\n"
+                          "#include \"" +
+                          B +
+                          "\"\n"
+                          "int g(void) { return with_feature(); }\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered))
+      << "with_feature is declared only if b.h is read with FEATURE defined";
+  EXPECT_FALSE(Entered.count(A)) << "a.h must come from the cache, or this "
+                                    "test is not testing a hit";
+  EXPECT_TRUE(Entered.count(B));
+}
+
+TEST_F(HitTest, ASyntacticCheckSeesAMacroFromAnEarlierHit) {
+  std::string A = write("wrap.h", "#ifndef WRAP_H\n#define WRAP_H\n"
+                                  "void *my_malloc(unsigned long n);\n"
+                                  "#define malloc my_malloc\n#endif\n");
+  std::string Lib = write("lib.h", "#ifndef LIB_H\n#define LIB_H\n"
+                                   "void *malloc(unsigned long n);\n"
+                                   "static inline void *grab(unsigned long n) "
+                                   "{ return malloc(n); }\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(A));
+  ASSERT_NO_FATAL_FAILURE(store(Lib));
+
+  // main.c declares malloc first, so its identifier exists before wrap.h
+  // loads and makes it a macro.
+  std::string Main = write("main.c", "void *malloc(unsigned long n);\n"
+                                     "#include \"" +
+                                         A +
+                                         "\"\n"
+                                         "#include \"" +
+                                         Lib +
+                                         "\"\n"
+                                         "void *f(void) { return grab(8); }\n");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(A)) << "wrap.h must come from the cache";
+  EXPECT_TRUE(Entered.count(Lib)) << "grab must call my_malloc";
 }
 
 } // namespace

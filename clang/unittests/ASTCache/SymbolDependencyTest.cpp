@@ -78,6 +78,7 @@ public:
         std::make_unique<ASTCacheDependencyTracker>(CI.getPreprocessor());
     ASTCacheDependencyTracker *Raw = Owned.get();
     CI.getPreprocessor().addPPCallbacks(std::move(Owned));
+    CI.getPreprocessor().setExpansionCandidateObserver(*Raw);
     return std::make_unique<SymbolConsumer>(*Raw, Out);
   }
 

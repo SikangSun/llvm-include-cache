@@ -20,6 +20,11 @@
 // pins it). One MacroExpands event is therefore asked the question once per
 // open frame, and can answer differently at each.
 //
+// Besides being attached with addPPCallbacks, the tracker must be registered
+// with Preprocessor::setExpansionCandidateObserver: identifiers that are not
+// macros reach no PPCallbacks event, and those are most syntactic
+// dependencies.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_ASTCACHE_ASTCACHEDEPENDENCYTRACKER_H
@@ -27,6 +32,7 @@
 
 #include "clang/ASTCache/DependencyRecord.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Lex/ExpansionCandidateObserver.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Sema/NameClassificationObserver.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -38,6 +44,7 @@
 
 namespace clang {
 class IdentifierInfo;
+class MacroInfo;
 class Preprocessor;
 
 namespace ast_cache {
@@ -46,7 +53,8 @@ namespace ast_cache {
 /// it is attached to. See DependencyRecord.h for what each dependency
 /// category means.
 class ASTCacheDependencyTracker : public PPCallbacks,
-                                   public NameClassificationObserver {
+                                  public ExpansionCandidateObserver,
+                                  public NameClassificationObserver {
 public:
   explicit ASTCacheDependencyTracker(Preprocessor &PP);
 
@@ -111,10 +119,24 @@ public:
   /// be missing, and a missing dependency matches every compile.
   void UndefinedIdentifierInDirective(const Token &IdentifierTok) override;
 
-  /// Value dependencies: for each open frame independently, recorded only
-  /// when the macro's currently-active #define lies outside *that frame's*
-  /// closure. Deduped per frame -- nested expansion fires this callback
-  /// repeatedly for one top-level use, and only the set of names matters.
+  /// Syntactic dependencies: every identifier that reaches the
+  /// macro-expansion decision, recorded in each open frame with the state it
+  /// has the first time that frame sees it --
+  ///   - not a macro: NotAMacro;
+  ///   - a macro whose active #define lies outside that frame's closure:
+  ///     ExpandsTo, with its replacement tokens;
+  ///   - a macro defined inside that frame's closure: nothing, since the
+  ///     header's own text pins it.
+  /// Only the first sighting counts. A header that uses BUF and later
+  /// #defines it depended on BUF not being a macro at that first use; a
+  /// header that #defines BUF and then uses it did not depend on the
+  /// includer at all.
+  void expansionCandidate(const Token &Identifier) override;
+
+  /// The same record, reached from an actual expansion. Every expansion is
+  /// preceded by an expansionCandidate for the same token, so this only
+  /// matters if some path reaches HandleIdentifier without one -- in which
+  /// case recording here keeps the dependency rather than dropping it.
   void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                      SourceRange Range, const MacroArgs *Args) override;
 
@@ -171,7 +193,10 @@ private:
     /// This file plus every real file entered beneath it.
     llvm::DenseSet<FileID> Closure;
     llvm::DenseSet<const IdentifierInfo *> SeenConditional;
-    llvm::DenseSet<const IdentifierInfo *> SeenValue;
+    /// Names this frame has already classified, whatever the outcome. Also
+    /// a subset relation: anything the innermost frame has seen, every frame
+    /// enclosing it has seen too, since both were open at the time.
+    llvm::DenseSet<const IdentifierInfo *> SeenSyntactic;
     llvm::DenseSet<const IdentifierInfo *> SeenSymbol;
     llvm::DenseSet<const FileEntry *> SeenSkipped;
     HeaderDependencySet Deps;
@@ -182,6 +207,10 @@ private:
 
   /// Records a definedness test into every open frame.
   void recordConditional(const Token &MacroNameTok, const MacroDefinition &MD);
+
+  /// Shared body of expansionCandidate and MacroExpands. \p MI is the name's
+  /// active macro, or null if it is not one.
+  void recordSyntactic(const IdentifierInfo *II, const MacroInfo *MI);
 
   /// Shared body of the two symbol-query hooks.
   void recordSymbol(const IdentifierInfo *Name,

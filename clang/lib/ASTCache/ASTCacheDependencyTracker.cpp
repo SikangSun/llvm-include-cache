@@ -173,54 +173,64 @@ void ASTCacheDependencyTracker::UndefinedIdentifierInDirective(
   recordConditional(IdentifierTok, MacroDefinition());
 }
 
-void ASTCacheDependencyTracker::MacroExpands(const Token &MacroNameTok,
-                                              const MacroDefinition &MD,
-                                              SourceRange Range,
-                                              const MacroArgs *Args) {
+void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
   if (Stack.empty())
     return;
-
-  const IdentifierInfo *II = MacroNameTok.getIdentifierInfo();
+  const IdentifierInfo *II = Identifier.getIdentifierInfo();
   if (!II)
     return;
-
-  const MacroInfo *MI = MD.getMacroInfo();
-  if (!MI)
+  // The common case: a name already seen. If the innermost frame has it,
+  // every enclosing frame has it too.
+  if (Stack.back().SeenSyntactic.contains(II))
     return;
+  // This runs just before HandleIdentifier would update an identifier that a
+  // module load left out of date, so do that here first, or the macro state
+  // read below could be stale.
+  PP.refreshIdentifier(*II);
+  recordSyntactic(II, PP.getMacroDefinition(II).getMacroInfo());
+}
 
-  // Known, still-open gap: a macro that is currently *undefined* and used in
-  // a #if/#elif arithmetic expression ("#if SOME_UNDEFINED > 5") never
-  // reaches this callback -- the expression evaluator substitutes 0 without
-  // going through macro expansion, and no callback names the identifier.
-  // Closing that needs the identifiers DirectiveEvalResult already collects
-  // to be surfaced through PPCallbacks::If/Elif.
+void ASTCacheDependencyTracker::MacroExpands(const Token &MacroNameTok,
+                                             const MacroDefinition &MD,
+                                             SourceRange Range,
+                                             const MacroArgs *Args) {
+  const IdentifierInfo *II = MacroNameTok.getIdentifierInfo();
+  const MacroInfo *MI = MD.getMacroInfo();
+  if (Stack.empty() || !II || !MI)
+    return;
+  recordSyntactic(II, MI);
+}
 
+void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
+                                                const MacroInfo *MI) {
   FileID DefFID =
-      PP.getSourceManager().getFileID(MI->getDefinitionLoc());
+      MI ? PP.getSourceManager().getFileID(MI->getDefinitionLoc()) : FileID();
 
-  // The same expansion answers the provenance question differently per
-  // frame: internal to a frame whose closure contains the definition,
-  // external -- and so a dependency -- to every frame nested beneath it.
+  // The same sighting answers differently per frame: a macro is internal to
+  // a frame whose closure contains its definition, and external -- so a
+  // dependency -- to every frame nested beneath it.
   std::string Sequence;
   bool Built = false;
 
   for (Frame &F : Stack) {
-    if (F.Closure.contains(DefFID))
+    if (!F.SeenSyntactic.insert(II).second)
       continue;
-    if (!F.SeenValue.insert(II).second)
+    if (MI && F.Closure.contains(DefFID))
       continue;
 
-    if (!Built) {
-      // Shared with the client's match check -- see MacroTokens.h for why
-      // these must not be two implementations.
-      Sequence = serializeMacroTokens(*MI);
-      Built = true;
+    SyntacticDependency Dep;
+    Dep.Name = II->getName().str();
+    if (MI) {
+      if (!Built) {
+        // Shared with the client's match check -- see MacroTokens.h for why
+        // these must not be two implementations.
+        Sequence = serializeMacroTokens(*MI);
+        Built = true;
+      }
+      Dep.Required = SyntacticDependency::State::ExpandsTo;
+      Dep.TokenSequence = Sequence;
     }
-
-    ValueDependency Dep;
-    Dep.MacroName = II->getName().str();
-    Dep.TokenSequence = Sequence;
-    F.Deps.Value.push_back(std::move(Dep));
+    F.Deps.Syntactic.push_back(std::move(Dep));
   }
 }
 

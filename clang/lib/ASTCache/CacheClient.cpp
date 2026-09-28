@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/ASTCache/CacheClient.h"
+#include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/MacroTokens.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
 #include "clang/Basic/IdentifierTable.h"
@@ -26,8 +27,8 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
     return "matched";
   case MismatchReason::Conditional:
     return "a macro's definedness differs";
-  case MismatchReason::Value:
-    return "a macro expands differently";
+  case MismatchReason::Syntactic:
+    return "an identifier is a macro here and was not, or expands differently";
   case MismatchReason::Symbol:
     return "an identifier classifies differently";
   case MismatchReason::Inclusion:
@@ -62,8 +63,10 @@ bool resolvesToType(Sema &S, const IdentifierInfo &Name,
 
 } // namespace
 
-MismatchReason clang::ast_cache::matchesLiveState(
-    const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S) {
+MismatchReason
+clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
+                                   Preprocessor &PP, Sema *S,
+                                   llvm::StringRef NotAMacroNames) {
   // Every record carries pragma state, and only Sema holds the live value to
   // compare it against. Without Sema that check cannot run, and a check that
   // cannot run must reject rather than pass -- an unverifiable dependency is
@@ -73,26 +76,43 @@ MismatchReason clang::ast_cache::matchesLiveState(
 
   IdentifierTable &Idents = PP.getIdentifierTable();
 
+  // The identifier for \p Name, brought up to date first. A hit earlier in
+  // this compile loads a module, which can define a name the compile had
+  // already seen; until the identifier is updated its macro bit still says
+  // it is not a macro, and a check on it would accept an entry it must not.
+  auto Fresh = [&](llvm::StringRef Name) {
+    IdentifierInfo *II = PP.getIdentifierInfo(Name);
+    PP.refreshIdentifier(*II);
+    return II;
+  };
+
   // Cheapest first: a definedness test is a hash lookup, and a header with
   // dozens of them usually fails on one.
   for (const ConditionalDependency &D : Deps.Conditional) {
-    bool Defined = PP.isMacroDefined(D.MacroName);
+    bool Defined = PP.isMacroDefined(Fresh(D.MacroName));
     if (Defined != D.WasDefined)
       return MismatchReason::Conditional;
   }
 
-  for (const ValueDependency &D : Deps.Value) {
-    IdentifierInfo *II = Idents.get(D.MacroName).getName().empty()
-                             ? nullptr
-                             : &Idents.get(D.MacroName);
-    if (!II)
-      return MismatchReason::Value;
-    MacroDefinition MD = PP.getMacroDefinition(II);
-    const MacroInfo *MI = MD.getMacroInfo();
-    if (!MI)
-      return MismatchReason::Value;
-    if (serializeMacroTokens(*MI) != D.TokenSequence)
-      return MismatchReason::Value;
+  // A name the stored parse read as plain text must still be plain text here.
+  // isMacroDefined tests the identifier's macro bit first, which is clear for
+  // nearly every name, and asks about module visibility only when it is set:
+  // the bit alone is also set for a module's macro that is not visible.
+  auto IsMacro = [&](llvm::StringRef Name) {
+    return PP.isMacroDefined(Fresh(Name));
+  };
+
+  for (const SyntacticDependency &D : Deps.Syntactic) {
+    if (D.Name.empty())
+      return MismatchReason::Syntactic;
+    if (D.Required == SyntacticDependency::State::NotAMacro) {
+      if (IsMacro(D.Name))
+        return MismatchReason::Syntactic;
+      continue;
+    }
+    const MacroInfo *MI = PP.getMacroDefinition(Fresh(D.Name)).getMacroInfo();
+    if (!MI || serializeMacroTokens(*MI) != D.TokenSequence)
+      return MismatchReason::Syntactic;
   }
 
   // An #include the recorded compile skipped must also be skippable here,
@@ -105,6 +125,17 @@ MismatchReason clang::ast_cache::matchesLiveState(
     if (!HS.hasFileBeenImported(*FE) &&
         !HS.getFileInfo(*FE).isImport)
       return MismatchReason::Inclusion;
+  }
+
+  // Several hundred names for a system header, so after the short lists.
+  if (!NotAMacroNames.empty()) {
+    std::optional<llvm::SmallVector<llvm::StringRef, 0>> Names =
+        splitNameList(NotAMacroNames);
+    if (!Names)
+      return MismatchReason::Syntactic;
+    for (llvm::StringRef Name : *Names)
+      if (IsMacro(Name))
+        return MismatchReason::Syntactic;
   }
 
   // Symbol dependencies last: the only ones that cost a name lookup.
@@ -166,7 +197,20 @@ llvm::StringRef CacheClient::lookup(llvm::StringRef Filename, Preprocessor &PP,
     return {};
 
   for (const CacheEntryRef &E : Resp->Entries) {
-    MismatchReason Why = matchesLiveState(E.Deps, PP, S);
+    // The names this entry requires not to be macros are in the region. If the
+    // offset addresses nothing written, they cannot be checked, and checking
+    // the rest without them would accept compiles it must not.
+    llvm::StringRef Names;
+    if (E.NamesLength) {
+      Names = Region.read(E.NamesOffset, E.NamesLength);
+      if (Names.empty()) {
+        ++Counters.CandidatesRejected;
+        ++Counters
+              .RejectedFor[static_cast<unsigned>(MismatchReason::Syntactic)];
+        continue;
+      }
+    }
+    MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;
       ++Counters.RejectedFor[static_cast<unsigned>(Why)];

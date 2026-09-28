@@ -88,6 +88,9 @@ private:
     std::string EncodedDeps;
     uint64_t Offset = 0;
     uint64_t Length = 0;
+    /// The record's NotAMacro names, moved out of Deps into the region.
+    uint64_t NamesOffset = 0;
+    uint64_t NamesLength = 0;
   };
 
   llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req);

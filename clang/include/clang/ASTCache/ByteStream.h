@@ -49,10 +49,10 @@ public:
     Out.append(Buf, Buf + 8);
   }
 
-  /// Length-prefixed, never NUL-terminated: a value dependency's token
-  /// sequence contains embedded NULs by construction -- they are its token
-  /// separator -- so a NUL-terminated encoding would truncate every one of
-  /// them to its first token.
+  /// Length-prefixed, never NUL-terminated: an ExpandsTo syntactic
+  /// dependency's token sequence contains embedded NULs by construction --
+  /// they are its token separator -- so a NUL-terminated encoding would
+  /// truncate every one of them to its first token.
   void str(llvm::StringRef S) {
     u32(static_cast<uint32_t>(S.size()));
     Out.append(S.begin(), S.end());

@@ -48,7 +48,7 @@ namespace ast_cache {
 enum class MismatchReason {
   None,
   Conditional,
-  Value,
+  Syntactic,
   Symbol,
   Inclusion,
   PragmaState,
@@ -60,8 +60,14 @@ llvm::StringRef describe(MismatchReason R);
 /// every record carries pragma state and only Sema holds the live value, so
 /// a null Sema rejects every candidate rather than passing checks it cannot
 /// run.
+///
+/// \p NotAMacroNames is the list extractNotAMacroNames took out of a record
+/// the daemon stored (see DependencySerialization.h). A record that never went
+/// through the daemon still carries those names in Deps.Syntactic, and both
+/// are checked.
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
-                                 Preprocessor &PP, Sema *S);
+                                Preprocessor &PP, Sema *S,
+                                llvm::StringRef NotAMacroNames = {});
 
 class CacheClient {
 public:

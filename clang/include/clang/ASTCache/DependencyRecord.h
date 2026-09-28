@@ -41,15 +41,29 @@ struct ConditionalDependency {
   bool WasDefined = false;
 };
 
-/// A macro's *expansion* substitutes into the cached Decl graph (a type
-/// name, an array bound, an attribute argument, a template argument --
-/// deliberately not filtered by grammar position, see
-/// ASTCacheDependencyTracker). A hit requires the live macro to expand to
-/// the exact same token sequence.
-struct ValueDependency {
-  std::string MacroName;
-  /// The macro's replacement-list tokens' spellings, concatenated with a
-  /// separator that cannot appear in a single spelling, so two different
+/// An identifier the preprocessor considered for macro expansion while
+/// processing the header, and the macro state it had the first time. Any
+/// identifier-shaped token can be turned into something else by an earlier
+/// #define -- keywords included -- so each one the header's text produced is
+/// a dependency on the includer's macro table.
+///
+/// Recorded only when that state could vary: a name first seen as a macro
+/// defined inside the header's own closure has no requirement, since the
+/// header's text pins it. See ASTCacheDependencyTracker for where the names
+/// come from.
+struct SyntacticDependency {
+  enum class State : uint8_t {
+    /// The name was not a macro. A hit requires that it is not one now.
+    NotAMacro,
+    /// The name was a macro defined outside the header. A hit requires that
+    /// it is one now, with the exact same replacement tokens.
+    ExpandsTo,
+  };
+
+  std::string Name;
+  State Required = State::NotAMacro;
+  /// For ExpandsTo: the replacement-list tokens' spellings, concatenated with
+  /// a separator that cannot appear in a single spelling, so two different
   /// token sequences never collide into the same recorded string.
   std::string TokenSequence;
 };
@@ -113,7 +127,7 @@ struct PragmaSnapshot {
 
 struct HeaderDependencySet {
   std::vector<ConditionalDependency> Conditional;
-  std::vector<ValueDependency> Value;
+  std::vector<SyntacticDependency> Syntactic;
   std::vector<SymbolDependency> Symbol;
   std::vector<InclusionDependency> Inclusion;
 

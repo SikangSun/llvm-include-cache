@@ -584,6 +584,12 @@ bool Preprocessor::HandleMacroExpandedIdentifier(Token &Identifier,
                                    ExpansionEnd,Identifier.getLength());
     Identifier.setLocation(Loc);
 
+    // An identifier here reached the expansion decision inside
+    // isTrivialSingleTokenExpansion, and is returned without passing through
+    // a TokenLexer, where it would otherwise be reported.
+    if (Identifier.getIdentifierInfo())
+      noteExpansionCandidate(Identifier);
+
     // If this is a disabled macro or #define X X, we must mark the result as
     // unexpandable.
     if (IdentifierInfo *NewII = Identifier.getIdentifierInfo()) {

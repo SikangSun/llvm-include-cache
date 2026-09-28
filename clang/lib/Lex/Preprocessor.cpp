@@ -36,8 +36,9 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/CodeCompletionHandler.h"
 #include "clang/Lex/DeclBoundaryObserver.h"
-#include "clang/Lex/HeaderCacheHook.h"
+#include "clang/Lex/ExpansionCandidateObserver.h"
 #include "clang/Lex/ExternalPreprocessorSource.h"
+#include "clang/Lex/HeaderCacheHook.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LexDiagnostic.h"
 #include "clang/Lex/Lexer.h"
@@ -1666,6 +1667,15 @@ EmptylineHandler::~EmptylineHandler() = default;
 CodeCompletionHandler::~CodeCompletionHandler() = default;
 
 DeclBoundaryObserver::~DeclBoundaryObserver() = default;
+
+ExpansionCandidateObserver::~ExpansionCandidateObserver() = default;
+
+void Preprocessor::reportExpansionCandidate(const Token &Identifier) {
+  // With expansion disabled the identifier is not a candidate: it is being
+  // read as a name, as in #define or #ifdef, not as text.
+  if (!DisableMacroExpansion)
+    ExpansionCandidates->expansionCandidate(Identifier);
+}
 
 HeaderCacheHook::~HeaderCacheHook() = default;
 

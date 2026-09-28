@@ -9,11 +9,11 @@
 // One definition of what a macro's replacement list looks like as a string.
 //
 // It lives on its own because two sides depend on producing byte-identical
-// output from it: the tracker writes it when recording a value dependency,
-// and the client writes it again for the live macro when checking whether a
-// stored entry still applies. If those two ever drifted, every value
-// dependency would compare unequal and nothing would ever hit -- a silent
-// failure that looks like the cache simply not helping.
+// output from it: the tracker writes it when recording an ExpandsTo
+// syntactic dependency, and the client writes it again for the live macro
+// when checking whether a stored entry still applies. If those two ever
+// drifted, every ExpandsTo dependency would compare unequal and nothing would
+// ever hit -- a silent failure that looks like the cache simply not helping.
 //
 //===----------------------------------------------------------------------===//
 

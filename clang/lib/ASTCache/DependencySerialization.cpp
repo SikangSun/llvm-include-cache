@@ -8,6 +8,7 @@
 
 #include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/ByteStream.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -39,9 +40,10 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
     W.u8(D.WasDefined ? 1 : 0);
   }
 
-  W.u32(static_cast<uint32_t>(Deps.Value.size()));
-  for (const ValueDependency &D : Deps.Value) {
-    W.str(D.MacroName);
+  W.u32(static_cast<uint32_t>(Deps.Syntactic.size()));
+  for (const SyntacticDependency &D : Deps.Syntactic) {
+    W.str(D.Name);
+    W.u8(static_cast<uint8_t>(D.Required));
     W.str(D.TokenSequence);
   }
 
@@ -78,10 +80,14 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
   }
 
   for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
-    ValueDependency D;
-    D.MacroName = R.str().str();
+    SyntacticDependency D;
+    D.Name = R.str().str();
+    uint8_t Raw = R.u8();
+    if (Raw > static_cast<uint8_t>(SyntacticDependency::State::ExpandsTo))
+      return std::nullopt;
+    D.Required = static_cast<SyntacticDependency::State>(Raw);
     D.TokenSequence = R.str().str();
-    Deps.Value.push_back(std::move(D));
+    Deps.Syntactic.push_back(std::move(D));
   }
 
   for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
@@ -114,4 +120,31 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
     return std::nullopt;
 
   return Deps;
+}
+
+std::string clang::ast_cache::extractNotAMacroNames(HeaderDependencySet &Deps) {
+  std::string List;
+  llvm::erase_if(Deps.Syntactic, [&](const SyntacticDependency &D) {
+    if (D.Required != SyntacticDependency::State::NotAMacro)
+      return false;
+    List += D.Name;
+    List += '\0';
+    return true;
+  });
+  return List;
+}
+
+std::optional<llvm::SmallVector<llvm::StringRef, 0>>
+clang::ast_cache::splitNameList(llvm::StringRef List) {
+  llvm::SmallVector<llvm::StringRef, 0> Names;
+  if (List.empty())
+    return Names;
+  if (List.back() != '\0')
+    return std::nullopt;
+  List = List.drop_back();
+  List.split(Names, '\0');
+  for (llvm::StringRef N : Names)
+    if (N.empty())
+      return std::nullopt;
+  return Names;
 }

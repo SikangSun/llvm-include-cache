@@ -76,6 +76,8 @@ void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
       writeRecord(W, E.Deps);
       W.u64(E.Offset);
       W.u64(E.Length);
+      W.u64(E.NamesOffset);
+      W.u64(E.NamesLength);
     }
   });
 }
@@ -141,6 +143,8 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
       return std::nullopt;
     E.Offset = R.u64();
     E.Length = R.u64();
+    E.NamesOffset = R.u64();
+    E.NamesLength = R.u64();
     Resp.Entries.push_back(std::move(E));
   }
   if (!R.atEnd())

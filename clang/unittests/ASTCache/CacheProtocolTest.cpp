@@ -13,8 +13,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/ASTCache/CacheDaemon.h"
+#include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/Support/FileSystem.h"
 #include "gtest/gtest.h"
 #include <string>
@@ -33,7 +34,8 @@ llvm::StringRef body(const llvm::SmallVectorImpl<char> &Framed) {
 HeaderDependencySet makeRecord(llvm::StringRef Macro, bool Defined) {
   HeaderDependencySet D;
   D.Conditional.push_back({Macro.str(), Defined});
-  D.Value.push_back({"BUFSZ", std::string("\0" "1024" "\0", 6)});
+  D.Syntactic.push_back({"BUFSZ", SyntacticDependency::State::ExpandsTo,
+                         std::string(1, '\0') + "1024" + '\0'});
   D.Symbol.push_back({"T", SymbolClassification::Type, "long"});
   D.Entry.AlignPackRaw = 7;
   D.Exit.AlignPackRaw = 7;
@@ -71,8 +73,29 @@ TEST(CacheProtocolTest, RequestsRoundTrip) {
   EXPECT_EQ(Got->Data, P.Data) << "payload must survive embedded NULs";
   ASSERT_EQ(Got->Deps.Conditional.size(), 1u);
   EXPECT_EQ(Got->Deps.Conditional[0].MacroName, "FEATURE");
-  EXPECT_EQ(Got->Deps.Value[0].TokenSequence, P.Deps.Value[0].TokenSequence);
+  EXPECT_EQ(Got->Deps.Syntactic[0].TokenSequence,
+            P.Deps.Syntactic[0].TokenSequence);
   EXPECT_EQ(Got->Deps.Entry.AlignPackRaw, 7u);
+}
+
+TEST(CacheProtocolTest, LookupResponseSaysWhereTheNamesAre) {
+  LookupResponse Resp;
+  CacheEntryRef E;
+  E.Deps = makeRecord("FEATURE", true);
+  E.Offset = 100;
+  E.Length = 20;
+  E.NamesOffset = 64;
+  E.NamesLength = 36;
+  Resp.Entries.push_back(E);
+  llvm::SmallVector<char, 0> Out;
+  encodeLookupResponse(Resp, Out);
+  auto Got = decodeLookupResponse(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Entries.size(), 1u);
+  EXPECT_EQ(Got->Entries[0].Offset, 100u);
+  EXPECT_EQ(Got->Entries[0].Length, 20u);
+  EXPECT_EQ(Got->Entries[0].NamesOffset, 64u);
+  EXPECT_EQ(Got->Entries[0].NamesLength, 36u);
 }
 
 TEST(CacheProtocolTest, WrongKindIsRejected) {
@@ -153,6 +176,30 @@ TEST_F(DaemonTest, PushThenLookupReturnsTheEntry) {
   ASSERT_EQ(R.Entries[0].Deps.Conditional.size(), 1u);
   EXPECT_EQ(R.Entries[0].Deps.Conditional[0].MacroName, "FEATURE");
   EXPECT_EQ(R.Entries[0].Length, 19u);
+}
+
+TEST_F(DaemonTest, NotAMacroNamesAreKeptInTheRegion) {
+  // Several hundred names for a system header: the reply says where they are
+  // and leaves them out of the record it carries.
+  HeaderDependencySet D = makeRecord("FEATURE", true);
+  D.Syntactic.push_back({"malloc", SyntacticDependency::State::NotAMacro, ""});
+  D.Syntactic.push_back({"long", SyntacticDependency::State::NotAMacro, ""});
+  push("h.h", D, "PARSED");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 1u);
+  const CacheEntryRef &E = R.Entries[0];
+  ASSERT_EQ(E.Deps.Syntactic.size(), 1u);
+  EXPECT_EQ(E.Deps.Syntactic[0].Name, "BUFSZ");
+  ASSERT_GT(E.NamesLength, 0u);
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  auto Names = splitNameList(Attached->read(E.NamesOffset, E.NamesLength));
+  ASSERT_TRUE(Names.has_value());
+  ASSERT_EQ(Names->size(), 2u);
+  EXPECT_EQ((*Names)[0], "malloc");
+  EXPECT_EQ((*Names)[1], "long");
+  EXPECT_EQ(Attached->read(E.Offset, E.Length), "PARSED");
 }
 
 TEST_F(DaemonTest, EveryVariantIsReturnedNotJustOne) {

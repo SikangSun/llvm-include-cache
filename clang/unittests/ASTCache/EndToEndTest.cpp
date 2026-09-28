@@ -172,7 +172,7 @@ TEST_F(EndToEndTest, ConditionalMismatchRejectsTheEntry) {
   EXPECT_FALSE(HitWith) << "a compile that defines FEATURE must not hit";
 }
 
-TEST_F(EndToEndTest, ValueMismatchRejectsTheEntry) {
+TEST_F(EndToEndTest, SyntacticMismatchRejectsTheEntry) {
   // "char buf[BUFSZ];" compiled with BUFSZ as 1024 cannot be reused where
   // BUFSZ is 512 -- the array bound is baked into the stored declarations.
   auto Writer = client();
@@ -192,7 +192,8 @@ TEST_F(EndToEndTest, ValueMismatchRejectsTheEntry) {
   PushRequest P;
   P.Filename = "/x/h.h";
   P.Data = "BUILT-WITH-1024";
-  P.Deps.Value.push_back({"BUFSZ", Seq1024});
+  P.Deps.Syntactic.push_back(
+      {"BUFSZ", SyntacticDependency::State::ExpandsTo, Seq1024});
   withCompile("int main(void){return 0;}\n", [&](Preprocessor &, Sema &S) {
     P.Deps.Entry = P.Deps.Exit = capturePragmaState(S);
   });

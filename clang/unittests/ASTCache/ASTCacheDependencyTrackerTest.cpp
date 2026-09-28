@@ -86,6 +86,7 @@ protected:
     auto Tracker = std::make_unique<ASTCacheDependencyTracker>(PP);
     ASTCacheDependencyTracker *TrackerPtr = Tracker.get();
     PP.addPPCallbacks(std::move(Tracker));
+    PP.setExpansionCandidateObserver(*TrackerPtr);
 
     PP.EnterMainSourceFile();
     PP.LexTokensUntilEOF();
@@ -103,11 +104,23 @@ protected:
     return nullptr;
   }
 
-  static bool hasValue(const HeaderDependencySet &D, StringRef Name) {
-    for (const ValueDependency &V : D.Value)
-      if (V.MacroName == Name)
-        return true;
-    return false;
+  /// The syntactic dependency recorded for \p Name, or nullptr.
+  static const SyntacticDependency *syntactic(const HeaderDependencySet &D,
+                                              StringRef Name) {
+    for (const SyntacticDependency &S : D.Syntactic)
+      if (S.Name == Name)
+        return &S;
+    return nullptr;
+  }
+
+  static bool expandsTo(const HeaderDependencySet &D, StringRef Name) {
+    const SyntacticDependency *S = syntactic(D, Name);
+    return S && S->Required == SyntacticDependency::State::ExpandsTo;
+  }
+
+  static bool notAMacro(const HeaderDependencySet &D, StringRef Name) {
+    const SyntacticDependency *S = syntactic(D, Name);
+    return S && S->Required == SyntacticDependency::State::NotAMacro;
   }
 
   static const ConditionalDependency *cond(const HeaderDependencySet &D,
@@ -127,15 +140,15 @@ TEST_F(ASTCacheDependencyTrackerTest, InternalMacroIsNotADependency) {
   auto Recs = run("#include \"h.h\"\n");
   const HeaderDependencySet *D = find(Recs, "h.h");
   ASSERT_NE(D, nullptr);
-  EXPECT_FALSE(hasValue(*D, "ALIGNMENT"));
+  EXPECT_EQ(syntactic(*D, "ALIGNMENT"), nullptr);
 }
 
-TEST_F(ASTCacheDependencyTrackerTest, PredefinedMacroIsAValueDependency) {
+TEST_F(ASTCacheDependencyTrackerTest, PredefinedMacroIsASyntacticDependency) {
   addFile("/h.h", "int buf[EXTERNAL];\n");
   auto Recs = run("#include \"h.h\"\n", "#define EXTERNAL 99\n");
   const HeaderDependencySet *D = find(Recs, "h.h");
   ASSERT_NE(D, nullptr);
-  EXPECT_TRUE(hasValue(*D, "EXTERNAL"));
+  EXPECT_TRUE(expandsTo(*D, "EXTERNAL"));
 }
 
 TEST_F(ASTCacheDependencyTrackerTest, MacroFromIncludingFileIsADependency) {
@@ -147,7 +160,7 @@ TEST_F(ASTCacheDependencyTrackerTest, MacroFromIncludingFileIsADependency) {
   auto Recs = run("#define FROM_MAIN 7\n#include \"h.h\"\n");
   const HeaderDependencySet *D = find(Recs, "h.h");
   ASSERT_NE(D, nullptr);
-  EXPECT_TRUE(hasValue(*D, "FROM_MAIN"))
+  EXPECT_TRUE(expandsTo(*D, "FROM_MAIN"))
       << "a macro defined in the including file is external to the header";
 }
 
@@ -159,7 +172,7 @@ TEST_F(ASTCacheDependencyTrackerTest, SubHeaderDefinedMacroIsInternalToParent) {
   auto Recs = run("#include \"h.h\"\n");
   const HeaderDependencySet *D = find(Recs, "h.h");
   ASSERT_NE(D, nullptr);
-  EXPECT_FALSE(hasValue(*D, "ALIGNMENT"));
+  EXPECT_EQ(syntactic(*D, "ALIGNMENT"), nullptr);
 }
 
 TEST_F(ASTCacheDependencyTrackerTest, ParentResolvesChildDependency) {
@@ -173,13 +186,110 @@ TEST_F(ASTCacheDependencyTrackerTest, ParentResolvesChildDependency) {
 
   const HeaderDependencySet *Child = find(Recs, "child.h");
   ASSERT_NE(Child, nullptr);
-  EXPECT_TRUE(hasValue(*Child, "SIZE"))
+  EXPECT_TRUE(expandsTo(*Child, "SIZE"))
       << "SIZE comes from outside child.h, so child.h depends on it";
 
   const HeaderDependencySet *Parent = find(Recs, "parent.h");
   ASSERT_NE(Parent, nullptr);
-  EXPECT_FALSE(hasValue(*Parent, "SIZE"))
+  EXPECT_EQ(syntactic(*Parent, "SIZE"), nullptr)
       << "parent.h defines SIZE itself, so it is not a dependency of parent.h";
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, PlainIdentifierIsRecordedAsNotAMacro) {
+  // No macro is involved at all, yet an includer that #defines malloc turns
+  // this declaration into a different one. Nothing but the expansion-decision
+  // hook sees the name.
+  addFile("/h.h", "void *malloc(unsigned long n);\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(notAMacro(*D, "malloc"));
+  EXPECT_TRUE(notAMacro(*D, "n"));
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, KeywordIsRecordedAsNotAMacro) {
+  // "#define long int" before the #include changes what sizeof(long) means
+  // inside the header. A keyword is an identifier to the preprocessor.
+  addFile("/h.h", "static unsigned width(void) { return sizeof(long); }\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(notAMacro(*D, "long"));
+  EXPECT_TRUE(notAMacro(*D, "sizeof"));
+  EXPECT_TRUE(notAMacro(*D, "static"));
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, PastedNameIsRecordedButNotItsOperands) {
+  // JOIN(mal, loc) never spells malloc, so no scan of the header's text finds
+  // it; the paste result reaches the expansion decision, and an includer that
+  // #defines malloc changes it. The operands of ## are not expanded, so an
+  // includer defining mal or loc changes nothing, and they are not recorded.
+  addFile("/h.h", "#define JOIN(a, b) a##b\nint JOIN(mal, loc);\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(notAMacro(*D, "malloc"));
+  EXPECT_EQ(syntactic(*D, "mal"), nullptr);
+  EXPECT_EQ(syntactic(*D, "loc"), nullptr);
+  EXPECT_EQ(syntactic(*D, "JOIN"), nullptr) << "JOIN is the header's own";
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, NameFromAnOutsideMacroBodyIsRecorded) {
+  // ALLOC is defined outside and expands to grab_impl. grab_impl was read
+  // when that #define was, outside the header, but it is rescanned here: an
+  // includer that #defines grab_impl changes the header without changing
+  // ALLOC's replacement tokens.
+  addFile("/h.h", "int ALLOC;\n");
+  auto Recs = run("#include \"h.h\"\n", "#define ALLOC grab_impl\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(expandsTo(*D, "ALLOC"));
+  EXPECT_TRUE(notAMacro(*D, "grab_impl"));
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, FirstSightingDecides) {
+  // BUF_A is used before the header defines it, so an includer's BUF_A would
+  // have reached that first use. BUF_B is defined before any use, so the
+  // header's own #define is all it ever sees.
+  addFile("/h.h", "int BUF_A;\n#define BUF_A 1\nint y = BUF_A;\n"
+                  "#define BUF_B 2\nint z = BUF_B;\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(notAMacro(*D, "BUF_A"));
+  EXPECT_EQ(syntactic(*D, "BUF_B"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, NamesReadWithExpansionOffAreNotRecorded) {
+  // The operand of #ifdef is a conditional dependency, not a syntactic one,
+  // and a #define body is only a candidate once the macro is used.
+  addFile("/h.h", "#ifdef ONLY_TESTED\n#endif\n"
+                  "#define UNUSED_M some_name\n"
+                  "#define USED_M other_name\nint USED_M;\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "ONLY_TESTED"), nullptr);
+  EXPECT_EQ(syntactic(*D, "ONLY_TESTED"), nullptr);
+  EXPECT_EQ(syntactic(*D, "some_name"), nullptr);
+  EXPECT_EQ(syntactic(*D, "UNUSED_M"), nullptr);
+  EXPECT_TRUE(notAMacro(*D, "other_name"));
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, ChildRecordsANameItsParentSawFirst) {
+  // parent.h uses foo before including child.h, so only the parent's frame
+  // was open for that first sighting. child.h's frame must still record foo
+  // when child.h uses it.
+  addFile("/child.h", "int bar = sizeof(foo);\n");
+  addFile("/parent.h", "int foo;\n#include \"child.h\"\n");
+  auto Recs = run("#include \"parent.h\"\n");
+  const HeaderDependencySet *Child = find(Recs, "child.h");
+  const HeaderDependencySet *Parent = find(Recs, "parent.h");
+  ASSERT_NE(Child, nullptr);
+  ASSERT_NE(Parent, nullptr);
+  EXPECT_TRUE(notAMacro(*Child, "foo"));
+  EXPECT_TRUE(notAMacro(*Parent, "foo"));
+  EXPECT_TRUE(notAMacro(*Parent, "bar")) << "child.h's text is parent.h's too";
 }
 
 TEST_F(ASTCacheDependencyTrackerTest, ConditionalRecordedAtEveryOpenLevel) {
