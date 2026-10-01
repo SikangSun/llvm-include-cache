@@ -27,7 +27,12 @@ a way to **check** at a later `#include` that the recorded dependencies still
 hold (§6.4). All three exist and are tested. The fourth part — the compiler asking
 the cache at an `#include` — exists as of `ab65051ab` (§6.6). As of
 `1291faa49` the record covers every identifier the header read, not only its
-macros (§3.5). What remains is filling the cache from inside a compile (§8).
+macros (§3.5). As of `2a4866313` a hit leaves the compile as reading the
+header would have (§6.7), a compile asks only about headers slow enough to be
+worth a lookup (§6.8), and a header included from inside another header is
+served too (§6.9). What remains is filling the cache during a build, and
+saved copies built after different `.c` files that conflict when loaded
+together (§8).
 
 ---
 
@@ -45,7 +50,11 @@ that nothing inside the compiler calls yet.
   answers lookups by header path.
 - The hit path, when `CLANG_HEADER_CACHE` names a daemon socket (§6.6,
   `ab65051ab`). Unset, nothing is installed.
-- 80 unit tests.
+- Timing every header and reporting the times to the daemon, which keeps the
+  list of headers worth asking about (§6.8, `2a4866313`).
+- With `CLANG_HEADER_CACHE_JOBS` set, recording the job that builds each
+  header's saved copy (§6.9, `2a4866313`).
+- 115 unit tests.
 
 **Changed by the hit path (`ab65051ab`):** `Parser::isAtDeclarationBoundary()`
 and `CacheClient` now have a real caller, and `clang/lib/Lex/PPDirectives.cpp`
@@ -56,8 +65,14 @@ down, is untouched).
 identifier at the expansion decision to an `ExpansionCandidateObserver` when
 one is registered (§3.5). None is registered in an ordinary compile.
 
-**Does not exist at all:** the miss path, population from inside a compile,
-and the `__COUNTER__` backfill (§8).
+**Changed by `2a4866313`:** the hit path serves an `#include` written in any
+file, not only in the `.c` file; the dependency tracker no longer records a
+definedness test of a macro the header set itself; `serializeMacroTokens`
+reads literal text from the source.
+
+**Does not exist at all:** running recorded jobs automatically during a build,
+the `__COUNTER__` dependency, and exporting a header's PCM from the real
+compile instead of a separate one (§8).
 
 ---
 
@@ -200,7 +215,7 @@ virtual calls on every identifier. Measured with no observer set: redis
 
 ## 4. The data model, and collecting it
 
-### 4.1 `clang/include/clang/ASTCache/DependencyRecord.h` (157 lines)
+### 4.1 `clang/include/clang/ASTCache/DependencyRecord.h` (172 lines)
 
 What a parsed header can depend on, in five pieces:
 
@@ -211,6 +226,7 @@ What a parsed header can depend on, in five pieces:
 | `SymbolDependency` | An identifier a grammar-ambiguity query asked about, which query, and the answer — including the resolved type's canonical spelling. |
 | `InclusionDependency` | An `#include` that did nothing because the file was already included (`#pragma once`, `#import`). |
 | `PragmaSnapshot` | Pragma state, twice: `Entry`, the state the header was compiled under, and `Exit`, the state the header leaves behind. |
+| `MacroEffect` | A macro the header defined or undefined, and whether it was left defined. Not a dependency but an effect: a hit replays it (§6.7, `2a4866313`). |
 
 `HeaderDependencySet` bundles all of the above; `HeaderRecord` pairs one set
 with the header's path.
@@ -219,9 +235,10 @@ Design notes worth knowing: `SymbolDependency::Classification` mirrors
 `clang::NameClassificationKind`'s integer values rather than including
 `Sema.h`, so the record stays cheap to include. And a macro is a dependency
 **only if its definition lies outside the header's own closure** — a macro
-defined and used inside the same header can never vary.
+defined and used inside the same header can never vary. As of `2a4866313`
+the same holds for a definedness test (§4.2).
 
-### 4.2 `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` (236) and `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` (332)
+### 4.2 `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` (251) and `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` (369)
 
 A `PPCallbacks` that also implements `ExpansionCandidateObserver` and
 `NameClassificationObserver`, so one object collects the preprocessor's, the
@@ -243,13 +260,26 @@ An earlier flat version got this wrong twice: it asked the question once per
 translation unit, and it treated the main `.c` file as internal to everything,
 which silently dropped real dependencies.
 
+**Conditionals face outward (`2a4866313`).** redis's `fmacros.h` defines
+`_BSD_SOURCE` and then includes `<features.h>`, which tests it. Recorded
+without a filter, `fmacros.h`'s record said "`_BSD_SOURCE` must be defined",
+which no compile satisfies before including `fmacros.h`, so its copy never
+matched. A definedness test is now recorded for a frame only if the state it
+saw came from outside that frame's closure: from the active `#define`, or,
+for an undefined name, from the `#undef` that removed it (`stateOrigin`). A
+name never defined, a `-D`, and a builtin count as outside. For `features.h`
+the definition still comes from outside, so it remains a dependency there. The
+same rule skips an include-guard or `#pragma once` skip of a file the frame
+itself read earlier. On `anet.c` alone, "recorded defined, live undefined"
+rejections fell from 42 to 2 (DECISIONS 1.5).
+
 **Poisoning:** a frame that meets something the recorder cannot describe —
 currently, any C++-only query, or a symbol query with no usable location — is
 dropped entirely and emits no record. A partial record would carry *fewer*
 constraints than the compile that produced it, so it would match compiles it
 must not. Missing entirely means a miss.
 
-### 4.3 `clang/include/clang/ASTCache/MacroTokens.h` (40) and `.cpp` (27)
+### 4.3 `clang/include/clang/ASTCache/MacroTokens.h` (51) and `.cpp` (34)
 
 One function that turns a macro's replacement list into a string. It is its
 own file because two sides must produce byte-identical output: the tracker
@@ -257,6 +287,14 @@ when recording, and the client when checking a stored record against a live
 macro. If those two ever drifted, every ExpandsTo dependency would compare
 unequal and nothing would ever hit — a failure that looks exactly like the
 cache simply not helping.
+
+**Literal text comes from the source (`2a4866313`).** A token keeps a pointer
+to its literal's text only while the text it was lexed from is around. A macro
+loaded from a saved copy has none, so `#define __WORDSIZE 64` serialized as
+"a number" and compared equal to `#define __WORDSIZE 32`. The text is now read
+with `Lexer::getSpelling` from where the token was written; a definition
+whose text cannot be read is neither recorded (the frame is poisoned) nor
+found to match.
 
 ### 4.4 `clang/include/clang/ASTCache/PragmaStateCheck.h` (87) and `.cpp` (111)
 
@@ -270,11 +308,13 @@ Serialization does not solve this on its own:
 `ASTWriter::WritePackPragmaOptions` returns early while a module is being
 written, so the PCM carries no pragma state in either direction.
 
-### 4.5 `clang/include/clang/ASTCache/ByteStream.h` (133), `DependencySerialization.h` (65) and `.cpp` (150)
+### 4.5 `clang/include/clang/ASTCache/ByteStream.h` (133), `DependencySerialization.h` (77) and `.cpp` (193)
 
 A flat byte encoding for `HeaderDependencySet`, the little-endian primitives
 under it, and the NUL-separated list a record's NotAMacro names travel as
-(§6.3).
+(§6.3). The macro effects travel the same way, each entry `+NAME` (left
+defined) or `-NAME` (left undefined); `decodeMacroEffects` rejects any other
+shape. Encoding version 4.
 
 Two properties matter. Strings are length-prefixed, not NUL-terminated,
 because a serialized replacement list contains NULs by construction — they
@@ -288,7 +328,7 @@ managed to read would produce a partial record, which is the unsafe direction
 
 ## 5. Building a PCM for one header
 
-### 5.1 `clang/include/clang/ASTCache/ASTCacheProducer.h` (194) and `clang/lib/ASTCache/ASTCacheProducer.cpp` (840)
+### 5.1 `clang/include/clang/ASTCache/ASTCacheProducer.h` (243) and `clang/lib/ASTCache/ASTCacheProducer.cpp` (939)
 
 This is the largest piece, and the one that changed most often.
 
@@ -298,6 +338,10 @@ that reads `bar.h` before `foo.h`, `foo.h`'s own `#include "bar.h"` does
 nothing, so `bar.h`'s declarations are outside the slice while `foo.h`'s
 declarations point at them. Reverse the order and the slice changes. A
 separate compile of `foo.h` fires that `#include` for real, every time.
+
+This was never approved, and on 2026-09-30 the user made exporting from the
+real compile the default (DECISIONS 2.1). The separate compile is what exists
+until that is designed and built.
 
 **The context.** A header like redis's `anet.h` uses `uint32_t` and never
 includes `<stdint.h>`, because whatever includes `anet.h` included
@@ -328,10 +372,23 @@ context became visible too, loading `anet.h` would declare all of `<stdint.h>`
 in a file that never included it. The loading compile names only
 `__hc_<hash>.target`.
 
-**A consequence:** only headers included directly by a `.c` file are
-populated. A header reached from inside another header would have to be
-reached by including all of that other header, which puts the wanted header
-inside the hidden half. The producer detects that and declines.
+**Headers included from headers (`2a4866313`).** Including all of `a.h` to
+reach the `b.h` inside it would compile `b.h` in the hidden half, so the
+producer declines a header its own context reaches. Instead, the context is a
+list of *lines*: an `#include`, a `#define` or an `#undef` (`ContextEntry`).
+For `b.h` it holds the `.c` file's lines before `#include "a.h"`, then
+`a.h`'s lines before `#include "b.h"`, never `a.h` itself. The `#define`s are
+what make glibc work: `bits/stdio_lim.h` begins `#ifndef _STDIO_H` /
+`#error "Never include <bits/stdio_lim.h> directly"`, and `_STDIO_H` comes
+from `stdio.h`'s own text. What `a.h` declared above the `#include` is
+missing, so a `b.h` that needs it fails to compile here and is declined. The
+`.c` file's own `#define`s come along the same way, which fixes the
+`_GNU_SOURCE` miss of DECISIONS §4. Before this, only headers a `.c` file
+includes directly were populated.
+
+**The effects (`2a4866313`).** While the target part is open, `TargetWatcher`
+collects every macro it defines or undefines; when the target wrapper ends, it
+reads each one's final state into `MacroEffects` (§6.7).
 
 **Replaying an include the way the compile found it.** Each entry of a request
 is an `IncludeRef` with two parts: the text as written (`<stdint.h>`) and the
@@ -369,13 +426,16 @@ own. Measured cost on a normal build: redis `object.c` 3025 → 3030 ms.
 - a replayed include opened a different file than the request recorded;
 - pragma state the record cannot carry;
 - the header expands `__COUNTER__`, `__INCLUDE_LEVEL__`, `__BASE_FILE__`,
-  `__DATE__`, `__TIME__` or `__TIMESTAMP__` in its own text, whose values
-  belong to the compile that includes it, until the backfill exists;
+  `__DATE__`, `__TIME__` or `__TIMESTAMP__`, directly or through a macro such
+  as glib's `G_LIKELY`, whose values belong to the compile that includes it.
+  Decided 2026-09-30, not built: `__COUNTER__` becomes a dependency on its
+  starting value plus an effect that advances it (DECISIONS 2.7);
 - the recorder was poisoned (§4.2).
 
-**Job files.** A plain-text format (`clang-header-cache-jobs 2`) carrying a
-list of requests, so a compile that missed can hand its work to another
-process. Values that cannot be represented, such as a flag containing a
+**Job files.** A plain-text format carrying a list of requests, so a compile
+can hand its work to another process. Version 3 (`2a4866313`) adds `define`
+and `undef` lines, replayed in order with the `context` lines; version 2 files
+still read. Values that cannot be represented, such as a flag containing a
 newline, are rejected rather than silently split.
 
 **One bug worth remembering:** the producer used to read the tracker and the
@@ -386,7 +446,7 @@ results are now copied out during `HandleTranslationUnit`.
 
 ## 6. Storing and serving PCMs
 
-### 6.1 `clang/include/clang/ASTCache/SharedRegion.h` (101) and `.cpp` (155)
+### 6.1 `clang/include/clang/ASTCache/SharedRegion.h` (114) and `.cpp` (196)
 
 An append-only region, mapped by the daemon and by every compile. Append-only
 is the concurrency argument: a written entry is never modified or moved, so
@@ -396,7 +456,13 @@ was fully written. The size is fixed generously at creation because growing a
 mapping can move it, which would invalidate every offset already handed out.
 The backing file is sparse, so reserved space costs nothing.
 
-### 6.2 `clang/include/clang/ASTCache/CacheProtocol.h` (149) and `.cpp` (215)
+As of `2a4866313` the region's header also holds the offset of the current
+ask-list (§6.8), published with a release store and read with an acquire
+load, so a reader sees either the old list or the whole new one. The header's
+random instance id, unused until then, is now what a client checks at connect
+(§6.4).
+
+### 6.2 `clang/include/clang/ASTCache/CacheProtocol.h` (208) and `.cpp` (309)
 
 Two request types: `LOOKUP(filename)`, answered with every entry stored under
 that name, each carrying its dependency record and where its bytes sit in the
@@ -404,11 +470,16 @@ region; and `PUSH(filename, record, data)`, answered with an acknowledgment.
 A lookup reply carries each record without its NotAMacro names, and says
 where in the region those names sit (§6.3).
 
+Added in `2a4866313`: a lookup reply also says where each entry's macro
+effects sit and gives its module name; a push carries the module name;
+`TIMING`, which reports how long the compile took to read each header and is
+acknowledged; and `HELLO`, answered with the region's path and instance id.
+
 The daemon never interprets a record. Deciding which entry fits needs the
 compile's live macro table and Sema, which the daemon does not have and could
 not be sent cheaply.
 
-### 6.3 `clang/include/clang/ASTCache/CacheDaemon.h` (118) and `.cpp` (181), plus `clang/tools/clang-header-cache-daemon/` (95 + 13)
+### 6.3 `clang/include/clang/ASTCache/CacheDaemon.h` (160) and `.cpp` (262), plus `clang/tools/clang-header-cache-daemon/` (113 + 13)
 
 A filename → entries table over the region. No state survives a restart, by
 choice: this is a proof of concept, and the daemon is not restarted during an
@@ -421,7 +492,16 @@ On a push the daemon moves the record's NotAMacro names — several hundred for
 a system header — into the region, so they stay out of every lookup reply,
 and keeps the entry only if both the names and the PCM were written.
 
-### 6.4 `clang/include/clang/ASTCache/CacheClient.h` (118) and `.cpp` (236)
+Changed in `2a4866313`. The macro effects go into the region beside the
+names. A push is a duplicate only if both its record *and* its module name
+match a stored one: the compiler flags are not in the record, so a copy built
+with `-fshort-enums` used to shut out every later copy of the same header
+built without it. A timing report keeps each header's first reported time
+and puts headers at or above `-ask-cutoff-us` on the ask-list (§6.8);
+`-list-stored` also lists every header the moment a copy is stored. The
+region path is made absolute, so a client elsewhere can attach to it.
+
+### 6.4 `clang/include/clang/ASTCache/CacheClient.h` (160) and `.cpp` (315)
 
 The judgement: given a stored record and the live compile, does the entry
 apply? Checks run cheapest first and stop at the first mismatch — conditional,
@@ -439,13 +519,30 @@ before the syntactic one existed; `1291faa49` fixes both.
 
 The hit path (§6.6) calls it.
 
-### 6.5 `clang/tools/clang-header-cache-populate/` (253 + 13)
+Changed in `2a4866313`:
+
+- **Connecting** sends `HELLO` and attaches to the region file the daemon
+  names, refusing one whose instance id differs. Before, a client attached
+  to the default path whatever its daemon wrote, and read names and saved
+  copies at offsets meant for another file.
+- **A candidate that passes** is offered to the caller with its module name,
+  and the caller may refuse it — the module reader refuses a copy built with
+  other options — in which case the next candidate is tried.
+- **A rejection names its reason** when asked (`CLANG_HEADER_CACHE_STATS=2`):
+  "`_BSD_SOURCE` was defined, is not", "`X` expands differently", and so on.
+- **`isListed`** reads the ask-list from the region with no socket traffic.
+
+### 6.5 `clang/tools/clang-header-cache-populate/` (262 + 13)
 
 The command-line front end to the producer: headers as arguments, the build's
 flags with `-Xcc`, the context with `-context` (a path, or a spelling such as
 `'<stdint.h>'`), or a whole job file with `-job`. `-dry-run` builds everything
 and reports without needing a daemon: how many headers were saved, the mean
 size of a PCM and of a record, and a tally of why the rest were declined.
+
+As of `2a4866313`, `-Xcc` may be combined with `-job`: a compile records its
+jobs without the driver's flags, which cc1 never sees, and the build passes
+them here.
 
 ### 6.6 The hit path (`ab65051ab`)
 
@@ -463,6 +560,8 @@ size of a PCM and of a record, and a tally of why the rest were declined.
   Three gates with no socket traffic (the `#include` is in the main file, at a
   declaration boundary, and Sema exists), the lookup name normalised the way
   the producer writes it, one lookup, load from shared memory, pragma replay.
+  `2a4866313` removed the main-file gate and added the ask-list check
+  (§6.8, §6.9).
 - **`clang/include/clang/Frontend/CompilerInstance.h` (+11),
   `clang/lib/Frontend/CompilerInstance.cpp` (+3), `clang/tools/driver/cc1_main.cpp`
   (+6), `clang/tools/driver/CMakeLists.txt` (+1)** — a callback slot filled by
@@ -493,41 +592,126 @@ conditional recorded defined and live undefined: macros glibc sets for itself
 (DECISIONS 1.5), and `_BSD_SOURCE` from `fmacros.h`, whose `#define`s do not
 take effect after a hit because macro replay is not built yet.
 
+### 6.7 A hit leaves the compile as the header would (`2a4866313`)
+
+Loading a module makes its macros *visible*, which is not what a textual
+`#include` does. Three differences showed up, each a different program:
+
+- **An `#undef` in the header did nothing.** A module's `#undef` of a macro
+  the includer defined does not hide the includer's definition.
+- **Of two loaded modules defining one name, neither wins**; the name is
+  ambiguous. Included as text, the later definition replaces the earlier.
+- **A module's macro does not override a local `#define`.**
+
+`replayMacroEffects` fixes all three by appending, at the `#include`, a local
+directive for each macro the header touched: an `#undef`, or a `#define`
+whose definition is the loaded module's own `MacroInfo`. A local directive
+overrides visible module macros, which is how text inclusion behaves. Include
+state needed nothing new: the module file carries `#pragma once` and
+included marks, and replayed guard macros skip guarded headers (four tests).
+
+Also on a hit:
+
+- **`__COUNTER__` is put back.** Loading a module file sets the counter to
+  the value its producer's compile ended with (`PCHValidator::ReadCounter`),
+  which counts the context's uses. A saved part uses none (the producer
+  declines such headers), so the counter after the hit is the counter before.
+- **A copy already loaded is reused.** `stddef.h` has no guard and is
+  entered again each time; when the same copy fits twice, loading a second
+  module of the same name is a fatal error.
+- **A refused copy is passed over.** `ReadAST` with
+  `ARR_ConfigurationMismatch` returns quietly for a copy built with other
+  options; `loadModuleFile` would report it as an error, since
+  `-Wmodule-file-config-mismatch` is one by default.
+
+### 6.8 Asking only about slow headers (`2a4866313`, DECISIONS 2.14)
+
+A lookup costs a socket round trip, and loading a PCM costs about 226 µs on
+release clang 18. A header that parses faster than that is cheaper to parse.
+So every compile times each header, from entering it to leaving it, headers
+it includes counted in, first entry only, and reports the times when its main
+file ends. The daemon keeps each header's first reported time and lists those
+at or above the cutoff. The list sits in the shared region; a compile checks
+it before touching the socket and records "not on the ask-list" otherwise.
+
+On a debug build every header takes longer than 226 µs, so everything is
+listed; the cutoff only filters on a release build.
+
+### 6.9 Headers included from headers (`2a4866313`)
+
+Three pieces:
+
+1. **The hit path asks at every `#include`**, in a `.c` file or in a header.
+   The declaration-boundary and ask-list checks still apply.
+2. **The producer builds a nested header after its chain's lines** (§5.1).
+3. **A compile records the jobs** (`JobRecorder` in `HeaderCacheServer.cpp`)
+   when `CLANG_HEADER_CACHE_JOBS` names a directory. It keeps one frame per
+   open file with that file's own `#include`, `#define` and `#undef` lines so
+   far. At each `#include` at a declaration boundary it builds the job: the
+   header, and every open frame's lines in order. The job is kept only if the
+   file is then entered, not if a guard skipped it or the cache served it.
+   An `#include` that entered its file joins the includer's lines when that
+   file ends, so a later sibling's context replays it. A quoted `#include`
+   found beside the file that wrote it, and every `#include_next`, are
+   replayed by path, because from the producer's wrapper the same spelling
+   would search elsewhere. Lines inside the predefines buffer and
+   `-include` files are not recorded; they come back through the flags. One
+   new file per compile, read by `clang-header-cache-populate -job`.
+
+**On redis, debug clang** (each `.c` file compiled once to record, its jobs
+populated, then compiled again with the cache and compared with a plain
+compile): `anet.c` on its own daemon, 156 of 217 jobs saved; 18 hits of 18
+lookups, no candidate rejected, assembly identical. Every header `anet.c`
+includes directly was served, so nothing inside them was asked about.
+
+**Saved copies built after different `.c` files conflict.** A saved copy's
+context sits in a hidden submodule: hidden from name lookup, but not from
+declaration merging. With several `.c` files sharing a daemon, two copies
+held `sys/select.h`'s `fd_set` built under different feature macros (member
+`fds_bits` in one, `__fds_bits` in the other), and the compile stopped:
+"`fd_set::__fds_bits` from module A.context is not present in definition of
+`fd_set` in module B.context". `stdio.h`'s `fscanf` likewise came with two
+different asm labels. Each such failure stops the compile with an error; none
+produced different code. This is the declaration-merging cost that ended
+Google's pre-parsed headers, and the reason to export from the real compile
+instead (DECISIONS 2.1, §3).
+
 ---
 
-## 7. Tests — 80, all passing
+## 7. Tests — 115, all passing
 
 `clang/unittests/ASTCache/` (plus `CMakeLists.txt`, 24 lines, and one line in
 `clang/unittests/CMakeLists.txt`).
 
 | File | Tests | What it pins down |
 |---|---|---|
-| `ASTCacheDependencyTrackerTest.cpp` (399) | 20 | Provenance: an internally defined macro is not a dependency; one from the includer is; a sub-header's macro is internal to its parent; a conditional is recorded at every open level; `#if UNDEFINED > 5` is recorded; a guard-suppressed `#include` is recorded. Syntactic: a plain name, a keyword, a `##` result and a name from an outside macro's body are recorded; the first sighting decides; names read with expansion off are not recorded; a child records a name its parent saw first. |
+| `ASTCacheDependencyTrackerTest.cpp` (454) | 24 | Provenance: an internally defined macro is not a dependency; one from the includer is; a sub-header's macro is internal to its parent; a conditional is recorded at every open level; `#if UNDEFINED > 5` is recorded; a guard-suppressed `#include` is recorded. Syntactic: a plain name, a keyword, a `##` result and a name from an outside macro's body are recorded; the first sighting decides; names read with expansion off are not recorded; a child records a name its parent saw first. Outward conditionals: a flag a header sets for itself is not its dependency; only the first test of a name decides; an `#undef` inside the header pins the name; a `#pragma once` file read twice inside a header is no dependency. |
 | `SymbolDependencyTest.cpp` (180) | 4 | The `T * p;` ambiguity: a typedef from the includer is a dependency; one the header declares itself is not; the resolved type's identity is recorded, not just "it was a type"; a typedef from a sub-header is internal to the parent. |
-| `DependencySerializationTest.cpp` (204) | 11 | An empty set and a full set round-trip; embedded NULs survive; an unknown syntactic state and a damaged name list are rejected; NotAMacro names move into the list; truncation, a version mismatch, trailing bytes and an out-of-range classification are all rejected rather than partially decoded; a corrupt count does not size an allocation. |
-| `CacheProtocolTest.cpp` (267) | 14 | Message framing (length prefix, round trip, wrong kind, truncation, where the NotAMacro names are) and daemon behaviour: the names are kept in the region, a miss is clean, every variant comes back, identical pushes are discarded, distinct headers do not collide, stored bytes come back exactly, an out-of-range offset reads as nothing, garbage closes the connection. |
-| `EndToEndTest.cpp` (347) | 7 | Push through a real socket, then reject the entry on each kind of mismatch in turn, and choose correctly between variants. |
-| `ProducerTest.cpp` (355) | 12 | Context makes an otherwise unbuildable header buildable; a context macro becomes a conditional dependency; pragma entry state is the header's, not the compile's; a header reached through its own context is declined; module names are unique and stable; `#include_next` works only when the context is replayed as written; a replay that opens a different file is declined; a header reading `__COUNTER__` is declined; job files round-trip. |
+| `DependencySerializationTest.cpp` (235) | 13 | An empty set and a full set round-trip; embedded NULs survive; an unknown syntactic state and a damaged name list are rejected; NotAMacro names and macro effects move into their lists, and a damaged effect list is rejected; truncation, a version mismatch, trailing bytes and an out-of-range classification are all rejected rather than partially decoded; a corrupt count does not size an allocation. |
+| `CacheProtocolTest.cpp` (405) | 22 | Message framing (length prefix, round trip, wrong kind, truncation, where the NotAMacro names and effects are, the module name, timing reports, the hello reply, a socket path too long for an address) and daemon behaviour: the names and effects are kept in the region, a miss is clean, every variant comes back, identical pushes are discarded but the same record built with other options is kept, distinct headers do not collide, stored bytes come back exactly, an out-of-range offset reads as nothing, garbage closes the connection; a slow header goes on the ask-list, a header's first time is the one kept, stored headers are listed when asked to. |
+| `EndToEndTest.cpp` (350) | 7 | Push through a real socket, then reject the entry on each kind of mismatch in turn, and choose correctly between variants. |
+| `ProducerTest.cpp` (434) | 14 | Context makes an otherwise unbuildable header buildable; a context macro becomes a conditional dependency; the macros the header touches are its effects; pragma entry state is the header's, not the compile's; a header reached through its own context is declined; a header included from a header builds after its includer's lines, `#define` and `#undef` included; module names are unique and stable; `#include_next` works only when the context is replayed as written; a replay that opens a different file is declined; a header reading `__COUNTER__` is declined; job files round-trip, version 2 still reads, and macro lines that cannot be represented are rejected. |
 | `LoadTest.cpp` (216) | 1 | A PCM is loaded from bytes in memory, under a name no file has, partway through a compile that already parsed the context header itself — and its declarations then work with that compile's own types. |
-| `HitTest.cpp` (548) | 11 | A stored header is served without the file being opened; an `#include` right after a function definition is served while one inside a body is not; a header the compile names relatively is still found; an entry whose record does not match is not used. Not served when the includer makes a name the header read as plain text into a macro — a plain name, a keyword, a pasted name, a name from an outside macro's body; served when the header defines the name before using it; a conditional and a syntactic check both see a macro an earlier hit defined. |
+| `HitTest.cpp` (974) | 30 | A stored header is served without the file being opened; an `#include` right after a function definition is served while one inside a body is not; a header the compile names relatively is still found; an entry whose record does not match is not used. Not served when the includer makes a name the header read as plain text into a macro — a plain name, a keyword, a pasted name, a name from an outside macro's body; served when the header defines the name before using it; a conditional and a syntactic check both see a macro an earlier hit defined. Effects: a redefinition and an `#undef` in the header take effect; of two served headers the later definition wins; a served header's flag is seen; `#pragma once` and guarded headers, served or inside a served one, are skipped when included again; the counter is where the header found it; a copy built with other options is passed over. Ask-list: a stored header is served only once a compile has timed it; one faster than the cutoff is never asked about. Nested: a header included from a header is served; a recorded job builds a copy the next compile serves; a recorded include is replayed the way it was found. A client attaches only to its daemon's region; an unguarded header served twice loads its copy once; a header that sets a flag for its own include is served; a macro from a served copy compares by its text. |
 
 ---
 
 ## 8. What does not exist yet
 
-1. **The miss path.** Nothing builds a request when a header is not found in
-   the cache.
-2. **Population from inside a compile.** Decided but unwritten: a thread
-   started at the first miss, with whatever it has not finished handed to a
-   detached `clang-header-cache-populate -job` when the compile exits.
-3. **The `__COUNTER__` backfill.** Such headers are declined today. The plan
-   is to record where each varying value landed and rewrite it on load.
-4. **Macro replay on load.** A hit must apply the header's `#define`s and
-   `#undef`s to the live compile; module macro visibility is not the same.
-5. **Loading the context's guard state.** A hit must leave the compile as a
-   textual include would, `#pragma once` and `#import` marks included.
-6. **Folding by parse time** (DECISIONS 2.15). The 226 us cutoff is decided;
-   how the producer keeps a header out of its parent's PCM is not approved.
+1. **Exporting from the real compile.** Decided 2026-09-30 as the default
+   (DECISIONS 2.1); not designed yet. It is also the way out of item 2.
+2. **Copies that conflict when loaded together** (§6.9). Blocks a benchmark
+   run over more than one `.c` file.
+3. **Filling the cache during a build.** A compile records its jobs (§6.9);
+   nothing runs them automatically, and a build needs one compile to record,
+   a populate step, and a second compile to hit.
+4. **The `__COUNTER__` dependency.** Decided: the counter's starting value as
+   a dependency and its advance as an effect (DECISIONS 2.7). Relocating the
+   numbers on load is deferred until the first benchmark round.
+5. **Folding by parse time** (DECISIONS 2.15). The 226 µs cutoff is decided;
+   the mechanism is not approved.
+6. **A release build** for timings. On the debug build every header is
+   listed (§6.8).
 7. **The token tier's server half.** The token tier can record and ship;
    nothing reads its payloads back.
 
@@ -572,6 +756,25 @@ Kept because each one is a mistake that could recur.
   expansion-decision sites (§3.5) before `1291faa49`.
 - **A stale macro bit let the conditional check pass wrongly** after an
   earlier hit (§6.4); fixed in `1291faa49`.
+- **"No benchmark header uses `__COUNTER__`" was wrong.** The search looked
+  for the word in header text, and found it only inside `#define`s. A header
+  runs the counter whenever it uses such a macro: glib's `G_LIKELY`, the
+  kernel's `READ_ONCE`. Preprocessing every `.c` file of qemu and the Linux
+  kernel showed 21% and 35% of their direct includes declined (DECISIONS
+  2.7). Found 2026-09-29, the day the claim was made.
+- **A module load reset `__COUNTER__`** to the value the producer's compile
+  ended with (§6.7); fixed in `2a4866313`.
+- **The daemon dropped a copy built with other options as a duplicate**
+  (§6.3); fixed in `2a4866313`.
+- **A client mapped the wrong region** (§6.4). The first nested end-to-end
+  run made 140 lookups and no hits, and 27 rejections read "the not-a-macro
+  name list is damaged": the test daemon wrote one region file and the
+  compiler read the default one. Fixed in `2a4866313` with the hello check.
+- **Literal text compared as "a number"** for a macro from a saved copy
+  (§4.3); fixed in `2a4866313`.
+- **The redis misses blamed on missing macro replay** were conditionals the
+  header set for itself; replay did not change them, the outward filter did
+  (§4.2).
 
 ---
 
@@ -601,23 +804,25 @@ that last refreshed this file is not listed in its own table.
 | [`ab65051ab`](https://github.com/SikangSun/llvm-include-cache/commit/ab65051ab35c09641ab79a65feef251a707cc761) | [clang] Header cache: serve an #include from the cache (the hit path) |
 | [`6996c31c7`](https://github.com/SikangSun/llvm-include-cache/commit/6996c31c77bf3f6458e35a37503395836d23f79d) | [clang] Header cache: walkthrough covers the hit path; add a commit map |
 | [`1291faa49`](https://github.com/SikangSun/llvm-include-cache/commit/1291faa49476645f91a02ae8a8e4cbd87f89b62d) | [clang] Header cache: syntactic dependencies |
+| [`880757f46`](https://github.com/SikangSun/llvm-include-cache/commit/880757f467035bc8e71ffa7eb7d208bfb5a2cc1e) | [clang] Header cache: walkthrough covers syntactic dependencies |
+| [`2a4866313`](https://github.com/SikangSun/llvm-include-cache/commit/2a4866313949a5a150cff00c4519854494e6b5e6) | [clang] Header cache: replay a hit's effects, ask-list, serve nested headers |
 
 Which commits changed each file, oldest first:
 
 | File | Commits |
 |---|---|
-| `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/ASTCacheProducer.h` | `91182dc08` `a5a384e19` `ea53c042d` |
+| `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/include/clang/ASTCache/ASTCacheProducer.h` | `91182dc08` `a5a384e19` `ea53c042d` `2a4866313` |
 | `clang/include/clang/ASTCache/ByteStream.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/CacheDaemon.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/CacheProtocol.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/HeaderCacheServer.h` | `ab65051ab` |
-| `clang/include/clang/ASTCache/MacroTokens.h` | `91182dc08` `1291faa49` |
+| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/include/clang/ASTCache/CacheDaemon.h` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/include/clang/ASTCache/CacheProtocol.h` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/include/clang/ASTCache/HeaderCacheServer.h` | `ab65051ab` `2a4866313` |
+| `clang/include/clang/ASTCache/MacroTokens.h` | `91182dc08` `1291faa49` `2a4866313` |
 | `clang/include/clang/ASTCache/PragmaStateCheck.h` | `91182dc08` |
-| `clang/include/clang/ASTCache/SharedRegion.h` | `91182dc08` |
+| `clang/include/clang/ASTCache/SharedRegion.h` | `91182dc08` `2a4866313` |
 | `clang/include/clang/Frontend/CompilerInstance.h` | `ab65051ab` |
 | `clang/include/clang/Lex/DeclBoundaryObserver.h` | `91182dc08` |
 | `clang/include/clang/Lex/ExpansionCandidateObserver.h` | `1291faa49` |
@@ -629,22 +834,22 @@ Which commits changed each file, oldest first:
 | `clang/include/clang/Parse/RAIIObjectsForParser.h` | `91182dc08` `ab65051ab` |
 | `clang/include/clang/Sema/NameClassificationObserver.h` | `91182dc08` |
 | `clang/include/clang/Sema/Sema.h` | `91182dc08` |
-| `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` | `91182dc08` `1291faa49` |
-| `clang/lib/ASTCache/ASTCacheProducer.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `1291faa49` |
+| `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/lib/ASTCache/ASTCacheProducer.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `1291faa49` `2a4866313` |
 | `clang/lib/ASTCache/CMakeLists.txt` | `91182dc08` `ab65051ab` |
-| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` `1291faa49` |
-| `clang/lib/ASTCache/CacheDaemon.cpp` | `91182dc08` `1291faa49` |
-| `clang/lib/ASTCache/CacheProtocol.cpp` | `91182dc08` `1291faa49` |
-| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` `1291faa49` |
-| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` `1291faa49` |
+| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/lib/ASTCache/CacheDaemon.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/lib/ASTCache/CacheProtocol.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` `1291faa49` `2a4866313` |
+| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` `1291faa49` `2a4866313` |
 | `clang/lib/ASTCache/FORMALIZATION.md` | `26a28d8ea` |
-| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` `1291faa49` |
-| `clang/lib/ASTCache/MacroTokens.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/NEXT.md` | `1291faa49` |
+| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` `1291faa49` `2a4866313` |
+| `clang/lib/ASTCache/MacroTokens.cpp` | `91182dc08` `2a4866313` |
+| `clang/lib/ASTCache/NEXT.md` | `1291faa49` `2a4866313` |
 | `clang/lib/ASTCache/PragmaStateCheck.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/README.md` | `91182dc08` `a5a384e19` `ea53c042d` |
-| `clang/lib/ASTCache/SharedRegion.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` `6996c31c7` this commit |
+| `clang/lib/ASTCache/README.md` | `91182dc08` `a5a384e19` `ea53c042d` `2a4866313` |
+| `clang/lib/ASTCache/SharedRegion.cpp` | `91182dc08` `2a4866313` |
+| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` `6996c31c7` `880757f46` this commit |
 | `clang/lib/CMakeLists.txt` | `91182dc08` |
 | `clang/lib/Frontend/CompilerInstance.cpp` | `ab65051ab` |
 | `clang/lib/Lex/CMakeLists.txt` | `91182dc08` |
@@ -661,18 +866,18 @@ Which commits changed each file, oldest first:
 | `clang/lib/Sema/SemaTemplate.cpp` | `91182dc08` |
 | `clang/tools/CMakeLists.txt` | `91182dc08` |
 | `clang/tools/clang-header-cache-daemon/CMakeLists.txt` | `91182dc08` |
-| `clang/tools/clang-header-cache-daemon/ClangHeaderCacheDaemon.cpp` | `91182dc08` |
+| `clang/tools/clang-header-cache-daemon/ClangHeaderCacheDaemon.cpp` | `91182dc08` `2a4866313` |
 | `clang/tools/clang-header-cache-populate/CMakeLists.txt` | `91182dc08` |
-| `clang/tools/clang-header-cache-populate/ClangHeaderCachePopulate.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `1291faa49` |
+| `clang/tools/clang-header-cache-populate/ClangHeaderCachePopulate.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `1291faa49` `2a4866313` |
 | `clang/tools/driver/CMakeLists.txt` | `ab65051ab` |
 | `clang/tools/driver/cc1_main.cpp` | `ab65051ab` |
-| `clang/unittests/ASTCache/ASTCacheDependencyTrackerTest.cpp` | `91182dc08` `1291faa49` |
+| `clang/unittests/ASTCache/ASTCacheDependencyTrackerTest.cpp` | `91182dc08` `1291faa49` `2a4866313` |
 | `clang/unittests/ASTCache/CMakeLists.txt` | `91182dc08` `a5a384e19` `f976d8fd4` `ab65051ab` |
-| `clang/unittests/ASTCache/CacheProtocolTest.cpp` | `91182dc08` `1291faa49` |
-| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` `1291faa49` |
-| `clang/unittests/ASTCache/EndToEndTest.cpp` | `91182dc08` `1291faa49` |
-| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` `1291faa49` |
+| `clang/unittests/ASTCache/CacheProtocolTest.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/unittests/ASTCache/EndToEndTest.cpp` | `91182dc08` `1291faa49` `2a4866313` |
+| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` `1291faa49` `2a4866313` |
 | `clang/unittests/ASTCache/LoadTest.cpp` | `f976d8fd4` `95232c6b6` |
-| `clang/unittests/ASTCache/ProducerTest.cpp` | `a5a384e19` `ea53c042d` `f976d8fd4` |
+| `clang/unittests/ASTCache/ProducerTest.cpp` | `a5a384e19` `ea53c042d` `f976d8fd4` `2a4866313` |
 | `clang/unittests/ASTCache/SymbolDependencyTest.cpp` | `91182dc08` `1291faa49` |
 | `clang/unittests/CMakeLists.txt` | `91182dc08` |
