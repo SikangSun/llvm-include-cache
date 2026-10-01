@@ -63,16 +63,23 @@ bool resolvesToType(Sema &S, const IdentifierInfo &Name,
 
 } // namespace
 
-MismatchReason
-clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
-                                   Preprocessor &PP, Sema *S,
-                                   llvm::StringRef NotAMacroNames) {
+MismatchReason clang::ast_cache::matchesLiveState(
+    const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
+    llvm::StringRef NotAMacroNames, std::string *Detail) {
+  // Names what failed, for a caller that reports it.
+  auto Because = [&](MismatchReason R, const llvm::Twine &What) {
+    if (Detail)
+      *Detail = What.str();
+    return R;
+  };
+
   // Every record carries pragma state, and only Sema holds the live value to
   // compare it against. Without Sema that check cannot run, and a check that
   // cannot run must reject rather than pass -- an unverifiable dependency is
   // the fail-open shape this whole design exists to avoid.
   if (!S)
-    return MismatchReason::PragmaState;
+    return Because(MismatchReason::PragmaState,
+                   "no Sema to check pragma state");
 
   IdentifierTable &Idents = PP.getIdentifierTable();
 
@@ -91,7 +98,9 @@ clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
   for (const ConditionalDependency &D : Deps.Conditional) {
     bool Defined = PP.isMacroDefined(Fresh(D.MacroName));
     if (Defined != D.WasDefined)
-      return MismatchReason::Conditional;
+      return Because(MismatchReason::Conditional,
+                     D.MacroName + (D.WasDefined ? " was defined, is not"
+                                                 : " was not defined, is"));
   }
 
   // A name the stored parse read as plain text must still be plain text here.
@@ -104,15 +113,20 @@ clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
 
   for (const SyntacticDependency &D : Deps.Syntactic) {
     if (D.Name.empty())
-      return MismatchReason::Syntactic;
+      return Because(MismatchReason::Syntactic, "a dependency with no name");
     if (D.Required == SyntacticDependency::State::NotAMacro) {
       if (IsMacro(D.Name))
-        return MismatchReason::Syntactic;
+        return Because(MismatchReason::Syntactic,
+                       D.Name + " was not a macro, is");
       continue;
     }
     const MacroInfo *MI = PP.getMacroDefinition(Fresh(D.Name)).getMacroInfo();
-    if (!MI || serializeMacroTokens(*MI) != D.TokenSequence)
-      return MismatchReason::Syntactic;
+    std::optional<std::string> Live =
+        MI ? serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts())
+           : std::nullopt;
+    if (!Live || *Live != D.TokenSequence)
+      return Because(MismatchReason::Syntactic,
+                     D.Name + " expands differently");
   }
 
   // An #include the recorded compile skipped must also be skippable here,
@@ -120,11 +134,9 @@ clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
   HeaderSearch &HS = PP.getHeaderSearchInfo();
   for (const InclusionDependency &D : Deps.Inclusion) {
     OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(D.HeaderPath);
-    if (!FE)
-      return MismatchReason::Inclusion;
-    if (!HS.hasFileBeenImported(*FE) &&
-        !HS.getFileInfo(*FE).isImport)
-      return MismatchReason::Inclusion;
+    if (!FE || (!HS.hasFileBeenImported(*FE) && !HS.getFileInfo(*FE).isImport))
+      return Because(MismatchReason::Inclusion,
+                     D.HeaderPath + " was already included, is not");
   }
 
   // Several hundred names for a system header, so after the short lists.
@@ -132,10 +144,12 @@ clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
     std::optional<llvm::SmallVector<llvm::StringRef, 0>> Names =
         splitNameList(NotAMacroNames);
     if (!Names)
-      return MismatchReason::Syntactic;
+      return Because(MismatchReason::Syntactic,
+                     "the not-a-macro name list is damaged");
     for (llvm::StringRef Name : *Names)
       if (IsMacro(Name))
-        return MismatchReason::Syntactic;
+        return Because(MismatchReason::Syntactic,
+                       Name + " was not a macro, is");
   }
 
   // Symbol dependencies last: the only ones that cost a name lookup.
@@ -147,30 +161,53 @@ clang::ast_cache::matchesLiveState(const HeaderDependencySet &Deps,
 
       bool WasType = D.Classification == SymbolClassification::Type;
       if (IsType != WasType)
-        return MismatchReason::Symbol;
+        return Because(
+            MismatchReason::Symbol,
+            D.Name + (WasType ? " was a type, is not" : " was not a type, is"));
       // "Still a type" is not enough: two translation units can both answer
       // yes with different types, and the stored parse holds one of them.
       if (IsType && LiveType != D.ResolvedTypeName)
-        return MismatchReason::Symbol;
+        return Because(MismatchReason::Symbol, D.Name + " was " +
+                                                   D.ResolvedTypeName +
+                                                   ", is " + LiveType);
     }
   }
 
   if (capturePragmaState(*S) != Deps.Entry)
-    return MismatchReason::PragmaState;
+    return Because(MismatchReason::PragmaState, "#pragma pack or float state");
 
   return MismatchReason::None;
 }
 
 llvm::Expected<std::unique_ptr<CacheClient>>
 CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
+  if (llvm::Error E = checkSocketPath(SocketPath))
+    return std::move(E);
   llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> S =
       llvm::raw_socket_stream::createConnectedUnix(SocketPath);
   if (!S)
     return S.takeError();
 
-  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  llvm::SmallVector<char, 0> Hello;
+  encodeHello(Hello);
+  std::optional<HelloReply> Reply;
+  if (sendMessage(**S, Hello))
+    if (std::optional<std::string> Body = receiveMessage(**S))
+      Reply = decodeHelloReply(*Body);
+  if (!Reply)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the daemon did not say which region it "
+                                   "writes");
+
+  std::string Path = RegionPath.empty() ? Reply->RegionPath : RegionPath.str();
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(Path);
   if (!R)
     return R.takeError();
+  if (R->instanceId() != Reply->InstanceId)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "region " + Path +
+                                       " is not the one the daemon writes (" +
+                                       Reply->RegionPath + ")");
 
   std::unique_ptr<CacheClient> C(new CacheClient());
   C->Conn = std::move(*S);
@@ -180,8 +217,11 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
 
 CacheClient::~CacheClient() = default;
 
-llvm::StringRef CacheClient::lookup(llvm::StringRef Filename, Preprocessor &PP,
-                                    Sema *S, HeaderDependencySet *MatchedDeps) {
+llvm::StringRef CacheClient::lookup(
+    llvm::StringRef Filename, Preprocessor &PP, Sema *S,
+    HeaderDependencySet *MatchedDeps,
+    llvm::function_ref<bool(llvm::StringRef Bytes, llvm::StringRef ModuleName)>
+        Use) {
   ++Counters.Lookups;
 
   llvm::SmallVector<char, 0> Msg;
@@ -210,21 +250,60 @@ llvm::StringRef CacheClient::lookup(llvm::StringRef Filename, Preprocessor &PP,
         continue;
       }
     }
-    MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names);
+    std::string Detail;
+    MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names,
+                                          LogRejections ? &Detail : nullptr);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;
       ++Counters.RejectedFor[static_cast<unsigned>(Why)];
+      if (LogRejections)
+        Counters.Rejections.push_back(Filename.str() + ": " + Detail);
       continue;
     }
     llvm::StringRef Bytes = Region.read(E.Offset, E.Length);
     if (Bytes.empty())
       continue; // an offset that does not address written data
+    // A hit must leave the macro table as the header would have, so an entry
+    // whose effects cannot be read is not used.
+    std::optional<std::vector<MacroEffect>> Effects = decodeMacroEffects(
+        E.EffectsLength ? Region.read(E.EffectsOffset, E.EffectsLength)
+                        : llvm::StringRef());
+    if (!Effects || (E.EffectsLength && Effects->empty()))
+      continue;
+    if (Use && !Use(Bytes, E.ModuleName))
+      continue;
     ++Counters.Hits;
-    if (MatchedDeps)
+    if (MatchedDeps) {
       *MatchedDeps = E.Deps;
+      MatchedDeps->MacroEffects = std::move(*Effects);
+    }
     return Bytes;
   }
   return {};
+}
+
+bool CacheClient::isListed(llvm::StringRef Path) {
+  uint64_t Version = 0;
+  llvm::StringRef List = Region.askList(&Version);
+  if (Version != AskListVersion) {
+    AskList.clear();
+    // A damaged list reads as empty: nothing is asked about, and every
+    // header is parsed as it would be without a cache.
+    if (std::optional<llvm::SmallVector<llvm::StringRef, 0>> Names =
+            splitNameList(List))
+      for (llvm::StringRef N : *Names)
+        AskList.insert(N);
+    AskListVersion = Version;
+  }
+  return AskList.contains(Path);
+}
+
+bool CacheClient::reportTimings(const TimingReport &Report) {
+  llvm::SmallVector<char, 0> Msg;
+  encodeTimingReport(Report, Msg);
+  if (!sendMessage(*Conn, Msg))
+    return false;
+  return receiveMessage(*Conn).has_value();
 }
 
 bool CacheClient::push(const PushRequest &Req) {

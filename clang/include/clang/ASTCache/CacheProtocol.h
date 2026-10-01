@@ -42,6 +42,7 @@
 #include "clang/ASTCache/DependencyRecord.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -59,6 +60,10 @@ enum class MessageKind : uint8_t {
   LookupResponse = 2,
   PushRequest = 3,
   PushAck = 4,
+  TimingReport = 5,
+  TimingAck = 6,
+  Hello = 7,
+  HelloReply = 8,
 };
 
 /// A stored result the daemon knows about: what it was built against, and
@@ -72,6 +77,15 @@ struct CacheEntryRef {
   /// extractNotAMacroNames. A zero length means the record has none.
   uint64_t NamesOffset = 0;
   uint64_t NamesLength = 0;
+  /// Where the record's macro effects sit in the shared region, as a list
+  /// built by extractMacroEffects. Read only on a hit.
+  uint64_t EffectsOffset = 0;
+  uint64_t EffectsLength = 0;
+  /// The saved copy's top-level module name (PushRequest::ModuleName). A
+  /// compile that already loaded this copy -- stddef.h, included again from
+  /// another header in the same state -- reuses it: loading a second module
+  /// of the same name is a fatal error.
+  std::string ModuleName;
 };
 
 struct LookupRequest {
@@ -86,11 +100,41 @@ struct LookupResponse {
 
 struct PushRequest {
   std::string Filename;
+  /// Names the build: the producer hashes the header, the compiler options
+  /// and the context into it. Two pushes with the same record but different
+  /// options are different entries -- the options are not part of the record
+  /// -- so the daemon compares this too before discarding a push as a
+  /// duplicate.
+  std::string ModuleName;
   /// The whole record. The daemon moves its NotAMacro names into the region.
   HeaderDependencySet Deps;
   /// The serialized parsed header. Copied into the shared region by the
   /// daemon, so it crosses the socket once.
   std::string Data;
+};
+
+/// How long a compile took to read one header, from entering it to leaving
+/// it, headers it included on the way counted in (DECISIONS.md 2.14).
+struct HeaderTiming {
+  std::string Path;
+  uint64_t Micros = 0;
+};
+
+/// Sent once when a compile's main file ends: every header the compile read,
+/// with its time, so the daemon can list the slow ones.
+struct TimingReport {
+  std::vector<HeaderTiming> Headers;
+};
+
+/// The daemon's answer to a client that has just connected: the region file
+/// its replies' offsets point into, and which instance of that file. A
+/// client that mapped some other file -- one left behind by an earlier
+/// daemon, or the default path while this daemon was started with another --
+/// would read other bytes at those offsets, including the bytes it loads as
+/// a saved copy.
+struct HelloReply {
+  std::string RegionPath;
+  uint64_t InstanceId = 0;
 };
 
 /// Largest message accepted, in bytes. A parsed header is the big payload
@@ -110,6 +154,12 @@ void encodeLookupResponse(const LookupResponse &Resp,
 void encodePushRequest(const PushRequest &Req,
                        llvm::SmallVectorImpl<char> &Out);
 void encodePushAck(llvm::SmallVectorImpl<char> &Out);
+void encodeTimingReport(const TimingReport &Report,
+                        llvm::SmallVectorImpl<char> &Out);
+void encodeTimingAck(llvm::SmallVectorImpl<char> &Out);
+void encodeHello(llvm::SmallVectorImpl<char> &Out);
+void encodeHelloReply(const HelloReply &Reply,
+                      llvm::SmallVectorImpl<char> &Out);
 
 //===----------------------------------------------------------------------===//
 // Decoding. \p Body is one message with the length prefix already stripped;
@@ -124,6 +174,8 @@ std::optional<MessageKind> peekMessageKind(llvm::StringRef Body);
 std::optional<LookupRequest> decodeLookupRequest(llvm::StringRef Body);
 std::optional<LookupResponse> decodeLookupResponse(llvm::StringRef Body);
 std::optional<PushRequest> decodePushRequest(llvm::StringRef Body);
+std::optional<TimingReport> decodeTimingReport(llvm::StringRef Body);
+std::optional<HelloReply> decodeHelloReply(llvm::StringRef Body);
 
 //===----------------------------------------------------------------------===//
 // Framed transport over a connected socket.
@@ -132,6 +184,13 @@ std::optional<PushRequest> decodePushRequest(llvm::StringRef Body);
 /// Writes \p Message -- already framed by one of the encoders -- and flushes.
 /// Returns false if the stream reported an error.
 bool sendMessage(llvm::raw_socket_stream &S, llvm::ArrayRef<char> Message);
+
+/// Fails when \p Path does not fit in a Unix socket address, which holds 107
+/// bytes on Linux and 103 on macOS. LLVM's socket classes cut a longer path
+/// short without saying so: a daemon would listen at the shortened path, and
+/// two long paths that share their first 107 bytes would name one socket.
+/// Checked before every connect and bind.
+llvm::Error checkSocketPath(llvm::StringRef Path);
 
 /// Reads exactly one message and returns its body with the length prefix
 /// stripped. Returns std::nullopt when the peer closed the connection, when

@@ -63,6 +63,7 @@ described soundly costs a cache miss, never a wrong answer.
 | `CacheDaemon.*` | the server: filename to entries, one lock, thread per connection |
 | `ASTCacheProducer.*` | compiles one header alone and records what it needed |
 | `CacheClient.*` | asks the daemon, picks a candidate, loads it |
+| `HeaderCacheServer.*` | the compiler's side at an `#include`: asks, loads, replays the header's effects, times headers, records jobs |
 
 The daemon never interprets a record. It matches on filename and returns every
 entry it holds; choosing between them needs the compile's live macro table and
@@ -120,12 +121,34 @@ clang-header-cache-daemon -v &
 clang-header-cache-populate -Xcc -Isrc src/*.h
 ```
 
+A compile uses the cache when `CLANG_HEADER_CACHE` names the daemon's socket.
+It asks only about headers on the daemon's ask-list: those some compile took at
+least `-ask-cutoff-us` (default 226) to read. `-list-stored` also lists every
+header with a stored copy, for trying things out. The compiler asks the daemon
+which shared-memory region it writes, and refuses one that is not that
+daemon's.
+
+```
+CLANG_HEADER_CACHE=/tmp/clang-header-cache.sock clang -fmodules \
+    -fno-implicit-module-maps -c anet.c
+```
+
+`CLANG_HEADER_CACHE_STATS=1` prints hits and rejection counts when the compile
+ends; `2` also names the macro behind each rejection.
+`CLANG_HEADER_CACHE_JOBS=<dir>` makes the compile write, for every header it
+reads, the job that builds that header's saved copy; the populate tool runs
+them with the build's flags added:
+
+```
+clang-header-cache-populate -job <dir>/jobs-XXXX.txt -Xcc -Isrc
+```
+
 ## Tests
 
 ```
 ninja AllClangUnitTests
 ./tools/clang/unittests/AllClangUnitTests \
-    --gtest_filter='*ASTCache*:*CacheProtocol*:*Daemon*:*EndToEnd*:*DependencySerialization*:*SymbolDependency*'
+    --gtest_filter='*ASTCache*:*CacheProtocol*:*Daemon*:*EndToEnd*:*DependencySerialization*:*SymbolDependency*:*Producer*:*Load*:*Hit*:*AskList*'
 ```
 
 `EndToEndTest` is the one that matters: it runs a daemon on a thread and a
@@ -137,8 +160,9 @@ does not exist.
 ## State
 
 Working: recording, the protocol, the daemon, the producer, the client's
-matching and loading.
+matching and loading, and serving an `#include` from the cache -- written in a
+`.c` file or in another header -- with the header's macro effects replayed.
 
-**Not done: nothing calls the client from an actual `#include`.** Until that
-exists there is no speedup and no correctness signal. See DECISIONS.md §4 for
-the rest of what is open.
+Not done: filling the cache during a build (a compile records its jobs, and
+something else runs them), and the conflicts between saved copies built after
+different `.c` files (DECISIONS.md §3). NEXT.md has the order.

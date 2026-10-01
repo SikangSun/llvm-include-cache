@@ -37,13 +37,16 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
       return;
 
     // Every open frame's closure covers everything entered beneath it.
-    for (Frame &F : Stack)
+    for (Frame &F : Stack) {
       F.Closure.insert(FID);
+      F.ClosureFiles.insert(&FE->getFileEntry());
+    }
 
     Frame New;
     New.FID = FID;
     New.Path = FE->getName().str();
     New.Closure.insert(FID);
+    New.ClosureFiles.insert(&FE->getFileEntry());
     Stack.push_back(std::move(New));
     return;
   }
@@ -95,6 +98,8 @@ void ASTCacheDependencyTracker::FileSkipped(
   // so those record file identity instead.
   const IdentifierInfo *Guard =
       HS.getFileInfo(SkippedFile).getControllingMacro(HS.getExternalLookup());
+  FileID GuardOrigin =
+      Guard ? stateOrigin(Guard, PP.getMacroDefinition(Guard)) : FileID();
 
   for (Frame &F : Stack) {
     if (!F.SeenSkipped.insert(&SkippedFile.getFileEntry()).second)
@@ -103,12 +108,20 @@ void ASTCacheDependencyTracker::FileSkipped(
     if (Guard) {
       if (!F.SeenConditional.insert(Guard).second)
         continue;
+      // The file was read earlier inside this header, which defined the
+      // guard itself: stdio.h reaching <features.h> a second time.
+      if (GuardOrigin.isValid() && F.Closure.contains(GuardOrigin))
+        continue;
       ConditionalDependency Dep;
       Dep.MacroName = Guard->getName().str();
       Dep.WasDefined = true;
       F.Deps.Conditional.push_back(std::move(Dep));
       continue;
     }
+
+    // Likewise for a #pragma once file this header itself read earlier.
+    if (F.ClosureFiles.contains(&SkippedFile.getFileEntry()))
+      continue;
 
     InclusionDependency Dep;
     Dep.HeaderPath = SkippedFile.getName().str();
@@ -125,14 +138,31 @@ void ASTCacheDependencyTracker::recordConditional(const Token &MacroNameTok,
   if (!II)
     return;
 
+  FileID Origin = stateOrigin(II, MD);
   for (Frame &F : Stack) {
+    // The first test in a frame decides, as for syntactic dependencies: a
+    // state the frame's own text set before testing it stays pinned however
+    // often it is tested again.
     if (!F.SeenConditional.insert(II).second)
+      continue;
+    if (Origin.isValid() && F.Closure.contains(Origin))
       continue;
     ConditionalDependency Dep;
     Dep.MacroName = II->getName().str();
     Dep.WasDefined = static_cast<bool>(MD);
     F.Deps.Conditional.push_back(std::move(Dep));
   }
+}
+
+FileID ASTCacheDependencyTracker::stateOrigin(const IdentifierInfo *II,
+                                              const MacroDefinition &MD) const {
+  SourceLocation Loc;
+  if (const MacroInfo *MI = MD.getMacroInfo())
+    Loc = MI->getDefinitionLoc();
+  else if (const MacroDirective *Latest = PP.getLocalMacroDirectiveHistory(II))
+    if (isa<UndefMacroDirective>(Latest))
+      Loc = Latest->getLocation();
+  return Loc.isValid() ? PP.getSourceManager().getFileID(Loc) : FileID();
 }
 
 void ASTCacheDependencyTracker::Ifdef(SourceLocation Loc,
@@ -209,7 +239,7 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
   // The same sighting answers differently per frame: a macro is internal to
   // a frame whose closure contains its definition, and external -- so a
   // dependency -- to every frame nested beneath it.
-  std::string Sequence;
+  std::optional<std::string> Sequence;
   bool Built = false;
 
   for (Frame &F : Stack) {
@@ -224,11 +254,18 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
       if (!Built) {
         // Shared with the client's match check -- see MacroTokens.h for why
         // these must not be two implementations.
-        Sequence = serializeMacroTokens(*MI);
+        Sequence =
+            serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts());
         Built = true;
       }
+      // A definition whose text cannot be read cannot be checked later, so
+      // this header cannot be saved.
+      if (!Sequence) {
+        F.Poisoned = true;
+        continue;
+      }
       Dep.Required = SyntacticDependency::State::ExpandsTo;
-      Dep.TokenSequence = Sequence;
+      Dep.TokenSequence = *Sequence;
     }
     F.Deps.Syntactic.push_back(std::move(Dep));
   }

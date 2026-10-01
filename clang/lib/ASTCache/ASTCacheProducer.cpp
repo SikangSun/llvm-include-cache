@@ -22,6 +22,8 @@
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaConsumer.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -71,6 +73,9 @@ struct ProduceOutcome {
   /// Non-empty names a builtin whose value depends on the compile that
   /// includes the header, expanded inside the target.
   std::string VaryingBuiltin;
+  /// Each macro the target's text defined or undefined, with its state when
+  /// the target ended.
+  std::vector<MacroEffect> MacroEffects;
 };
 
 /// Builtins whose value depends on the compile that includes the header
@@ -194,26 +199,42 @@ private:
 /// target.
 class TargetWatcher : public PPCallbacks {
 public:
-  TargetWatcher(SourceManager &SM, const FileEntry *Target,
+  TargetWatcher(Preprocessor &PP, const FileEntry *Target,
                 const FileEntry *TargetWrapper, ProducerObserver &Obs,
-                std::string &VaryingBuiltin)
-      : SM(SM), Target(Target), TargetWrapper(TargetWrapper), Obs(Obs),
-        VaryingBuiltin(VaryingBuiltin) {}
+                ProduceOutcome &Out)
+      : PP(PP), SM(PP.getSourceManager()), Target(Target),
+        TargetWrapper(TargetWrapper), Obs(Obs), Out(Out) {}
+
+  // A macro the target part defines or undefines is part of what including
+  // the header does to its includer. Which macros is collected here; their
+  // state is read once the target part ends.
+  void MacroDefined(const Token &MacroNameTok,
+                    const MacroDirective *) override {
+    if (InTargetPart)
+      Touched.insert(MacroNameTok.getIdentifierInfo());
+  }
+
+  void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &,
+                      const MacroDirective *) override {
+    if (InTargetPart)
+      Touched.insert(MacroNameTok.getIdentifierInfo());
+  }
 
   void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                     SourceRange, const MacroArgs *) override {
     // Only the target's text counts. The context's declarations stay hidden
-    // from the loading compile, so a counter value the context used never
+    // from the loading compile, and the server puts back the counter the
+    // module file's load sets, so a counter value the context used never
     // reaches it. The target part is everything from the target wrapper on,
     // headers the target includes among it.
-    if (!InTargetPart || !VaryingBuiltin.empty())
+    if (!InTargetPart || !Out.VaryingBuiltin.empty())
       return;
     const MacroInfo *MI = MD.getMacroInfo();
     if (!MI || !MI->isBuiltinMacro())
       return;
     llvm::StringRef Name = MacroNameTok.getIdentifierInfo()->getName();
     if (llvm::is_contained(TranslationUnitVaryingBuiltins, Name))
-      VaryingBuiltin = Name.str();
+      Out.VaryingBuiltin = Name.str();
   }
 
   void FileChanged(SourceLocation Loc, FileChangeReason Reason,
@@ -234,16 +255,26 @@ public:
       OptionalFileEntryRef FE = SM.getFileEntryRefForID(PrevFID);
       if (FE && &FE->getFileEntry() == Target)
         Obs.targetExited();
+      // Nothing after the target wrapper belongs to the target, so every
+      // touched macro now holds the state the header leaves it in.
+      if (FE && &FE->getFileEntry() == TargetWrapper && InTargetPart) {
+        for (const IdentifierInfo *II : Touched)
+          Out.MacroEffects.push_back(
+              {II->getName().str(), PP.isMacroDefined(II)});
+        InTargetPart = false;
+      }
     }
   }
 
 private:
+  Preprocessor &PP;
   SourceManager &SM;
   const FileEntry *Target;
   const FileEntry *TargetWrapper;
   ProducerObserver &Obs;
-  std::string &VaryingBuiltin;
+  ProduceOutcome &Out;
   bool InTargetPart = false;
+  llvm::SetVector<const IdentifierInfo *> Touched;
 };
 
 /// Checks that each replayed #include opened the file the compile being
@@ -333,7 +364,10 @@ public:
       return nullptr;
 
     std::vector<ReplayChecker::Expectation> Context;
-    for (const IncludeRef &C : Req.Context) {
+    for (const ContextEntry &E : Req.Context) {
+      if (!E.isInclude())
+        continue;
+      const IncludeRef &C = E.Include;
       const FileEntry *Want = nullptr;
       if (!C.Path.empty() && !(Want = entry(C.Path)))
         return nullptr;
@@ -358,9 +392,8 @@ public:
         Outcome.ReplayMismatch));
 
     auto Obs = std::make_unique<ProducerObserver>(Tracker, Outcome);
-    PP.addPPCallbacks(std::make_unique<TargetWatcher>(
-        CI.getSourceManager(), Target, TargetWrapper, *Obs,
-        Outcome.VaryingBuiltin));
+    PP.addPPCallbacks(std::make_unique<TargetWatcher>(PP, Target, TargetWrapper,
+                                                      *Obs, Outcome));
 
     std::vector<std::unique_ptr<ASTConsumer>> Consumers;
     // The observer goes first so that it reads Sema's state before the writer
@@ -434,6 +467,34 @@ bool writableInInclude(llvm::StringRef P) {
   return P.find_first_of("\"\n\r") == llvm::StringRef::npos;
 }
 
+/// The directive that replays \p E in the context wrapper.
+std::string contextLine(const ContextEntry &E) {
+  switch (E.K) {
+  case ContextEntry::Kind::Include:
+    return "#include " + replayText(E.Include);
+  case ContextEntry::Kind::Define:
+    return "#define " + E.Macro;
+  case ContextEntry::Kind::Undef:
+    return "#undef " + E.Macro;
+  }
+  llvm_unreachable("unknown context entry kind");
+}
+
+/// A #define or #undef line is written into the wrapper as one line, so its
+/// text cannot contain a line break, and it must name a macro.
+std::optional<std::string> checkMacroLine(const ContextEntry &E) {
+  llvm::StringRef Text = E.Macro;
+  if (Text.find_first_of("\n\r") != llvm::StringRef::npos)
+    return "a context macro line contains a line break: " + E.Macro;
+  llvm::StringRef Name = Text.take_while(
+      [](char C) { return llvm::isAlnum(C) || C == '_' || C == '$'; });
+  if (Name.empty() || llvm::isDigit(Name.front()))
+    return "a context macro line does not start with a name: " + E.Macro;
+  if (E.K == ContextEntry::Kind::Undef && Name.size() != Text.size())
+    return "a context #undef names more than a macro: " + E.Macro;
+  return std::nullopt;
+}
+
 /// Normalizes \p I's path and checks that \p I can be replayed. Returns what
 /// is wrong, if anything.
 std::optional<std::string> prepare(IncludeRef &I, llvm::StringRef What) {
@@ -479,9 +540,19 @@ std::string clang::ast_cache::moduleNameFor(const ProduceRequest &Req) {
   add("header-path", Req.Header.Path);
   for (const std::string &A : Req.Args)
     add("arg", A);
-  for (const IncludeRef &C : Req.Context) {
-    add("context", replayText(C));
-    add("context-path", C.Path);
+  for (const ContextEntry &E : Req.Context) {
+    switch (E.K) {
+    case ContextEntry::Kind::Include:
+      add("context", replayText(E.Include));
+      add("context-path", E.Include.Path);
+      break;
+    case ContextEntry::Kind::Define:
+      add("define", E.Macro);
+      break;
+    case ContextEntry::Kind::Undef:
+      add("undef", E.Macro);
+      break;
+    }
   }
 
   std::string Name;
@@ -498,7 +569,13 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
     return failed("the request names no header file");
   if (std::optional<std::string> Problem = prepare(Req.Header, "file"))
     return failed(*Problem);
-  for (IncludeRef &C : Req.Context) {
+  for (ContextEntry &E : Req.Context) {
+    if (!E.isInclude()) {
+      if (std::optional<std::string> Problem = checkMacroLine(E))
+        return failed(*Problem);
+      continue;
+    }
+    IncludeRef &C = E.Include;
     if (C.Spelled.empty() && C.Path.empty())
       return failed("a context entry has neither a spelling nor a file");
     if (std::optional<std::string> Problem = prepare(C, "context file"))
@@ -527,8 +604,8 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   // Each #include is replayed the way the compile being reproduced found its
   // file; IncludeRef::Spelled says why a path is not enough.
   std::string ContextText;
-  for (const IncludeRef &C : Req.Context)
-    ContextText += "#include " + replayText(C) + "\n";
+  for (const ContextEntry &E : Req.Context)
+    ContextText += contextLine(E) + "\n";
   std::string TargetText = "#include " + replayText(Req.Header) + "\n";
 
   std::string MapText;
@@ -645,8 +722,8 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   if (!O.TargetEntered)
     return failed("the header was never entered");
   if (O.ReachedThroughContext)
-    return declined("already included by its own context -- a header reached "
-                    "from inside another is saved as part of that one's copy");
+    return declined("already included by its own context: a replayed "
+                    "#include reaches the header before the target does");
   if (!O.Unrepresentable.empty())
     return declined("compiled under, or leaves, #pragma " + O.Unrepresentable +
                     " in a state a record cannot carry");
@@ -672,9 +749,11 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   R.Stat = ProduceResult::Status::Produced;
   R.ModuleName = Name;
   R.Push.Filename = Req.Header.Path;
+  R.Push.ModuleName = Name;
   R.Push.Deps = O.Deps;
   R.Push.Deps.Entry = O.Entry;
   R.Push.Deps.Exit = O.Exit;
+  R.Push.Deps.MacroEffects = O.MacroEffects;
   R.Push.Data = (*Buf)->getBuffer().str();
   return R;
 }
@@ -683,7 +762,10 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
 // Job files
 //===----------------------------------------------------------------------===//
 
-static constexpr llvm::StringLiteral JobFileMagic = "clang-header-cache-jobs 2";
+static constexpr llvm::StringLiteral JobFileMagic = "clang-header-cache-jobs 3";
+/// The version before define and undef lines, still read.
+static constexpr llvm::StringLiteral JobFileMagicV2 =
+    "clang-header-cache-jobs 2";
 
 static llvm::Error jobError(const llvm::Twine &Msg) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
@@ -749,18 +831,26 @@ clang::ast_cache::encodeJobs(llvm::ArrayRef<ProduceRequest> Jobs) {
       if (!oneLine(A))
         return jobError("argument contains a line break: " + A);
     std::vector<std::string> Context;
-    for (const IncludeRef &C : J.Context) {
-      llvm::Expected<std::string> V = ref(C, "context");
+    for (const ContextEntry &E : J.Context) {
+      if (!E.isInclude()) {
+        if (std::optional<std::string> Problem = checkMacroLine(E))
+          return jobError(*Problem);
+        Context.push_back(
+            (E.K == ContextEntry::Kind::Define ? "define " : "undef ") +
+            E.Macro);
+        continue;
+      }
+      llvm::Expected<std::string> V = ref(E.Include, "context");
       if (!V)
         return V.takeError();
-      Context.push_back(std::move(*V));
+      Context.push_back("context " + *V);
     }
 
     OS << "job\n" << "header " << *Header << "\n";
     for (const std::string &A : J.Args)
       OS << "arg " << A << "\n";
     for (const std::string &C : Context)
-      OS << "context " << C << "\n";
+      OS << C << "\n";
     OS << "end\n";
   }
   return Out;
@@ -770,8 +860,9 @@ llvm::Expected<std::vector<ProduceRequest>>
 clang::ast_cache::decodeJobs(llvm::StringRef Text) {
   llvm::SmallVector<llvm::StringRef, 64> Lines;
   Text.split(Lines, '\n', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  if (Lines.empty() || Lines[0] != JobFileMagic)
+  if (Lines.empty() || (Lines[0] != JobFileMagic && Lines[0] != JobFileMagicV2))
     return jobError("not a header cache job file");
+  bool AllowMacros = Lines[0] == JobFileMagic;
 
   std::vector<ProduceRequest> Jobs;
   std::optional<ProduceRequest> Cur;
@@ -812,6 +903,14 @@ clang::ast_cache::decodeJobs(llvm::StringRef Text) {
       if (R->Spelled.empty() && R->Path.empty())
         return jobError("line " + llvm::Twine(I + 1) + ": empty context");
       Cur->Context.push_back(std::move(*R));
+    } else if (AllowMacros &&
+               (L.starts_with("define ") || L.starts_with("undef "))) {
+      ContextEntry E = L.consume_front("define ")
+                           ? ContextEntry::define(L.str())
+                           : ContextEntry::undef(L.drop_front(6).str());
+      if (std::optional<std::string> Problem = checkMacroLine(E))
+        return jobError("line " + llvm::Twine(I + 1) + ": " + *Problem);
+      Cur->Context.push_back(std::move(E));
     } else {
       return jobError("line " + llvm::Twine(I + 1) + ": unrecognised: " + L);
     }

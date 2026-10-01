@@ -31,6 +31,7 @@
 #include "clang/ASTCache/SharedRegion.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include <atomic>
 #include <cstdint>
@@ -43,11 +44,27 @@
 namespace clang {
 namespace ast_cache {
 
+/// The slowest header parse a saved copy is not worth loading instead of:
+/// what loading one saved copy costs, 226 us on release clang 18
+/// (DECISIONS.md 2.14). A header any compile took at least this long to read
+/// is on the ask-list.
+constexpr uint64_t DefaultAskCutoffMicros = 226;
+
+struct CacheDaemonOptions {
+  uint64_t AskCutoffMicros = DefaultAskCutoffMicros;
+  /// Also list every header the moment a copy of it is stored, timed or not.
+  /// For the populate tool and tests, where no compile has reported a time
+  /// yet; a build leaves it off.
+  bool ListStored = false;
+};
+
 class CacheDaemon {
 public:
+  using Options = CacheDaemonOptions;
+
   static llvm::Expected<std::unique_ptr<CacheDaemon>>
   create(llvm::StringRef RegionPath = DefaultRegionPath,
-         uint64_t RegionSize = DefaultRegionSize);
+         uint64_t RegionSize = DefaultRegionSize, Options Opts = Options());
 
   /// Handles one message body and returns the reply, or std::nullopt for a
   /// message that could not be understood. An unreadable message closes the
@@ -72,6 +89,9 @@ public:
     uint64_t BytesStored = 0;
     uint64_t Entries = 0;
     uint64_t Headers = 0;
+    uint64_t TimingReports = 0;
+    uint64_t HeadersTimed = 0;
+    uint64_t HeadersListed = 0;
   };
   Stats stats() const;
 
@@ -86,17 +106,32 @@ private:
     /// entry -- which costs space, never correctness, since matching is
     /// semantic and happens on the client.
     std::string EncodedDeps;
+    /// The pushed module name; see PushRequest::ModuleName.
+    std::string ModuleName;
     uint64_t Offset = 0;
     uint64_t Length = 0;
     /// The record's NotAMacro names, moved out of Deps into the region.
     uint64_t NamesOffset = 0;
     uint64_t NamesLength = 0;
+    /// The record's macro effects, moved out of Deps into the region.
+    uint64_t EffectsOffset = 0;
+    uint64_t EffectsLength = 0;
   };
 
   llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req);
   llvm::SmallVector<char, 0> handlePush(const PushRequest &Req);
+  llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
+  llvm::SmallVector<char, 0> handleHello();
+
+  /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
+  bool listLocked(llvm::StringRef Path);
+  /// Publishes the whole ask-list as a new version. Mutex held.
+  void publishLocked();
 
   SharedRegion Region;
+  /// Absolute, so a client in another directory can attach to it.
+  std::string RegionPath;
+  Options Opts;
 
   /// Guards Table and Counters. A lookup holds it just long enough to copy
   /// out one filename's entries; a push holds it to check for a duplicate and
@@ -106,6 +141,13 @@ private:
   mutable std::mutex Mutex;
   llvm::StringMap<std::vector<StoredEntry>> Table;
   Stats Counters;
+  /// The first time any compile reported for each header. The first is kept:
+  /// it lands on the same side of the cutoff as later ones for 93.8% of
+  /// parses (DECISIONS.md 2.14), and keeping it makes membership final.
+  llvm::StringMap<uint64_t> FirstTiming;
+  /// The ask-list, in the order headers joined it.
+  std::vector<std::string> Listed;
+  llvm::StringSet<> ListedSet;
 
   std::atomic<bool> Stopping{false};
   /// Owned by run(); shutdown() on it makes a blocked accept return.

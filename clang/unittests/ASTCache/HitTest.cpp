@@ -21,6 +21,7 @@
 #include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/HeaderCacheServer.h"
+#include "clang/ASTCache/SharedRegion.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -32,6 +33,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Testing/Support/Error.h"
 #include "gtest/gtest.h"
 #include <chrono>
 #include <set>
@@ -64,19 +66,22 @@ private:
 /// Installs the hit path and the file recorder on the compile.
 class CachedAction : public SyntaxOnlyAction {
 public:
-  CachedAction(std::unique_ptr<CacheClient> Client, std::set<std::string> &Out)
-      : Client(std::move(Client)), Out(Out) {}
+  CachedAction(std::unique_ptr<CacheClient> Client, std::set<std::string> &Out,
+               std::string JobsDir = "")
+      : Client(std::move(Client)), Out(Out), JobsDir(std::move(JobsDir)) {}
 
   bool BeginSourceFileAction(CompilerInstance &CI) override {
     CI.getPreprocessor().addPPCallbacks(
         std::make_unique<EnteredFiles>(CI.getSourceManager(), Out));
-    installHeaderCacheHook(CI, std::move(Client));
+    installHeaderCacheHook(CI, std::move(Client), /*ReportStats=*/false,
+                           JobsDir);
     return true;
   }
 
 private:
   std::unique_ptr<CacheClient> Client;
   std::set<std::string> &Out;
+  std::string JobsDir;
 };
 
 class HitTest : public ::testing::Test {
@@ -88,7 +93,7 @@ protected:
     SocketPath = Dir + "/sock";
     RegionPath = Dir + "/region";
 
-    auto Made = CacheDaemon::create(RegionPath, 16u << 20);
+    auto Made = CacheDaemon::create(RegionPath, 16u << 20, daemonOptions());
     ASSERT_TRUE(bool(Made)) << llvm::toString(Made.takeError());
     Daemon = std::move(*Made);
     Server = std::thread([this] {
@@ -98,6 +103,14 @@ protected:
     for (int I = 0; I < 500 && !llvm::sys::fs::exists(SocketPath); ++I)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     ASSERT_TRUE(llvm::sys::fs::exists(SocketPath)) << "daemon never bound";
+  }
+
+  /// These tests are about serving, not about which headers are asked about,
+  /// so every stored header is listed.
+  virtual CacheDaemon::Options daemonOptions() {
+    CacheDaemon::Options O;
+    O.ListStored = true;
+    return O;
   }
 
   void TearDown() override {
@@ -167,7 +180,7 @@ protected:
     CI.createVirtualFileSystem(VFS);
     CI.createFileManager();
 
-    CachedAction Action(client(), Entered);
+    CachedAction Action(client(), Entered, RecordJobsTo);
     return CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
   }
 
@@ -196,6 +209,8 @@ protected:
   }
 
   std::string Dir, SocketPath, RegionPath;
+  /// When set, compiles record their jobs in this directory.
+  std::string RecordJobsTo;
   std::unique_ptr<CacheDaemon> Daemon;
   std::thread Server;
 };
@@ -543,6 +558,417 @@ TEST_F(HitTest, ASyntacticCheckSeesAMacroFromAnEarlierHit) {
   ASSERT_TRUE(compile(Main, Entered));
   EXPECT_FALSE(Entered.count(A)) << "wrap.h must come from the cache";
   EXPECT_TRUE(Entered.count(Lib)) << "grab must call my_malloc";
+}
+
+// A served header must leave the compile as entering it would have: its
+// macros defined or undefined, and a header it read skipped when included
+// again.
+
+TEST_F(HitTest, ARedefinitionInTheHeaderTakesEffect) {
+  std::string Config = write("config.h", "#define LIMIT 10\n");
+  std::string Lim = write("lim.h", "#undef LIMIT\n#define LIMIT 20\n");
+  ASSERT_NO_FATAL_FAILURE(store(Lim, {Config}));
+  std::string Main =
+      write("main.c", "#include \"" + Config +
+                          "\"\n"
+                          "#include \"" +
+                          Lim +
+                          "\"\n"
+                          "_Static_assert(LIMIT == 20, \"\");\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered)) << "LIMIT must be 20 after lim.h";
+  EXPECT_FALSE(Entered.count(Lim));
+}
+
+TEST_F(HitTest, AnUndefInTheHeaderTakesEffect) {
+  // A module's #undef of a macro its importer defined does not hide the
+  // importer's definition; only replaying the #undef does.
+  std::string Config = write("config.h", "#define LIMIT 10\n");
+  std::string Lim = write("lim.h", "#undef LIMIT\nint lim_loaded;\n");
+  ASSERT_NO_FATAL_FAILURE(store(Lim, {Config}));
+  std::string Main = write(
+      "main.c", "#include \"" + Config +
+                    "\"\n"
+                    "#include \"" +
+                    Lim +
+                    "\"\n"
+                    "#ifdef LIMIT\n#error LIMIT survived lim.h\n#endif\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered)) << "LIMIT must be gone after lim.h";
+  EXPECT_FALSE(Entered.count(Lim));
+}
+
+TEST_F(HitTest, OfTwoServedHeadersDefiningAMacroTheLaterWins) {
+  // Two loaded modules that define one name differently leave it ambiguous;
+  // included as text, the later definition wins.
+  std::string A = write("a.h", "#define MODE 1\n");
+  std::string B = write("b.h", "#undef MODE\n#define MODE 2\n");
+  ASSERT_NO_FATAL_FAILURE(store(A));
+  ASSERT_NO_FATAL_FAILURE(store(B, {A}));
+  std::string Main = write("main.c", "#include \"" + A +
+                                         "\"\n"
+                                         "#include \"" +
+                                         B +
+                                         "\"\n"
+                                         "_Static_assert(MODE == 2, \"\");\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(A));
+  EXPECT_FALSE(Entered.count(B));
+}
+
+TEST_F(HitTest, AFlagFromOneServedHeaderIsSeenByTheCompile) {
+  std::string Fm = write("fm.h", "#ifndef FM_H\n#define FM_H\n"
+                                 "#define FEATURE_X 1\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Fm +
+                          "\"\n"
+                          "#if FEATURE_X != 1\n#error\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Fm));
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Fm));
+}
+
+TEST_F(HitTest, AServedPragmaOnceHeaderIsSkippedWhenIncludedAgain) {
+  std::string Once = write("once.h", "#pragma once\nstruct s { int a; };\n");
+  ASSERT_NO_FATAL_FAILURE(store(Once));
+  std::string Main = write("main.c", "#include \"" + Once +
+                                         "\"\n"
+                                         "#include \"" +
+                                         Once +
+                                         "\"\n"
+                                         "struct s v;\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered)) << "a second struct s would not compile";
+  EXPECT_FALSE(Entered.count(Once));
+}
+
+TEST_F(HitTest, APragmaOnceHeaderInsideAServedHeaderIsSkippedLater) {
+  // once.h was never entered by this compile -- it came inside use.h's saved
+  // copy -- and must still count as included.
+  std::string Once = write("once.h", "#pragma once\nstruct s { int a; };\n");
+  std::string Use = write("use.h", "#pragma once\n#include \"" + Once +
+                                       "\"\nvoid take(struct s *);\n");
+  ASSERT_NO_FATAL_FAILURE(store(Use));
+  std::string Main = write("main.c", "#include \"" + Use +
+                                         "\"\n"
+                                         "#include \"" +
+                                         Once +
+                                         "\"\n"
+                                         "struct s v;\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Use));
+  EXPECT_FALSE(Entered.count(Once));
+}
+
+TEST_F(HitTest, AGuardedHeaderInsideAServedHeaderIsSkippedLater) {
+  // Its guard macro is one of the served header's effects, so the second
+  // #include is skipped without opening the file.
+  std::string Sub = write("sub.h", "#ifndef SUB_H\n#define SUB_H\n"
+                                   "struct t { int a; };\n#endif\n");
+  std::string Use =
+      write("use.h", "#ifndef USE_H\n#define USE_H\n#include \"" + Sub +
+                         "\"\nvoid take(struct t *);\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Use));
+  std::string Main = write("main.c", "#include \"" + Use +
+                                         "\"\n"
+                                         "#include \"" +
+                                         Sub +
+                                         "\"\n"
+                                         "struct t v;\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Use));
+  EXPECT_FALSE(Entered.count(Sub)) << "sub.h's guard is already defined";
+}
+
+TEST_F(HitTest, AServedGuardedHeaderIsSkippedWhenIncludedAgain) {
+  std::string G = write("g.h", "#ifndef G_H\n#define G_H\n"
+                               "struct g { int a; };\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(G));
+  std::string Main = write("main.c", "#include \"" + G +
+                                         "\"\n"
+                                         "#include \"" +
+                                         G +
+                                         "\"\n"
+                                         "struct g v;\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(G));
+}
+
+TEST_F(HitTest, ACopyBuiltWithOtherOptionsIsPassedOverNotAnError) {
+  // The daemon stores entries by header path alone, so copies built with
+  // other compiler options are candidates too, and their dependencies can
+  // all match. The module reader refuses them. That must cost a miss -- or
+  // the next candidate -- and never fail a compile that could parse the
+  // header itself: -Wmodule-file-config-mismatch is an error by default.
+  std::string H = write("h.h", "enum small { A, B };\nint h_loaded;\n");
+  auto StoreWith = [&](std::vector<std::string> Args) {
+    ProduceRequest Req;
+    Req.Header.Path = H;
+    Req.Args = std::move(Args);
+    ProduceResult P = produceHeader(Req);
+    ASSERT_TRUE(P.produced()) << P.Reason;
+    auto Writer = client();
+    ASSERT_TRUE(Writer);
+    ASSERT_TRUE(Writer->push(P.Push));
+  };
+  ASSERT_NO_FATAL_FAILURE(StoreWith({"-std=c17", "-fshort-enums"}));
+  ASSERT_NO_FATAL_FAILURE(StoreWith({"-std=c11"}));
+  std::string Main = write("main.c", "#include \"" + H + "\"\n");
+  EXPECT_TRUE(reads(Main, H)) << "no stored copy fits this compile";
+
+  // Stored after the two that do not fit, and still found.
+  ASSERT_NO_FATAL_FAILURE(StoreWith({"-std=c17"}));
+  EXPECT_FALSE(reads(Main, H));
+}
+
+/// The ask-list as a build uses it: a header is asked about only once some
+/// compile has reported reading it slowly.
+class AskListTest : public HitTest {
+protected:
+  CacheDaemon::Options daemonOptions() override {
+    CacheDaemon::Options O;
+    O.AskCutoffMicros = Cutoff;
+    return O;
+  }
+  uint64_t Cutoff = 0;
+};
+
+TEST_F(AskListTest, AStoredHeaderIsServedOnlyOnceACompileHasTimedIt) {
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "int used(void);\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Use + "\"\n");
+  ASSERT_NO_FATAL_FAILURE(store(Use));
+
+  // Stored, but no compile has reported a time for it: not asked about.
+  EXPECT_TRUE(reads(Main, Use)) << "unlisted headers must not be asked about";
+  EXPECT_EQ(Daemon->stats().Lookups, 0u);
+  EXPECT_EQ(Daemon->stats().HeadersListed, 1u)
+      << "that compile read use.h and reported it; any time meets a cutoff "
+         "of zero";
+
+  EXPECT_FALSE(reads(Main, Use));
+  EXPECT_EQ(Daemon->stats().Lookups, 1u);
+}
+
+TEST_F(AskListTest, AHeaderReadFasterThanTheCutoffIsNeverAskedAbout) {
+  Daemon->stop();
+  if (Server.joinable())
+    Server.join();
+  llvm::sys::fs::remove(SocketPath);
+  Cutoff = 60ull * 1000 * 1000; // a minute: no header takes that long
+  SetUp();
+
+  std::string Use = write("use.h", "int used(void);\n");
+  std::string Main = write("main.c", "#include \"" + Use + "\"\n");
+  ASSERT_NO_FATAL_FAILURE(store(Use));
+  EXPECT_TRUE(reads(Main, Use));
+  EXPECT_TRUE(reads(Main, Use));
+  EXPECT_EQ(Daemon->stats().HeadersTimed, 1u);
+  EXPECT_EQ(Daemon->stats().HeadersListed, 0u);
+  EXPECT_EQ(Daemon->stats().Lookups, 0u);
+}
+
+TEST_F(HitTest, AHitLeavesTheCounterWhereTheHeaderFoundIt) {
+  // plain.h is saved after ctx.h, whose two uses of __COUNTER__ the module
+  // file records as the count it ended with. Loading it must not set the live
+  // counter back to 2 after other.h has taken it to 5.
+  std::string Ctx =
+      write("ctx.h", "#ifndef CTX_H\n#define CTX_H\n"
+                     "enum { C0 = __COUNTER__, C1 = __COUNTER__ };\n"
+                     "#endif\n");
+  std::string Plain = write("plain.h", "#ifndef PLAIN_H\n#define PLAIN_H\n"
+                                       "struct plain { int a; };\n#endif\n");
+  std::string Other =
+      write("other.h", "enum { O0 = __COUNTER__, "
+                       "O1 = __COUNTER__, O2 = __COUNTER__ };\n");
+  ASSERT_NO_FATAL_FAILURE(store(Plain, {Ctx}));
+  std::string Main = write("main.c", "#include \"" + Ctx + "\"\n#include \"" +
+                                         Other + "\"\n#include \"" + Plain +
+                                         "\"\n_Static_assert(__COUNTER__ == 5, "
+                                         "\"\");\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Plain));
+}
+
+TEST_F(HitTest, AHeaderIncludedFromAHeaderIsServed) {
+  // inner.h refuses to compile unless outer.h's own text came first, the
+  // shape of glibc's bits/ headers. Its copy is built after outer.h's lines,
+  // and served at outer.h's #include of it.
+  std::string Inner = write("inner.h", "#ifndef OUTER_H\n#error\n#endif\n"
+                                       "enum { LIM = LEN };\n");
+  std::string Outer = write("outer.h", "#define OUTER_H 1\n#define LEN 4096\n"
+                                       "#include \"" +
+                                           Inner + "\"\n");
+  ProduceRequest Req;
+  Req.Header.Path = Inner;
+  Req.Args = {"-std=c17"};
+  Req.Context = {ContextEntry::define("OUTER_H 1"),
+                 ContextEntry::define("LEN 4096")};
+  ProduceResult P = produceHeader(Req);
+  ASSERT_TRUE(P.produced()) << P.Reason;
+  ASSERT_TRUE(client()->push(P.Push));
+
+  std::string Main =
+      write("main.c", "#include \"" + Outer +
+                          "\"\n"
+                          "_Static_assert(LIM == 4096, \"\");\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_TRUE(Entered.count(Outer));
+  EXPECT_FALSE(Entered.count(Inner));
+}
+
+TEST_F(HitTest, ARecordedJobBuildsACopyTheNextCompileServes) {
+  std::string Inner = write("inner.h", "#ifndef OUTER_H\n#error\n#endif\n"
+                                       "enum { LIM = LEN };\n");
+  std::string Outer = write("outer.h", "#define OUTER_H 1\n#define LEN 4096\n"
+                                       "#include \"" +
+                                           Inner + "\"\n");
+  std::string Main =
+      write("main.c", "#define FROM_MAIN 1\n#include \"" + Outer +
+                          "\"\n"
+                          "_Static_assert(LIM == 4096, \"\");\n");
+  RecordJobsTo = Dir + "/jobs";
+  ASSERT_FALSE(llvm::sys::fs::create_directory(RecordJobsTo));
+  ASSERT_TRUE(reads(Main, Inner)) << "nothing is stored yet";
+
+  // One job file per compile, with a job for each header it read.
+  std::vector<ProduceRequest> Jobs;
+  std::error_code EC;
+  for (llvm::sys::fs::directory_iterator It(RecordJobsTo, EC), End;
+       !EC && It != End; It.increment(EC)) {
+    llvm::Expected<std::vector<ProduceRequest>> Read = readJobFile(It->path());
+    ASSERT_THAT_EXPECTED(Read, llvm::Succeeded());
+    Jobs.insert(Jobs.end(), Read->begin(), Read->end());
+  }
+  ASSERT_EQ(Jobs.size(), 2u);
+  const ProduceRequest *ForOuter = nullptr, *ForInner = nullptr;
+  for (const ProduceRequest &J : Jobs)
+    (J.Header.Path == Outer ? ForOuter : ForInner) = &J;
+  ASSERT_TRUE(ForOuter && ForInner);
+  EXPECT_EQ(ForInner->Header.Path, Inner);
+  // main.c's line before #include "outer.h", then outer.h's lines before
+  // #include "inner.h" -- never outer.h itself.
+  std::vector<ContextEntry> Want = {ContextEntry::define("FROM_MAIN 1"),
+                                    ContextEntry::define("OUTER_H 1"),
+                                    ContextEntry::define("LEN 4096")};
+  EXPECT_EQ(ForInner->Context, Want);
+  EXPECT_EQ(ForOuter->Context,
+            std::vector<ContextEntry>{ContextEntry::define("FROM_MAIN 1")});
+
+  // The flags come from the build, as the populate tool adds them.
+  ProduceRequest Req = *ForInner;
+  Req.Args = {"-std=c17"};
+  ProduceResult P = produceHeader(Req);
+  ASSERT_TRUE(P.produced()) << P.Reason;
+  ASSERT_TRUE(client()->push(P.Push));
+  RecordJobsTo.clear();
+  EXPECT_FALSE(reads(Main, Inner));
+}
+
+TEST_F(HitTest, ARecordedIncludeIsReplayedTheWayItWasFound) {
+  // Beside its includer, a quoted #include is replayed by path: from the
+  // producer's wrapper, in a directory of its own, "first.h" finds nothing.
+  std::string Sub = Dir + "/sub";
+  ASSERT_FALSE(llvm::sys::fs::create_directory(Sub));
+  std::string First = write("sub/first.h", "typedef int first_t;\n");
+  std::string Second = write("sub/second.h", "first_t second(void);\n");
+  std::string Outer = write("sub/outer.h", "#include \"first.h\"\n"
+                                           "#include \"second.h\"\n");
+  std::string Main = write("main.c", "#include \"sub/outer.h\"\n");
+  RecordJobsTo = Dir + "/jobs";
+  ASSERT_FALSE(llvm::sys::fs::create_directory(RecordJobsTo));
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered));
+
+  std::error_code EC;
+  llvm::sys::fs::directory_iterator It(RecordJobsTo, EC);
+  ASSERT_FALSE(EC);
+  llvm::Expected<std::vector<ProduceRequest>> Jobs = readJobFile(It->path());
+  ASSERT_THAT_EXPECTED(Jobs, llvm::Succeeded());
+  const ProduceRequest *ForSecond = nullptr;
+  for (const ProduceRequest &J : *Jobs)
+    if (J.Header.Path == Second)
+      ForSecond = &J;
+  ASSERT_NE(ForSecond, nullptr);
+  EXPECT_EQ(ForSecond->Header.Spelled, "");
+  EXPECT_EQ(ForSecond->Context,
+            std::vector<ContextEntry>{ContextEntry(IncludeRef{"", First})});
+
+  ProduceRequest Req = *ForSecond;
+  Req.Args = {"-std=c17"};
+  ProduceResult P = produceHeader(Req);
+  EXPECT_TRUE(P.produced()) << P.Reason;
+}
+
+TEST_F(HitTest, AClientAttachesOnlyToTheDaemonsOwnRegion) {
+  // Without a path, the client attaches to the file the daemon names.
+  auto Asked = CacheClient::connect(SocketPath);
+  EXPECT_TRUE(bool(Asked)) << llvm::toString(Asked.takeError());
+
+  // Another region file -- a leftover, or the default path while this daemon
+  // writes elsewhere -- holds other bytes at the offsets the daemon names.
+  std::string Other = Dir + "/other-region";
+  auto Stale = SharedRegion::create(Other, 1u << 20);
+  ASSERT_TRUE(bool(Stale)) << llvm::toString(Stale.takeError());
+  auto Wrong = CacheClient::connect(SocketPath, Other);
+  EXPECT_FALSE(bool(Wrong));
+  llvm::consumeError(Wrong.takeError());
+}
+
+TEST_F(HitTest, AnUnguardedHeaderServedTwiceLoadsItsCopyOnce) {
+  // stddef.h's shape: no include guard, so it is entered again each time,
+  // and the same copy fits both times. A second module of the same name is a
+  // fatal error, so the second hit reuses the first load.
+  std::string Twice = write("twice.h", "typedef int twice_t;\n");
+  ASSERT_NO_FATAL_FAILURE(store(Twice));
+  std::string Main = write("main.c", "#include \"" + Twice + "\"\n#include \"" +
+                                         Twice + "\"\ntwice_t x;\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Twice));
+}
+
+TEST_F(HitTest, AHeaderThatSetsAFlagForItsOwnIncludeIsServed) {
+  // fmacros.h's shape. Before dependencies faced strictly outward, fm.h's
+  // copy required FM_SOURCE defined at #include "fm.h", which no compile
+  // ever has, so the copy was never used.
+  std::string Feat =
+      write("feat.h", "#ifdef FM_SOURCE\nint feature_on;\n#endif\n");
+  std::string Fm =
+      write("fm.h", "#define FM_SOURCE 1\n#include \"" + Feat + "\"\n");
+  ASSERT_NO_FATAL_FAILURE(store(Fm));
+  std::string Main = write("main.c", "#include \"" + Fm +
+                                         "\"\nint use(void) { return "
+                                         "feature_on; }\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Fm));
+  EXPECT_FALSE(Entered.count(Feat));
+}
+
+TEST_F(HitTest, AMacroFromAServedCopyComparesByItsText) {
+  // A saved copy stores a macro's tokens without their text, so 64 loaded
+  // from wordsize.h's copy is a number with no digits. Compared that way it
+  // never equals the 64 that size.h's copy recorded from text, and size.h
+  // was never served once wordsize.h was.
+  std::string Word = write("wordsize.h", "#define WORDSIZE 64\n");
+  std::string Size = write("size.h", "enum { BITS = WORDSIZE };\n");
+  ASSERT_NO_FATAL_FAILURE(store(Word));
+  ASSERT_NO_FATAL_FAILURE(store(Size, {Word}));
+  std::string Main =
+      write("main.c", "#include \"" + Word + "\"\n#include \"" + Size +
+                          "\"\n_Static_assert(BITS == 64, \"\");\n");
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(Word));
+  EXPECT_FALSE(Entered.count(Size));
 }
 
 } // namespace

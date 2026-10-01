@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/ASTCache/CacheClient.h"
 #include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/Support/FileSystem.h"
@@ -63,6 +64,7 @@ TEST(CacheProtocolTest, RequestsRoundTrip) {
   llvm::SmallVector<char, 0> Out2;
   PushRequest P;
   P.Filename = "h.h";
+  P.ModuleName = "__hc_0123456789abcdef";
   P.Deps = makeRecord("FEATURE", true);
   P.Data = std::string("\0\1\2binary\0", 10);
   encodePushRequest(P, Out2);
@@ -70,6 +72,7 @@ TEST(CacheProtocolTest, RequestsRoundTrip) {
   auto Got = decodePushRequest(body(Out2));
   ASSERT_TRUE(Got.has_value());
   EXPECT_EQ(Got->Filename, "h.h");
+  EXPECT_EQ(Got->ModuleName, "__hc_0123456789abcdef");
   EXPECT_EQ(Got->Data, P.Data) << "payload must survive embedded NULs";
   ASSERT_EQ(Got->Deps.Conditional.size(), 1u);
   EXPECT_EQ(Got->Deps.Conditional[0].MacroName, "FEATURE");
@@ -78,7 +81,7 @@ TEST(CacheProtocolTest, RequestsRoundTrip) {
   EXPECT_EQ(Got->Deps.Entry.AlignPackRaw, 7u);
 }
 
-TEST(CacheProtocolTest, LookupResponseSaysWhereTheNamesAre) {
+TEST(CacheProtocolTest, LookupResponseSaysWhereTheListsAre) {
   LookupResponse Resp;
   CacheEntryRef E;
   E.Deps = makeRecord("FEATURE", true);
@@ -86,6 +89,9 @@ TEST(CacheProtocolTest, LookupResponseSaysWhereTheNamesAre) {
   E.Length = 20;
   E.NamesOffset = 64;
   E.NamesLength = 36;
+  E.EffectsOffset = 200;
+  E.EffectsLength = 12;
+  E.ModuleName = "__hc_0123456789abcdef";
   Resp.Entries.push_back(E);
   llvm::SmallVector<char, 0> Out;
   encodeLookupResponse(Resp, Out);
@@ -96,6 +102,50 @@ TEST(CacheProtocolTest, LookupResponseSaysWhereTheNamesAre) {
   EXPECT_EQ(Got->Entries[0].Length, 20u);
   EXPECT_EQ(Got->Entries[0].NamesOffset, 64u);
   EXPECT_EQ(Got->Entries[0].NamesLength, 36u);
+  EXPECT_EQ(Got->Entries[0].EffectsOffset, 200u);
+  EXPECT_EQ(Got->Entries[0].EffectsLength, 12u);
+  EXPECT_EQ(Got->Entries[0].ModuleName, "__hc_0123456789abcdef");
+}
+
+TEST(CacheProtocolTest, ASocketPathTooLongForTheAddressIsRefused) {
+  // Cut short silently, it would name a different socket.
+  EXPECT_TRUE(llvm::errorToBool(checkSocketPath(std::string(200, 'a'))));
+  EXPECT_FALSE(llvm::errorToBool(checkSocketPath(DefaultSocketPath)));
+  std::string Long = "/tmp/" + std::string(150, 'x');
+  llvm::Error E = checkSocketPath(Long);
+  ASSERT_TRUE(bool(E));
+  EXPECT_NE(llvm::toString(std::move(E)).find("at most"), std::string::npos);
+  auto C = CacheClient::connect(Long, "/dev/null");
+  ASSERT_FALSE(bool(C));
+  EXPECT_NE(llvm::toString(C.takeError()).find("at most"), std::string::npos)
+      << "the client must refuse before trying the shortened path";
+}
+
+TEST(CacheProtocolTest, TimingReportRoundTrips) {
+  TimingReport Report;
+  Report.Headers = {{"/src/server.h", 41250}, {"/usr/include/stdio.h", 612}};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Headers.size(), 2u);
+  EXPECT_EQ(Got->Headers[0].Path, "/src/server.h");
+  EXPECT_EQ(Got->Headers[0].Micros, 41250u);
+  EXPECT_EQ(Got->Headers[1].Micros, 612u);
+}
+
+TEST(CacheProtocolTest, HelloReplyRoundTrips) {
+  llvm::SmallVector<char, 0> Out;
+  encodeHelloReply({"/dev/shm/x.region", 0x0123456789abcdefull}, Out);
+  auto Got = decodeHelloReply(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->RegionPath, "/dev/shm/x.region");
+  EXPECT_EQ(Got->InstanceId, 0x0123456789abcdefull);
+
+  // A reply naming no file tells the client nothing it can attach to.
+  Out.clear();
+  encodeHelloReply({"", 1}, Out);
+  EXPECT_FALSE(decodeHelloReply(body(Out)).has_value());
 }
 
 TEST(CacheProtocolTest, WrongKindIsRejected) {
@@ -137,6 +187,29 @@ protected:
   }
   void TearDown() override { llvm::sys::fs::remove_directories(TestDir); }
 
+  void report(std::vector<HeaderTiming> Headers) {
+    llvm::SmallVector<char, 0> Msg;
+    encodeTimingReport({std::move(Headers)}, Msg);
+    auto Reply = Daemon->handleMessage(body(Msg));
+    ASSERT_TRUE(Reply.has_value());
+    EXPECT_EQ(peekMessageKind(body(*Reply)), MessageKind::TimingAck);
+  }
+
+  /// The ask-list as a client reads it from the region.
+  std::vector<std::string> askList() {
+    auto Attached = SharedRegion::attach(RegionPath);
+    EXPECT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+    std::vector<std::string> Out;
+    if (!Attached)
+      return Out;
+    auto Names = splitNameList(Attached->askList());
+    EXPECT_TRUE(Names.has_value());
+    if (Names)
+      for (llvm::StringRef N : *Names)
+        Out.push_back(N.str());
+    return Out;
+  }
+
   LookupResponse lookup(llvm::StringRef Name) {
     llvm::SmallVector<char, 0> Msg;
     encodeLookupRequest({Name.str()}, Msg);
@@ -148,10 +221,11 @@ protected:
   }
 
   void push(llvm::StringRef Name, const HeaderDependencySet &Deps,
-            llvm::StringRef Data) {
+            llvm::StringRef Data, llvm::StringRef ModuleName = "__hc_m") {
     llvm::SmallVector<char, 0> Msg;
     PushRequest P;
     P.Filename = Name.str();
+    P.ModuleName = ModuleName.str();
     P.Deps = Deps;
     P.Data = Data.str();
     encodePushRequest(P, Msg);
@@ -202,6 +276,30 @@ TEST_F(DaemonTest, NotAMacroNamesAreKeptInTheRegion) {
   EXPECT_EQ(Attached->read(E.Offset, E.Length), "PARSED");
 }
 
+TEST_F(DaemonTest, MacroEffectsAreKeptInTheRegion) {
+  // Thousands for a header that pulls in a system header, and needed only on
+  // a hit, so a lookup reply says where they are.
+  HeaderDependencySet D = makeRecord("FEATURE", true);
+  D.MacroEffects.push_back({"H_H", true});
+  D.MacroEffects.push_back({"LIMIT", false});
+  push("h.h", D, "PARSED");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 1u);
+  const CacheEntryRef &E = R.Entries[0];
+  EXPECT_TRUE(E.Deps.MacroEffects.empty());
+  ASSERT_GT(E.EffectsLength, 0u);
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  auto Effects =
+      decodeMacroEffects(Attached->read(E.EffectsOffset, E.EffectsLength));
+  ASSERT_TRUE(Effects.has_value());
+  ASSERT_EQ(Effects->size(), 2u);
+  EXPECT_EQ((*Effects)[0].Name, "H_H");
+  EXPECT_FALSE((*Effects)[1].Defined);
+  EXPECT_EQ(Attached->read(E.Offset, E.Length), "PARSED");
+}
+
 TEST_F(DaemonTest, EveryVariantIsReturnedNotJustOne) {
   // The daemon matches on filename only. Deciding between variants needs the
   // client's live macro table and its Sema, neither of which the daemon has,
@@ -222,6 +320,46 @@ TEST_F(DaemonTest, IdenticalPushIsDiscarded) {
   push("h.h", makeRecord("FEATURE", true), "SAME");
   EXPECT_EQ(lookup("h.h").Entries.size(), 1u);
   EXPECT_EQ(Daemon->stats().Duplicates, 1u);
+}
+
+TEST_F(DaemonTest, TheSameRecordBuiltWithOtherOptionsIsKept) {
+  // Compiler options are not part of the record; they are in the module
+  // name. Discarding this push would leave only a copy the module reader
+  // refuses for every compile using the second set of options.
+  push("h.h", makeRecord("FEATURE", true), "SHORT-ENUMS", "__hc_1111");
+  push("h.h", makeRecord("FEATURE", true), "PLAIN", "__hc_2222");
+  EXPECT_EQ(lookup("h.h").Entries.size(), 2u);
+  EXPECT_EQ(Daemon->stats().Duplicates, 0u);
+}
+
+TEST_F(DaemonTest, ASlowHeaderGoesOnTheAskList) {
+  // At or above the cost of one load, a saved copy is worth asking for.
+  EXPECT_TRUE(askList().empty()) << "nothing is listed before any report";
+  report({{"/src/slow.h", 5000},
+          {"/src/fast.h", 40},
+          {"/src/edge.h", DefaultAskCutoffMicros}});
+  EXPECT_EQ(askList(),
+            (std::vector<std::string>{"/src/slow.h", "/src/edge.h"}));
+  EXPECT_EQ(Daemon->stats().HeadersTimed, 3u);
+}
+
+TEST_F(DaemonTest, AHeadersFirstTimeIsTheOneKept) {
+  // One observation predicts the rest well, and keeping the first makes
+  // membership final: a header does not flicker on and off the list.
+  report({{"/src/fast.h", 40}});
+  report({{"/src/fast.h", 90000}});
+  EXPECT_TRUE(askList().empty());
+}
+
+TEST_F(DaemonTest, StoredHeadersAreListedWhenAskedTo) {
+  llvm::sys::fs::remove(RegionPath);
+  CacheDaemon::Options O;
+  O.ListStored = true;
+  auto D = CacheDaemon::create(RegionPath, 1u << 20, O);
+  ASSERT_TRUE(bool(D)) << llvm::toString(D.takeError());
+  Daemon = std::move(*D);
+  push("/src/h.h", makeRecord("FEATURE", true), "PARSED");
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/h.h"});
 }
 
 TEST_F(DaemonTest, DistinctHeadersDoNotCollide) {

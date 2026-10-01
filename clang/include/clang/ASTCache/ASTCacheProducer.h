@@ -18,8 +18,9 @@
 // way every time.
 //
 // The separate compile is given the context the real build had: the files the
-// real build had already included when it reached the header, in order, and
-// the real build's own flags. Every header in a working build compiles in that
+// real build had already included when it reached the header and the macros
+// the including files' own text defined, in order, and the real build's own
+// flags. Every header in a working build compiles in that
 // context, so every one is cacheable. Nothing about the context is chosen
 // here -- a request carries exactly what the compile that missed had.
 //
@@ -27,8 +28,8 @@
 // module map:
 //
 //   module __hc_<hash> {
-//     explicit module context { header "<wrapper including each context file>" }
-//     module target { header "<wrapper including the header>" export * }
+//     explicit module context { header "<wrapper including each context file>"
+//     } module target { header "<wrapper including the header>" export * }
 //   }
 //
 // The context has to be compiled into the saved copy, because the header's
@@ -94,6 +95,50 @@ struct IncludeRef {
   }
 };
 
+/// One line replayed in front of the header: an #include the compile that
+/// missed performed, or a #define or #undef that an including file's own text
+/// made before the header's #include.
+///
+/// The macro lines exist for headers included from inside another header.
+/// glibc's stdio.h defines _STDIO_H and then includes <bits/stdio_lim.h>,
+/// which begins `#ifndef _STDIO_H` / `#error "Never include
+/// <bits/stdio_lim.h> directly"`. _STDIO_H comes from stdio.h's own text, not
+/// from any file stdio.h includes, so replaying includes alone cannot
+/// reproduce it.
+struct ContextEntry {
+  enum class Kind { Include, Define, Undef };
+  Kind K = Kind::Include;
+  /// Kind::Include: the #include to replay.
+  IncludeRef Include;
+  /// Kind::Define: the text after `#define `, such as `_STDIO_H 1` or
+  /// `MAX(a, b) ((a) > (b) ? (a) : (b))`. Kind::Undef: the macro's name.
+  std::string Macro;
+
+  ContextEntry() = default;
+  ContextEntry(IncludeRef I) : Include(std::move(I)) {}
+  ContextEntry(std::string Spelled, std::string Path)
+      : Include{std::move(Spelled), std::move(Path)} {}
+
+  static ContextEntry define(std::string Text) {
+    ContextEntry E;
+    E.K = Kind::Define;
+    E.Macro = std::move(Text);
+    return E;
+  }
+  static ContextEntry undef(std::string Name) {
+    ContextEntry E;
+    E.K = Kind::Undef;
+    E.Macro = std::move(Name);
+    return E;
+  }
+
+  bool isInclude() const { return K == Kind::Include; }
+
+  friend bool operator==(const ContextEntry &A, const ContextEntry &B) {
+    return A.K == B.K && A.Include == B.Include && A.Macro == B.Macro;
+  }
+};
+
 /// Everything needed to build one header's saved copy in a separate process.
 /// A compile that misses on a header records exactly this, so the same struct
 /// is the population job format (see writeJobFile).
@@ -106,18 +151,18 @@ struct ProduceRequest {
   /// the loading compile will check it against.
   std::vector<std::string> Args;
 
-  /// Includes to replay, in order, in front of the header: the files the
-  /// missing compile had already included directly from its .c file when it
-  /// reached the header.
+  /// Lines to replay, in order, in front of the header: what the missing
+  /// compile had done when it reached the header's #include.
   ///
-  /// Only whole files belong here, which is why only headers included
-  /// directly by a .c file are populated. A header reached from inside
-  /// another header -- b.h, included partway through a.h -- is saved as part
-  /// of a.h's copy instead. Reproducing "partway through a.h" would mean
-  /// including all of a.h, which compiles b.h inside the hidden context
-  /// submodule and leaves the visible target submodule empty. produceHeader
-  /// detects that and declines.
-  std::vector<IncludeRef> Context;
+  /// For a header the .c file includes, that is the .c file's earlier
+  /// #includes and #defines. For b.h, included partway through a.h, it is the
+  /// .c file's lines before `#include "a.h"`, then a.h's lines before
+  /// `#include "b.h"`. a.h itself is never replayed: including all of a.h
+  /// would compile b.h inside the hidden context submodule and leave the
+  /// visible target submodule empty, which produceHeader detects and
+  /// declines. What a.h declared above the #include is therefore missing; a
+  /// b.h that needs it fails to compile here and is declined.
+  std::vector<ContextEntry> Context;
 };
 
 struct ProduceResult {
@@ -165,20 +210,24 @@ std::string moduleNameFor(const ProduceRequest &Req);
 // Job files: how a compile hands its misses to the process that populates
 // them. Plain text, one field per line:
 //
-//   clang-header-cache-jobs 2
+//   clang-header-cache-jobs 3
 //   job
 //   header /abs/redis/src/anet.h
 //   arg -I/abs/redis/deps/hiredis
 //   arg -DMSG=hello world
 //   context /abs/redis/src/fmacros.h
+//   define _GNU_SOURCE
 //   context <stdint.h> /usr/lib/clang/22/include/stdint.h
+//   undef NDEBUG
 //   context "hiredis.h" /abs/redis/deps/hiredis/hiredis.h
 //   end
 //
 // Everything after the first space of a field line is the value, spaces
 // included. A header or context value is an IncludeRef: an optional spelling
-// in <> or "", a space, then the path. A value containing a newline cannot be
-// written and is rejected rather than silently split.
+// in <> or "", a space, then the path. context, define and undef lines are
+// replayed in the order they appear. A value containing a newline cannot be
+// written and is rejected rather than silently split. Version 2 files, which
+// have no define or undef lines, are still read.
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<std::string> encodeJobs(llvm::ArrayRef<ProduceRequest> Jobs);

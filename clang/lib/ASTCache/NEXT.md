@@ -2,7 +2,7 @@
 
 What is not built, in what order, and where our storage meets PCM. Reasons live
 in `DECISIONS.md`; this file is the worklist. Written 2026-09-18 against
-`6996c31c7`.
+`6996c31c7`; statuses updated 2026-10-01.
 
 ## Build order
 
@@ -12,27 +12,49 @@ None of this waits on the layout question in §3.
    collection at the expansion decision through an `ExpansionCandidateObserver`,
    first-sighting state per frame, NotAMacro names in the shared region, and a
    regression test through the real hit path for each known miscompile.
-2. **Replay the header's `#define`/`#undef`** into the live macro table after
-   the load. Module macro visibility is not the same thing — `lim.h`'s `#undef`
-   never took effect, which is a silently different program.
-3. **Replay inclusion state.** `#pragma once` and `#import` set
-   `HeaderFileInfo::isPragmaOnce`/`isImport` (`HeaderSearch.h:70-74`) and define
-   no macro, so without this a second `#include` is not skipped.
-4. **Backfill the varying builtins** (`__COUNTER__` and the rest). Needs a fixup
-   list written at population, because by AST time only the value survives.
-5. **Two bugs.** `warn_ast_file_config_mismatch` is `DefaultError`
-   (`DiagnosticSerializationKinds.td:42-47`), so a rejected candidate fails the
-   user's build; and a socket path over 108 characters truncates silently.
+2. **Replay the header's `#define`/`#undef`** (`DECISIONS.md` §2.16). Built
+   2026-09-29.
+3. **Replay inclusion state.** Needed nothing new: the module file carries
+   `#pragma once`, `#import` and included marks, and replayed guard macros
+   skip guarded headers. Pinned by four tests. Built 2026-09-29.
+4. **Headers that run `__COUNTER__`** (called item 5 in conversation). They
+   are declined, and that is common: 21% of qemu's direct includes, among them
+   `osdep.h`, and 35% of the kernel's (`DECISIONS.md` §2.7). Decided
+   2026-09-30: the counter's starting value is a dependency and its advance
+   an effect. Relocating the numbers on load waits for the first benchmark
+   round (§4). A hit no longer resets the live counter (fixed 2026-09-29).
+5. **Two bugs.** Fixed 2026-09-29. A copy the module reader refuses (built
+   with other options) is passed over quietly and the next candidate tried;
+   the daemon no longer drops such a copy as a duplicate; a socket path too
+   long for a Unix address is refused with an error.
 
-6. **Ask only about listed headers** (`DECISIONS.md` §2.14). Time each
-   header between its `FileChanged` events and report the times at the end of
-   the compile; the daemon decides membership and publishes the list in the
-   shared region; the compiler checks the list before opening the socket.
+6. **Ask only about listed headers** (`DECISIONS.md` §2.14). Built
+   2026-09-29. `CLANG_HEADER_CACHE_STATS=2` also names the macro behind each
+   rejected candidate.
 7. **Fold by parse time** (`DECISIONS.md` §2.15). A header costing less than
    one PCM load (226 us) folds into its parent's PCM; one costing more gets
    its own. The cutoff is decided; how the producer keeps a header out, and
    the record merge that needs, are still proposals. A dynamic cutoff that
    measures load time too is deferred (§4).
+
+## Built 2026-09-30, not in the numbered list above
+
+- **Item 6 of the conversation list: dependencies face strictly outward**
+  (`DECISIONS.md` §1.5 update). Plus the macro-text comparison fix found with
+  it.
+- **Serving headers included from headers** (conversation item 7;
+  `DECISIONS.md` §2.9 update). Context lines along the include chain,
+  including #defines; job recording in the compile; no main-file gate.
+- Region identity check at connect; reuse of an already loaded copy.
+
+## Blocking a benchmark run
+
+- **Copies that carry other headers' declarations** (`DECISIONS.md` §3,
+  "Copies built after different .c files conflict"). The replayed #includes
+  in front of a header end up inside its copy and clash with the compile that
+  loads it. Proposed: replay macros only (every macro defined at the
+  #include), never #includes; a header that needs an outside type is not
+  saved for now. Awaiting the user.
 
 ## What changes in what exists
 

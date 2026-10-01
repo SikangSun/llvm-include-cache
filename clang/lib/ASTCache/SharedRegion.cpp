@@ -18,14 +18,17 @@ using namespace clang::ast_cache;
 
 namespace {
 
-constexpr uint64_t RegionMagic = 0x4348444352474E30ull; // "CHDCRGN0"
+constexpr uint64_t RegionMagic = 0x4348444352474E31ull; // "CHDCRGN1"
 
-/// Sits at offset 0 of the region. Only Used changes after creation, and only
-/// the daemon changes it.
+/// Sits at offset 0 of the region. Only Used and AskList change after
+/// creation, and only the daemon changes them.
 struct RegionHeader {
   uint64_t Magic;
   uint64_t InstanceId;
   std::atomic<uint64_t> Used;
+  /// Offset of the current ask-list: an 8-byte little-endian length, then the
+  /// list. Zero before the first list is published.
+  std::atomic<uint64_t> AskList;
 };
 
 /// Entries start after the header, aligned so a stored parsed header begins
@@ -75,6 +78,7 @@ llvm::Expected<SharedRegion> SharedRegion::create(llvm::StringRef Path,
   H->Magic = RegionMagic;
   std::random_device RD;
   H->InstanceId = (static_cast<uint64_t>(RD()) << 32) | RD();
+  H->AskList.store(0, std::memory_order_relaxed);
   H->Used.store(DataStart, std::memory_order_release);
   return R;
 }
@@ -152,4 +156,41 @@ uint64_t SharedRegion::bytesUsed() const {
     return 0;
   return reinterpret_cast<const RegionHeader *>(Mapping.const_data())
       ->Used.load(std::memory_order_acquire);
+}
+
+bool SharedRegion::publishAskList(llvm::StringRef List) {
+  if (!valid())
+    return false;
+  std::string Blob(8, '\0');
+  uint64_t Len = List.size();
+  for (unsigned I = 0; I != 8; ++I)
+    Blob[I] = static_cast<char>((Len >> (8 * I)) & 0xff);
+  Blob += List;
+  std::optional<uint64_t> Offset = append(Blob);
+  if (!Offset)
+    return false;
+  // Release: a reader that sees the new offset also sees the list behind it.
+  reinterpret_cast<RegionHeader *>(Mapping.data())
+      ->AskList.store(*Offset, std::memory_order_release);
+  return true;
+}
+
+llvm::StringRef SharedRegion::askList(uint64_t *Version) const {
+  if (Version)
+    *Version = 0;
+  if (!valid())
+    return {};
+  uint64_t Offset = reinterpret_cast<const RegionHeader *>(Mapping.const_data())
+                        ->AskList.load(std::memory_order_acquire);
+  if (Version)
+    *Version = Offset;
+  if (Offset == 0)
+    return {};
+  llvm::StringRef LenBytes = read(Offset, 8);
+  if (LenBytes.size() != 8)
+    return {};
+  uint64_t Len = 0;
+  for (unsigned I = 0; I != 8; ++I)
+    Len |= static_cast<uint64_t>(static_cast<uint8_t>(LenBytes[I])) << (8 * I);
+  return read(Offset + 8, Len);
 }

@@ -396,4 +396,59 @@ TEST_F(ASTCacheDependencyTrackerTest, PragmaOnceSkipRecordsFileIdentity) {
   EXPECT_EQ(D->Inclusion[0].Why, InclusionDependency::Reason::PragmaOnce);
 }
 
+TEST_F(ASTCacheDependencyTrackerTest,
+       AFlagAHeaderSetsForItselfIsNotItsDependency) {
+  // redis's fmacros.h: define a feature flag, then include the header that
+  // tests it. The test is a dependency of feat.h, which did not set the flag,
+  // and not of fm.h, whose own text set it -- every includer reaches
+  // #include "fm.h" with the flag still undefined.
+  addFile("/feat.h", "#ifdef FM_SOURCE\nint feature_on;\n#endif\n");
+  addFile("/fm.h", "#define FM_SOURCE 1\n#include \"feat.h\"\n");
+  auto Recs = run("#include \"fm.h\"\n");
+
+  const HeaderDependencySet *Feat = find(Recs, "feat.h");
+  ASSERT_NE(Feat, nullptr);
+  const ConditionalDependency *C = cond(*Feat, "FM_SOURCE");
+  ASSERT_NE(C, nullptr);
+  EXPECT_TRUE(C->WasDefined);
+
+  const HeaderDependencySet *Fm = find(Recs, "fm.h");
+  ASSERT_NE(Fm, nullptr);
+  EXPECT_EQ(cond(*Fm, "FM_SOURCE"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, OnlyTheFirstTestOfANameDecides) {
+  // The first test sees the includer's state and is recorded; once the
+  // header has set the name itself, later tests are pinned.
+  addFile("/h.h", "#ifndef LIMIT\n#define LIMIT 8\n#endif\n"
+                  "#ifdef LIMIT\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  const ConditionalDependency *C = cond(*D, "LIMIT");
+  ASSERT_NE(C, nullptr);
+  EXPECT_FALSE(C->WasDefined);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, AnUndefInsideTheHeaderPinsTheName) {
+  addFile("/h.h", "#undef DEBUG\n#ifdef DEBUG\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define DEBUG 1\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_EQ(cond(*D, "DEBUG"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       AOnceFileReadTwiceInsideAHeaderIsNoDependency) {
+  // parent.h reads once.h and then includes it again. The skip is parent.h's
+  // own doing; recording "once.h was already included" would reject parent.h
+  // wherever once.h had not been read before it.
+  addFile("/once.h", "#pragma once\nint once_v;\n");
+  addFile("/parent.h", "#include \"once.h\"\n#include \"once.h\"\nint p;\n");
+  auto Recs = run("#include \"parent.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "parent.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(D->Inclusion.empty());
+}
+
 } // namespace

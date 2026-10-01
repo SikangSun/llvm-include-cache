@@ -122,6 +122,26 @@ TEST_F(ProducerTest, AMacroFromTheContextIsAConditionalDependency) {
   EXPECT_FALSE(C2->WasDefined);
 }
 
+TEST_F(ProducerTest, TheMacrosTheHeaderTouchesAreItsEffects) {
+  // What including the header does to its includer's macros, each with its
+  // state when the header ends. The context's own macros are the includer's,
+  // not the header's, and are left out.
+  std::string Config =
+      write("config.h", "#define FEATURE 1\n#define LIMIT 10\n");
+  std::string H = write("h.h", "#ifndef H_H\n#define H_H\n"
+                               "#undef LIMIT\n#define TEMP 1\n#undef TEMP\n"
+                               "#define NEW 2\nint x;\n#endif\n");
+  ProduceResult P = produceHeader(request(H, {Config}));
+  ASSERT_TRUE(P.produced()) << P.Reason;
+
+  std::vector<std::pair<std::string, bool>> Got;
+  for (const MacroEffect &E : P.Push.Deps.MacroEffects)
+    Got.push_back({E.Name, E.Defined});
+  std::vector<std::pair<std::string, bool>> Want = {
+      {"H_H", true}, {"LIMIT", false}, {"TEMP", false}, {"NEW", true}};
+  EXPECT_EQ(Got, Want);
+}
+
 TEST_F(ProducerTest, PragmaEntryIsTheStateTheHeaderSaw) {
   // The pragma snapshot must be taken where the header begins, not where the
   // compile begins, because the context in front of the header can change it.
@@ -142,8 +162,8 @@ TEST_F(ProducerTest, PragmaEntryIsTheStateTheHeaderSaw) {
 TEST_F(ProducerTest, AHeaderReachedThroughItsOwnContextIsDeclined) {
   // a.h includes b.h. Saving b.h with a.h in front would compile b.h inside
   // the hidden context submodule and leave the visible target submodule
-  // empty. A header reached from inside another is saved as part of that
-  // other header's copy instead.
+  // empty. A header reached from inside another is saved with that other
+  // header's earlier lines in front instead (the next test).
   std::string B = write("b.h", "#ifndef B_H\n#define B_H\n"
                                "int from_b(void);\n#endif\n");
   std::string A = write("a.h", "#ifndef A_H\n#define A_H\n#include \"b.h\"\n"
@@ -151,6 +171,35 @@ TEST_F(ProducerTest, AHeaderReachedThroughItsOwnContextIsDeclined) {
 
   ProduceResult R = produceHeader(request(B, {A}));
   EXPECT_EQ(R.Stat, ProduceResult::Status::Declined) << R.Reason;
+}
+
+TEST_F(ProducerTest, AHeaderIncludedFromAHeaderBuildsAfterItsIncludersLines) {
+  // The glibc shape: stdio.h defines _STDIO_H, then includes
+  // bits/stdio_lim.h, which refuses to compile without it. The context for
+  // stdio_lim.h is stdio.h's lines before that #include, not stdio.h itself.
+  std::string Lim =
+      write("stdio_lim.h", "#ifndef _STDIO_H\n"
+                           "#error \"Never include stdio_lim.h directly\"\n"
+                           "#endif\nenum { LIM = FILENAME_LEN };\n");
+  write("stdio.h", "#define _STDIO_H 1\n#define FILENAME_LEN 4096\n"
+                   "#include \"stdio_lim.h\"\n");
+
+  ProduceResult Alone = produceHeader(request(Lim));
+  EXPECT_EQ(Alone.Stat, ProduceResult::Status::Declined) << Alone.Reason;
+
+  ProduceRequest R = request(Lim);
+  R.Context = {ContextEntry::define("_STDIO_H 1"),
+               ContextEntry::define("FILENAME_LEN 4096")};
+  ProduceResult WithLines = produceHeader(R);
+  ASSERT_TRUE(WithLines.produced()) << WithLines.Reason;
+  // A macro the context defines is outside the header, so the header's use
+  // of it is a dependency like any other.
+  EXPECT_NE(conditional(WithLines.Push.Deps, "_STDIO_H"), nullptr);
+
+  // An #undef replays too: with FILENAME_LEN undefined again, the enum's
+  // initializer is an undeclared name.
+  R.Context.push_back(ContextEntry::undef("FILENAME_LEN"));
+  EXPECT_EQ(produceHeader(R).Stat, ProduceResult::Status::Declined);
 }
 
 TEST_F(ProducerTest, ModuleNamesAreUniquePerRequestAndStable) {
@@ -171,12 +220,19 @@ TEST_F(ProducerTest, ModuleNamesAreUniquePerRequestAndStable) {
   // Same file, replayed through the include path instead of by its path.
   ProduceRequest OtherSpelling = Base;
   OtherSpelling.Context = {IncludeRef{"<ctx.h>", "/x/ctx.h"}};
+  // A macro line in front, and the same text as an #undef.
+  ProduceRequest WithDefine = Base;
+  WithDefine.Context.push_back(ContextEntry::define("X"));
+  ProduceRequest WithUndef = Base;
+  WithUndef.Context.push_back(ContextEntry::undef("X"));
 
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherHeader));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherContext));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherArgs));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(Resplit));
   EXPECT_NE(moduleNameFor(Base), moduleNameFor(OtherSpelling));
+  EXPECT_NE(moduleNameFor(Base), moduleNameFor(WithDefine));
+  EXPECT_NE(moduleNameFor(WithDefine), moduleNameFor(WithUndef));
 }
 
 TEST_F(ProducerTest, IncludeNextWorksOnlyWhenTheContextIsReplayedAsWritten) {
@@ -296,6 +352,9 @@ TEST_F(ProducerTest, JobFilesRoundTrip) {
   J1.Context.push_back({"<stdint.h>", "/usr/lib/clang/22/include/stdint.h"});
   J1.Context.push_back({"\"my dir/x.h\"", "/x/my dir/x.h"});
   J1.Context.push_back({"<stdio.h>", ""}); // spelling, unchecked
+  J1.Context.push_back(ContextEntry::define("MAX(a, ...) ((a) > 0 ? a : 0)"));
+  J1.Context.push_back(ContextEntry::undef("NDEBUG"));
+  J1.Context.push_back({"<stdlib.h>", ""}); // order across kinds is kept
   ProduceRequest J2 = request("/x/g.h");
   J2.Header.Spelled = "<g.h>";
   J2.Args.clear();
@@ -328,7 +387,23 @@ TEST_F(ProducerTest, JobFilesRejectWhatTheyCannotRepresent) {
   EXPECT_THAT_EXPECTED(encodeJobs({PathLikeSpelling}), llvm::Failed())
       << "would read back as a spelling";
 
-  const std::string Magic = "clang-header-cache-jobs 2\n";
+  ProduceRequest BadDefine = request("/x/h.h");
+  BadDefine.Context.push_back(ContextEntry::define("A 1\n#define B 2"));
+  EXPECT_THAT_EXPECTED(encodeJobs({BadDefine}), llvm::Failed())
+      << "a line break would smuggle in a second directive";
+  ProduceRequest BadUndef = request("/x/h.h");
+  BadUndef.Context.push_back(ContextEntry::undef("A B"));
+  EXPECT_THAT_EXPECTED(encodeJobs({BadUndef}), llvm::Failed());
+
+  // Version 2 files, from before define lines, still read; a define line
+  // in one does not.
+  const std::string V2 = "clang-header-cache-jobs 2\n";
+  EXPECT_THAT_EXPECTED(decodeJobs(V2 + "job\nheader /x/h.h\nend\n"),
+                       llvm::Succeeded());
+  EXPECT_THAT_EXPECTED(decodeJobs(V2 + "job\nheader /x/h.h\ndefine X\nend\n"),
+                       llvm::Failed());
+
+  const std::string Magic = "clang-header-cache-jobs 3\n";
   EXPECT_THAT_EXPECTED(decodeJobs("not a job file\n"), llvm::Failed());
   EXPECT_THAT_EXPECTED(
       decodeJobs("clang-header-cache-jobs 1\njob\nheader /x/h.h\nend\n"),
@@ -350,6 +425,10 @@ TEST_F(ProducerTest, JobFilesRejectWhatTheyCannotRepresent) {
       decodeJobs(Magic + "job\nheader /x/h.h\ncontext <stdint.h\nend\n"),
       llvm::Failed())
       << "an unterminated spelling";
+  EXPECT_THAT_EXPECTED(
+      decodeJobs(Magic + "job\nheader /x/h.h\ndefine 1X\nend\n"),
+      llvm::Failed())
+      << "a define must start with a name";
 }
 
 } // namespace

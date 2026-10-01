@@ -19,6 +19,7 @@
 #ifndef LLVM_CLANG_ASTCACHE_HEADERCACHESERVER_H
 #define LLVM_CLANG_ASTCACHE_HEADERCACHESERVER_H
 
+#include "llvm/ADT/StringRef.h"
 #include <memory>
 
 namespace clang {
@@ -30,16 +31,21 @@ class CacheClient;
 /// Installs the hit path when CLANG_HEADER_CACHE names a daemon socket, and
 /// does nothing otherwise -- including when no daemon answers, which is an
 /// ordinary condition rather than an error. With CLANG_HEADER_CACHE_STATS
-/// set, lookup and hit counts are printed when the compile ends.
+/// set, lookup and hit counts are printed when the compile ends. With
+/// CLANG_HEADER_CACHE_JOBS naming a directory, the compile also writes there,
+/// for each header it reads at a declaration boundary, the job that builds
+/// that header's saved copy (ASTCacheProducer.h), less the driver flags.
 ///
 /// Signature matches CompilerInstance::PreprocessorCreatedCallback.
 void installHeaderCacheHook(CompilerInstance &CI);
 
 /// The same, with the client supplied rather than built from the
-/// environment. For tests, which run their own daemon.
+/// environment. For tests, which run their own daemon. A non-empty \p JobsDir
+/// records jobs there.
 void installHeaderCacheHook(CompilerInstance &CI,
                             std::unique_ptr<CacheClient> Client,
-                            bool ReportStats = false);
+                            bool ReportStats = false,
+                            llvm::StringRef JobsDir = {});
 
 } // namespace ast_cache
 } // namespace clang

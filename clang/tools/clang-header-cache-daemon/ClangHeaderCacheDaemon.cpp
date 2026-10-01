@@ -45,6 +45,18 @@ static cl::opt<unsigned long long>
 static cl::opt<bool> Verbose("v", cl::desc("Report stats on exit"),
                              cl::init(false), cl::cat(Category));
 
+static cl::opt<unsigned long long> AskCutoff(
+    "ask-cutoff-us",
+    cl::desc("A header some compile took at least this many microseconds to "
+             "read goes on the ask-list, the headers compiles ask about"),
+    cl::init(DefaultAskCutoffMicros), cl::cat(Category));
+
+static cl::opt<bool> ListStored(
+    "list-stored",
+    cl::desc("Also put every header with a stored copy on the ask-list, timed "
+             "or not (for clang-header-cache-populate and tests)"),
+    cl::init(false), cl::cat(Category));
+
 static CacheDaemon *TheDaemon = nullptr;
 
 /// Signal handling exists for one reason: the socket file has to come off
@@ -63,8 +75,11 @@ int main(int argc, char **argv) {
       "Serves cached parsed headers to clang processes.\n\n"
       "Start before building; stop with Ctrl-C. Nothing is persisted.\n");
 
+  CacheDaemon::Options Opts;
+  Opts.AskCutoffMicros = AskCutoff;
+  Opts.ListStored = ListStored;
   Expected<std::unique_ptr<CacheDaemon>> D =
-      CacheDaemon::create(RegionPath, RegionSize);
+      CacheDaemon::create(RegionPath, RegionSize, Opts);
   if (!D) {
     errs() << "clang-header-cache-daemon: " << toString(D.takeError()) << "\n";
     return 1;
@@ -89,7 +104,10 @@ int main(int argc, char **argv) {
     outs() << "lookups " << S.Lookups << " (" << S.Hits << " with entries)\n"
            << "pushes  " << S.Pushes << " (" << S.Duplicates << " duplicate)\n"
            << "stored  " << S.Entries << " entries for " << S.Headers
-           << " headers, " << (S.BytesStored / 1024) << " KiB\n";
+           << " headers, " << (S.BytesStored / 1024) << " KiB\n"
+           << "timed   " << S.HeadersTimed << " headers from "
+           << S.TimingReports << " compiles; " << S.HeadersListed
+           << " on the ask-list\n";
   }
   return 0;
 }

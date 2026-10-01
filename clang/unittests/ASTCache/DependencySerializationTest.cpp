@@ -42,6 +42,8 @@ HeaderDependencySet makeFullSet() {
   D.Symbol.push_back({"count", SymbolClassification::NonType, ""});
   D.Inclusion.push_back({"/usr/include/stdio.h",
                          InclusionDependency::Reason::PragmaOnce});
+  D.MacroEffects.push_back({"GUARD_H", true});
+  D.MacroEffects.push_back({"LIMIT", false});
   return D;
 }
 
@@ -67,6 +69,11 @@ void expectEqual(const HeaderDependencySet &A, const HeaderDependencySet &B) {
   for (size_t I = 0; I != A.Inclusion.size(); ++I) {
     EXPECT_EQ(A.Inclusion[I].HeaderPath, B.Inclusion[I].HeaderPath);
     EXPECT_EQ(A.Inclusion[I].Why, B.Inclusion[I].Why);
+  }
+  ASSERT_EQ(A.MacroEffects.size(), B.MacroEffects.size());
+  for (size_t I = 0; I != A.MacroEffects.size(); ++I) {
+    EXPECT_EQ(A.MacroEffects[I].Name, B.MacroEffects[I].Name);
+    EXPECT_EQ(A.MacroEffects[I].Defined, B.MacroEffects[I].Defined);
   }
 }
 
@@ -141,6 +148,30 @@ TEST(DependencySerializationTest, DamagedNameListIsRejected) {
   // complete the list.
   EXPECT_FALSE(splitNameList(llvm::StringRef("malloc\0lon", 10)).has_value());
   EXPECT_FALSE(splitNameList(llvm::StringRef("malloc\0\0", 8)).has_value());
+}
+
+TEST(DependencySerializationTest, MacroEffectsMoveIntoTheirList) {
+  HeaderDependencySet D = makeFullSet();
+  std::string List = extractMacroEffects(D);
+  EXPECT_TRUE(D.MacroEffects.empty());
+  EXPECT_EQ(List, std::string("+GUARD_H\0-LIMIT\0", 16));
+
+  auto Effects = decodeMacroEffects(List);
+  ASSERT_TRUE(Effects.has_value());
+  ASSERT_EQ(Effects->size(), 2u);
+  EXPECT_EQ((*Effects)[0].Name, "GUARD_H");
+  EXPECT_TRUE((*Effects)[0].Defined);
+  EXPECT_EQ((*Effects)[1].Name, "LIMIT");
+  EXPECT_FALSE((*Effects)[1].Defined);
+  EXPECT_TRUE(decodeMacroEffects("").has_value()) << "no effects is valid";
+}
+
+TEST(DependencySerializationTest, DamagedEffectListIsRejected) {
+  // A dropped effect leaves a macro as the header would not have: an #undef
+  // that never happens is a different program.
+  EXPECT_FALSE(decodeMacroEffects(llvm::StringRef("+A\0-B", 5)).has_value());
+  EXPECT_FALSE(decodeMacroEffects(llvm::StringRef("+\0", 2)).has_value());
+  EXPECT_FALSE(decodeMacroEffects(llvm::StringRef("A\0", 2)).has_value());
 }
 
 TEST(DependencySerializationTest, TruncationIsRejectedNotPartiallyDecoded) {

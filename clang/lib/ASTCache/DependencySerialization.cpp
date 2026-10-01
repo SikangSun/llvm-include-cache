@@ -62,6 +62,12 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
 
   encodeSnapshot(W, Deps.Entry);
   encodeSnapshot(W, Deps.Exit);
+
+  W.u32(static_cast<uint32_t>(Deps.MacroEffects.size()));
+  for (const MacroEffect &E : Deps.MacroEffects) {
+    W.str(E.Name);
+    W.u8(E.Defined ? 1 : 0);
+  }
 }
 
 std::optional<HeaderDependencySet>
@@ -114,6 +120,16 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
   Deps.Entry = decodeSnapshot(R);
   Deps.Exit = decodeSnapshot(R);
 
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    MacroEffect E;
+    E.Name = R.str().str();
+    uint8_t Raw = R.u8();
+    if (Raw > 1)
+      return std::nullopt;
+    E.Defined = Raw != 0;
+    Deps.MacroEffects.push_back(std::move(E));
+  }
+
   // Trailing bytes mean the writer and reader disagree about the shape even
   // though the version matched, so the decode is not trustworthy.
   if (!R.atEnd())
@@ -147,4 +163,31 @@ clang::ast_cache::splitNameList(llvm::StringRef List) {
     if (N.empty())
       return std::nullopt;
   return Names;
+}
+
+std::string clang::ast_cache::extractMacroEffects(HeaderDependencySet &Deps) {
+  std::string List;
+  for (const MacroEffect &E : Deps.MacroEffects) {
+    List += E.Defined ? '+' : '-';
+    List += E.Name;
+    List += '\0';
+  }
+  Deps.MacroEffects.clear();
+  return List;
+}
+
+std::optional<std::vector<MacroEffect>>
+clang::ast_cache::decodeMacroEffects(llvm::StringRef List) {
+  std::optional<llvm::SmallVector<llvm::StringRef, 0>> Entries =
+      splitNameList(List);
+  if (!Entries)
+    return std::nullopt;
+  std::vector<MacroEffect> Effects;
+  Effects.reserve(Entries->size());
+  for (llvm::StringRef Entry : *Entries) {
+    if (Entry.size() < 2 || (Entry[0] != '+' && Entry[0] != '-'))
+      return std::nullopt;
+    Effects.push_back({Entry.drop_front().str(), Entry[0] == '+'});
+  }
+  return Effects;
 }

@@ -26,11 +26,14 @@
 
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/SharedRegion.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llvm {
 class raw_socket_stream;
@@ -65,18 +68,26 @@ llvm::StringRef describe(MismatchReason R);
 /// the daemon stored (see DependencySerialization.h). A record that never went
 /// through the daemon still carries those names in Deps.Syntactic, and both
 /// are checked.
+///
+/// \p Detail, when non-null, receives what failed, e.g. "LIMIT was not
+/// defined, is".
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
                                 Preprocessor &PP, Sema *S,
-                                llvm::StringRef NotAMacroNames = {});
+                                llvm::StringRef NotAMacroNames = {},
+                                std::string *Detail = nullptr);
 
 class CacheClient {
 public:
-  /// Connects and attaches to the shared region. Fails if no daemon is
-  /// running, which is an ordinary condition: the compiler then behaves
-  /// exactly as it would without a cache.
+  /// Connects, asks the daemon which region file it writes, and attaches to
+  /// that file. A non-empty \p RegionPath is attached instead, for a test
+  /// that wants to name it. Either way the file must be the daemon's own
+  /// instance (HelloReply), or nothing the daemon says about offsets can be
+  /// trusted and connecting fails. Fails too if no daemon is running, which
+  /// is an ordinary condition: the compiler then behaves exactly as it would
+  /// without a cache.
   static llvm::Expected<std::unique_ptr<CacheClient>>
   connect(llvm::StringRef SocketPath = DefaultSocketPath,
-          llvm::StringRef RegionPath = DefaultRegionPath);
+          llvm::StringRef RegionPath = {});
 
   ~CacheClient();
 
@@ -86,23 +97,50 @@ public:
   /// append-only, so nothing rewrites them.
   ///
   /// \p MatchedDeps, when non-null, receives the matched entry's record, whose
-  /// Entry/Exit snapshots the caller needs to replay the header's pragma
-  /// effect after loading.
+  /// Entry/Exit snapshots and macro effects the caller needs to replay the
+  /// header's effect on the compile after loading.
+  ///
+  /// \p Use, when given, is offered each candidate that passes the check, in
+  /// order, with its module name, and the first it accepts is the result. A
+  /// candidate the check cannot rule out can still be unusable -- built with
+  /// other compiler options, say -- and a later one may serve.
   llvm::StringRef lookup(llvm::StringRef Filename, Preprocessor &PP, Sema *S,
-                         HeaderDependencySet *MatchedDeps = nullptr);
+                         HeaderDependencySet *MatchedDeps = nullptr,
+                         llvm::function_ref<bool(llvm::StringRef Bytes,
+                                                 llvm::StringRef ModuleName)>
+                             Use = nullptr);
 
   /// Stores a newly produced entry. Blocks until the daemon acknowledges, so
   /// a caller that does not want to wait should run this off the critical
   /// path.
   bool push(const PushRequest &Req);
 
+  /// Whether \p Path is on the daemon's ask-list, the headers some compile
+  /// found slow enough to be worth a saved copy (DECISIONS.md 2.14). Read
+  /// from the shared region, with no socket traffic; the parsed list is kept
+  /// until the daemon publishes a new one.
+  bool isListed(llvm::StringRef Path);
+
+  /// Sends the times this compile took to read its headers. Blocks until the
+  /// daemon acknowledges, which is one round trip at the end of the main file.
+  bool reportTimings(const TimingReport &Report);
+
   struct Stats {
     unsigned Lookups = 0;
     unsigned Hits = 0;
     unsigned CandidatesRejected = 0;
     unsigned RejectedFor[6] = {};
+    /// With logRejections on: the header and what failed, one per rejected
+    /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
+    /// is not".
+    std::vector<std::string> Rejections;
   };
   const Stats &stats() const { return Counters; }
+
+  /// Keep a line per rejected candidate naming what failed. Off by default:
+  /// it builds a string for every rejection.
+  void logRejections(bool On) { LogRejections = On; }
+  bool loggingRejections() const { return LogRejections; }
 
 private:
   CacheClient() = default;
@@ -110,6 +148,10 @@ private:
   std::unique_ptr<llvm::raw_socket_stream> Conn;
   SharedRegion Region;
   Stats Counters;
+  bool LogRejections = false;
+  /// The ask-list as last parsed, and the version it was parsed from.
+  llvm::StringSet<> AskList;
+  uint64_t AskListVersion = 0;
 };
 
 } // namespace ast_cache

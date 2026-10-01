@@ -48,7 +48,8 @@ static cl::list<std::string> Headers(cl::Positional, cl::desc("<header>..."),
 static cl::list<std::string>
     CompilerArgs("Xcc",
                  cl::desc("Pass an argument to the compile, e.g. -Xcc -I. "
-                          "-Xcc -DFOO=1. Repeatable."),
+                          "-Xcc -DFOO=1. Repeatable. With -job, added after "
+                          "each job's own flags."),
                  cl::value_desc("arg"), cl::cat(Category));
 
 static cl::list<std::string>
@@ -143,9 +144,9 @@ int main(int argc, char **argv) {
 
   std::vector<ProduceRequest> Requests;
   if (!JobFile.empty()) {
-    if (!Headers.empty() || !ContextFiles.empty() || !CompilerArgs.empty()) {
-      errs() << "-job cannot be combined with headers, -context, or -Xcc: the "
-                "job file carries all three\n";
+    if (!Headers.empty() || !ContextFiles.empty()) {
+      errs() << "-job cannot be combined with headers or -context: the job "
+                "file carries both\n";
       return 1;
     }
     Expected<std::vector<ProduceRequest>> Jobs = readJobFile(JobFile);
@@ -155,6 +156,10 @@ int main(int argc, char **argv) {
       return 1;
     }
     Requests = std::move(*Jobs);
+    // A compile records its jobs without the driver's flags, which only the
+    // build that ran it knows; the build passes them here.
+    for (ProduceRequest &R : Requests)
+      R.Args.insert(R.Args.end(), CompilerArgs.begin(), CompilerArgs.end());
   } else {
     for (const std::string &H : Headers) {
       ProduceRequest R;
@@ -180,6 +185,10 @@ int main(int argc, char **argv) {
 
   std::unique_ptr<raw_socket_stream> Conn;
   if (!DryRun) {
+    if (Error E = checkSocketPath(SocketPath)) {
+      errs() << toString(std::move(E)) << "\n";
+      return 1;
+    }
     Expected<std::unique_ptr<raw_socket_stream>> S =
         raw_socket_stream::createConnectedUnix(SocketPath);
     if (!S) {

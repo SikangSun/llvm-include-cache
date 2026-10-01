@@ -20,10 +20,13 @@
 #ifndef LLVM_CLANG_ASTCACHE_MACROTOKENS_H
 #define LLVM_CLANG_ASTCACHE_MACROTOKENS_H
 
+#include <optional>
 #include <string>
 
 namespace clang {
+class LangOptions;
 class MacroInfo;
+class SourceManager;
 
 namespace ast_cache {
 
@@ -32,7 +35,15 @@ namespace ast_cache {
 /// space-joined so two different token sequences cannot collide into one
 /// string -- which is why every consumer must treat this as opaque bytes and
 /// never as a C string.
-std::string serializeMacroTokens(const MacroInfo &MI);
+///
+/// A literal's text is read from where the token was written, not from the
+/// token: a macro loaded from a saved copy carries no literal text, so
+/// `#define __WORDSIZE 64` would otherwise read as "some number" and match
+/// `#define __WORDSIZE 32`. std::nullopt when that text cannot be read; such
+/// a definition must neither be recorded nor be found to match.
+std::optional<std::string> serializeMacroTokens(const MacroInfo &MI,
+                                                const SourceManager &SM,
+                                                const LangOptions &LangOpts);
 
 } // namespace ast_cache
 } // namespace clang

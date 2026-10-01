@@ -5,7 +5,7 @@ observation hooks in Lex/Parse/Sema are shaped the way they are. Each entry
 records what was decided, the reason, and what was rejected — the reasons are
 the part that doesn't survive in the code.
 
-Last updated 2026-09-25.
+Last updated 2026-09-30.
 
 ---
 
@@ -61,6 +61,27 @@ that was in fact invariant. Under-recording is never safe. The filter for
 conditionals is also harder to state correctly, because an *undefined* macro
 has no `#define` location to test provenance against. Deferred as an
 efficiency question, not a correctness one.
+
+**Superseded 2026-09-30 (user: "Dependency should be strictly outward
+facing").** Built. A definedness test is recorded for a header only if the
+state it saw came from outside that header's closure. The state comes from
+the active `#define`, or, for an undefined name, from the `#undef` that
+removed it; a name never defined, a `-D` and a builtin count as outside.
+The first test in a header decides, as for syntactic dependencies. The same
+rule covers include-guard and `#pragma once` skips of a file the header
+itself read earlier. On redis's `anet.c` (one `.c` file, its own daemon),
+rejections of the form "recorded defined, live undefined" fell from 42 to 2;
+the two left are `stddef.h` testing `__need_size_t`, which its includer sets
+-- outward facing, as they should be.
+
+That exposed a comparison bug: a saved copy stores a macro's body tokens
+without their text, so `64` loaded with `__WORDSIZE` from the served copy of
+`fmacros.h` read as "a number" and never equalled the `64` another copy had
+recorded from text. Literal text is now read from where the token was
+written (`serializeMacroTokens`, both sides), and text that cannot be read
+neither records nor matches. With both: `anet.c` 18 hits of 18 lookups, no
+candidate rejected, assembly identical to an uncached compile. Every header
+`anet.c` includes directly was served, so nothing inside them was asked for.
 
 ### 1.6 Poison, don't guess
 
@@ -215,6 +236,24 @@ rejection of a header that defines a name before using it.
 ## 2. What gets stored and where
 
 ### 2.1 A separate sub-compile of the header, not a slice of the real compile
+
+**Reversed 2026-09-30 (user): exporting from the real compile is the
+default.** The section below argues for the separate compile; it was never
+approved, and the user had said on 2026-09-02 that the project goes without
+it. What exporting needs, from the code: `ASTWriter` writes every top-level
+declaration the compile did not load from a module file
+(`ASTWriter.cpp:5648`), and every declaration those reference. Run on the
+real compile of anet.c it would write all of stdio.h, every other header read
+so far, and anet.c's own declarations -- the context problem again, without
+the hidden submodule. Writing one header needs (1) each declaration's header,
+taken from its location, and (2) a way to refer to another header's
+declarations, which a module file can do only by importing the module file
+that holds them. So each header becomes its own PCM importing the PCMs of
+the headers it uses -- layout C, written by one compile. That also answers
+this section's include-guard objection: whether bar.h came before foo.h or
+inside it, foo.h's PCM imports bar.h's. And it answers the conflicts in
+section 3: `fd_set` lives once, in sys/select.h's PCM, and a copy names the
+exact PCM it was built against. Design to be written up for approval.
 
 The token tier populates by observing the real compile, because tokens slice
 positionally: a token belongs to exactly one file, and
@@ -375,6 +414,44 @@ answer. Expansions in the context do not count; the context's declarations
 stay hidden from the loading compile, so its counter values never reach it.
 The backfill is still the plan.
 
+**Update 2026-09-29.** Two corrections.
+
+The context's counter did reach the loading compile. A module file records the
+counter its producer ended with (`PP_COUNTER_VALUE`, `ASTWriter.cpp:2593`), and
+the reader's listener sets the live counter to it on every load
+(`PCHValidator::ReadCounter`). A copy saved after a context that used the
+counter twice set a compile that had reached 5 back to 2, so later "unique"
+names could repeat. Fixed: the server restores the counter after the load,
+which is right because the saved part itself used none. Pinned by
+`HitTest.AHitLeavesTheCounterWhereTheHeaderFoundIt`.
+
+The exclusion is not rare. Searching header text for the six names found them
+only inside `#define`s, which was read as "no header runs one". But a header
+runs the counter whenever its own text uses a macro that expands to it: glib's
+`G_LIKELY` (`_g_boolean_var_N`), the kernel's `READ_ONCE` and `BUILD_BUG_ON`
+(`__compiletime_assert_N`). Measured by preprocessing every `.c` file of six
+benchmark projects with their build flags and each of the six replaced by a
+marker word: of the headers a `.c` file includes directly, none are declined in
+redis, nginx, git or FFmpeg; 5,945 of 28,528 in qemu (21%), among them
+`qemu/osdep.h` in 3,340 of 3,855 files; and 11,323 of 32,094 in the Linux
+kernel (35%), among them `module.h`, `kernel.h`, `mm.h` and `slab.h`. Only
+`__COUNTER__` appeared; the other five ran in no header.
+
+**Decided 2026-09-30 (user): the counter is a plain dependency and an
+effect.** A header whose text runs `__COUNTER__` is saved, not declined. Its
+metadata records the counter's value where the header starts and how many
+values the header used. A saved copy is reused only when the live counter has
+that starting value, and after the hit the live counter is set to start plus
+count, as reading the header would have left it. Exact by construction. The
+other five builtins stay declined; none ran in any measured header.
+
+Relocation -- rewriting the copy's counter numbers on load (section 4) -- is
+deferred. A number that fed a computation cannot be rewritten after Clang
+computed with it, which the user judged a real gap. Revisit only if the first
+round of benchmarks shows the exact-start rule costs too much reuse; measured
+beforehand, it keeps 5,203 of qemu's 5,377 reusable includes and 5,549 of the
+Linux kernel's 10,145.
+
 ### 2.8 Every compile runs with `-fmodules -fno-implicit-module-maps`
 
 Decided 2026-09-11. Applies to both the cached build and the uncached
@@ -450,6 +527,27 @@ hidden context submodule and leaves the visible one empty. The producer
 detects this and declines. (An earlier experiment showed `b.h`'s declarations
 do end up in such a copy. True — but in the hidden part, which is exactly what
 makes the copy unusable.)
+
+**Superseded 2026-09-30 (user: "headers in .h file should also be served").**
+A header included from inside another header is now built and served too.
+Its context is the lines each file along the include chain ran before the
+next #include: the .c file's lines before `#include "a.h"`, then a.h's lines
+before `#include "b.h"`. A line is an #include (replayed the way the compile
+found the file) or a #define or #undef the file's own text made, so glibc's
+`bits/stdio_lim.h` sees `_STDIO_H` from stdio.h's text. a.h itself is never
+replayed, and what a.h declared above the #include is missing; a b.h that
+needs it fails to compile in the producer and is declined. The .c file's own
+#defines now come along as well, which fixes the `_GNU_SOURCE` miss in
+section 4. The compile that reads a header records this request when
+`CLANG_HEADER_CACHE_JOBS` names a directory (job file version 3); the driver
+flags are added by the populate tool's `-Xcc`, since cc1 does not see them.
+The hit path no longer limits serving to the .c file's own #includes.
+
+First end-to-end result (redis, debug clang, one daemon): `anet.c` alone made
+161 lookups with 76 hits, and its assembly matched an uncached compile. With
+five more files on the same daemon, `sds.c` matched; `object.c`, `zmalloc.c`,
+`ae.c` and `util.c` failed to compile. See section 3, "Copies built after
+different .c files conflict".
 
 The context goes in through a generated wrapper header rather than `-include`
 flags. `-include` lists are among the preprocessor options the reader
@@ -597,6 +695,13 @@ determines the output, dropping the duplicate needs no guess about fit. It
 needs a new protocol message (a claim on K, answered "go ahead" or "in
 flight"), and a correct first population comes first.
 
+Corrected 2026-09-29: the daemon used to treat two pushes with byte-equal
+records as one production and keep only the first. The compiler options are
+not in the record, so a copy built with `-fshort-enums` shut out every later
+copy of the same header built without it -- the reader refuses the first for
+such compiles, and the second was never stored. A push now carries the module
+name, which hashes the options, and a duplicate must match it too.
+
 ### 2.12 Assumption: no source file changes during a complete build
 
 The evaluation builds each benchmark from a clean tree and runs its tests. No
@@ -709,6 +814,16 @@ is already mapped by every client.
 Not decided: putting each listed header's candidates (record and stored-result
 offsets) in the region too, which would remove the socket from lookups entirely.
 
+Built 2026-09-29, with two choices the user made. A header joins the list only
+when a compile reports reading it at or above the cutoff; a copy stored by
+`clang-header-cache-populate` is not asked about until then, and the daemon's
+`-list-stored` option lists stored headers anyway, for that tool and for tests.
+And the time is from entering the header to leaving it, the headers it includes
+on the way counted in, since a saved copy holds all of them. The daemon keeps
+each header's first reported time, so membership never flips back. On a debug
+build of clang every header parses slower than the 226 us cutoff and is
+listed; the cutoff only filters on a release build.
+
 ### 2.15 Folding: a fixed parse-time cutoff decides which headers get their own PCM
 
 Decided 2026-09-25: whether a header is folded into its parent's PCM or gets
@@ -749,9 +864,47 @@ with `__need_size_t`), since a PCM holds one version of it.
 
 Deferred as an optimization: a dynamic cutoff (section 4).
 
+### 2.16 A hit replays what the header did to the macro table
+
+Built 2026-09-29, as the macro half of the effects the user listed on
+2026-09-17. The producer records each macro the target's text defined or
+undefined, once, with its state when the target ended. After a load the
+client makes the module visible and then appends one local directive per
+name at the `#include`: `#undef`, or `#define` with the loaded module's own
+definition (`Preprocessor::getModuleMacro`), not a copy re-lexed from text.
+
+Module macro visibility alone was not enough, in two ways a test pinned down.
+A module's `#undef` of a macro its importer defined does not hide the
+importer's definition, so `lim.h`'s `#undef LIMIT` never took effect. And two
+loaded modules that define one name differently leave it ambiguous, where a
+textual include lets the later one win. A local directive overrides every
+visible module macro, which gives both answers a textual include gives.
+
+The effects travel like the NotAMacro names: the daemon moves them into the
+region and a reply carries their offset, since a header that pulls in a system
+header touches thousands of macros and they are needed only on a hit.
+
+What this does not cover: a `#pragma push_macro` the header leaves unpopped,
+and `#pragma pop_macro` inside the header, which defines a macro without a
+`MacroDefined` callback (the `pop_macro` hole, section 4).
+
+Include-once state needed nothing new. The loaded module file already carries
+each header's `#pragma once`, `#import` and included marks, and Clang applies
+them when it reads the header info. A guarded header's second `#include` is
+skipped because replay defines its guard macro.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
+
+- **Two misses were blamed on missing replay.** NEXT.md said a second
+  `#include` of a `#pragma once` header would not be skipped after a hit; a
+  test showed the module file's header info already marks it included. And
+  section 4 blamed redis's `_BSD_SOURCE` miss on unreplayed macros; the
+  rejection log (`CLANG_HEADER_CACHE_STATS=2`) showed it is 1.5 instead:
+  `fmacros.h` defines `_BSD_SOURCE` and then includes `<features.h>`, which
+  tests it, so the saved copy of `fmacros.h` requires the flag to be set
+  before `fmacros.h` sets it.
 
 - **PCM was adopted without stating what it cannot do.** 2.2 compared PCH
   and PCM only on when a file may be loaded. The property that decides fit
@@ -852,6 +1005,58 @@ Kept because the reasoning that produced them is likely to recur.
 
 ---
 
+### Copies built after different .c files conflict (found 2026-09-30)
+
+Every saved copy carries its context in a hidden submodule. Hidden from name
+lookup, but not from declaration merging: when two loaded copies, or a copy
+and the live compile, declare the same entity differently, Clang reports an
+error. Two cases on redis, once copies from several .c files shared a daemon:
+
+- `ae.c`, `util.c`: `fd_set::__fds_bits` from one copy's context is not
+  present in `fd_set` from another copy's context. sys/select.h names the
+  member `fds_bits` or `__fds_bits` depending on `__USE_XOPEN`, and the two
+  copies were built after different .c files' feature macros.
+- `object.c`, `zmalloc.c`: "conflicting asm label" on stdio.h's `fscanf`,
+  which `__REDIRECT`s to a different symbol depending on feature macros.
+
+A copy's metadata covers only its target part, so nothing checks that the
+context's declarations agree with the compile loading it. This is the
+duplicate-merging cost that layout D names and that stopped Google's
+pre-parsed headers (N3426: "merging symbols is technically difficult").
+Every failure so far stops the compile with an error; none produced different
+code. Not fixed; needs a decision (NEXT.md).
+
+Traced 2026-09-30 to a real pair. `sds.c` starts with `<stdio.h>` and
+`<stdlib.h>`; inside `stdlib.h` glibc reaches `bits/types/clock_t.h`, nine
+lines declaring `clock_t`. Its copy, built while compiling `sds.c`, replayed
+38 lines in front, all of `<stdio.h>` first, without `_GNU_SOURCE`, so the
+copy declares `fscanf` as `__isoc99_fscanf`. `ae.c` has `_GNU_SOURCE`, loads
+that copy (clock_t.h's own text never tests it), then reads `stdio.h`, which
+declares `fscanf` as `__isoc23_fscanf`: "conflicting asm label". clock_t.h
+needed none of the replayed lines; it includes `bits/types.h` itself.
+
+The user does not accept the replayed #includes ("I don't buy context"): a
+copy should hold only its header and what the header includes, with
+everything from outside a dependency. Measured by rebuilding every header
+`sds.c` and `ae.c` read with only the recorded `#define` lines in front: 159
+of 170 build for `sds.c` (114 with the replay), 99 of 110 for `ae.c` (67),
+and the mean copy shrinks from 235 KB to 40 KB and from 360 KB to 47 KB. Of
+the 11 that fail per file, a few need a macro an earlier header defined
+(`__BEGIN_DECLS`, from `sys/cdefs.h`) and the rest need a type from another
+header (`anet.h`'s `uint32_t`, `__dev_t`, `size_t`). Proposed, awaiting the
+user: in front of a header, a `#define` for every macro defined at its
+#include and nothing else; a header that still needs an outside type is not
+saved for now.
+
+Also found and fixed on the way:
+- A client attached to the default region path whatever region its daemon
+  wrote, and read names and saved copies at offsets meant for another file.
+  The daemon now answers a hello with its region path and instance id; the
+  client attaches to that file and refuses one whose id differs.
+- An unguarded header served twice (stddef.h) loaded the same module twice,
+  a fatal error. A copy already loaded in the compile is reused.
+- Two rejection paths gave no reason; they now say which list was damaged.
+
 ## 4. Open
 
 - The `pop_macro` hole: a macro's textual definition location is not trustworthy
@@ -872,11 +1077,42 @@ Kept because the reasoning that produced them is likely to recur.
   own `#define`/`#undef` lines in the context -- a separate design, not yet
   proposed.
 - `__COUNTER__` and the other translation-unit-varying builtins: declined for
-  now (2.7). The backfill -- rewrite each value on load from the loading
-  compile's own state, and advance its counter -- is still to write.
-- Loading a saved copy must leave the includer as a textual include would:
-  the guard macro defined and the file marked as included, so a second
-  `#include` of the same header is skipped. Not written.
+  now (2.7). Rewriting values on load cannot handle the commonest use,
+  `CAT(tmp_, __COUNTER__)`, which puts the value into a declaration's name.
+  The alternative is a dependency and an effect: the counter's value where
+  the header starts must match, and the live counter is advanced by the
+  number the header used. Recommended 2026-09-29 to build neither, on a search
+  that missed macros which expand to the counter; withdrawn the same day (2.7,
+  update 2026-09-29).
+
+  Where the numbers land, measured 2026-09-29 over every `.c` file of qemu and
+  the Linux kernel (the counter replaced by a marker word; `-Wundef` for
+  `#if`): never in an `#if`; in names in all of qemu's uses and most of the
+  kernel's (glib's `_g_boolean_var_N`, `__compiletime_assert_N`,
+  `__UNIQUE_ID_x_N`); in inline-asm labels and their `"i"` operands, from the
+  kernel's `WARN_ON` via `instrumentation_begin()`; and in error-message and
+  `WARN` strings that quote an expanded name. None feeds a computation: no
+  bare number reaches an enum value, an array size or a constant.
+
+  Proposed 2026-09-29, at the user's push for a real algorithm: relocate the
+  numbers on load, as a loader relocates addresses. The producer starts the
+  counter at a base no compile reaches (1,000,000,000), so each number it hands
+  out is a ten-digit value, and records where each one landed; a spare
+  `Token` flag bit (three are free) carried through `##` and `#` makes that
+  exact. The metadata keeps the base and the count. On a hit the loader
+  rewrites each number to the live counter plus its offset -- in identifiers
+  through the existing deserialization listener and
+  `ASTReader::SetIdentifierInfo`, which `DecodeIdentifierInfo` honours before
+  returning; in asm and string literals through a small reader hook -- then
+  advances the live counter by the count. Dependencies naming a relocated
+  identifier are checked under its rewritten spelling. A number that fed a
+  computation, a directive or an `#if` cannot be rewritten; such a copy keeps
+  the exact-start dependency above. Reuse, counting only the counter: qemu
+  5,377 of 5,924 declined includes, the Linux kernel 10,145 of 11,319 -- every
+  one but each header's first build. Names alone give qemu the same and the
+  kernel 6,422; an exact start gives 5,203 and 5,549. Deferred 2026-09-30
+  (2.7): the exact-start dependency is the default, and relocation is worked
+  out only if the first round of benchmarks shows poor reuse.
 - A population request whose context cannot be reproduced fails every time it
   is retried; the daemon should remember the failure.
 - Overlap the lookup round trip with the work around it. `receiveMessage`
@@ -923,10 +1159,11 @@ Kept because the reasoning that produced them is likely to recur.
   itself -- glibc `#define`s `__need_size_t` or
   `__GLIBC_INTERNAL_STARTING_HEADER_IMPLEMENTATION`, includes a header that
   tests and `#undef`s it -- which 1.5 records without a provenance filter, so
-  no includer can ever match. The rest was `_BSD_SOURCE` from `fmacros.h`,
-  served from the cache, not being defined afterwards: macro effects are not
-  replayed yet. The 1.5 filter was deferred as an efficiency improvement; this
-  is its cost.
+  no includer can ever match. The rest was `_BSD_SOURCE` in `fmacros.h`, the
+  same case: `fmacros.h` defines it and `<features.h>` tests it (section 3).
+  The 1.5 filter was deferred as an efficiency improvement; this is its cost.
+  Rerun 2026-09-29 with macro replay and the rejection log: same counts, and
+  every rejection named a macro the header's own closure set.
 - A cheaper syntactic check, adapted from Bothner's GCC compile server (2003,
   §8.2). Proposed 2026-09-22, not approved, not built. The check in 1.12 asks
   "is this a macro here?" for every NotAMacro name of a saved copy, about 500

@@ -125,6 +125,18 @@ struct PragmaSnapshot {
   }
 };
 
+/// A macro the header's own text defined or undefined, and whether it was
+/// defined when the header ended. This is an *effect*, not a dependency:
+/// included as text, the header leaves these macros in this state, and a
+/// loaded result must leave them the same way. Module macro visibility alone
+/// does not: a module's #undef of a macro the includer defined does not hide
+/// the includer's definition, and two loaded results that define one name
+/// differently leave it ambiguous rather than set to the later one.
+struct MacroEffect {
+  std::string Name;
+  bool Defined = false;
+};
+
 struct HeaderDependencySet {
   std::vector<ConditionalDependency> Conditional;
   std::vector<SyntacticDependency> Syntactic;
@@ -142,6 +154,9 @@ struct HeaderDependencySet {
   /// packed, and loading a stored result does not replay that. The client
   /// applies the difference from Entry after loading.
   PragmaSnapshot Exit;
+
+  /// Every macro the header touched, each once, in the order first touched.
+  std::vector<MacroEffect> MacroEffects;
 };
 
 /// One header's dependency set, as observed over the region between entering

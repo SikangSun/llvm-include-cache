@@ -11,6 +11,10 @@
 #include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/Support/raw_socket_stream.h"
 
+#ifndef _WIN32
+#include <sys/un.h>
+#endif
+
 using namespace clang;
 using namespace clang::ast_cache;
 
@@ -78,6 +82,9 @@ void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
       W.u64(E.Length);
       W.u64(E.NamesOffset);
       W.u64(E.NamesLength);
+      W.u64(E.EffectsOffset);
+      W.u64(E.EffectsLength);
+      W.str(E.ModuleName);
     }
   });
 }
@@ -86,6 +93,7 @@ void clang::ast_cache::encodePushRequest(const PushRequest &Req,
                                          llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::PushRequest, [&](ByteWriter &W) {
     W.str(Req.Filename);
+    W.str(Req.ModuleName);
     writeRecord(W, Req.Deps);
     W.str(Req.Data);
   });
@@ -93,6 +101,33 @@ void clang::ast_cache::encodePushRequest(const PushRequest &Req,
 
 void clang::ast_cache::encodePushAck(llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::PushAck, [](ByteWriter &) {});
+}
+
+void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
+                                          llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::TimingReport, [&](ByteWriter &W) {
+    W.u32(static_cast<uint32_t>(Report.Headers.size()));
+    for (const HeaderTiming &H : Report.Headers) {
+      W.str(H.Path);
+      W.u64(H.Micros);
+    }
+  });
+}
+
+void clang::ast_cache::encodeTimingAck(llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::TimingAck, [](ByteWriter &) {});
+}
+
+void clang::ast_cache::encodeHello(llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::Hello, [](ByteWriter &) {});
+}
+
+void clang::ast_cache::encodeHelloReply(const HelloReply &Reply,
+                                        llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::HelloReply, [&](ByteWriter &W) {
+    W.str(Reply.RegionPath);
+    W.u64(Reply.InstanceId);
+  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -112,6 +147,14 @@ clang::ast_cache::peekMessageKind(llvm::StringRef Body) {
     return MessageKind::PushRequest;
   case static_cast<uint8_t>(MessageKind::PushAck):
     return MessageKind::PushAck;
+  case static_cast<uint8_t>(MessageKind::TimingReport):
+    return MessageKind::TimingReport;
+  case static_cast<uint8_t>(MessageKind::TimingAck):
+    return MessageKind::TimingAck;
+  case static_cast<uint8_t>(MessageKind::Hello):
+    return MessageKind::Hello;
+  case static_cast<uint8_t>(MessageKind::HelloReply):
+    return MessageKind::HelloReply;
   default:
     return std::nullopt;
   }
@@ -145,6 +188,9 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
     E.Length = R.u64();
     E.NamesOffset = R.u64();
     E.NamesLength = R.u64();
+    E.EffectsOffset = R.u64();
+    E.EffectsLength = R.u64();
+    E.ModuleName = R.str().str();
     Resp.Entries.push_back(std::move(E));
   }
   if (!R.atEnd())
@@ -160,12 +206,43 @@ clang::ast_cache::decodePushRequest(llvm::StringRef Body) {
 
   PushRequest Req;
   Req.Filename = R.str().str();
+  Req.ModuleName = R.str().str();
   if (!readRecord(R, Req.Deps))
     return std::nullopt;
   Req.Data = R.str().str();
   if (!R.atEnd())
     return std::nullopt;
   return Req;
+}
+
+std::optional<TimingReport>
+clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::TimingReport))
+    return std::nullopt;
+  TimingReport Report;
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    HeaderTiming H;
+    H.Path = R.str().str();
+    H.Micros = R.u64();
+    Report.Headers.push_back(std::move(H));
+  }
+  if (!R.atEnd())
+    return std::nullopt;
+  return Report;
+}
+
+std::optional<HelloReply>
+clang::ast_cache::decodeHelloReply(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::HelloReply))
+    return std::nullopt;
+  HelloReply Reply;
+  Reply.RegionPath = R.str().str();
+  Reply.InstanceId = R.u64();
+  if (!R.ok() || !R.atEnd() || Reply.RegionPath.empty())
+    return std::nullopt;
+  return Reply;
 }
 
 //===----------------------------------------------------------------------===//
@@ -212,4 +289,21 @@ clang::ast_cache::receiveMessage(llvm::raw_socket_stream &S) {
   if (!readExactly(Body.data(), Len))
     return std::nullopt;
   return Body;
+}
+
+llvm::Error clang::ast_cache::checkSocketPath(llvm::StringRef Path) {
+#ifdef _WIN32
+  // UNIX_PATH_MAX in afunix.h.
+  constexpr size_t PathField = 108;
+#else
+  constexpr size_t PathField = sizeof(sockaddr_un::sun_path);
+#endif
+  // One byte of the field is the terminating NUL.
+  if (Path.size() < PathField)
+    return llvm::Error::success();
+  return llvm::createStringError(
+      llvm::inconvertibleErrorCode(),
+      "socket path is " + llvm::Twine(Path.size()) +
+          " bytes; a Unix socket address holds at most " +
+          llvm::Twine(PathField - 1) + ": " + Path);
 }

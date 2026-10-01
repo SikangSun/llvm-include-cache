@@ -36,7 +36,7 @@ namespace ast_cache {
 /// version it does not know declines the whole block rather than guessing:
 /// a misparsed dependency set is a dependency set with the wrong contents,
 /// which is exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 3;
+constexpr uint32_t DependencyEncodingVersion = 4;
 
 /// Appends the encoding of \p Deps to \p Out.
 void encodeDependencySet(const HeaderDependencySet &Deps,
@@ -58,6 +58,18 @@ std::string extractNotAMacroNames(HeaderDependencySet &Deps);
 /// pass as a shorter one.
 std::optional<llvm::SmallVector<llvm::StringRef, 0>>
 splitNameList(llvm::StringRef List);
+
+/// Removes the macro effects from \p Deps and returns them as one list in
+/// splitNameList's form, each name prefixed with '+' (defined at the end of
+/// the header) or '-' (undefined). A header that pulls in a system header
+/// touches thousands of macros, and they are needed only on a hit, so the
+/// daemon keeps them in the shared region like the NotAMacro names.
+std::string extractMacroEffects(HeaderDependencySet &Deps);
+
+/// The effects in a list built by extractMacroEffects, or std::nullopt for a
+/// damaged list.
+std::optional<std::vector<MacroEffect>>
+decodeMacroEffects(llvm::StringRef List);
 
 } // namespace ast_cache
 } // namespace clang

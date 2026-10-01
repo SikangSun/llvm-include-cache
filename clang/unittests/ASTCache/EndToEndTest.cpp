@@ -186,7 +186,10 @@ TEST_F(EndToEndTest, SyntacticMismatchRejectsTheEntry) {
                 IdentifierInfo &II = PP.getIdentifierTable().get("BUFSZ");
                 const MacroInfo *MI = PP.getMacroDefinition(&II).getMacroInfo();
                 ASSERT_NE(MI, nullptr);
-                Seq1024 = serializeMacroTokens(*MI);
+                std::optional<std::string> Seq = serializeMacroTokens(
+                    *MI, PP.getSourceManager(), PP.getLangOpts());
+                ASSERT_TRUE(Seq.has_value());
+                Seq1024 = *Seq;
               });
 
   PushRequest P;

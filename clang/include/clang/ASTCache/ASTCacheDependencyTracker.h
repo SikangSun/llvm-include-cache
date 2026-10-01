@@ -80,10 +80,16 @@ public:
   void FileSkipped(const FileEntryRef &SkippedFile, const Token &FilenameTok,
                     SrcMgr::CharacteristicKind FileType) override;
 
-  /// Conditional dependencies: recorded on every definedness test, in every
-  /// open frame, with no provenance filtering. Over-recording is always
-  /// sound -- it can only cost a redundant check at validation time, never
-  /// miss a real dependency. Deduped per frame.
+  /// Conditional dependencies: a definedness test, recorded in each open
+  /// frame the first time that frame sees the name -- unless the state tested
+  /// was set inside that frame's closure. Dependencies face strictly outward:
+  /// redis's fmacros.h defines _BSD_SOURCE and then includes <features.h>,
+  /// which tests it. For features.h the definition came from outside, so it
+  /// is a dependency; for fmacros.h its own text set it, and recording "must
+  /// be defined" would demand of every includer a macro none defines before
+  /// including fmacros.h. The state comes from the active #define, or from
+  /// the #undef that removed it; a name never defined, or defined on the
+  /// command line, is always external.
   void Ifdef(SourceLocation Loc, const Token &MacroNameTok,
              const MacroDefinition &MD) override;
   void Ifndef(SourceLocation Loc, const Token &MacroNameTok,
@@ -192,6 +198,9 @@ private:
     std::string Path;
     /// This file plus every real file entered beneath it.
     llvm::DenseSet<FileID> Closure;
+    /// The same files by identity, for a #pragma once skip, which names a
+    /// file rather than a FileID.
+    llvm::DenseSet<const FileEntry *> ClosureFiles;
     llvm::DenseSet<const IdentifierInfo *> SeenConditional;
     /// Names this frame has already classified, whatever the outcome. Also
     /// a subset relation: anything the innermost frame has seen, every frame
@@ -205,8 +214,14 @@ private:
     bool Poisoned = false;
   };
 
-  /// Records a definedness test into every open frame.
+  /// Records a definedness test into every open frame it is external to.
   void recordConditional(const Token &MacroNameTok, const MacroDefinition &MD);
+
+  /// The file whose directive gave \p II the state just observed: the
+  /// #define behind \p MD or, when \p II is not defined, the #undef that
+  /// removed it. Invalid when no file set it -- a name never defined, a -D on
+  /// the command line, a builtin -- which only the outside can change.
+  FileID stateOrigin(const IdentifierInfo *II, const MacroDefinition &MD) const;
 
   /// Shared body of expansionCandidate and MacroExpands. \p MI is the name's
   /// active macro, or null if it is not one.

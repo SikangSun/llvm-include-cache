@@ -84,6 +84,19 @@ public:
   /// from a previous instance is detected rather than silently misread.
   uint64_t instanceId() const;
 
+  /// Daemon side. Makes \p List -- names in splitNameList's form -- the list
+  /// of headers clients ask about (DECISIONS.md 2.14). The list is appended
+  /// like any entry and then published by storing its offset in a fixed slot
+  /// of the region's header, so a reader sees either the previous list or the
+  /// whole new one. Returns false when the region is full.
+  bool publishAskList(llvm::StringRef List);
+
+  /// Client side. The current list, or an empty StringRef if none has been
+  /// published. \p Version, when non-null, receives a value that changes
+  /// exactly when a new list is published, so a caller can keep a parsed copy
+  /// until then.
+  llvm::StringRef askList(uint64_t *Version = nullptr) const;
+
   uint64_t bytesUsed() const;
   uint64_t capacity() const { return Mapping.size(); }
 
