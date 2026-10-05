@@ -403,6 +403,10 @@ public:
     bool AnyFits = false;
     size_t HitBytes = 0;
     uint64_t HitLoadMicros = 0;
+    const CacheClient::Stats &Before = Client->stats();
+    uint64_t DaemonBefore = Before.DaemonMicros,
+             CheckBefore = Before.CheckMicros;
+    unsigned CheckedBefore = Before.CandidatesChecked;
     auto Asked = std::chrono::steady_clock::now();
     llvm::TimeTraceScope QueryScope("HeaderCache Query", Path);
     Client->lookup(
@@ -423,10 +427,17 @@ public:
         &Site);
     uint64_t Took = micros(Asked);
     LookupMicros += Took;
-    if (LogServed)
+    if (LogServed) {
+      const CacheClient::Stats &After = Client->stats();
       QueryLines.push_back(
-          Path + (Target ? " hit " : " miss ") + std::to_string(Took) + " " +
-          std::to_string(HitBytes) + " " + std::to_string(HitLoadMicros));
+          Path + (Target ? " hit" : " miss") +
+          " total=" + std::to_string(Took) +
+          " ask=" + std::to_string(After.DaemonMicros - DaemonBefore) +
+          " check=" + std::to_string(After.CheckMicros - CheckBefore) +
+          " checked=" +
+          std::to_string(After.CandidatesChecked - CheckedBefore) + " load=" +
+          std::to_string(HitLoadMicros) + " bytes=" + std::to_string(HitBytes));
+    }
     PP.setCounterValue(Counter);
     if (!Target) {
       // A miss where a copy could have stood in: save this header's part of
@@ -639,8 +650,8 @@ private:
   /// them excluded, and how many such reads.
   uint64_t TextMicros = 0;
   unsigned TextReads = 0;
-  /// With LogServed: "<header> hit|miss <us> <part bytes> <load us>" per
-  /// lookup, and
+  /// With LogServed: "<header> hit|miss total= ask= check= checked= load=
+  /// bytes=" per lookup (times in us; checked = saved PCMs checked), and
   /// "<header> <us> depth <n>" per header read as text, n = 0 outermost.
   std::vector<std::string> QueryLines, TextLines;
   /// Files entered and not yet left, innermost last.
