@@ -80,10 +80,13 @@ files: 72 compiles across both modes, with and without `-g`, all identical.
 1. **Cross-reference IDs** for outside declarations (the user's "keep both
    capabilities"): needs a writer with a module chain. Not started.
 2. **A benchmark run over all of redis**, with the release build
-   (`build_rel`, 2026-10-05). At `-O2`, three files are 4 to 5 ms slower
-   served than plain (`DECISIONS.md` §2.18); find out why.
-3. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
-4. **Remove the producer**, job recording and the populate tool once parts
+   (`build_rel`, 2026-10-05). The `-O2` slowdown was the benchmark's own
+   flags (`DECISIONS.md` §2.18).
+3. **Cheaper hit checks** (proposed 2026-10-05, not approved). Redoing the
+   recorded `#include` lookups is most of the hook's time; a daemon round
+   trip per lookup is the rest on a miss (`DECISIONS.md` §2.18).
+4. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
+5. **Remove the producer**, job recording and the populate tool once parts
    cover everything they did.
 
 ## What changes in what exists

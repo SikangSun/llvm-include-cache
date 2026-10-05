@@ -158,6 +158,11 @@ public:
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".
     std::vector<std::string> Rejections;
+    /// Wall time, in microseconds: waiting for the daemon to answer lookups,
+    /// checking candidates against the live state, sending this compile's
+    /// header timings, and connecting.
+    uint64_t DaemonMicros = 0, CheckMicros = 0, ReportMicros = 0,
+             ConnectMicros = 0;
   };
   const Stats &stats() const { return Counters; }
 

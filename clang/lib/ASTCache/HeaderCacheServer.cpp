@@ -33,6 +33,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -294,6 +295,11 @@ public:
     if (LoadsRefused)
       OS << "  refused by the module reader (built with other options?): "
          << LoadsRefused << "\n";
+    OS << "header cache time: " << ms(LookupMicros) << " ms in lookups ("
+       << ms(S.DaemonMicros) << " waiting for the daemon, " << ms(S.CheckMicros)
+       << " checking candidates, " << ms(LoadMicros) << " loading), "
+       << ms(S.ReportMicros) << " reporting timings, " << ms(S.ConnectMicros)
+       << " connecting\n";
     if (EffectsWithoutDefinition)
       OS << "  macro effects without a definition in the module: "
          << EffectsWithoutDefinition << "\n";
@@ -376,18 +382,22 @@ public:
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc};
     bool AnyFits = false;
+    auto Asked = std::chrono::steady_clock::now();
     Client->lookup(
         Path, PP, &CI.getSema(), &Deps,
         [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
           AnyFits = true;
           if (PopulateOnly)
             return false;
+          auto Loading = std::chrono::steady_clock::now();
           Target = load(Bytes, ModuleName);
+          LoadMicros += micros(Loading);
           if (Target && LogServed)
             Served.push_back(Path + " from " + ModuleName.str());
           return Target != nullptr;
         },
         &Site);
+    LookupMicros += micros(Asked);
     PP.setCounterValue(Counter);
     if (!Target) {
       // A miss where a copy could have stood in: save this header's part of
@@ -554,6 +564,17 @@ private:
   /// carry. Expected to stay zero; the module's own visible macro still
   /// applies to such a name.
   unsigned EffectsWithoutDefinition = 0;
+  /// Wall time in lookups, the loads they made included, and in the loads.
+  uint64_t LookupMicros = 0, LoadMicros = 0;
+
+  static uint64_t micros(std::chrono::steady_clock::time_point Start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - Start)
+        .count();
+  }
+  static std::string ms(uint64_t Micros) {
+    return llvm::formatv("{0:f1}", Micros / 1000.0).str();
+  }
   /// Candidates whose bytes the module reader refused, most likely because
   /// they were built with other compiler options.
   unsigned LoadsRefused = 0;

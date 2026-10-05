@@ -19,6 +19,7 @@
 #include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTReader.h"
 #include "llvm/Support/raw_socket_stream.h"
+#include <chrono>
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -329,8 +330,17 @@ MismatchReason clang::ast_cache::matchesLiveState(
   return MismatchReason::None;
 }
 
+namespace {
+uint64_t microsSince(std::chrono::steady_clock::time_point Start) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - Start)
+      .count();
+}
+} // namespace
+
 llvm::Expected<std::unique_ptr<CacheClient>>
 CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
+  auto Start = std::chrono::steady_clock::now();
   if (llvm::Error E = checkSocketPath(SocketPath))
     return std::move(E);
   llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> S =
@@ -362,6 +372,7 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
   std::unique_ptr<CacheClient> C(new CacheClient());
   C->Conn = std::move(*S);
   C->Region = std::move(*R);
+  C->Counters.ConnectMicros = microsSince(Start);
   return C;
 }
 
@@ -377,10 +388,12 @@ llvm::StringRef CacheClient::lookup(
 
   llvm::SmallVector<char, 0> Msg;
   encodeLookupRequest({Filename.str()}, Msg);
+  auto Asked = std::chrono::steady_clock::now();
   if (!sendMessage(*Conn, Msg))
     return {};
 
   std::optional<std::string> Reply = receiveMessage(*Conn);
+  Counters.DaemonMicros += microsSince(Asked);
   if (!Reply)
     return {};
   std::optional<LookupResponse> Resp = decodeLookupResponse(*Reply);
@@ -402,8 +415,10 @@ llvm::StringRef CacheClient::lookup(
       }
     }
     std::string Detail;
+    auto Checking = std::chrono::steady_clock::now();
     MismatchReason Why = matchesLiveState(
         E.Deps, PP, S, Names, LogRejections ? &Detail : nullptr, Site);
+    Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;
       ++Counters.RejectedFor[static_cast<unsigned>(Why)];
@@ -450,11 +465,12 @@ bool CacheClient::isListed(llvm::StringRef Path) {
 }
 
 bool CacheClient::reportTimings(const TimingReport &Report) {
+  auto Start = std::chrono::steady_clock::now();
   llvm::SmallVector<char, 0> Msg;
   encodeTimingReport(Report, Msg);
-  if (!sendMessage(*Conn, Msg))
-    return false;
-  return receiveMessage(*Conn).has_value();
+  bool Sent = sendMessage(*Conn, Msg) && receiveMessage(*Conn).has_value();
+  Counters.ReportMicros += microsSince(Start);
+  return Sent;
 }
 
 bool CacheClient::push(const PushRequest &Req) {

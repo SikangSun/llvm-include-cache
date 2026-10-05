@@ -1284,8 +1284,43 @@ Loading by name is no faster than loading copies, except `object.c` by
 3 ms: five copies per part cost little to merge. The gain is in the first
 build, where by name a compile keeps exporting after its first hit (the pass
 1 table above). Served, the front end is faster than plain: `object.c` 114 to
-54 ms. At `-O2`, code generation dominates, and three files are 4 to 5 ms
-slower served than plain; not yet looked into.
+54 ms.
+
+**The `-O2` slowdown in that table was the benchmark's** (found
+2026-10-05). `bench_outside.py` fills the cache with `-fsyntax-only`, which
+leaves `__OPTIMIZE__` undefined, so its `-O2` compiles miss every header that
+tests it, and pay for the misses. Filled with the same flags
+(`scratch/e2e/overhead.py`, 21 interleaved runs, medians in ms), served
+compiles are faster at `-O2` too. The third column is a daemon with nothing
+stored and every header listed: the hook's cost with no hit to pay for it.
+
+| File | `-O2 -S`: plain | served | empty daemon |
+|---|---|---|---|
+| `anet.c` | 121.1 | 118.0 | 126.8 |
+| `ae.c` | 115.8 | 107.9 | 122.1 |
+| `zmalloc.c` | 167.5 | 159.6 | 174.2 |
+| `util.c` | 274.2 | 247.3 | 282.9 |
+
+**Where the hook's time goes.** `CLANG_HEADER_CACHE_STATS=1` now prints it.
+Release build, full cache, the daemon's default cutoff, `-fsyntax-only`, in
+ms:
+
+| File | In lookups | Waiting for the daemon | Checking candidates | Loading |
+|---|---|---|---|---|
+| `anet.c` | 10.5 | 1.6 | 6.4 | 1.6 |
+| `util.c` | 12.8 | 1.4 | 8.2 | 2.2 |
+| `object.c` | 10.6 | 0.8 | 7.8 | 1.3 |
+
+- *Checking.* Most of it is redoing the header's recorded `#include`
+  lookups (3): 328 lookups for `anet.c`, 605 for `object.c`, at 8 to 10 us in
+  `HeaderSearch::LookupFile` and 2 us resolving each file's real path, 4 to
+  6.6 ms per compile. Then the names that must not be macros, 1.2 to 1.9 ms,
+  and the outside declarations of 2.18, 0.2 to 0.7 ms. A plain compile pays
+  the same `LookupFile` cost for the same `#include`s, so the check repeats
+  the search a textual include would make.
+- *Waiting for the daemon.* Every lookup is a socket round trip, 16 to 24 us.
+  With nothing stored and every header listed (`-ask-cutoff-us 0`), that is
+  217 to 362 round trips and 3.6 to 6.8 ms per compile, which no hit repays.
 
 ## 3. Things that turned out to be wrong
 
