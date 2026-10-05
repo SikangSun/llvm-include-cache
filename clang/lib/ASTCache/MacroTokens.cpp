@@ -10,6 +10,8 @@
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/MacroInfo.h"
+#include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/SmallString.h"
 
 using namespace clang;
 
@@ -31,4 +33,21 @@ std::optional<std::string> clang::ast_cache::serializeMacroTokens(
     Sequence.push_back('\0');
   }
   return Sequence;
+}
+
+std::string clang::ast_cache::fileMacroText(llvm::StringRef Name,
+                                            bool LastComponentOnly,
+                                            const LangOptions &LangOpts,
+                                            const TargetInfo &TI) {
+  llvm::SmallString<256> Text;
+  if (LastComponentOnly) {
+    std::string Terminated = Name.str();
+    Preprocessor::processPathToFileName(
+        Text, PresumedLoc(Terminated.c_str(), FileID(), 1, 1, SourceLocation()),
+        LangOpts, TI);
+  } else {
+    Text += Name;
+    Preprocessor::processPathForFileMacro(Text, LangOpts, TI);
+  }
+  return std::string(Text);
 }

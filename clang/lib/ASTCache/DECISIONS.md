@@ -255,6 +255,16 @@ inside it, foo.h's PCM imports bar.h's. And it answers the conflicts in
 section 3: `fd_set` lives once, in sys/select.h's PCM, and a copy names the
 exact PCM it was built against. Design to be written up for approval.
 
+Tested 2026-10-01 with a throwaway test: a compile called
+`ASTWriter::WriteAST(&Sema, ..., /*WritingModule=*/nullptr, ...)` from the
+`FileChanged` exit of `a.h`, kept compiling to the end without error, and a
+second compile loaded the 241 KB result with `-include-pch` and used `a.h`'s
+struct and macro -- and the first `.c` file's own `MAIN_FLAG` and `main_t`.
+So the writer exports "the state so far" as it is, mid-compile, with no
+separate compile; what it writes is all of that state, visible on load, not
+one header. The only end-of-compile assumption found is an assertion that no
+C++ local instantiations are pending, which C never has.
+
 The token tier populates by observing the real compile, because tokens slice
 positionally: a token belongs to exactly one file, and
 `TokenBuffer::spelledTokens(FID)` hands back one file's worth.
@@ -893,6 +903,187 @@ each header's `#pragma once`, `#import` and included marks, and Clang applies
 them when it reads the header info. A guarded header's second `#include` is
 skipped because replay defines its guard macro.
 
+### 2.17 Export only the header's own part, from the real compile (proposed 2026-10-02)
+
+**Proposed, awaiting approval.** The user: "given the sizes, reduced BMI mode
+is a must". This replaces the separate compile of 2.1 and the context of 2.9.
+
+**What a saved copy holds.** At the end of header H in the real compile,
+write a PCM with H's own part: the declarations H's text produced, the
+macros H defined, and copies of the outside declarations those declarations
+point at. Nothing else the compile holds.
+
+**Why.** Measured on redis with release clang 18, as PCH sizes, the compile's
+whole state right after an `#include` against what that `#include` added:
+`anet.c` after `anet.h`, 737 KB against 7 KB; `util.c` after `util.h`,
+1,697 KB against 45 KB; `object.c` after `server.h`, its first include,
+1,929 KB against 1,717 KB. Over 45 includes that are not first in their file,
+the added part is a median 2.1% of the whole
+(`scratch/statesize/statesize.py`).
+
+**How the writer does it.**
+
+1. *H's region.* Source-location offsets are handed out in order, so every
+   location created between entering H and leaving H, in H or in a file first
+   entered under it, falls in one range. A declaration is H's when its
+   expansion location falls in that range.
+2. *Seeds.* `ASTWriter` starts from every top-level declaration not loaded
+   from a module file (`ASTWriter.cpp:5648`) and then writes everything those
+   reference (`GetDeclRef` queues it). Starting from H's declarations instead
+   writes H's part plus exactly the outside declarations it points at.
+3. *Lookup tables.* Written after the declarations, keeping only names whose
+   declarations were written: what C++20 reduced BMI already does
+   (`isLookupResultNotInteresting`, `ASTWriter.cpp:4631` and `:4691`).
+4. *Not reduced BMI as it stands.* Reduced BMI also drops the bodies of
+   non-inline functions and some variable initializers (`CanElideDeclDef`,
+   `ASTWriterDecl.cpp:429`), and never seeds `static` declarations. A C
+   header's `static` functions need both, so the change is a sibling mode on
+   the same machinery: an optional seed predicate on `ASTWriter`, no eliding.
+5. *Macros.* For a C++20 header unit the writer already writes each macro's
+   final value as a module macro (`ASTWriter.cpp`, `isHeaderUnit()` in
+   `WritePreprocessor`). Here: the same, for each macro whose `#define` lies in
+   H's region. `#undef`s stay in the metadata's effects, as now.
+6. *A module.* Only a module loads partway through another compile, so the
+   writer gets a `Module` made for H, as for a header unit. The declarations
+   stay unowned; the reader treats an unowned declaration as visible
+   (`ASTReaderDecl.cpp:647`).
+7. *When.* Not at H's `FileChanged` exit: the parser reads one token ahead,
+   so the last declaration of H may not be finished there. At the next
+   top-level declaration boundary after H ends.
+
+**What the metadata adds.**
+
+- *Outside declarations become dependencies.* Each written declaration
+  outside H's region (`anet.h`'s `uint32_t` typedef) is recorded with its
+  name and a fingerprint: Clang's ODR hash for a struct, enum or function,
+  the canonical type for a typedef. A hit requires this compile to have a
+  visible declaration with that name and fingerprint. A different `fd_set` is
+  then a miss, not `object.c`'s merge error. Because the check passes only
+  where the outside declarations already exist, their being visible on load
+  changes nothing. It also covers names an expression uses, such as a
+  `memcpy` call in an inline function, which no symbol hook sees.
+- *Include resolution* (section 3, `-I`): each `#include` in H's region with
+  its spelling and the file found.
+
+**What goes away:** the separate compile, the context and its hidden
+submodule, job files, and with them the conflicts of section 3.
+
+**Costs and risks.**
+
+- Writing is on the compile's own path: the AST cannot be read on another
+  thread while parsing goes on. Done only on a miss, only for a header on the
+  ask-list. Not measured.
+- A header N inside H gets its own copy, and H's copy holds N's declarations
+  again; loaded together, the two merge. Folding (2.15) could later make H's
+  copy import N's.
+- Not verified: writing a module from a compile that is not building one, and
+  loading it partway through another compile.
+
+**Plan.** (1) A throwaway experiment for the last risk: export `anet.h`'s own
+part from a real `anet.c` compile, load it into a second `anet.c` compile,
+compare assembly, report the PCM's size. (2) The writer's seed predicate and
+macro filter, with tests. (3) The two metadata additions. (4) Export at a
+miss in place of job recording.
+
+**Approved 2026-10-02** (user: "If reduced export doesn't break semantics
+then it's fine. You can start testing").
+
+**Experiment, 2026-10-02.** `ASTWriter::setPartFilter` (a starting-set
+predicate and a macro predicate; lookup tables and C name chains keep only
+what was written; nothing elided) and `CLANG_HEADER_CACHE_EXPORT` /
+`CLANG_HEADER_CACHE_LOAD` in `HeaderCacheServer.cpp`. The export is written
+at the header's `FileChanged` exit, so only headers that end with a
+prototype or a macro were tried. Each redis `.c` file was compiled once to
+export the header, again serving the header from the export, and compared
+with a plain compile (debug clang, `-O2 -S`):
+
+| File : header | Assembly | Copy | Source locations | Declarations | Macros | Export |
+|---|---|---|---|---|---|---|
+| `anet.c` : `anet.h` | identical | 107 KB | 40 KB | 7 KB | 0.4 KB | 21 ms |
+| `sds.c` : `sds.h` | identical | 147 KB | 39 KB | 27 KB | 6 KB | 30 ms |
+| `util.c` : `util.h` | identical | 875 KB | 595 KB | 30 KB | 2 KB | 111 ms |
+| `zmalloc.c` : `zmalloc.h` | identical | 172 KB | 51 KB | 29 KB | 4 KB | 34 ms |
+| `ae.c` : `ae.h` | identical | 203 KB | 14 KB | 48 KB | 29 KB | 38 ms |
+| `adlist.c` : `adlist.h` | identical | 57 KB | 18 KB | 4 KB | 1 KB | 10 ms |
+| `dict.c` : `dict.h` | identical | 124 KB | 38 KB | 19 KB | 3 KB | 24 ms |
+
+So a module written from an ordinary compile loads partway through another
+compile and gives the same program. The declarations and macros are the
+small part the measurement predicted. Most of each copy is tables that cover
+the whole compile so far, which the filter does not touch: the source
+manager block (every file and macro expansion before the header; `util.c`
+includes `math.h` first, whose macros expand thousands of times), the
+source-location offsets, the input-file list, and the header-search table.
+Split three ways (`scratch/partexport/breakdown.py`): the header's part
+(declarations, macros, and the name and index tables over them), the tables
+describing the whole compile so far (source manager block, source-location
+offsets, input files, header-search table), and a fixed format overhead
+(mostly the bitstream's block-info block):
+
+| Header | Part | Whole compile | Fixed |
+|---|---|---|---|
+| `anet.h` | 20 KB | 72 KB | 15 KB |
+| `sds.h` | 63 KB | 69 KB | 15 KB |
+| `util.h` | 62 KB | 797 KB | 15 KB |
+| `zmalloc.h` | 69 KB | 87 KB | 15 KB |
+| `ae.h` | 164 KB | 22 KB | 16 KB |
+| `adlist.h` | 12 KB | 31 KB | 14 KB |
+| `dict.h` | 46 KB | 64 KB | 14 KB |
+
+`ae.h` is `ae.c`'s first `#include`, so it is the first to include
+`monotonic.h`, `<stdint.h>`, `<unistd.h>` and the glibc headers under them,
+and all of those are its part; for the same reason little came before it, so
+its whole-compile tables are small. The declarations-and-macros column of the
+first table leaves out the name table, which for `ae.h` is 56 KB. The writer already drops
+unused module maps from the same tables and shifts every location it writes
+to match (`computeNonAffectingInputFiles`); trimming them to the header's
+region is the next step. Also still to do: the included-file marks, which the
+writer saves for every file the compile read, must be limited to the region,
+or a `#pragma once` file the loading compile never read would be skipped.
+
+**Trimming, 2026-10-02** (user: "yes, if you can, without breaking
+semantics and correctness"). Almost all of the source-location table was
+macro-expansion entries: 2,636 of `anet.h`'s 2,811 entries (34 of 40 KB) and
+45,369 of `util.h`'s (582 of 595 KB); file entries were 2-3 KB. So a part now
+drops every macro-expansion entry outside the region and keeps every file
+entry, through the same mechanism that drops unused module maps
+(`computeNonAffectingInputFiles`): the dropped entries leave the table and
+every offset after them shifts down. A location inside a dropped expansion
+is written as the place that macro was used (`getAdjustedLocation`). That is
+the file, line and column a presumed location already reports for it, and
+so what debug information and a diagnostic's first line show; only the
+"expanded from macro" notes of a diagnostic about an outside declaration are
+lost. Such an expansion was used outside the region too, so that place is
+in a file, and files are kept. Diagnostic-pragma state recorded inside a
+dropped expansion is dropped with it.
+
+`-g` exposed one more difference, in file names, not locations: the writer
+saves every file name as an absolute path, so a compile that loaded the part
+named `ae.h` `/home/.../src/ae.h` in its debug information where a compile
+that read the file says `./ae.h`. A part now saves each name as the compile
+opened it. A consequence for the design: a part holding `./ae.h` is right
+only for a compile that also opens `ae.h` as `./ae.h`, so the hit check must
+compare the name each recorded lookup finds, not only the real path.
+
+Rerun, seven headers, `-O2 -S` and `-O2 -g -S`: all 14 compiles gave
+assembly identical to a plain compile's.
+
+| Header | Copy | Part | Whole-compile tables | Fixed | Export |
+|---|---|---|---|---|---|
+| `anet.h` | 62 KB | 20 KB | 27 KB (was 72) | 15 KB | 17 ms |
+| `sds.h` | 107 KB | 63 KB | 29 KB (was 69) | 15 KB | 28 ms |
+| `util.h` | 119 KB | 62 KB | 42 KB (was 797) | 15 KB | 62 ms |
+| `zmalloc.h` | 115 KB | 69 KB | 30 KB (was 87) | 15 KB | 32 ms |
+| `ae.h` | 203 KB | 164 KB | 22 KB (was 22) | 16 KB | 39 ms |
+| `adlist.h` | 37 KB | 12 KB | 12 KB (was 31) | 14 KB | 9 ms |
+| `dict.h` | 80 KB | 45 KB | 20 KB (was 64) | 14 KB | 22 ms |
+
+What remains in the whole-compile tables is one entry per file in the input
+list, the header-search table and the file entries, for every file read so
+far. Dropping the files the part never refers to needs the set of locations
+the part writes before the writer starts, which it computes as it goes; not
+attempted.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
@@ -1023,8 +1214,10 @@ A copy's metadata covers only its target part, so nothing checks that the
 context's declarations agree with the compile loading it. This is the
 duplicate-merging cost that layout D names and that stopped Google's
 pre-parsed headers (N3426: "merging symbols is technically difficult").
-Every failure so far stops the compile with an error; none produced different
-code. Not fixed; needs a decision (NEXT.md).
+These failures stop the compile with an error. Not fixed; needs a decision
+(NEXT.md). In a later run `object.c` also loaded a copy of `server.h` whose
+load reported the `fd_set` error, then read `server.h` as text, and every
+enumerator in it was a redefinition.
 
 Traced 2026-09-30 to a real pair. `sds.c` starts with `<stdio.h>` and
 `<stdlib.h>`; inside `stdlib.h` glibc reaches `bits/types/clock_t.h`, nine
@@ -1056,6 +1249,90 @@ Also found and fixed on the way:
 - An unguarded header served twice (stddef.h) loaded the same module twice,
   a fatal error. A copy already loaded in the compile is reused.
 - Two rejection paths gave no reason; they now say which list was damaged.
+
+### `__FILE__` is not the same in every compile (found 2026-10-01)
+
+2.7 says `__FILE__` names the current file, so a use inside a header is the
+same in every translation unit. Wrong: it is the path the compile used to
+open the file. redis `ae.c` includes `ae_epoll.c`, found beside `ae.c`, so a
+normal compile from `src/` spells it `./ae_epoll.c`. The job recorder replays
+an include found beside its includer by absolute path (the producer's wrapper
+sits in another directory), so the saved copy holds
+`/home/.../redis/src/ae_epoll.c`. With all six redis files on one daemon,
+`ae.c` compiled cleanly and its assembly differed from an uncached compile in
+exactly that string: a different program, not an error.
+
+Approved 2026-10-02 and built: `FileNameDependency`. The tracker records the
+text each `__FILE__` and `__FILE_NAME__` produced, and which file it was
+expanded in: the header itself, or the file a recorded `#include` found
+(next entry). A hit redoes those lookups, takes the name each found, and
+rejects the copy if any text differs. A `#line` in a file's own text names
+the file, so a use after one is not recorded. (The first version worked
+names out only for files found beside the header; the include-path fix
+replaced that with the recorded lookups the same day.)
+
+Two gaps remain. A file the compile already read under another name keeps
+the first name; the check asks the source manager for it, but a copy that is
+served does not register its files, so a later textual `#include` of the same
+file under a third name gets that name where a textual compile would have
+used the first. And nothing checks that this compile's include path finds the
+same files the copy's did; see the next entry. Both need a decision.
+
+The fix makes `ae.c` correct, not faster: the producer still opens
+`ae_epoll.c` by absolute path, so its copy never matches a compile that says
+`./ae_epoll.c`. Opening it by the compile's own name would need the
+producer's wrapper to sit in the includer's directory. Not proposed yet.
+
+
+### The include path is not checked (found 2026-10-02)
+
+The lookup key is the absolute path of the header the `#include` names, so a
+hit always loads a copy of that same file. The files that header includes
+are a different matter: the producer found them through its own `-I` list,
+and nothing compares that list, or what it found, with the compile loading
+the copy. The module reader checks only the module cache path
+(`PCHValidator::ReadHeaderSearchOptions`); it does not override
+`ReadHeaderSearchPaths`.
+
+qemu shows the case. qemu compiles some files once per target CPU, with
+`-I../target/arm` in one compile and `-I../target/i386` in another (20 source
+files of its build appear with more than one target directory).
+`include/system/kvm.h` says `#ifdef COMPILING_PER_TARGET` /
+`#include "cpu.h"`, which finds `target/arm/cpu.h` in one compile and
+`target/i386/cpu.h` in the other. A copy of `kvm.h` built in the arm compile
+holds arm's `cpu.h`, and its metadata says nothing about which `cpu.h`.
+
+The user (2026-10-02): if the PCM does not check this, the cache must, and
+what it needs belongs in the metadata on the server. Two ways, proposed:
+
+- **Store the include path** with each copy and require the loading compile's
+  to be identical. One comparison per hit, but it refuses every copy across
+  qemu's targets, even for the many headers that find the same files in
+  every target.
+- **Store each `#include`'s result** -- the text as written and the file
+  found -- for every `#include` in the header's region, entered or skipped,
+  and at a hit redo each lookup through the compile's own `HeaderSearch` and
+  compare. Exact: only an `#include` that finds a different file rejects.
+  About one cached lookup per `#include`; `stdio.h` enters 34 other files,
+  plus the `#include`s its guards skip.
+  `#include_next` needs the directory each file was found in, which the
+  lookup returns. Comparing the name found, not only the file, also settles
+  `__FILE__` for files the include path found.
+
+Recommended: the second. Approved 2026-10-02 and built:
+`IncludeDependency` records every `#include`, `#include_next`,
+`__has_include` and `__has_include_next` in the header's region, entered or
+skipped, with the file found (by real path) and the entry whose file holds
+the directive. At a hit, `redoLookups` (`CacheClient.cpp`) repeats each one
+through the compile's `HeaderSearch`, from the header's own name and search
+directory (the hook now passes the directory), and rejects on the first
+that finds a different file. `FileNameDependency` now names the entry that
+found its file instead of a path under the header's directory, so
+`__FILE__` is checked for every file, include path or not. With
+`-fms-compatibility`, a quoted lookup also searches beside every open file,
+which one includer cannot reproduce, so such a frame is poisoned. Test: a
+copy built with `-Ia` is served under `-Ia` and not under `-Ib`, where
+`<cfg.h>` finds another file.
 
 ## 4. Open
 

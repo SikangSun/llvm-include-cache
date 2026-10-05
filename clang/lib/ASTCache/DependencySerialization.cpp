@@ -68,6 +68,22 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
     W.str(E.Name);
     W.u8(E.Defined ? 1 : 0);
   }
+
+  W.u32(static_cast<uint32_t>(Deps.Includes.size()));
+  for (const IncludeDependency &D : Deps.Includes) {
+    W.u8(static_cast<uint8_t>(D.K));
+    W.u8(D.Angled ? 1 : 0);
+    W.str(D.Spelled);
+    W.u32(static_cast<uint32_t>(D.Includer));
+    W.str(D.Found);
+  }
+
+  W.u32(static_cast<uint32_t>(Deps.FileNames.size()));
+  for (const FileNameDependency &D : Deps.FileNames) {
+    W.u8(static_cast<uint8_t>(D.Which));
+    W.u32(static_cast<uint32_t>(D.File));
+    W.str(D.Text);
+  }
 }
 
 std::optional<HeaderDependencySet>
@@ -128,6 +144,40 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
       return std::nullopt;
     E.Defined = Raw != 0;
     Deps.MacroEffects.push_back(std::move(E));
+  }
+
+  // An entry names its includer, and a __FILE__ its file, by the index of
+  // an entry before it; anything else would send a hit's lookups to the
+  // wrong place.
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    IncludeDependency D;
+    uint8_t Raw = R.u8();
+    if (Raw > static_cast<uint8_t>(IncludeDependency::Kind::HasIncludeNext))
+      return std::nullopt;
+    D.K = static_cast<IncludeDependency::Kind>(Raw);
+    Raw = R.u8();
+    if (Raw > 1)
+      return std::nullopt;
+    D.Angled = Raw != 0;
+    D.Spelled = R.str().str();
+    D.Includer = static_cast<int32_t>(R.u32());
+    if (D.Includer < -1 || D.Includer >= static_cast<int32_t>(I))
+      return std::nullopt;
+    D.Found = R.str().str();
+    Deps.Includes.push_back(std::move(D));
+  }
+
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    FileNameDependency D;
+    uint8_t Raw = R.u8();
+    if (Raw > static_cast<uint8_t>(FileNameDependency::Macro::FileName))
+      return std::nullopt;
+    D.Which = static_cast<FileNameDependency::Macro>(Raw);
+    D.File = static_cast<int32_t>(R.u32());
+    if (D.File < -1 || D.File >= static_cast<int32_t>(Deps.Includes.size()))
+      return std::nullopt;
+    D.Text = R.str().str();
+    Deps.FileNames.push_back(std::move(D));
   }
 
   // Trailing bytes mean the writer and reader disagree about the shape even

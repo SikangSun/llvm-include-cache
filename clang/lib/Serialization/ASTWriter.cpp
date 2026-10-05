@@ -1951,8 +1951,14 @@ void ASTWriter::WriteInputFiles(SourceManager &SourceMgr) {
       SmallString<128> NameAsRequested = Entry.File.getNameAsRequested();
       SmallString<128> Name = Entry.File.getName();
 
-      PreparePathForOutput(NameAsRequested);
-      PreparePathForOutput(Name);
+      // A part keeps each name as the compile opened the file, "./ae.h"
+      // rather than the absolute path: a compile that loads the part names
+      // the file by it in __FILE__, diagnostics and debug information, as a
+      // compile that read the file would.
+      if (!PartDecls) {
+        PreparePathForOutput(NameAsRequested);
+        PreparePathForOutput(Name);
+      }
 
       if (Name == NameAsRequested)
         Name.clear();
@@ -2466,6 +2472,8 @@ void ASTWriter::WriteSourceManagerBlock(SourceManager &SourceMgr) {
       }
     } else {
       // The source location entry is a macro expansion.
+      if (!IsSLocAffecting[I])
+        continue;
       const SrcMgr::ExpansionInfo &Expansion = SLoc->getExpansion();
       SLocEntryOffsets.push_back(Offset);
       // Starting offset of this entry within this module, so skip the dummy.
@@ -2677,12 +2685,15 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
     // do not have sub-modules (although they might import other header units).
     // PCH files, conversely, retain the history of each macro's define/undef
     // and of leaf macros in sub modules.
-    if (IsModule && WritingModule->isHeaderUnit()) {
-      // This is for the main TU when it is a C++20 header unit.
+    if (IsModule && (WritingModule->isHeaderUnit() || PartMacros)) {
+      // This is for the main TU when it is a C++20 header unit, or for a part
+      // of an ordinary compile, whose macros have no module of their own.
       // We preserve the final state of defined macros, and we do not emit ones
       // that are undefined.
       if (!MD || shouldIgnoreMacro(MD, IsModule, PP) ||
           MD->getKind() == MacroDirective::MD_Undefine)
+        continue;
+      if (PartMacros && !PartMacros(MD))
         continue;
       AddSourceLocation(MD->getLocation(), Record);
       Record.push_back(MD->getKind());
@@ -3348,6 +3359,11 @@ void ASTWriter::WritePragmaDiagnosticMappings(const DiagnosticsEngine &Diag,
     if (!FileIDAndFile.first.isValid() ||
         !FileIDAndFile.second.HasLocalTransitions)
       continue;
+    // A macro expansion a part dropped, such as a _Pragma outside it.
+    if (PartKeepsExpansion &&
+        !PP->getSourceManager().isLoadedFileID(FileIDAndFile.first) &&
+        !IsSLocAffecting[FileIDAndFile.first.ID])
+      continue;
     ++NumLocations;
 
     AddFileID(FileIDAndFile.first, Record);
@@ -3899,6 +3915,18 @@ public:
 
   bool needDecls() const { return NeedDecls; }
 
+  /// The declarations to list for \p II: all of them, or, when writing part
+  /// of a translation unit, those the part wrote.
+  SmallVector<NamedDecl *, 16> declsFor(const IdentifierInfo *II) {
+    SmallVector<NamedDecl *, 16> Decls(IdResolver->decls(II));
+    if (Writer.isWritingPart())
+      llvm::erase_if(Decls, [&](NamedDecl *D) {
+        return !Writer.wasDeclEmitted(
+            getDeclForLocalLookup(PP.getLangOpts(), D));
+      });
+    return Decls;
+  }
+
   static hash_value_type ComputeHash(const IdentifierInfo* II) {
     return llvm::djbHash(II->getName());
   }
@@ -3932,8 +3960,7 @@ public:
         DataLen += 4; // MacroDirectives offset.
 
       if (NeedDecls && IdResolver)
-        DataLen += std::distance(IdResolver->begin(II), IdResolver->end()) *
-                   sizeof(DeclID);
+        DataLen += declsFor(II).size() * sizeof(DeclID);
     }
     return emitULEBKeyDataLength(KeyLen, DataLen, Out);
   }
@@ -3979,7 +4006,7 @@ public:
       // "stat"), but the ASTReader adds declarations to the end of the list
       // (so we need to see the struct "stat" before the function "stat").
       // Only emit declarations that aren't from a chained PCH, though.
-      SmallVector<NamedDecl *, 16> Decls(IdResolver->decls(II));
+      SmallVector<NamedDecl *, 16> Decls = declsFor(II);
       for (NamedDecl *D : llvm::reverse(Decls))
         LE.write<DeclID>((DeclID)Writer.getDeclID(
             getDeclForLocalLookup(PP.getLangOpts(), D)));
@@ -4688,7 +4715,8 @@ void ASTWriter::GenerateNameLookupTable(
     // Also in reduced BMI, we'd like to avoid writing unreachable
     // declarations in GMF, so we need to avoid writing declarations
     // that entirely external or unreachable.
-    if (GeneratingReducedBMI && isLookupResultNotInteresting(*this, Result))
+    if ((GeneratingReducedBMI || PartDecls) &&
+        isLookupResultNotInteresting(*this, Result))
       continue;
     // We also skip empty results. If any of the results could be external and
     // the currently available results are empty, then all of the results are
@@ -5528,47 +5556,58 @@ void ASTWriter::computeNonAffectingInputFiles() {
     FileID FID = FileID::get(I);
     assert(&SrcMgr.getSLocEntry(FID) == SLoc);
 
-    if (!SLoc->isFile())
-      continue;
-    const SrcMgr::FileInfo &File = SLoc->getFile();
-    const SrcMgr::ContentCache *Cache = &File.getContentCache();
-    if (!Cache->OrigEntry)
-      continue;
+    if (!SLoc->isFile()) {
+      // A part keeps only the macro expansions inside it; a location in any
+      // other is written as the place that macro was used
+      // (getAdjustedLocation).
+      if (!PartKeepsExpansion || PartKeepsExpansion(SLoc->getOffset()))
+        continue;
+    } else {
+      const SrcMgr::FileInfo &File = SLoc->getFile();
+      const SrcMgr::ContentCache *Cache = &File.getContentCache();
+      if (!Cache->OrigEntry)
+        continue;
 
-    // Don't prune anything other than module maps.
-    if (!isModuleMap(File.getFileCharacteristic()))
-      continue;
+      // Don't prune anything other than module maps.
+      if (!isModuleMap(File.getFileCharacteristic()))
+        continue;
 
-    // Don't prune module maps if all are guaranteed to be affecting.
-    if (!AffectingModuleMaps)
-      continue;
+      // Don't prune module maps if all are guaranteed to be affecting.
+      if (!AffectingModuleMaps)
+        continue;
 
-    // Don't prune module maps that are affecting.
-    if (AffectingModuleMaps->DefinitionFileIDs.contains(FID))
-      continue;
+      // Don't prune module maps that are affecting.
+      if (AffectingModuleMaps->DefinitionFileIDs.contains(FID))
+        continue;
+
+      IsSLocFileEntryAffecting[I] =
+          AffectingModuleMaps->DefinitionFiles.contains(*Cache->OrigEntry);
+    }
 
     IsSLocAffecting[I] = false;
-    IsSLocFileEntryAffecting[I] =
-        AffectingModuleMaps->DefinitionFiles.contains(*Cache->OrigEntry);
 
     FileIDAdjustment += 1;
     // Even empty files take up one element in the offset table.
     OffsetAdjustment += SrcMgr.getFileIDSize(FID) + 1;
 
-    // If the previous file was non-affecting as well, just extend its entry
+    // The first and last offset the entry covers.
+    SourceLocation RangeBegin = SourceLocation::getFileLoc(SLoc->getOffset());
+    SourceLocation RangeEnd = RangeBegin.getLocWithOffset(
+        static_cast<SourceLocation::IntTy>(SrcMgr.getFileIDSize(FID)));
+
+    // If the previous entry was non-affecting as well, just extend its range
     // with our information.
     if (!NonAffectingFileIDs.empty() &&
         NonAffectingFileIDs.back().ID == FID.ID - 1) {
       NonAffectingFileIDs.back() = FID;
-      NonAffectingRanges.back().setEnd(SrcMgr.getLocForEndOfFile(FID));
+      NonAffectingRanges.back().setEnd(RangeEnd);
       NonAffectingFileIDAdjustments.back() = FileIDAdjustment;
       NonAffectingOffsetAdjustments.back() = OffsetAdjustment;
       continue;
     }
 
     NonAffectingFileIDs.push_back(FID);
-    NonAffectingRanges.emplace_back(SrcMgr.getLocForStartOfFile(FID),
-                                    SrcMgr.getLocForEndOfFile(FID));
+    NonAffectingRanges.emplace_back(RangeBegin, RangeEnd);
     NonAffectingFileIDAdjustments.push_back(FileIDAdjustment);
     NonAffectingOffsetAdjustments.push_back(OffsetAdjustment);
   }
@@ -5649,6 +5688,9 @@ void ASTWriter::PrepareWritingSpecialDecls(Sema &SemaRef) {
     if (D->isFromASTFile())
       continue;
 
+    if (PartDecls && !PartDecls(D))
+      continue;
+
     if (GeneratingReducedBMI) {
       if (D->isFromExplicitGlobalModule())
         continue;
@@ -5675,7 +5717,9 @@ void ASTWriter::PrepareWritingSpecialDecls(Sema &SemaRef) {
     GetDeclRef(D);
   }
 
-  if (GeneratingReducedBMI)
+  // A part, like a reduced BMI, holds what its declarations reach, not every
+  // declaration Sema keeps a list of.
+  if (GeneratingReducedBMI || PartDecls)
     return;
 
   // Writing all of the tentative definitions in this file, in
@@ -5989,9 +6033,13 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
   //
   // We do this before emitting any Decl and Types to make sure the
   // Identifier ID is stable.
+  //
+  // A part lists only the names its declarations and macros use, which get
+  // their IDs as those are written.
   SmallVector<const IdentifierInfo *, 128> IIs;
   for (const auto &ID : PP->getIdentifierTable())
-    if (IsInterestingNonMacroIdentifier(ID.second, *this))
+    if (IsInterestingNonMacroIdentifier(ID.second, *this) &&
+        (!PartDecls || ID.second->isPoisoned()))
       IIs.push_back(ID.second);
   // Sort the identifiers lexicographically before getting the references so
   // that their order is stable.
@@ -6666,6 +6714,17 @@ unsigned ASTWriter::getAdjustedNumCreatedFIDs(FileID FID) const {
 SourceLocation ASTWriter::getAdjustedLocation(SourceLocation Loc) const {
   if (Loc.isInvalid())
     return Loc;
+  // A part drops the macro expansions outside it. A location in one becomes
+  // the place the macro was used, which is the file, line and column a
+  // presumed location -- and so debug information -- reports for it anyway.
+  // Such an expansion was used outside the part too, so that place is in a
+  // file, and files are kept.
+  if (PartKeepsExpansion && Loc.isMacroID()) {
+    const SourceManager &SM = PP->getSourceManager();
+    if (!SM.isLoadedSourceLocation(Loc) &&
+        !IsSLocAffecting[SM.getFileID(Loc).ID])
+      Loc = SM.getExpansionLoc(Loc);
+  }
   return Loc.getLocWithOffset(-getAdjustment(Loc.getOffset()));
 }
 
@@ -7005,7 +7064,7 @@ bool ASTWriter::wasDeclEmitted(const Decl *D) const {
 
   bool Emitted = DeclIDs.contains(D);
   assert((Emitted || (!D->getOwningModule() && isWritingStdCXXNamedModules()) ||
-          GeneratingReducedBMI) &&
+          GeneratingReducedBMI || PartDecls) &&
          "The declaration within modules can only be omitted in reduced BMI.");
   return Emitted;
 }

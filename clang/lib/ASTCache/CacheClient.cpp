@@ -35,6 +35,10 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
     return "a suppressed #include would not be suppressed here";
   case MismatchReason::PragmaState:
     return "pragma state at the #include differs";
+  case MismatchReason::FileName:
+    return "__FILE__ would name a file differently";
+  case MismatchReason::Include:
+    return "an #include inside the header finds a different file";
   }
   return "unknown";
 }
@@ -61,11 +65,83 @@ bool resolvesToType(Sema &S, const IdentifierInfo &Name,
   return false;
 }
 
+/// \p File as this compile names it once entered. A file the compile has
+/// read before keeps the name it was first read by, whatever this #include
+/// calls it: the source manager keeps one record per file. That name is what
+/// __FILE__ gives, and the directory a quoted #include inside it searches.
+FileEntryRef refOnEntry(const SourceManager &SM, FileEntryRef File) {
+  if (SM.hasFileInfo(&File.getFileEntry()))
+    for (auto It = SM.fileinfo_begin(), E = SM.fileinfo_end(); It != E; ++It)
+      if (&It->first.getFileEntry() == &File.getFileEntry() &&
+          It->second->OrigEntry)
+        return *It->second->OrigEntry;
+  return File;
+}
+
+/// Redoes \p Deps' #include and __has_include lookups as this compile would
+/// make them from \p Site, in order, the way Preprocessor::LookupFile makes
+/// them: a quoted lookup also searches beside the file holding the
+/// directive, and a _next lookup starts after the directory that file was
+/// found in. Fills \p Found with what each found. Returns the index of the
+/// first entry that found a different file, or -1.
+int redoLookups(
+    const HeaderDependencySet &Deps, Preprocessor &PP, const IncludeSite &Site,
+    std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
+        &Found) {
+  HeaderSearch &HS = PP.getHeaderSearchInfo();
+  FileManager &FM = PP.getFileManager();
+  SourceManager &SM = PP.getSourceManager();
+  for (size_t I = 0; I != Deps.Includes.size(); ++I) {
+    const IncludeDependency &D = Deps.Includes[I];
+    OptionalFileEntryRef Includer;
+    ConstSearchDirIterator IncluderDir = nullptr;
+    if (D.Includer < 0) {
+      Includer = Site.File;
+      IncluderDir = Site.Dir;
+    } else {
+      Includer = Found[D.Includer].first;
+      IncluderDir = Found[D.Includer].second;
+    }
+    // __has_include found nothing for the file holding this directive, so
+    // the directive cannot be in a file this compile reaches the same way.
+    if (!Includer)
+      return static_cast<int>(I);
+    FileEntryRef Holder = refOnEntry(SM, *Includer);
+
+    bool Next = D.K == IncludeDependency::Kind::IncludeNext ||
+                D.K == IncludeDependency::Kind::HasIncludeNext;
+    // A _next lookup in a file found without searching starts from the top,
+    // as an ordinary lookup does (Preprocessor::getIncludeNextStart).
+    ConstSearchDirIterator FromDir = nullptr;
+    if (Next && IncluderDir) {
+      FromDir = IncluderDir;
+      ++FromDir;
+    }
+    SmallVector<std::pair<OptionalFileEntryRef, DirectoryEntryRef>, 1>
+        Includers;
+    if (!FromDir)
+      Includers.push_back({Holder, Holder.getDir()});
+
+    ConstSearchDirIterator CurDir = nullptr;
+    OptionalFileEntryRef File = HS.LookupFile(
+        D.Spelled, Site.Loc, D.Angled, FromDir, &CurDir, Includers,
+        /*SearchPath=*/nullptr, /*RelativePath=*/nullptr,
+        /*RequestingModule=*/nullptr, /*SuggestedModule=*/nullptr,
+        /*IsMapped=*/nullptr, /*IsFrameworkFound=*/nullptr);
+    std::string Path = File ? FM.getCanonicalName(*File).str() : "";
+    if (Path != D.Found)
+      return static_cast<int>(I);
+    Found.push_back({File, CurDir});
+  }
+  return -1;
+}
+
 } // namespace
 
 MismatchReason clang::ast_cache::matchesLiveState(
     const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
-    llvm::StringRef NotAMacroNames, std::string *Detail) {
+    llvm::StringRef NotAMacroNames, std::string *Detail,
+    const IncludeSite *Site) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -176,6 +252,43 @@ MismatchReason clang::ast_cache::matchesLiveState(
   if (capturePragmaState(*S) != Deps.Entry)
     return Because(MismatchReason::PragmaState, "#pragma pack or float state");
 
+  // The files the header's own #includes find depend on this compile's
+  // include path, which nothing else compares. The stored parse also holds
+  // the text each __FILE__ produced, which is the name the producer's compile
+  // opened the file by.
+  if (!Deps.Includes.empty() || !Deps.FileNames.empty()) {
+    if (!Site)
+      return Because(MismatchReason::Include,
+                     "no #include site to redo the header's lookups from");
+    std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>> Found;
+    int Bad = redoLookups(Deps, PP, *Site, Found);
+    if (Bad >= 0) {
+      const IncludeDependency &D = Deps.Includes[Bad];
+      std::string Written =
+          D.Angled ? "<" + D.Spelled + ">" : "\"" + D.Spelled + "\"";
+      return Because(MismatchReason::Include,
+                     Written + " found " +
+                         (D.Found.empty() ? std::string("nothing") : D.Found) +
+                         ", finds something else");
+    }
+
+    SourceManager &SM = PP.getSourceManager();
+    for (const FileNameDependency &D : Deps.FileNames) {
+      OptionalFileEntryRef File =
+          D.File < 0 ? OptionalFileEntryRef(Site->File) : Found[D.File].first;
+      if (!File)
+        return Because(MismatchReason::FileName,
+                       "__FILE__ is in a file this compile does not find");
+      std::string Live =
+          fileMacroText(refOnEntry(SM, *File).getName(),
+                        D.Which == FileNameDependency::Macro::FileName,
+                        PP.getLangOpts(), PP.getTargetInfo());
+      if (Live != D.Text)
+        return Because(MismatchReason::FileName,
+                       "__FILE__ was \"" + D.Text + "\", is \"" + Live + "\"");
+    }
+  }
+
   return MismatchReason::None;
 }
 
@@ -221,7 +334,8 @@ llvm::StringRef CacheClient::lookup(
     llvm::StringRef Filename, Preprocessor &PP, Sema *S,
     HeaderDependencySet *MatchedDeps,
     llvm::function_ref<bool(llvm::StringRef Bytes, llvm::StringRef ModuleName)>
-        Use) {
+        Use,
+    const IncludeSite *Site) {
   ++Counters.Lookups;
 
   llvm::SmallVector<char, 0> Msg;
@@ -251,8 +365,8 @@ llvm::StringRef CacheClient::lookup(
       }
     }
     std::string Detail;
-    MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names,
-                                          LogRejections ? &Detail : nullptr);
+    MismatchReason Why = matchesLiveState(
+        E.Deps, PP, S, Names, LogRejections ? &Detail : nullptr, Site);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;
       ++Counters.RejectedFor[static_cast<unsigned>(Why)];

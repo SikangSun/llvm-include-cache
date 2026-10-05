@@ -451,4 +451,75 @@ TEST_F(ASTCacheDependencyTrackerTest,
   EXPECT_TRUE(D->Inclusion.empty());
 }
 
+TEST_F(ASTCacheDependencyTrackerTest, AFileMacroInTheHeaderRecordsItsText) {
+  addFile("/h.h", "const char *where = __FILE__;\n"
+                  "const char *base = __FILE_NAME__;\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "/h.h");
+  ASSERT_NE(D, nullptr);
+  std::vector<FileNameDependency> Want = {
+      {FileNameDependency::Macro::File, -1, "/h.h"},
+      {FileNameDependency::Macro::FileName, -1, "h.h"}};
+  EXPECT_EQ(D->FileNames, Want);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       AFileMacroNamesTheLookupThatFoundItsFile) {
+  // outer.h finds sub/inner.h beside itself; sub/inner.h asks for "top.h",
+  // which only the search path ("/") finds. Each __FILE__ points at the
+  // recorded lookup that found its file, which a hit redoes.
+  addFile("/outer.h", "#include \"sub/inner.h\"\n");
+  addFile("/sub/inner.h", "#include \"top.h\"\n"
+                          "const char *inner = __FILE__;\n");
+  addFile("/top.h", "const char *top = __FILE__;\n");
+  auto Recs = run("#include \"outer.h\"\n");
+  const HeaderDependencySet *Outer = find(Recs, "/outer.h");
+  ASSERT_NE(Outer, nullptr);
+  ASSERT_EQ(Outer->Includes.size(), 2u);
+  EXPECT_EQ(Outer->Includes[0].Spelled, "sub/inner.h");
+  EXPECT_EQ(Outer->Includes[0].Includer, -1);
+  EXPECT_EQ(Outer->Includes[1].Spelled, "top.h");
+  EXPECT_EQ(Outer->Includes[1].Includer, 0);
+  std::vector<FileNameDependency> Want = {
+      {FileNameDependency::Macro::File, 1, "/top.h"},
+      {FileNameDependency::Macro::File, 0, "/sub/inner.h"}};
+  EXPECT_EQ(Outer->FileNames, Want);
+
+  // sub/inner.h's own metadata counts from sub/inner.h.
+  const HeaderDependencySet *Inner = find(Recs, "/sub/inner.h");
+  ASSERT_NE(Inner, nullptr);
+  ASSERT_EQ(Inner->Includes.size(), 1u);
+  EXPECT_EQ(Inner->Includes[0].Includer, -1);
+  Want = {{FileNameDependency::Macro::File, 0, "/top.h"},
+          {FileNameDependency::Macro::File, -1, "/sub/inner.h"}};
+  EXPECT_EQ(Inner->FileNames, Want);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, EveryLookupRecordsWhatItFound) {
+  // An #include that a guard skips and a __has_include that finds nothing
+  // still depend on the include path.
+  addFile("/a.h", "#ifndef A_H\n#define A_H\n#endif\n");
+  addFile("/h.h", "#include \"a.h\"\n#include \"a.h\"\n"
+                  "#if __has_include(\"missing.h\")\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "/h.h");
+  ASSERT_NE(D, nullptr);
+  ASSERT_EQ(D->Includes.size(), 3u);
+  EXPECT_EQ(D->Includes[0].K, IncludeDependency::Kind::Include);
+  EXPECT_FALSE(D->Includes[0].Angled);
+  EXPECT_EQ(D->Includes[0].Found, "/a.h");
+  EXPECT_EQ(D->Includes[1].Found, "/a.h") << "the guard skipped this one";
+  EXPECT_EQ(D->Includes[2].K, IncludeDependency::Kind::HasInclude);
+  EXPECT_EQ(D->Includes[2].Spelled, "missing.h");
+  EXPECT_EQ(D->Includes[2].Found, "");
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, ALineDirectiveNamesTheFileItself) {
+  addFile("/h.h", "#line 1 \"fixed.h\"\nconst char *where = __FILE__;\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "/h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_TRUE(D->FileNames.empty());
+}
+
 } // namespace

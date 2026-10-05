@@ -164,6 +164,7 @@ protected:
                                            MainPath};
     if (!WorkingDir.empty())
       ArgStrings.insert(ArgStrings.begin() + 1, {"-working-directory", WorkingDir});
+    ArgStrings.insert(ArgStrings.end() - 1, ExtraArgs.begin(), ExtraArgs.end());
     std::vector<const char *> Args;
     for (const std::string &A : ArgStrings)
       Args.push_back(A.c_str());
@@ -209,6 +210,8 @@ protected:
   }
 
   std::string Dir, SocketPath, RegionPath;
+  /// Flags added to every compile, before the file.
+  std::vector<std::string> ExtraArgs;
   /// When set, compiles record their jobs in this directory.
   std::string RecordJobsTo;
   std::unique_ptr<CacheDaemon> Daemon;
@@ -328,6 +331,93 @@ TEST_F(HitTest, AHeaderTheCompileNamesRelativelyIsStillServed) {
   for (const std::string &E : Entered)
     ReadTypes |= llvm::StringRef(E).ends_with("types.h");
   EXPECT_TRUE(ReadTypes) << "types.h is the compile's own and must be read";
+}
+
+TEST_F(HitTest, AHeaderUsingFileIsServedOnlyUnderTheNameItWasBuiltBy) {
+  // __FILE__ is the name the compile opened the file by. The producer opens
+  // where.h by its absolute path, so the copy holds that path; a compile run
+  // from the directory names it "./where.h" and must read the file.
+  std::string Where =
+      write("where.h", "#ifndef WHERE_H\n#define WHERE_H\n"
+                       "static const char *where_file = __FILE__;\n#endif\n");
+  store(Where);
+
+  std::string Abs =
+      write("abs.c", "#include \"" + Where +
+                         "\"\n"
+                         "const char *f(void) { return where_file; }\n");
+  EXPECT_FALSE(reads(Abs, Where)) << "the same name should have been served";
+
+  write("rel.c", "#include \"where.h\"\n"
+                 "const char *f(void) { return where_file; }\n");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile("rel.c", Entered, /*WorkingDir=*/Dir));
+  bool Read = false;
+  for (const std::string &E : Entered)
+    Read |= llvm::StringRef(E).ends_with("where.h");
+  EXPECT_TRUE(Read) << "a copy holding another name for where.h was served";
+}
+
+TEST_F(HitTest, AFileBesideTheHeaderIsCheckedUnderTheNameTheHeaderGivesIt) {
+  // outer.h finds inner.h beside itself, and inner.h uses __FILE__. Its
+  // name follows from outer.h's: "<outer.h's directory>/inner.h".
+  llvm::SmallString<256> Sub(Dir);
+  llvm::sys::path::append(Sub, "sub");
+  ASSERT_FALSE(llvm::sys::fs::create_directory(Sub));
+  std::string Outer = write("sub/outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                           "#include \"inner.h\"\n#endif\n");
+  std::string Inner =
+      write("sub/inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                           "static const char *inner_file = __FILE__;\n"
+                           "#endif\n");
+  store(Outer);
+
+  std::string Abs =
+      write("abs.c", "#include \"" + Outer +
+                         "\"\n"
+                         "const char *f(void) { return inner_file; }\n");
+  EXPECT_FALSE(reads(Abs, Outer)) << "the same name should have been served";
+
+  write("rel.c", "#include \"sub/outer.h\"\n"
+                 "const char *f(void) { return inner_file; }\n");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile("rel.c", Entered, /*WorkingDir=*/Dir));
+  bool Read = false;
+  for (const std::string &E : Entered)
+    Read |= llvm::StringRef(E).ends_with("inner.h");
+  EXPECT_TRUE(Read) << "a copy holding another name for inner.h was served";
+}
+
+TEST_F(HitTest, AHeaderIsServedOnlyWhereItsIncludesFindTheSameFiles) {
+  // h.h includes <cfg.h>, and the include path decides which cfg.h: qemu's
+  // kvm.h and "cpu.h" under -I../target/arm or -I../target/i386. Nothing in
+  // cfg.h is outside h.h's region, so no other dependency tells them apart.
+  for (const char *D : {"a", "b"}) {
+    llvm::SmallString<256> Sub(Dir);
+    llvm::sys::path::append(Sub, D);
+    ASSERT_FALSE(llvm::sys::fs::create_directory(Sub));
+  }
+  write("a/cfg.h", "typedef int cfg_t;\n");
+  write("b/cfg.h", "typedef long cfg_t;\n");
+  std::string H = write("h.h", "#ifndef H_H\n#define H_H\n#include <cfg.h>\n"
+                               "cfg_t get(void);\n#endif\n");
+  ProduceRequest Req;
+  Req.Header.Path = H;
+  Req.Args = {"-std=c17", "-I" + Dir + "/a"};
+  ProduceResult P = produceHeader(Req);
+  ASSERT_TRUE(P.produced()) << P.Reason;
+  auto Writer = client();
+  ASSERT_TRUE(Writer);
+  ASSERT_TRUE(Writer->push(P.Push));
+
+  std::string Main = write(
+      "main.c", "#include \"" + H + "\"\nint f(void) { return (int)get(); }\n");
+  ExtraArgs = {"-I" + Dir + "/a"};
+  EXPECT_FALSE(reads(Main, H))
+      << "the same include path should have been served";
+  ExtraArgs = {"-I" + Dir + "/b"};
+  EXPECT_TRUE(reads(Main, H)) << "a copy holding a/cfg.h was served where "
+                                 "<cfg.h> finds b/cfg.h";
 }
 
 TEST_F(HitTest, AHeaderIsNotServedWhenTheRecordDoesNotMatch) {

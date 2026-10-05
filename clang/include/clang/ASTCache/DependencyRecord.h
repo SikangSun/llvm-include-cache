@@ -102,6 +102,64 @@ struct InclusionDependency {
   Reason Why = Reason::PragmaOnce;
 };
 
+/// An #include, #include_next, __has_include or __has_include_next inside
+/// the header's region, and the file it found. The file depends on the
+/// compile's include path: qemu compiles some files once per target CPU, and
+/// include/system/kvm.h's `#include "cpu.h"` finds target/arm/cpu.h under
+/// -I../target/arm and target/i386/cpu.h under -I../target/i386. A hit redoes
+/// each lookup in the loading compile and requires the same file.
+///
+/// Recorded in the order the directives ran, so an entry's includer is always
+/// an earlier entry, or the header itself.
+struct IncludeDependency {
+  enum class Kind : uint8_t {
+    Include,
+    IncludeNext,
+    HasInclude,
+    HasIncludeNext
+  };
+  Kind K = Kind::Include;
+  bool Angled = false;
+  /// The name between the quotes or angle brackets, after macro expansion.
+  std::string Spelled;
+  /// Where the directive is written: -1 for the header itself, otherwise the
+  /// index of the entry that found the file holding it.
+  int32_t Includer = -1;
+  /// The real path of the file found. Empty when __has_include found nothing.
+  std::string Found;
+
+  friend bool operator==(const IncludeDependency &A,
+                         const IncludeDependency &B) {
+    return A.K == B.K && A.Angled == B.Angled && A.Spelled == B.Spelled &&
+           A.Includer == B.Includer && A.Found == B.Found;
+  }
+};
+
+/// A __FILE__ or __FILE_NAME__ expanded in the header or in a file the header
+/// reached, and the text it produced. __FILE__ names the file by the path the
+/// compile opened it with, not by the file itself: redis's ae.c includes
+/// ae_epoll.c, found beside it, and a compile run from src/ calls it
+/// "./ae_epoll.c" while one that opened it by absolute path calls it
+/// "/.../src/ae_epoll.c". The text is in the parsed header, so a hit requires
+/// this compile to produce the same text. A #line in the file's own text
+/// names the file the same way in every compile, so a use after one is not
+/// recorded.
+struct FileNameDependency {
+  enum class Macro : uint8_t { File, FileName };
+  Macro Which = Macro::File;
+  /// The file the macro was expanded in: -1 for the header itself, otherwise
+  /// the index of the IncludeDependency that found it.
+  int32_t File = -1;
+  /// What the macro produced, without its quotes: after -fmacro-prefix-map,
+  /// and for __FILE_NAME__ only the last path component.
+  std::string Text;
+
+  friend bool operator==(const FileNameDependency &A,
+                         const FileNameDependency &B) {
+    return A.Which == B.Which && A.File == B.File && A.Text == B.Text;
+  }
+};
+
 /// The pragma state that was active at a single point, reduced to the values
 /// that actually reach a Decl. Only the small-value pragmas are represented:
 /// a header reached under one of the others (#pragma clang attribute push,
@@ -142,6 +200,8 @@ struct HeaderDependencySet {
   std::vector<SyntacticDependency> Syntactic;
   std::vector<SymbolDependency> Symbol;
   std::vector<InclusionDependency> Inclusion;
+  std::vector<IncludeDependency> Includes;
+  std::vector<FileNameDependency> FileNames;
 
   /// Pragma state where the header was reached. This is an *input* to the
   /// header's compilation -- "#pragma pack(1)" before an #include changes the

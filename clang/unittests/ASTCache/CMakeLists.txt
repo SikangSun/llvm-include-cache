@@ -5,6 +5,7 @@ add_clang_unittest(ASTCacheTests
   EndToEndTest.cpp
   HitTest.cpp
   LoadTest.cpp
+  PartExportTest.cpp
   ProducerTest.cpp
   SymbolDependencyTest.cpp
 

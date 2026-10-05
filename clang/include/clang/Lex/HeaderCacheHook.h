@@ -21,6 +21,7 @@
 
 #include "clang/Basic/FileEntry.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Lex/HeaderSearch.h"
 
 namespace clang {
 
@@ -31,13 +32,16 @@ public:
   virtual ~HeaderCacheHook();
 
   /// Called where the preprocessor is about to enter \p File, with
-  /// \p IncludeLoc the location of the #include's filename token.
+  /// \p IncludeLoc the location of the #include's filename token and
+  /// \p CurDir the search directory \p File was found in (null when found
+  /// without searching), from which an #include_next inside it would continue.
   ///
   /// Returning a module makes that module's declarations stand in for the
   /// file's contents, and the file is never entered. Returning null -- the
   /// ordinary answer -- enters the file as usual, so a cache that holds
   /// nothing suitable costs only the time it took to decide that.
-  virtual Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc) = 0;
+  virtual Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc,
+                           ConstSearchDirIterator CurDir) = 0;
 };
 
 } // namespace clang

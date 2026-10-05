@@ -14,12 +14,14 @@
 // when checking whether a stored entry still applies. If those two ever
 // drifted, every ExpandsTo dependency would compare unequal and nothing would
 // ever hit -- a silent failure that looks like the cache simply not helping.
+// What __FILE__ expands to is here for the same reason.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_ASTCACHE_MACROTOKENS_H
 #define LLVM_CLANG_ASTCACHE_MACROTOKENS_H
 
+#include "llvm/ADT/StringRef.h"
 #include <optional>
 #include <string>
 
@@ -27,6 +29,7 @@ namespace clang {
 class LangOptions;
 class MacroInfo;
 class SourceManager;
+class TargetInfo;
 
 namespace ast_cache {
 
@@ -44,6 +47,14 @@ namespace ast_cache {
 std::optional<std::string> serializeMacroTokens(const MacroInfo &MI,
                                                 const SourceManager &SM,
                                                 const LangOptions &LangOpts);
+
+/// What __FILE__ expands to, without its quotes, in a file the compile names
+/// \p Name; with \p LastComponentOnly, what __FILE_NAME__ expands to. The same
+/// steps as Preprocessor::ExpandBuiltinMacro, here for the same reason as
+/// serializeMacroTokens: the tracker records this text and the client
+/// computes it again for the live compile, and the two must not drift.
+std::string fileMacroText(llvm::StringRef Name, bool LastComponentOnly,
+                          const LangOptions &LangOpts, const TargetInfo &TI);
 
 } // namespace ast_cache
 } // namespace clang

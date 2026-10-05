@@ -2680,7 +2680,8 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
     // the compile exactly as an imported header's would, through the arm
     // above.
     if (HeaderCacheHook *Hook = getHeaderCacheHook()) {
-      if (Module *Cached = Hook->tryServe(*File, FilenameTok.getLocation())) {
+      if (Module *Cached =
+              Hook->tryServe(*File, FilenameTok.getLocation(), CurDir)) {
         makeModuleVisible(Cached, EndLoc);
         return {ImportAction::ModuleImport, Cached};
       }

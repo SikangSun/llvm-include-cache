@@ -24,15 +24,18 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTReader.h"
+#include "clang/Serialization/ASTWriter.h"
 #include "clang/Serialization/ModuleFile.h"
 #include "clang/Serialization/ModuleManager.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 #include <chrono>
 #include <cstdlib>
 #include <iterator>
@@ -305,7 +308,8 @@ public:
       OS << "  served " << Line << "\n";
   }
 
-  Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc) override {
+  Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc,
+                   ConstSearchDirIterator CurDir) override {
     Preprocessor &PP = CI.getPreprocessor();
 
     // Served wherever the #include is written, in the .c file or in another
@@ -343,13 +347,16 @@ public:
     uint32_t Counter = PP.getCounterValue();
     HeaderDependencySet Deps;
     Module *Target = nullptr;
-    Client->lookup(Path, PP, &CI.getSema(), &Deps,
-                   [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
-                     Target = load(Bytes, ModuleName);
-                     if (Target && LogServed)
-                       Served.push_back(Path + " from " + ModuleName.str());
-                     return Target != nullptr;
-                   });
+    IncludeSite Site{File, CurDir, IncludeLoc};
+    Client->lookup(
+        Path, PP, &CI.getSema(), &Deps,
+        [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
+          Target = load(Bytes, ModuleName);
+          if (Target && LogServed)
+            Served.push_back(Path + " from " + ModuleName.str());
+          return Target != nullptr;
+        },
+        &Site);
     PP.setCounterValue(Counter);
     if (!Target)
       return nullptr;
@@ -602,7 +609,182 @@ void clang::ast_cache::installHeaderCacheHook(
   CI.getPreprocessor().setHeaderCacheHook(std::move(Server));
 }
 
+//===----------------------------------------------------------------------===//
+// Experiment for DECISIONS.md 2.17, not yet part of the design: export one
+// header's own part from an ordinary compile, and serve that header from the
+// export in a later compile.
+//
+//   CLANG_HEADER_CACHE_EXPORT=<header>=<out.pcm>
+//   CLANG_HEADER_CACHE_LOAD=<header>=<in.pcm>
+//
+// <header> is an absolute path. The export is written when the header's file
+// ends. The parser reads one token ahead, so that is only safe for a header
+// whose last declaration is finished before its file is: prototypes and
+// macros, not a function body last.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+std::pair<std::string, std::string> experimentSetting(const char *Var) {
+  const char *V = std::getenv(Var);
+  if (!V)
+    return {};
+  auto [Header, File] = llvm::StringRef(V).split('=');
+  return {Header.str(), File.str()};
+}
+
+class ExportExperiment : public PPCallbacks {
+public:
+  ExportExperiment(CompilerInstance &CI, std::string Header, std::string Out)
+      : CI(CI), Header(std::move(Header)), Out(std::move(Out)) {}
+
+  void FileChanged(SourceLocation Loc, FileChangeReason Reason,
+                   SrcMgr::CharacteristicKind, FileID PrevFID) override {
+    SourceManager &SM = CI.getSourceManager();
+    if (Reason == EnterFile) {
+      FileID FID = SM.getFileID(Loc);
+      OptionalFileEntryRef F = SM.getFileEntryRefForID(FID);
+      if (Done || Open.isValid() || !F ||
+          absolutePath(CI.getFileManager(), F->getName()) != Header)
+        return;
+      Open = FID;
+      Begin = SM.getSLocEntry(FID).getOffset();
+      return;
+    }
+    if (Reason != ExitFile || !Open.isValid() || PrevFID != Open)
+      return;
+    // Every location made while the header was open, in it or in a file
+    // first entered under it, has an offset in [Begin, End).
+    End = SM.getNextLocalOffset();
+    Open = FileID();
+    Done = true;
+    write();
+  }
+
+private:
+  bool inPart(SourceLocation L) const {
+    if (L.isInvalid())
+      return false;
+    L = CI.getSourceManager().getExpansionLoc(L);
+    SourceLocation::UIntTy Raw = L.getRawEncoding();
+    return Begin <= Raw && Raw < End;
+  }
+
+  void write() {
+    if (!CI.hasSema()) {
+      llvm::errs() << "header cache export: no Sema\n";
+      return;
+    }
+    Preprocessor &PP = CI.getPreprocessor();
+    ModuleMap &MM = PP.getHeaderSearchInfo().getModuleMap();
+    std::string Name = "__hcx_" + llvm::utohexstr(llvm::xxh3_64bits(Header));
+    Module *M = MM.createModule(Name, /*Parent=*/nullptr,
+                                /*IsFramework=*/false, /*IsExplicit=*/false);
+    M->PresumedModuleMapFile = "<header-cache-export>";
+
+    SmallVector<char, 0> Buffer;
+    llvm::BitstreamWriter Stream(Buffer);
+    ASTWriter Writer(Stream, Buffer, CI.getModuleCache(), CI.getCodeGenOpts(),
+                     {}, /*IncludeTimestamps=*/false);
+    Writer.setPartFilter(
+        [this](const Decl *D) { return inPart(D->getLocation()); },
+        [this](const MacroDirective *MD) { return inPart(MD->getLocation()); },
+        [this](SourceLocation::UIntTy Offset) {
+          return Begin <= Offset && Offset < End;
+        });
+    auto Start = std::chrono::steady_clock::now();
+    Writer.WriteAST(&CI.getSema(), Out, M, /*isysroot=*/"");
+    auto Micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - Start)
+                      .count();
+
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(Out, EC);
+    if (EC) {
+      llvm::errs() << "header cache export: " << Out << ": " << EC.message()
+                   << "\n";
+      return;
+    }
+    OS.write(Buffer.data(), Buffer.size());
+    llvm::errs() << "header cache export: " << Header << " -> " << Out << ", "
+                 << Buffer.size() << " bytes in " << Micros << " us, module "
+                 << Name << "\n";
+  }
+
+  CompilerInstance &CI;
+  std::string Header, Out;
+  FileID Open;
+  SourceLocation::UIntTy Begin = 0, End = 0;
+  bool Done = false;
+};
+
+class LoadExperiment : public HeaderCacheHook {
+public:
+  LoadExperiment(CompilerInstance &CI, std::string Header, std::string In)
+      : CI(CI), Header(std::move(Header)), In(std::move(In)) {}
+
+  Module *tryServe(FileEntryRef File, SourceLocation,
+                   ConstSearchDirIterator) override {
+    if (Served || absolutePath(CI.getFileManager(), File.getName()) != Header)
+      return nullptr;
+    Served = true;
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buf =
+        llvm::MemoryBuffer::getFile(In);
+    if (!Buf) {
+      llvm::errs() << "header cache load: " << In << ": "
+                   << Buf.getError().message() << "\n";
+      return nullptr;
+    }
+    if (!CI.getASTReader())
+      CI.createASTReader();
+    ASTReader &Reader = *CI.getASTReader();
+    std::string Name = "/__hcx_memory/in.pcm";
+    Reader.getModuleManager().addInMemoryBuffer(Name, std::move(*Buf));
+
+    Preprocessor &PP = CI.getPreprocessor();
+    uint32_t Counter = PP.getCounterValue();
+    serialization::ModuleFile *MF = nullptr;
+    ASTReader::ASTReadResult R =
+        Reader.ReadAST(Name, serialization::MK_ExplicitModule, SourceLocation(),
+                       ASTReader::ARR_None, &MF);
+    PP.setCounterValue(Counter);
+    if (R != ASTReader::Success || !MF) {
+      llvm::errs() << "header cache load: the reader refused " << In << "\n";
+      return nullptr;
+    }
+    ModuleMap &MM = PP.getHeaderSearchInfo().getModuleMap();
+    Module *Top = MM.findModule(MF->ModuleName);
+    if (!Top) {
+      llvm::errs() << "header cache load: no module " << MF->ModuleName << "\n";
+      return nullptr;
+    }
+    MM.cacheModuleLoad(*PP.getIdentifierInfo(MF->ModuleName), Top);
+    llvm::errs() << "header cache load: served " << Header << " from " << In
+                 << "\n";
+    return Top;
+  }
+
+private:
+  CompilerInstance &CI;
+  std::string Header, In;
+  bool Served = false;
+};
+
+} // namespace
+
 void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
+  // The 2.17 experiment, above.
+  if (auto [Header, Out] = experimentSetting("CLANG_HEADER_CACHE_EXPORT");
+      !Header.empty() && CI.hasPreprocessor())
+    CI.getPreprocessor().addPPCallbacks(
+        std::make_unique<ExportExperiment>(CI, Header, Out));
+  if (auto [Header, In] = experimentSetting("CLANG_HEADER_CACHE_LOAD");
+      !Header.empty() && CI.hasPreprocessor()) {
+    CI.getPreprocessor().setHeaderCacheHook(
+        std::make_unique<LoadExperiment>(CI, Header, In));
+    return;
+  }
+
   const char *Socket = std::getenv("CLANG_HEADER_CACHE");
   if (!Socket || !*Socket)
     return;

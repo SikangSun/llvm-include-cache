@@ -135,6 +135,12 @@ CLANG_HEADER_CACHE=/tmp/clang-header-cache.sock clang -fmodules \
 
 `CLANG_HEADER_CACHE_STATS=1` prints hits and rejection counts when the compile
 ends; `2` also names the macro behind each rejection.
+
+An experiment for exporting a header's own part from the real compile
+(DECISIONS.md §2.17), with no daemon: `CLANG_HEADER_CACHE_EXPORT=<abs
+header>=<out.pcm>` writes the part when the header's file ends, and
+`CLANG_HEADER_CACHE_LOAD=<abs header>=<in.pcm>` serves the header from it in a
+later compile. Safe only for a header that does not end in a function body.
 `CLANG_HEADER_CACHE_JOBS=<dir>` makes the compile write, for every header it
 reads, the job that builds that header's saved copy; the populate tool runs
 them with the build's flags added:

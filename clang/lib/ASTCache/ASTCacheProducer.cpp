@@ -80,7 +80,9 @@ struct ProduceOutcome {
 
 /// Builtins whose value depends on the compile that includes the header
 /// rather than on the header. DECISIONS.md 2.7 has the reasoning, including
-/// why __LINE__ and __FILE__ are not here.
+/// why __LINE__ is not here. __FILE__ and __FILE_NAME__ are not either: their
+/// text depends on the name the compile reaches the header by, which a hit
+/// can check (FileNameDependency).
 constexpr llvm::StringLiteral TranslationUnitVaryingBuiltins[] = {
     "__COUNTER__", "__INCLUDE_LEVEL__", "__BASE_FILE__",
     "__DATE__",    "__TIME__",          "__TIMESTAMP__"};

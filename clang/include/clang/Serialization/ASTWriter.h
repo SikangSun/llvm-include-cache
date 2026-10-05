@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <queue>
 #include <string>
@@ -177,6 +178,16 @@ private:
   /// Indicates that we're going to generate the reduced BMI for C++20
   /// named modules.
   bool GeneratingReducedBMI = false;
+
+  /// When set, the writer writes one part of an ordinary compile: only the
+  /// top-level declarations PartDecls accepts start what is written, the
+  /// rest of the translation unit is written only as far as those
+  /// declarations reach, and only macros whose latest directive PartMacros
+  /// accepts are written, as the writing module's macros. Unlike reduced BMI,
+  /// nothing reached is elided. See setPartFilter.
+  std::function<bool(const Decl *)> PartDecls;
+  std::function<bool(const MacroDirective *)> PartMacros;
+  std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
 
   /// Mapping from input file entries to the index into the
   /// offset table where information about that input file is stored.
@@ -914,6 +925,24 @@ public:
   }
 
   bool isGeneratingReducedBMI() const { return GeneratingReducedBMI; }
+
+  /// Write only part of the translation unit: the top-level declarations
+  /// \p Decls accepts and what they reference, and the macros whose latest
+  /// directive \p Macros accepts. Used to save one header's part of an
+  /// ordinary compile, which builds no module; requires a WritingModule.
+  ///
+  /// \p KeepsExpansion says, by its starting offset, which local macro
+  /// expansions keep their entry in the source-location table. A location in
+  /// a dropped one is written as the place the macro was used.
+  void
+  setPartFilter(std::function<bool(const Decl *)> Decls,
+                std::function<bool(const MacroDirective *)> Macros,
+                std::function<bool(SourceLocation::UIntTy)> KeepsExpansion) {
+    PartDecls = std::move(Decls);
+    PartMacros = std::move(Macros);
+    PartKeepsExpansion = std::move(KeepsExpansion);
+  }
+  bool isWritingPart() const { return bool(PartDecls); }
 
   bool getDoneWritingDeclsAndTypes() const { return DoneWritingDeclsAndTypes; }
 

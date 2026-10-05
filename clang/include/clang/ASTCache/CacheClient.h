@@ -26,6 +26,8 @@
 
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/SharedRegion.h"
+#include "clang/Basic/FileEntry.h"
+#include "clang/Lex/HeaderSearch.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -55,9 +57,21 @@ enum class MismatchReason {
   Symbol,
   Inclusion,
   PragmaState,
+  FileName,
+  Include,
 };
 
 llvm::StringRef describe(MismatchReason R);
+
+/// Where the compile is about to include the header: the file, under the
+/// name the compile found it by, the search directory it was found in
+/// (null when found without searching), and the #include's location.
+/// A hit redoes the header's own #include lookups from here.
+struct IncludeSite {
+  FileEntryRef File;
+  ConstSearchDirIterator Dir;
+  SourceLocation Loc;
+};
 
 /// Whether \p Deps still holds in this compile. \p S must be non-null:
 /// every record carries pragma state and only Sema holds the live value, so
@@ -71,10 +85,15 @@ llvm::StringRef describe(MismatchReason R);
 ///
 /// \p Detail, when non-null, receives what failed, e.g. "LIMIT was not
 /// defined, is".
+///
+/// \p Site is where the header is being included. Deps.Includes and
+/// Deps.FileNames are checked from there, and metadata with either is
+/// rejected without one.
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
                                 Preprocessor &PP, Sema *S,
                                 llvm::StringRef NotAMacroNames = {},
-                                std::string *Detail = nullptr);
+                                std::string *Detail = nullptr,
+                                const IncludeSite *Site = nullptr);
 
 class CacheClient {
 public:
@@ -104,11 +123,15 @@ public:
   /// order, with its module name, and the first it accepts is the result. A
   /// candidate the check cannot rule out can still be unusable -- built with
   /// other compiler options, say -- and a later one may serve.
+  ///
+  /// \p Site is where the header is being included, as matchesLiveState
+  /// takes it.
   llvm::StringRef lookup(llvm::StringRef Filename, Preprocessor &PP, Sema *S,
                          HeaderDependencySet *MatchedDeps = nullptr,
                          llvm::function_ref<bool(llvm::StringRef Bytes,
                                                  llvm::StringRef ModuleName)>
-                             Use = nullptr);
+                             Use = nullptr,
+                         const IncludeSite *Site = nullptr);
 
   /// Stores a newly produced entry. Blocks until the daemon acknowledges, so
   /// a caller that does not want to wait should run this off the critical
@@ -129,7 +152,7 @@ public:
     unsigned Lookups = 0;
     unsigned Hits = 0;
     unsigned CandidatesRejected = 0;
-    unsigned RejectedFor[6] = {};
+    unsigned RejectedFor[8] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".

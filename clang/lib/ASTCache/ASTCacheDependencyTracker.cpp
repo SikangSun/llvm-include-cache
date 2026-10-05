@@ -33,6 +33,11 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
     // the predefines buffer), so they must never join a closure: doing so
     // would classify every command-line macro as internal and drop it.
     OptionalFileEntryRef FE = SM.getFileEntryRefForID(FID);
+    if (FE && PendingFile == &FE->getFileEntry())
+      for (auto [Frame, Entry] : PendingEntries)
+        Stack[Frame].EntryOf[FID] = Entry;
+    PendingFile = nullptr;
+    PendingEntries.clear();
     if (!FE)
       return;
 
@@ -84,9 +89,82 @@ void ASTCacheDependencyTracker::finalize() {
   }
 }
 
+void ASTCacheDependencyTracker::InclusionDirective(
+    SourceLocation HashLoc, const Token &IncludeTok, StringRef FileName,
+    bool IsAngled, CharSourceRange FilenameRange, OptionalFileEntryRef File,
+    StringRef SearchPath, StringRef RelativePath, const Module *SuggestedModule,
+    bool ModuleImported, SrcMgr::CharacteristicKind FileType) {
+  PendingFile = nullptr;
+  PendingEntries.clear();
+  // Not found is an error, and a compile with an error saves nothing.
+  if (!File)
+    return;
+  const IdentifierInfo *Directive = IncludeTok.getIdentifierInfo();
+  bool Next = Directive && Directive->getPPKeywordID() == tok::pp_include_next;
+  recordLookup(HashLoc,
+               Next ? IncludeDependency::Kind::IncludeNext
+                    : IncludeDependency::Kind::Include,
+               IsAngled, FileName, File);
+  PendingFile = &File->getFileEntry();
+}
+
+void ASTCacheDependencyTracker::HasInclude(
+    SourceLocation Loc, StringRef FileName, bool IsAngled,
+    OptionalFileEntryRef File, SrcMgr::CharacteristicKind FileType) {
+  bool Next = NextHasIncludeIsNext;
+  NextHasIncludeIsNext = false;
+  recordLookup(Loc,
+               Next ? IncludeDependency::Kind::HasIncludeNext
+                    : IncludeDependency::Kind::HasInclude,
+               IsAngled, FileName, File);
+  PendingEntries.clear();
+}
+
+void ASTCacheDependencyTracker::recordLookup(SourceLocation Loc,
+                                             IncludeDependency::Kind K,
+                                             bool Angled, StringRef Spelled,
+                                             OptionalFileEntryRef Found) {
+  SourceManager &SM = PP.getSourceManager();
+  FileID Where = SM.getFileID(SM.getExpansionLoc(Loc));
+  std::string FoundPath;
+  if (Found)
+    FoundPath = PP.getFileManager().getCanonicalName(*Found).str();
+
+  for (size_t I = 0; I != Stack.size(); ++I) {
+    Frame &F = Stack[I];
+    if (!F.Closure.contains(Where))
+      continue;
+    // With -fms-compatibility a quoted lookup also searches beside every file
+    // on the include stack, which a hit's lookup from one includer does not
+    // reproduce.
+    if (!Angled && PP.getLangOpts().MSVCCompat) {
+      F.Poisoned = true;
+      continue;
+    }
+    IncludeDependency Dep;
+    Dep.K = K;
+    Dep.Angled = Angled;
+    Dep.Spelled = Spelled.str();
+    Dep.Found = FoundPath;
+    if (Where != F.FID) {
+      auto It = F.EntryOf.find(Where);
+      // A file in the region that no recorded lookup entered.
+      if (It == F.EntryOf.end()) {
+        F.Poisoned = true;
+        continue;
+      }
+      Dep.Includer = It->second;
+    }
+    F.Deps.Includes.push_back(std::move(Dep));
+    PendingEntries.push_back({I, int32_t(F.Deps.Includes.size() - 1)});
+  }
+}
+
 void ASTCacheDependencyTracker::FileSkipped(
     const FileEntryRef &SkippedFile, const Token &FilenameTok,
     SrcMgr::CharacteristicKind FileType) {
+  PendingFile = nullptr;
+  PendingEntries.clear();
   if (Stack.empty())
     return;
 
@@ -228,7 +306,56 @@ void ASTCacheDependencyTracker::MacroExpands(const Token &MacroNameTok,
   const MacroInfo *MI = MD.getMacroInfo();
   if (Stack.empty() || !II || !MI)
     return;
+  if (MI->isBuiltinMacro()) {
+    if (II->isStr("__FILE__") || II->isStr("__FILE_NAME__"))
+      recordFileName(MacroNameTok.getLocation(), II->isStr("__FILE_NAME__"));
+    else if (II->isStr("__has_include_next"))
+      NextHasIncludeIsNext = true;
+    else if (II->isStr("__has_include"))
+      NextHasIncludeIsNext = false;
+  }
   recordSyntactic(II, MI);
+}
+
+void ASTCacheDependencyTracker::recordFileName(SourceLocation Loc,
+                                               bool LastComponentOnly) {
+  SourceManager &SM = PP.getSourceManager();
+  // The same lookup Preprocessor::ExpandBuiltinMacro makes: the file is the
+  // one the outermost macro use is written in.
+  PresumedLoc PLoc = SM.getPresumedLoc(Loc);
+  if (PLoc.isInvalid())
+    return;
+  FileID FID = SM.getFileID(SM.getExpansionLoc(Loc));
+  OptionalFileEntryRef FE = SM.getFileEntryRefForID(FID);
+  // A #line in the file's own text named it, and every compile reads that
+  // #line the same way.
+  if (!FE || llvm::StringRef(PLoc.getFilename()) != FE->getName())
+    return;
+
+  std::string Text = fileMacroText(PLoc.getFilename(), LastComponentOnly,
+                                   PP.getLangOpts(), PP.getTargetInfo());
+  for (Frame &F : Stack) {
+    if (!F.Closure.contains(FID))
+      continue;
+    int32_t File = -1;
+    if (FID != F.FID) {
+      auto It = F.EntryOf.find(FID);
+      if (It == F.EntryOf.end()) {
+        F.Poisoned = true;
+        continue;
+      }
+      File = It->second;
+    }
+    std::string Key = (LastComponentOnly ? "N" : "F") + std::to_string(File);
+    if (!F.SeenFileNames.insert(Key).second)
+      continue;
+    FileNameDependency Dep;
+    Dep.Which = LastComponentOnly ? FileNameDependency::Macro::FileName
+                                  : FileNameDependency::Macro::File;
+    Dep.File = File;
+    Dep.Text = Text;
+    F.Deps.FileNames.push_back(std::move(Dep));
+  }
 }
 
 void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,

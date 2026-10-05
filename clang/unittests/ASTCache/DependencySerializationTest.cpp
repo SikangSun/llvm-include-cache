@@ -44,6 +44,12 @@ HeaderDependencySet makeFullSet() {
                          InclusionDependency::Reason::PragmaOnce});
   D.MacroEffects.push_back({"GUARD_H", true});
   D.MacroEffects.push_back({"LIMIT", false});
+  D.Includes.push_back(
+      {IncludeDependency::Kind::Include, false, "sub/x.h", -1, "/src/sub/x.h"});
+  D.Includes.push_back(
+      {IncludeDependency::Kind::HasIncludeNext, true, "cfg.h", 0, ""});
+  D.FileNames.push_back({FileNameDependency::Macro::File, -1, "./ae_epoll.c"});
+  D.FileNames.push_back({FileNameDependency::Macro::FileName, 0, "x.h"});
   return D;
 }
 
@@ -75,6 +81,8 @@ void expectEqual(const HeaderDependencySet &A, const HeaderDependencySet &B) {
     EXPECT_EQ(A.MacroEffects[I].Name, B.MacroEffects[I].Name);
     EXPECT_EQ(A.MacroEffects[I].Defined, B.MacroEffects[I].Defined);
   }
+  EXPECT_EQ(A.Includes, B.Includes);
+  EXPECT_EQ(A.FileNames, B.FileNames);
 }
 
 TEST(DependencySerializationTest, EmptySetRoundTrips) {
@@ -217,6 +225,36 @@ TEST(DependencySerializationTest, OutOfRangeClassificationIsRejected) {
   ASSERT_NE(Diff, std::string::npos);
   Data[Diff] = static_cast<char>(200);
   EXPECT_FALSE(decodeDependencySet(Data).has_value());
+}
+
+TEST(DependencySerializationTest, OutOfRangeFileNameMacroIsRejected) {
+  // The same diffing trick, on which macro a __FILE__ dependency names.
+  std::string Data = encode(makeFullSet());
+  HeaderDependencySet Other = makeFullSet();
+  Other.FileNames[0].Which = FileNameDependency::Macro::FileName;
+  std::string Alt = encode(Other);
+  ASSERT_EQ(Data.size(), Alt.size());
+  size_t Diff = std::string::npos;
+  for (size_t I = 0; I != Data.size(); ++I)
+    if (Data[I] != Alt[I]) {
+      ASSERT_EQ(Diff, std::string::npos)
+          << "expected exactly one differing byte";
+      Diff = I;
+    }
+  ASSERT_NE(Diff, std::string::npos);
+  Data[Diff] = static_cast<char>(200);
+  EXPECT_FALSE(decodeDependencySet(Data).has_value());
+}
+
+TEST(DependencySerializationTest, AnIndexThatPointsForwardIsRejected) {
+  // An entry's includer and a __FILE__'s file are earlier entries; anything
+  // else would send a hit's lookups to the wrong file.
+  HeaderDependencySet D = makeFullSet();
+  D.Includes[0].Includer = 0;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = makeFullSet();
+  D.FileNames[1].File = 2;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
 }
 
 TEST(DependencySerializationTest, HugeCountDoesNotOverAllocate) {

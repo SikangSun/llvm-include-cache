@@ -2,7 +2,7 @@
 
 What is not built, in what order, and where our storage meets PCM. Reasons live
 in `DECISIONS.md`; this file is the worklist. Written 2026-09-18 against
-`6996c31c7`; statuses updated 2026-10-01.
+`6996c31c7`; statuses updated 2026-10-05.
 
 ## Build order
 
@@ -47,14 +47,37 @@ None of this waits on the layout question in §3.
   including #defines; job recording in the compile; no main-file gate.
 - Region identity check at connect; reuse of an already loaded copy.
 
+## Built 2026-10-02
+
+- **`__FILE__` and the include path are checked** (`DECISIONS.md` §3): a
+  copy records each lookup its header's `#include`s and `__has_include`s
+  made and the text each `__FILE__` produced; a hit redoes the lookups.
+- **Exporting a header's own part from the real compile** (`DECISIONS.md`
+  §2.17), as an experiment behind `CLANG_HEADER_CACHE_EXPORT` and
+  `CLANG_HEADER_CACHE_LOAD`: `ASTWriter::setPartFilter`, macro expansions
+  outside the part dropped from the source-location table, file names kept
+  as opened. Seven redis headers served back into their own `.c` file give
+  identical assembly with and without `-g`.
+
 ## Blocking a benchmark run
 
-- **Copies that carry other headers' declarations** (`DECISIONS.md` §3,
-  "Copies built after different .c files conflict"). The replayed #includes
-  in front of a header end up inside its copy and clash with the compile that
-  loads it. Proposed: replay macros only (every macro defined at the
-  #include), never #includes; a header that needs an outside type is not
-  saved for now. Awaiting the user.
+The export at a miss (`DECISIONS.md` §2.17, approved 2026-10-02), which
+replaces the separate compile and with it the conflicts between copies
+built after different `.c` files (§3). Target: a first debugging version the
+week of 2026-10-05. What it needs:
+
+1. Export at a miss, at the first top-level declaration boundary after the
+   header ends, and push the part with its metadata.
+2. The dependency tracker running in the real compile for the headers it
+   exports, with the macro effects, pragma snapshots and the
+   `__COUNTER__`-family decline the producer had.
+3. Outside declarations as dependencies: name and fingerprint.
+4. The name each recorded lookup found, compared at a hit, not only the real
+   path: a part holds files under the names its compile opened them by.
+5. Included-file marks limited to the header's region.
+6. A compile that already loaded a copy writes the part as importing every
+   loaded module. First version: export only from a compile that has loaded
+   none.
 
 ## What changes in what exists
 

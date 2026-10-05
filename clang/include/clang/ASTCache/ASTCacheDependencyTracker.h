@@ -36,9 +36,12 @@
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Sema/NameClassificationObserver.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,6 +82,23 @@ public:
   /// content. Recorded here so it is not silently invisible.
   void FileSkipped(const FileEntryRef &SkippedFile, const Token &FilenameTok,
                     SrcMgr::CharacteristicKind FileType) override;
+
+  /// Records the lookup in every open frame whose region holds the
+  /// directive (IncludeDependency), and remembers which entry the file about
+  /// to be entered came from.
+  void InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
+                          StringRef FileName, bool IsAngled,
+                          CharSourceRange FilenameRange,
+                          OptionalFileEntryRef File, StringRef SearchPath,
+                          StringRef RelativePath, const Module *SuggestedModule,
+                          bool ModuleImported,
+                          SrcMgr::CharacteristicKind FileType) override;
+
+  /// The same for __has_include and __has_include_next, whose answer also
+  /// depends on the include path.
+  void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                  OptionalFileEntryRef File,
+                  SrcMgr::CharacteristicKind FileType) override;
 
   /// Conditional dependencies: a definedness test, recorded in each open
   /// frame the first time that frame sees the name -- unless the state tested
@@ -143,6 +163,9 @@ public:
   /// preceded by an expansionCandidate for the same token, so this only
   /// matters if some path reaches HandleIdentifier without one -- in which
   /// case recording here keeps the dependency rather than dropping it.
+  ///
+  /// Also where a __FILE__ or __FILE_NAME__ is seen, whose text is recorded,
+  /// and where __has_include_next is told apart from __has_include.
   void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                      SourceRange Range, const MacroArgs *Args) override;
 
@@ -208,6 +231,10 @@ private:
     llvm::DenseSet<const IdentifierInfo *> SeenSyntactic;
     llvm::DenseSet<const IdentifierInfo *> SeenSymbol;
     llvm::DenseSet<const FileEntry *> SeenSkipped;
+    llvm::StringSet<> SeenFileNames;
+    /// For each file entered under this frame, the index of the
+    /// IncludeDependency that found it.
+    llvm::DenseMap<FileID, int32_t> EntryOf;
     HeaderDependencySet Deps;
     /// Something happened in this header that this tracker cannot record
     /// soundly, so it must not be cached at all. Checked at frame close.
@@ -240,9 +267,25 @@ private:
   /// Marks every open frame uncacheable.
   void poisonOpenFrames();
 
+  /// Records the text of a __FILE__ (or, with \p LastComponentOnly,
+  /// __FILE_NAME__) whose name token is at \p Loc.
+  void recordFileName(SourceLocation Loc, bool LastComponentOnly);
+
+  /// Appends one lookup to every open frame whose region holds the
+  /// directive at \p Loc, and leaves the entries made in PendingEntries.
+  void recordLookup(SourceLocation Loc, IncludeDependency::Kind K, bool Angled,
+                    StringRef Spelled, OptionalFileEntryRef Found);
+
   Preprocessor &PP;
   llvm::SmallVector<Frame, 8> Stack;
   std::vector<HeaderRecord> Completed;
+  /// The entries InclusionDirective just made, as (frame, index), waiting
+  /// for the file they found to be entered.
+  const FileEntry *PendingFile = nullptr;
+  llvm::SmallVector<std::pair<size_t, int32_t>, 4> PendingEntries;
+  /// Set by MacroExpands for __has_include_next, read by the HasInclude call
+  /// that follows it.
+  bool NextHasIncludeIsNext = false;
 };
 
 } // namespace ast_cache
