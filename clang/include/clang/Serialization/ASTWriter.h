@@ -88,6 +88,17 @@ namespace SrcMgr {
 class FileInfo;
 } // namespace SrcMgr
 
+/// What one declaration or macro took in a part. See
+/// ASTWriter::setPartSizes.
+struct PartSize {
+  /// The declaration, or null for a macro.
+  const Decl *D = nullptr;
+  /// The macro's name and definition, for a macro.
+  const IdentifierInfo *MacroName = nullptr;
+  const MacroInfo *Macro = nullptr;
+  uint64_t Bits = 0;
+};
+
 /// Writes an AST file containing the contents of a translation unit.
 ///
 /// The ASTWriter class produces a bitstream containing the serialized
@@ -207,6 +218,10 @@ private:
 
   /// Locations in a loaded module file the part wrote as invalid ones.
   unsigned PartDroppedLocations = 0;
+
+  /// Where to note what each declaration and macro of a part took, if
+  /// anywhere. See setPartSizes.
+  std::vector<struct PartSize> *PartSizes = nullptr;
 
   /// Mapping from input file entries to the index into the
   /// offset table where information about that input file is stored.
@@ -1012,6 +1027,11 @@ public:
   /// How many locations in a loaded module file the part just written holds
   /// as invalid ones. Expected to be zero.
   unsigned getPartDroppedLocations() const { return PartDroppedLocations; }
+
+  /// While a part is written, notes in \p Out the bits each declaration took,
+  /// its statements and context tables included, and each macro, its tokens
+  /// included. For measuring what parts repeat; null stops it.
+  void setPartSizes(std::vector<PartSize> *Out) { PartSizes = Out; }
 
   /// Whether the part being written holds \p D itself, rather than a
   /// reference to it or nothing.

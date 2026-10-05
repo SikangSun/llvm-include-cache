@@ -35,6 +35,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <chrono>
@@ -292,6 +293,7 @@ private:
     if (Ready.empty())
       return;
     auto Start = std::chrono::steady_clock::now();
+    llvm::TimeTraceScope Scope("HeaderCache Export");
     std::vector<Part> Parts;
     Parts.swap(Ready);
     for (Part &P : Parts)
@@ -368,16 +370,52 @@ private:
       Line += ", " + std::to_string(W.DroppedLocations) +
               " locations in module files dropped";
     Counts.Exports.push_back(std::move(Line));
-    dump(P, R);
+    dump(P, R, W.Sizes);
     Deliver(std::move(R));
   }
 
   /// CLANG_HEADER_CACHE_DUMP_PARTS=<dir>, for debugging: each part goes to
   /// <dir>/<module name>.pcm, and what it was exported from and the outside
   /// declarations it requires to <dir>/<module name>.txt.
-  void dump(const Part &P, const PushRequest &R) {
+  static const char *dumpDir() {
     const char *Dir = std::getenv("CLANG_HEADER_CACHE_DUMP_PARTS");
-    if (!Dir || !*Dir)
+    return Dir && *Dir ? Dir : nullptr;
+  }
+
+  /// "<bits>\t<kind>\t<name>\t<file>:<line>" for one declaration or macro
+  /// a part holds. A declaration from outside the header is of kind "ref"
+  /// when referred to by name, "copy" when deep-copied.
+  std::string describeSize(const Part &P, bool Named, const PartSize &Z) const {
+    std::string Kind, Name;
+    SourceLocation Loc;
+    if (Z.D) {
+      Kind = inPart(P, Z.D->getLocation()) ? Z.D->getDeclKindName()
+             : Named                       ? "ref"
+                                           : "copy";
+      if (const auto *ND = dyn_cast<NamedDecl>(Z.D))
+        Name = ND->getNameAsString();
+      Loc = Z.D->getLocation();
+    } else {
+      Kind = "macro";
+      Name = Z.MacroName->getName().str();
+      Loc = Z.Macro->getDefinitionLoc();
+    }
+    if (Name.empty())
+      Name = "(unnamed)";
+    std::string Where = "?";
+    if (Loc.isValid()) {
+      PresumedLoc PL = SM.getPresumedLoc(SM.getFileLoc(Loc));
+      if (PL.isValid())
+        Where =
+            std::string(PL.getFilename()) + ":" + std::to_string(PL.getLine());
+    }
+    return std::to_string(Z.Bits) + "\t" + Kind + "\t" + Name + "\t" + Where;
+  }
+
+  void dump(const Part &P, const PushRequest &R,
+            const std::vector<std::string> &Sizes) {
+    const char *Dir = dumpDir();
+    if (!Dir)
       return;
     std::string Base = (llvm::Twine(Dir) + "/" + R.ModuleName).str();
     std::error_code EC;
@@ -393,6 +431,11 @@ private:
          << P.ModulesAtBegin << "\n";
     for (const DeclarationDependency &D : R.Deps.Declarations)
       Text << "requires " << D.Name << ": " << D.Fingerprint << "\n";
+    llvm::raw_fd_ostream SizeText(Base + ".sizes", EC);
+    if (EC)
+      return;
+    for (const std::string &Line : Sizes)
+      SizeText << Line << "\n";
   }
 
   struct Written {
@@ -405,6 +448,9 @@ private:
     std::vector<DeclarationDependency> Declarations;
     /// Non-empty: an outside declaration that could not be named, and why.
     std::string Failure;
+    /// With CLANG_HEADER_CACHE_DUMP_PARTS: one line per declaration and
+    /// macro written, "<bits>\t<kind>\t<name>\t<file>:<line>".
+    std::vector<std::string> Sizes;
   };
 
   /// Writes \p P's part as module \p M, referring to outside declarations
@@ -423,12 +469,17 @@ private:
         [&](FileEntryRef F) { return P.Files.contains(&F.getFileEntry()); });
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
+    std::vector<PartSize> Sizes;
+    if (dumpDir())
+      Writer.setPartSizes(&Sizes);
     auto Start = std::chrono::steady_clock::now();
     Writer.WriteAST(&CI.getSema(), P.Stored, M, /*isysroot=*/"");
     W.Micros = std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::steady_clock::now() - Start)
                    .count();
     W.DroppedLocations = Writer.getPartDroppedLocations();
+    for (const PartSize &Z : Sizes)
+      W.Sizes.push_back(describeSize(P, Named, Z));
 
     // The outside declarations the part refers to, each once. A member of a
     // struct, or an unnamed struct a typedef names, is reached through the

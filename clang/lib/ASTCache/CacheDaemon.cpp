@@ -165,6 +165,10 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const PushRequest &Req) {
       E.EffectsLength = Effects.size();
       Entries.push_back(std::move(E));
       Counters.BytesStored += Req.Data.size() + Names.size() + Effects.size();
+      Counters.PartBytes += Req.Data.size();
+      Counters.NameBytes += Names.size();
+      Counters.EffectBytes += Effects.size();
+      Counters.MetadataBytes += EncodedRef.size();
       ++Counters.Entries;
       Counters.Headers = Table.size();
       if (Opts.ListStored && listLocked(Req.Filename))

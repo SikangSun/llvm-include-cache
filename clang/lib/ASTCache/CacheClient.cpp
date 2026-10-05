@@ -18,6 +18,7 @@
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTReader.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_socket_stream.h"
 #include <chrono>
 
@@ -444,10 +445,13 @@ llvm::StringRef CacheClient::lookup(
   llvm::SmallVector<char, 0> Msg;
   encodeLookupRequest({Filename.str()}, Msg);
   auto Asked = std::chrono::steady_clock::now();
-  if (!sendMessage(*Conn, Msg))
-    return {};
-
-  std::optional<std::string> Reply = receiveMessage(*Conn);
+  std::optional<std::string> Reply;
+  {
+    llvm::TimeTraceScope Scope("HeaderCache Ask");
+    if (!sendMessage(*Conn, Msg))
+      return {};
+    Reply = receiveMessage(*Conn);
+  }
   Counters.DaemonMicros += microsSince(Asked);
   if (!Reply)
     return {};
@@ -472,9 +476,13 @@ llvm::StringRef CacheClient::lookup(
     std::string Detail;
     ++Counters.CandidatesChecked;
     auto Checking = std::chrono::steady_clock::now();
-    MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names,
-                                          LogRejections ? &Detail : nullptr,
-                                          Site, &Counters.Check);
+    MismatchReason Why;
+    {
+      llvm::TimeTraceScope Scope("HeaderCache Check");
+      Why = matchesLiveState(E.Deps, PP, S, Names,
+                             LogRejections ? &Detail : nullptr, Site,
+                             &Counters.Check);
+    }
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;

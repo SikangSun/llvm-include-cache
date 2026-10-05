@@ -87,6 +87,10 @@ public:
     uint64_t Pushes = 0;
     uint64_t Duplicates = 0; // pushes discarded as already stored
     uint64_t BytesStored = 0;
+    /// BytesStored by kind: the parts' module files, the not-a-macro name
+    /// lists, the macro effects. MetadataBytes is the encoded metadata kept
+    /// in the daemon's own memory, not in the region.
+    uint64_t PartBytes = 0, NameBytes = 0, EffectBytes = 0, MetadataBytes = 0;
     uint64_t Entries = 0;
     uint64_t Headers = 0;
     uint64_t TimingReports = 0;

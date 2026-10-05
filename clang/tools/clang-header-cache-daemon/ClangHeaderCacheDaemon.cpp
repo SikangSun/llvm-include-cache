@@ -104,7 +104,12 @@ int main(int argc, char **argv) {
     outs() << "lookups " << S.Lookups << " (" << S.Hits << " with entries)\n"
            << "pushes  " << S.Pushes << " (" << S.Duplicates << " duplicate)\n"
            << "stored  " << S.Entries << " entries for " << S.Headers
-           << " headers, " << (S.BytesStored / 1024) << " KiB\n"
+           << " headers, " << (S.BytesStored / 1024)
+           << " KiB: " << (S.PartBytes / 1024) << " KiB of parts, "
+           << (S.NameBytes / 1024) << " KiB of not-a-macro names, "
+           << (S.EffectBytes / 1024) << " KiB of macro effects; "
+           << (S.MetadataBytes / 1024)
+           << " KiB of metadata in the daemon's memory\n"
            << "timed   " << S.HeadersTimed << " headers from "
            << S.TimingReports << " compiles; " << S.HeadersListed
            << " on the ask-list\n";

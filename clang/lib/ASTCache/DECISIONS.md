@@ -1367,8 +1367,9 @@ since it too is many compiles. Clang's module cache has a form of this
 compilation instead of recompilation, if following the same philosophy we
 simply stored read data on the server, which the server can serve without
 the compiler worrying, per complete make ... Our goal is to cut down the
-granularity and enable first compilation optimizations." Not designed: how
-the daemon learns where a build starts and ends.
+granularity and enable first compilation optimizations." The daemon learns
+where a build starts and ends from a build ID. User, 2026-10-05: "For build
+boundaries, I was thinking build ID." Not designed further.
 
 **Cost.** `CLANG_HEADER_CACHE_STATS=1` prints each check step's time on its
 own line, and the time spent exporting. A one-thread build of redis-server's

@@ -36,6 +36,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <chrono>
@@ -324,6 +325,14 @@ public:
       OS << "    " << Line << "\n";
     for (const std::string &Line : Served)
       OS << "  served " << Line << "\n";
+    OS << "header cache text time: " << ms(TextMicros) << " ms reading "
+       << TextReads
+       << " outermost headers as text, the cache's work inside them "
+          "excluded\n";
+    for (const std::string &Line : QueryLines)
+      OS << "  query " << Line << "\n";
+    for (const std::string &Line : TextLines)
+      OS << "  text " << Line << "\n";
     if (Exporter) {
       const PartExporter::Stats &E = Exporter->stats();
       OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
@@ -392,7 +401,10 @@ public:
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc};
     bool AnyFits = false;
+    size_t HitBytes = 0;
+    uint64_t HitLoadMicros = 0;
     auto Asked = std::chrono::steady_clock::now();
+    llvm::TimeTraceScope QueryScope("HeaderCache Query", Path);
     Client->lookup(
         Path, PP, &CI.getSema(), &Deps,
         [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
@@ -401,13 +413,20 @@ public:
             return false;
           auto Loading = std::chrono::steady_clock::now();
           Target = load(Bytes, ModuleName);
-          LoadMicros += micros(Loading);
+          HitLoadMicros = micros(Loading);
+          HitBytes = Bytes.size();
+          LoadMicros += HitLoadMicros;
           if (Target && LogServed)
             Served.push_back(Path + " from " + ModuleName.str());
           return Target != nullptr;
         },
         &Site);
-    LookupMicros += micros(Asked);
+    uint64_t Took = micros(Asked);
+    LookupMicros += Took;
+    if (LogServed)
+      QueryLines.push_back(
+          Path + (Target ? " hit " : " miss ") + std::to_string(Took) + " " +
+          std::to_string(HitBytes) + " " + std::to_string(HitLoadMicros));
     PP.setCounterValue(Counter);
     if (!Target) {
       // A miss where a copy could have stood in: save this header's part of
@@ -436,20 +455,30 @@ public:
   void headerEntered(OptionalFileEntryRef File) {
     Open.push_back({File ? &File->getFileEntry() : nullptr,
                     File ? File->getName().str() : std::string(),
-                    std::chrono::steady_clock::now()});
+                    std::chrono::steady_clock::now(), cacheMicros()});
   }
 
   void headerExited() {
     if (Open.empty())
       return;
     OpenFile F = Open.pop_back_val();
+    auto Micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - F.Start)
+                      .count();
+    // Outermost: below it only the main file, which is never left, and
+    // buffers with no file behind them, such as the predefines.
+    if (F.Entry && llvm::all_of(llvm::drop_begin(Open),
+                                [](const OpenFile &O) { return !O.Entry; })) {
+      TextMicros += Micros - (cacheMicros() - F.CacheAtStart);
+      ++TextReads;
+    }
+    if (F.Entry && LogServed)
+      TextLines.push_back(storedName(F.Name) + " " + std::to_string(Micros) +
+                          " depth " + std::to_string(Open.size()));
     // Only a header's first entry in this compile is its parse; a later one
     // of an unguarded header says nothing about what a saved copy saves.
     if (!F.Entry || !Timed.insert(F.Entry).second)
       return;
-    auto Micros = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - F.Start)
-                      .count();
     Timings.Headers.push_back(
         {storedName(F.Name), static_cast<uint64_t>(Micros)});
   }
@@ -598,7 +627,22 @@ private:
     const FileEntry *Entry;
     std::string Name;
     std::chrono::steady_clock::time_point Start;
+    /// cacheMicros() when the file was entered.
+    uint64_t CacheAtStart;
   };
+  /// The cache's own time so far: lookups, the loads they made included,
+  /// and writing parts.
+  uint64_t cacheMicros() const {
+    return LookupMicros + (Exporter ? Exporter->stats().Micros : 0);
+  }
+  /// Time reading outermost headers as text, the cache's own work inside
+  /// them excluded, and how many such reads.
+  uint64_t TextMicros = 0;
+  unsigned TextReads = 0;
+  /// With LogServed: "<header> hit|miss <us> <part bytes> <load us>" per
+  /// lookup, and
+  /// "<header> <us> depth <n>" per header read as text, n = 0 outermost.
+  std::vector<std::string> QueryLines, TextLines;
   /// Files entered and not yet left, innermost last.
   llvm::SmallVector<OpenFile, 16> Open;
   llvm::SmallPtrSet<const FileEntry *, 32> Timed;

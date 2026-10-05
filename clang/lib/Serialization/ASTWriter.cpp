@@ -2786,7 +2786,8 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
     if (Index >= MacroOffsets.size())
       MacroOffsets.resize(Index + 1);
 
-    uint64_t Offset = Stream.GetCurrentBitNo() - MacroOffsetsBase;
+    uint64_t StartBit = Stream.GetCurrentBitNo();
+    uint64_t Offset = StartBit - MacroOffsetsBase;
     assert((Offset >> 32) == 0 && "Macro offset too large");
     MacroOffsets[Index] = Offset;
 
@@ -2828,6 +2829,9 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
       Stream.EmitRecord(PP_TOKEN, Record);
       Record.clear();
     }
+    if (PartSizes)
+      PartSizes->push_back(
+          {nullptr, Name, MI, Stream.GetCurrentBitNo() - StartBit});
     ++NumMacros;
   }
 

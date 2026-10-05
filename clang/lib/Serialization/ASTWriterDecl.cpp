@@ -3066,6 +3066,7 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
   assert(ID >= FirstDeclID && "invalid decl ID");
 
   uint64_t Offset;
+  uint64_t StartBit = Stream.GetCurrentBitNo();
   if (ByName) {
     Offset = WritePartNameReference(Context, D);
   } else {
@@ -3078,6 +3079,9 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
     // Emit this declaration to the bitstream.
     Offset = W.Emit(D);
   }
+  if (PartSizes)
+    PartSizes->push_back(
+        {D, nullptr, nullptr, Stream.GetCurrentBitNo() - StartBit});
 
   // Record the offset for this declaration. A reference by name has no
   // location of its own in the part.
