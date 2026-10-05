@@ -1104,10 +1104,125 @@ TEST_F(ExportTest, AMissExportsAPartTheNextCompileServes) {
   EXPECT_FALSE(reads(Main, Use)) << "use.h's part was not served";
 }
 
+TEST_F(ExportTest, APartIsExportedAfterTheCompileLoadsOne) {
+  // A part refers to an outside declaration by name, even one a loaded part
+  // holds. main.c's third compile is served types.h, then misses use.h and
+  // exports it: use.h's part names u32, which types.h's part declares.
+  std::string Types = write("types.h", "#ifndef TYPES_H\n#define TYPES_H\n"
+                                       "typedef unsigned int u32;\n#endif\n");
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "u32 count(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Types + "\"\n#include \"" + Use +
+                          "\"\n"
+                          "u32 f(void) { return count(); }\n");
+  std::string OnlyTypes =
+      write("t.c", "#include \"" + Types + "\"\nu32 g(void) { return 1; }\n");
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(OnlyTypes, Types)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "types.h was not exported alone";
+  EXPECT_TRUE(reads(Main, Use)) << "use.h is not stored yet";
+  EXPECT_FALSE(reads(Main, Types)) << "types.h was not served";
+  EXPECT_EQ(Daemon->stats().Entries, 2u)
+      << "use.h was not exported after types.h was loaded";
+  EXPECT_FALSE(reads(Main, Use)) << "use.h's part was not served";
+}
+
+TEST_F(ExportTest, AHeaderAServedHeaderIsInsideIsNotExported) {
+  // main.c is served inner.h, then misses outer.h, inside which inner.h is
+  // served again from the part already loaded, which loads no module file.
+  // outer.h's part would hold that import, not inner.h's declarations, so
+  // outer.h is not exported; other.c reads it instead of being served a
+  // part that leaves my_size undeclared.
+  std::string Inner = write("inner.h", "typedef unsigned long my_size;\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                       "#include \"" +
+                           Inner +
+                           "\"\n"
+                           "my_size outer_len(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Inner + "\"\n#include \"" + Outer +
+                          "\"\n"
+                          "my_size f(void) { return outer_len(); }\n");
+  std::string OnlyInner = write(
+      "i.c", "#include \"" + Inner + "\"\nmy_size g(void) { return 1; }\n");
+  std::string Other =
+      write("other.c", "#include \"" + Outer +
+                           "\"\n"
+                           "my_size h(void) { return outer_len(); }\n");
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(OnlyInner, Inner)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "inner.h was not exported alone";
+  EXPECT_TRUE(reads(Main, Outer)) << "outer.h is not stored yet";
+  EXPECT_EQ(Daemon->stats().Entries, 1u)
+      << "outer.h was exported around a served inner.h";
+  EXPECT_TRUE(reads(Other, Outer));
+}
+
+TEST_F(ExportTest, APartThatDefinesAnOutsideStructIsServed) {
+  // a.c declares struct pt before use.h, and use.h defines it. A hit is
+  // checked where use.h begins, when struct pt is only declared, so the
+  // part's metadata must say "declared", not use.h's own definition.
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "struct pt { int x, y; };\n"
+                                   "int area(struct pt *p);\n#endif\n");
+  std::string A = write("a.c", "struct pt;\n#include \"" + Use +
+                                   "\"\nint f(struct pt *p) { return "
+                                   "area(p) + p->x; }\n");
+  EXPECT_TRUE(reads(A, Use));
+  EXPECT_TRUE(reads(A, Use));
+  ASSERT_GE(Daemon->stats().Entries, 1u) << "use.h was not exported";
+  EXPECT_FALSE(reads(A, Use)) << "use.h's part was not served";
+}
+
+TEST_F(ExportTest, APartIsNotServedWhereAnOutsideEnumeratorDiffers) {
+  // struct buf's array bound comes from the enumerator BUFN, which the part
+  // refers to by name. The bound is a constant in the part, so a compile
+  // whose BUFN has another value cannot take it.
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "struct buf { char data[BUFN]; };\n"
+                                   "int fill(struct buf *b);\n#endif\n");
+  std::string A = write("a.c", "enum { BUFN = 4 };\n#include \"" + Use +
+                                   "\"\nint f(struct buf *b) { return "
+                                   "fill(b); }\n");
+  std::string B = write("b.c", "enum { BUFN = 8 };\n#include \"" + Use +
+                                   "\"\nint f(struct buf *b) { return "
+                                   "fill(b); }\n");
+  EXPECT_TRUE(reads(A, Use));
+  EXPECT_TRUE(reads(A, Use));
+  ASSERT_GE(Daemon->stats().Entries, 1u) << "use.h was not exported";
+  EXPECT_FALSE(reads(A, Use)) << "the same BUFN should have been served";
+  EXPECT_TRUE(reads(B, Use)) << "a part built with another BUFN was served";
+}
+
+TEST_F(ExportTest, APartIsNotServedWhereAnOutsideStructIsPacked) {
+  // struct holder's array bound is sizeof(struct pt), a constant in the
+  // part. A packed struct pt has the same members, and so the same ODR
+  // hash, but another size.
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "struct holder { char raw[sizeof(struct "
+                                   "pt)]; };\n"
+                                   "int keep(struct holder *h);\n#endif\n");
+  std::string A =
+      write("a.c", "struct pt { char c; int i; };\n#include \"" + Use +
+                       "\"\nint f(struct holder *h) { return keep(h); }\n");
+  std::string B = write("b.c", "struct __attribute__((packed)) pt { char c; "
+                               "int i; };\n#include \"" +
+                                   Use +
+                                   "\"\nint f(struct holder *h) { return "
+                                   "keep(h); }\n");
+  EXPECT_TRUE(reads(A, Use));
+  EXPECT_TRUE(reads(A, Use));
+  ASSERT_GE(Daemon->stats().Entries, 1u) << "use.h was not exported";
+  EXPECT_FALSE(reads(A, Use)) << "the same struct pt should have been served";
+  EXPECT_TRUE(reads(B, Use)) << "a part built with an unpacked pt was served";
+}
+
 TEST_F(ExportTest, APartIsNotServedWhereAnOutsideStructDiffers) {
-  // use.h's part carries a copy of struct pt, which use.h's declarations
-  // refer to. A compile whose struct pt has other members cannot take it:
-  // the copy would not merge with its own struct pt.
+  // use.h's part refers to struct pt by name, and use.h's declarations were
+  // compiled against its members. A compile whose struct pt has other
+  // members cannot take the part.
   std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
                                    "int area(struct pt *p);\n#endif\n");
   std::string A = write("a.c", "struct pt { int x, y; };\n"

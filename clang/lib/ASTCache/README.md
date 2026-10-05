@@ -65,7 +65,7 @@ described soundly costs a cache miss, never a wrong answer.
 | `CacheClient.*` | asks the daemon, picks a candidate, loads it |
 | `HeaderCacheServer.*` | the compiler's side at an `#include`: asks, loads, replays the header's effects, times headers, records jobs |
 | `PartExporter.*` | at a miss, writes the header's own part of the real compile and its metadata, and hands it to the server to push |
-| `DeclFingerprint.*` | what must match for a declaration a part carries to merge with the loading compile's own |
+| `DeclFingerprint.*` | what must match for an outside declaration a part refers to: kind, type, layout, value, definition |
 
 The daemon never interprets a record. It matches on filename and returns every
 entry it holds; choosing between them needs the compile's live macro table and
@@ -141,10 +141,17 @@ ends; `2` also names the macro behind each rejection.
 A compile fills the cache itself (DECISIONS.md §2.17): each listed header
 it has to read, it exports as its own part and pushes to the daemon.
 `CLANG_HEADER_CACHE_EXPORT_PARTS` picks how: unset, serve what fits and export
-misses until the compile loads its first copy; `0`, serve only; `populate`,
-serve nothing and export every listed header no stored copy fits. A first
-build with `populate` and a second without is the way to fill and then use the
-cache. `scratch/e2e/export_e2e.py` does this for redis.
+the misses; `0`, serve only; `populate`, serve nothing and export every listed
+header no stored copy fits. `scratch/e2e/export_e2e.py` runs redis through
+all three.
+
+A part refers to each declaration from outside its header by name, and the
+loading compile resolves the name to its own declaration (DECISIONS.md
+§2.18). `CLANG_HEADER_CACHE_OUTSIDE=copy` writes a deep copy of each instead,
+as the first version did; a compile then stops exporting at its first load.
+`CLANG_HEADER_CACHE_DUMP_PARTS=<dir>` also writes each exported part to
+`<dir>/<module name>.pcm`, with the outside declarations it requires in a
+`.txt` beside it.
 
 For looking at one part with no daemon: `CLANG_HEADER_CACHE_EXPORT=<abs
 header>=<out.pcm>` writes the part to a file, and

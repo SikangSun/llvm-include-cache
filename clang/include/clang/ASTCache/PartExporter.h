@@ -7,9 +7,15 @@
 //===----------------------------------------------------------------------===//
 //
 // Saves a header's own part of the real compile, at a miss (DECISIONS.md
-// 2.17): the declarations and macros the header's text produced, copies of
-// the outside declarations those refer to, and the metadata a later hit
-// checks. Replaces the separate producer compile.
+// 2.17): the declarations and macros the header's text produced, the
+// outside declarations those refer to, and the metadata a later hit checks.
+// Replaces the separate producer compile.
+//
+// The part refers to an outside declaration by name, and the loading
+// compile resolves the name to its own declaration. CLANG_HEADER_CACHE_OUTSIDE
+// =copy writes a deep copy of each instead, which the loading compile merges
+// with its own. A part with a declaration it cannot name, such as a field of
+// a variable's unnamed struct, is written with copies too.
 //
 // The part is written at the first top-level declaration the parser finishes
 // after the header ends, not when the header's file ends: the parser reads
@@ -39,9 +45,14 @@ public:
   struct Stats {
     unsigned Exported = 0;
     unsigned Declined = 0;
+    /// Exported parts written with deep copies, because some outside
+    /// declaration could not be named, and why.
+    unsigned Copied = 0;
+    std::vector<std::string> Copies;
     /// "<header>: <why>", one per declined part.
     std::vector<std::string> Declines;
-    /// "<header>: <bytes> bytes in <us> us", one per exported part.
+    /// "<header>: <bytes> bytes in <us> us, <n> by name", one per exported
+    /// part.
     std::vector<std::string> Exports;
   };
 
@@ -55,6 +66,11 @@ public:
   /// The compile is about to enter \p File at an #include where a saved copy
   /// could have stood in, and none fit: export the header.
   virtual void exportNext(FileEntryRef File) = 0;
+
+  /// A saved copy stood in for an #include. A header open now is not
+  /// exported: its part would hold the import, not the declarations. The
+  /// copy may be one the compile loaded before, which loads no module file.
+  virtual void served() = 0;
 
   /// Export the header whose absolute path is \p Path the first time it is
   /// entered, whatever the cache says. For CLANG_HEADER_CACHE_EXPORT.

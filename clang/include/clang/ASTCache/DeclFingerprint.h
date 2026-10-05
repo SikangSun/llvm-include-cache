@@ -17,11 +17,13 @@
 #define LLVM_CLANG_ASTCACHE_DECLFINGERPRINT_H
 
 #include "clang/ASTCache/DependencyRecord.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include <optional>
 #include <string>
 
 namespace clang {
+class Decl;
 class NamedDecl;
 
 namespace ast_cache {
@@ -29,13 +31,23 @@ namespace ast_cache {
 /// \p D's fingerprint, or std::nullopt for a declaration a part cannot depend
 /// on by name: one without a name, or not at file scope.
 ///
-/// The fingerprint says what kind of declaration \p D is and what a merge
-/// compares: for a struct, union or enum, whether it is defined and, if so,
-/// Clang's ODR hash of the definition; for a typedef, the canonical type it
-/// names, with the definition's hash if that is a struct, union or enum; for
-/// a function or variable, its canonical type and asm label, and whether this
-/// compile has a definition of it with its ODR hash.
-std::optional<std::string> declarationFingerprint(const NamedDecl &D);
+/// The fingerprint says what kind of declaration \p D is and what the
+/// part's own declarations were compiled against: for a struct, union or
+/// enum, whether it is defined and, if so, Clang's ODR hash of the
+/// definition, and for a struct or union its layout; for a typedef, the
+/// canonical type it names and any aligned attribute, with the description
+/// of the struct, union or enum it names; for an enumerator, its type and
+/// value; for a function or variable, its canonical type and asm label, and
+/// whether this compile has a definition of it, with the function's ODR hash
+/// or the hash of the variable's initializer.
+///
+/// \p Counts, when set, says which redeclarations the fingerprint looks at
+/// for a definition or an asm label. The exporting compile passes those made
+/// before the header began: a hit checks the loading compile where the
+/// header begins, before the part adds its own definition of, say, bsearch.
+std::optional<std::string>
+declarationFingerprint(const NamedDecl &D,
+                       llvm::function_ref<bool(const Decl *)> Counts = nullptr);
 
 /// The C name space \p D's name is looked up in.
 DeclarationDependency::Space nameSpaceOf(const NamedDecl &D);

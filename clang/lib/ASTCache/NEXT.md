@@ -66,13 +66,22 @@ files on one daemon give identical assembly in all 18 compiles, `object.c`
 included. Not yet removed: the producer, job files and the populate tool,
 which still work.
 
+## Built 2026-10-05: outside declarations by name
+
+`DECISIONS.md` §2.18. A part refers to each outside declaration by name and
+the loading compile resolves it to its own; deep copies stay behind
+`CLANG_HEADER_CACHE_OUTSIDE=copy`. A compile now exports its misses after its
+first hit. The fingerprint gained layout, enumerator values, typedef
+alignment and initializers, and is taken as of the header's start. Six redis
+files: 72 compiles across both modes, with and without `-g`, all identical.
+
 ## Next
 
-1. **Parts that import the copies they refer to.** A part imports nothing,
-   so a compile stops exporting at its first hit; a build has to populate
-   first (`CLANG_HEADER_CACHE_EXPORT_PARTS=populate`). With imports, any
-   compile could export its misses.
-2. **A release build** for timings, and a benchmark run over all of redis.
+1. **Cross-reference IDs** for outside declarations (the user's "keep both
+   capabilities"): needs a writer with a module chain. Not started.
+2. **A benchmark run over all of redis**, with the release build
+   (`build_rel`, 2026-10-05). At `-O2`, three files are 4 to 5 ms slower
+   served than plain (`DECISIONS.md` §2.18); find out why.
 3. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
 4. **Remove the producer**, job recording and the populate tool once parts
    cover everything they did.

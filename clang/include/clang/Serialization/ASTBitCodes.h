@@ -1540,7 +1540,29 @@ enum DeclCode {
   // An OpenACCRoutineDecl record.
   DECL_OPENACC_ROUTINE,
 
-  DECL_LAST = DECL_OPENACC_ROUTINE
+  /// A declaration from outside a header cache part, written as a reference
+  /// by name instead of a copy. The reader resolves the name in the loading
+  /// compile and uses that compile's own declaration.
+  DECL_NAME_REFERENCE,
+
+  DECL_LAST = DECL_NAME_REFERENCE
+};
+
+/// How a DECL_NAME_REFERENCE record names its declaration. The record holds
+/// the declaration's kind, one of these, the parent (a declaration
+/// reference, null for file scope), and then:
+enum class NameReferenceKind : unsigned {
+  /// Whether the name is a struct, union or enum tag, and the name. Looked
+  /// up at file scope when there is no parent, and otherwise among the
+  /// members of the parent struct or union.
+  Named,
+  /// Nothing: the unnamed struct, union or enum the parent typedef names.
+  TagOfTypedef,
+  /// The position among the parent's unnamed members of the same kind.
+  Unnamed,
+  /// Nothing: the writer could not name the declaration, and the part is
+  /// not used.
+  Unnameable,
 };
 
 /// Record codes for each kind of statement or expression.

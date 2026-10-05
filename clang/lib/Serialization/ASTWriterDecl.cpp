@@ -2263,7 +2263,8 @@ void ASTDeclWriter::VisitRedeclarable(Redeclarable<T> *D) {
       ASTRecordWriter LocalRedeclWriter(Record, LocalRedecls);
       for (const Decl *Prev = FirstLocal->getMostRecentDecl();
            Prev != FirstLocal; Prev = Prev->getPreviousDecl())
-        if (!Prev->isFromASTFile())
+        if (Writer.isWritingPart() ? Writer.IsLocalDecl(Prev)
+                                   : !Prev->isFromASTFile())
           LocalRedeclWriter.AddDeclRef(Prev);
 
       // If we have any redecls, write them now as a separate record preceding
@@ -2284,7 +2285,10 @@ void ASTDeclWriter::VisitRedeclarable(Redeclarable<T> *D) {
     // FIXME: This is not correct; when we reach an imported declaration we
     // won't emit its previous declaration.
     (void)Writer.GetDeclRef(D->getPreviousDecl());
-    (void)Writer.GetDeclRef(MostRecent);
+    // A part does not hold a redeclaration made after its header ended,
+    // such as the main file's definition of a function the header declared.
+    if (!Writer.isWritingPart() || Writer.IsLocalDecl(MostRecent))
+      (void)Writer.GetDeclRef(MostRecent);
   } else {
     // We use the sentinel value 0 to indicate an only declaration.
     Record.push_back(0);
@@ -3050,7 +3054,9 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
 
   // Determine the ID for this declaration.
   LocalDeclID ID;
-  assert(!D->isFromASTFile() && "should not be emitting imported decl");
+  bool ByName = isPartNameReference(D);
+  assert((!D->isFromASTFile() || ByName) &&
+         "should not be emitting imported decl");
   LocalDeclID &IDR = DeclIDs[D];
   if (IDR.isInvalid())
     IDR = NextDeclID++;
@@ -3059,17 +3065,23 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
 
   assert(ID >= FirstDeclID && "invalid decl ID");
 
-  RecordData Record;
-  ASTDeclWriter W(*this, Context, Record, GeneratingReducedBMI);
+  uint64_t Offset;
+  if (ByName) {
+    Offset = WritePartNameReference(Context, D);
+  } else {
+    RecordData Record;
+    ASTDeclWriter W(*this, Context, Record, GeneratingReducedBMI);
 
-  // Build a record for this declaration
-  W.Visit(D);
+    // Build a record for this declaration
+    W.Visit(D);
 
-  // Emit this declaration to the bitstream.
-  uint64_t Offset = W.Emit(D);
+    // Emit this declaration to the bitstream.
+    Offset = W.Emit(D);
+  }
 
-  // Record the offset for this declaration
-  SourceLocation Loc = D->getLocation();
+  // Record the offset for this declaration. A reference by name has no
+  // location of its own in the part.
+  SourceLocation Loc = ByName ? SourceLocation() : D->getLocation();
   SourceLocationEncoding::RawLocEncoding RawLoc =
       getRawSourceLocationEncoding(getAdjustedLocation(Loc));
 
@@ -3085,6 +3097,9 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
     llvm_unreachable("declarations should be emitted in ID order");
   }
 
+  if (ByName)
+    return;
+
   SourceManager &SM = Context.getSourceManager();
   if (Loc.isValid() && SM.isLocalSourceLocation(Loc))
     associateDeclWithFile(D, ID);
@@ -3093,6 +3108,87 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
   // them to a record in the AST file later.
   if (isRequiredDecl(D, Context, WritingModule))
     AddDeclRef(D, EagerlyDeserializedDecls);
+}
+
+uint64_t ASTWriter::WritePartNameReference(ASTContext &Context, const Decl *D) {
+  RecordData Record;
+  ASTRecordWriter W(Context, *this, Record);
+  W.push_back(D->getKind());
+
+  auto Unnameable = [&](StringRef Why) {
+    if (PartNameReferenceFailure.empty()) {
+      std::string Name;
+      if (const auto *ND = dyn_cast<NamedDecl>(D))
+        Name = ND->getNameAsString();
+      PartNameReferenceFailure =
+          (Twine(D->getDeclKindName()) + " '" + Name + "' " + Why).str();
+    }
+    W.push_back(unsigned(NameReferenceKind::Unnameable));
+    W.AddDeclRef(nullptr);
+    return W.Emit(DECL_NAME_REFERENCE);
+  };
+
+  const auto *ND = dyn_cast<NamedDecl>(D);
+  if (!ND)
+    return Unnameable("has no name");
+
+  IdentifierInfo *II = ND->getIdentifier();
+  bool Member = isa<FieldDecl, IndirectFieldDecl>(ND);
+  if (II && !Member) {
+    // Looked up at file scope. The loading compile's lookup finds its own
+    // declaration of the name; this compile's must find this declaration.
+    bool Tag = isa<TagDecl>(ND);
+    NamedDecl *Found =
+        PartSema ? ASTReader::lookupAtFileScope(*PartSema, *II, Tag,
+                                                /*CreateBuiltin=*/false)
+                 : nullptr;
+    if (!Found || Found->getCanonicalDecl() != ND->getCanonicalDecl())
+      return Unnameable("is not what its name finds at file scope");
+    // Two functions can share an overloadable name; the name alone does not
+    // say which.
+    if (ND->hasAttr<OverloadableAttr>())
+      return Unnameable("is overloadable");
+    W.push_back(unsigned(NameReferenceKind::Named));
+    W.AddDeclRef(nullptr);
+    W.push_back(Tag);
+    W.AddIdentifierRef(II);
+    PartNameReferences.push_back(ND);
+    return W.Emit(DECL_NAME_REFERENCE);
+  }
+
+  const auto *Parent = dyn_cast<RecordDecl>(ND->getDeclContext());
+  if (II) {
+    if (!Parent)
+      return Unnameable("is a member outside a struct or union");
+    W.push_back(unsigned(NameReferenceKind::Named));
+    W.AddDeclRef(Parent);
+    W.push_back(false);
+    W.AddIdentifierRef(II);
+    return W.Emit(DECL_NAME_REFERENCE);
+  }
+
+  if (const auto *Tag = dyn_cast<TagDecl>(ND))
+    if (TypedefNameDecl *TD = Tag->getTypedefNameForAnonDecl()) {
+      W.push_back(unsigned(NameReferenceKind::TagOfTypedef));
+      W.AddDeclRef(TD);
+      return W.Emit(DECL_NAME_REFERENCE);
+    }
+
+  if (!Parent || !ND->getDeclName().isEmpty())
+    return Unnameable("has no name to look up");
+  unsigned Index = 0;
+  for (const Decl *Sibling : Parent->decls()) {
+    if (Sibling == ND)
+      break;
+    const auto *Other = dyn_cast<NamedDecl>(Sibling);
+    if (Other && Other->getKind() == ND->getKind() &&
+        Other->getDeclName().isEmpty())
+      ++Index;
+  }
+  W.push_back(unsigned(NameReferenceKind::Unnamed));
+  W.AddDeclRef(Parent);
+  W.push_back(Index);
+  return W.Emit(DECL_NAME_REFERENCE);
 }
 
 void ASTRecordWriter::AddFunctionDefinition(const FunctionDecl *FD) {

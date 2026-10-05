@@ -35,6 +35,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <chrono>
 #include <mutex>
@@ -71,9 +72,9 @@ std::string absolutePath(FileManager &FM, llvm::StringRef Name) {
 class Exporter : public PartExporter, public PPCallbacks {
 public:
   Exporter(CompilerInstance &CI, ASTCacheDependencyTracker &Tracker,
-           std::function<void(PushRequest &&)> Deliver)
+           std::function<void(PushRequest &&)> Deliver, bool ByName)
       : CI(CI), SM(CI.getSourceManager()), Tracker(Tracker),
-        Deliver(std::move(Deliver)) {
+        Deliver(std::move(Deliver)), ByName(ByName) {
     std::lock_guard<std::mutex> L(RegistryLock);
     registry()[&CI] = this;
   }
@@ -85,6 +86,12 @@ public:
 
   void exportNext(FileEntryRef File) override {
     Expected = &File.getFileEntry();
+  }
+
+  void served() override {
+    for (Part &P : Open)
+      if (P.Decline.empty())
+        P.Decline = "a saved copy was served inside the header";
   }
 
   void exportWhenEntered(std::string Path) override {
@@ -168,11 +175,15 @@ public:
 private:
   struct Part {
     FileID FID;
+    /// The #include that entered the header.
+    SourceLocation IncludeLoc;
     /// The name the compile opened the header by, and the absolute path the
     /// daemon stores it under.
     std::string Name, Stored;
     /// The offsets of every location made while the header was open.
     SourceLocation::UIntTy Begin = 0, End = 0;
+    /// How many module files the compile had loaded when the header began.
+    size_t ModulesAtBegin = 0;
     PragmaSnapshot Entry, Exit;
     llvm::SetVector<const IdentifierInfo *> Touched;
     std::vector<MacroEffect> Effects;
@@ -193,8 +204,21 @@ private:
     return P.contains(SM.getExpansionLoc(L).getRawEncoding());
   }
 
-  /// Copies a module load leaves in this compile: the part cannot name them,
-  /// since a part imports nothing.
+  /// Whether the compile made \p D after \p P's header ended. Offsets do
+  /// not say: the includer's text after the #include has offsets below the
+  /// header's, since a file's offsets are handed out when it is entered.
+  bool madeAfter(const Part &P, const Decl *D) const {
+    SourceLocation L = D->getLocation();
+    if (D->isFromASTFile() || L.isInvalid() || P.IncludeLoc.isInvalid())
+      return false;
+    L = SM.getExpansionLoc(L);
+    if (!SM.isLocalSourceLocation(L) || P.contains(L.getRawEncoding()))
+      return false;
+    return SM.isBeforeInTranslationUnit(P.IncludeLoc, L);
+  }
+
+  /// Module files the compile has loaded. A deep copy cannot be of a
+  /// declaration from one, since a part imports nothing.
   size_t modulesLoaded() const {
     if (!CI.getASTReader())
       return 0;
@@ -206,7 +230,9 @@ private:
     P.FID = FID;
     P.Name = FE.getName().str();
     P.Stored = absolutePath(CI.getFileManager(), P.Name);
+    P.IncludeLoc = SM.getIncludeLoc(FID);
     P.Begin = SM.getSLocEntry(FID).getOffset();
+    P.ModulesAtBegin = modulesLoaded();
     P.Files.insert(&FE.getFileEntry());
     if (!CI.hasSema()) {
       P.Decline = "no Sema when the header was entered";
@@ -221,8 +247,9 @@ private:
         P.Decline =
             std::string("pragma state a record cannot carry: ") + Pragma;
     }
-    // A declaration from a loaded copy cannot be written into a part.
-    if (modulesLoaded())
+    // A part refers to a declaration from a loaded copy by name; it cannot
+    // hold a deep copy of one.
+    if (P.ModulesAtBegin && !ByName && P.Decline.empty())
       P.Decline = "a saved copy was loaded before the header";
     Tracked.insert(FID);
     Open.push_back(std::move(P));
@@ -244,7 +271,7 @@ private:
           P.Decline =
               std::string("pragma state a record cannot carry: ") + Pragma;
     }
-    if (modulesLoaded() && P.Decline.empty())
+    if (modulesLoaded() > P.ModulesAtBegin && P.Decline.empty())
       P.Decline = "a saved copy was loaded inside the header";
     Ready.push_back(std::move(P));
   }
@@ -297,9 +324,75 @@ private:
                                 /*IsFramework=*/false, /*IsExplicit=*/false);
     M->PresumedModuleMapFile = "<header-cache-part>";
 
+    Written W = writePart(P, M, ByName);
+    if (ByName && !W.Failure.empty()) {
+      if (P.ModulesAtBegin)
+        return decline(P, "cannot refer by name to " + W.Failure);
+      std::string Why = std::move(W.Failure);
+      W = writePart(P, M, /*ByName=*/false);
+      ++Counts.Copied;
+      Counts.Copies.push_back(P.Stored + ": " + Why);
+    }
+    Deps.Declarations = std::move(W.Declarations);
+
+    PushRequest R;
+    R.Filename = P.Stored;
+    R.ModuleName = Name;
+    R.Deps = std::move(Deps);
+    R.Data.assign(W.Buffer.begin(), W.Buffer.end());
+    ++Counts.Exported;
+    std::string Line = P.Stored + ": " + std::to_string(W.Buffer.size()) +
+                       " bytes in " + std::to_string(W.Micros) + " us, " +
+                       std::to_string(W.ByName) + " by name";
+    if (W.DroppedLocations)
+      Line += ", " + std::to_string(W.DroppedLocations) +
+              " locations in module files dropped";
+    Counts.Exports.push_back(std::move(Line));
+    dump(P, R);
+    Deliver(std::move(R));
+  }
+
+  /// CLANG_HEADER_CACHE_DUMP_PARTS=<dir>, for debugging: each part goes to
+  /// <dir>/<module name>.pcm, and what it was exported from and the outside
+  /// declarations it requires to <dir>/<module name>.txt.
+  void dump(const Part &P, const PushRequest &R) {
+    const char *Dir = std::getenv("CLANG_HEADER_CACHE_DUMP_PARTS");
+    if (!Dir || !*Dir)
+      return;
+    std::string Base = (llvm::Twine(Dir) + "/" + R.ModuleName).str();
+    std::error_code EC;
+    llvm::raw_fd_ostream Bytes(Base + ".pcm", EC);
+    if (EC)
+      return;
+    Bytes.write(R.Data.data(), R.Data.size());
+    llvm::raw_fd_ostream Text(Base + ".txt", EC);
+    if (EC)
+      return;
+    Text << "header " << P.Stored << "\nfrom "
+         << CI.getFrontendOpts().Inputs[0].getFile() << "\nloaded before "
+         << P.ModulesAtBegin << "\n";
+    for (const DeclarationDependency &D : R.Deps.Declarations)
+      Text << "requires " << D.Name << ": " << D.Fingerprint << "\n";
+  }
+
+  struct Written {
     SmallVector<char, 0> Buffer;
-    llvm::BitstreamWriter Stream(Buffer);
-    ASTWriter Writer(Stream, Buffer, CI.getModuleCache(), CI.getCodeGenOpts(),
+    long long Micros = 0;
+    /// Outside declarations referred to by name.
+    size_t ByName = 0;
+    unsigned DroppedLocations = 0;
+    /// The outside declarations a hit requires, by name and fingerprint.
+    std::vector<DeclarationDependency> Declarations;
+    /// Non-empty: an outside declaration that could not be named, and why.
+    std::string Failure;
+  };
+
+  /// Writes \p P's part as module \p M, referring to outside declarations
+  /// by name if \p Named, and by deep copy otherwise.
+  Written writePart(const Part &P, Module *M, bool Named) {
+    Written W;
+    llvm::BitstreamWriter Stream(W.Buffer);
+    ASTWriter Writer(Stream, W.Buffer, CI.getModuleCache(), CI.getCodeGenOpts(),
                      {}, /*IncludeTimestamps=*/false);
     Writer.setPartFilter(
         [&](const Decl *D) { return inPart(P, D->getLocation()); },
@@ -308,47 +401,70 @@ private:
         },
         [&](SourceLocation::UIntTy Offset) { return P.contains(Offset); },
         [&](FileEntryRef F) { return P.Files.contains(&F.getFileEntry()); });
+    Writer.setPartOutside(Named,
+                          [&](const Decl *D) { return madeAfter(P, D); });
     auto Start = std::chrono::steady_clock::now();
     Writer.WriteAST(&CI.getSema(), P.Stored, M, /*isysroot=*/"");
-    auto Micros = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - Start)
-                      .count();
+    W.Micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - Start)
+                   .count();
+    W.DroppedLocations = Writer.getPartDroppedLocations();
 
-    // The declarations from outside the header that the part carries a copy
-    // of: anything written that the header's region did not produce.
+    // The outside declarations the part refers to, each once. A member of a
+    // struct, or an unnamed struct a typedef names, is reached through the
+    // file-scope declaration listed here, whose fingerprint covers it.
+    //
+    // A hit checks the loading compile where the header begins, so the
+    // fingerprint is of the declarations made before the header: the latest
+    // of them, and none of the header's own redeclarations or definitions.
+    auto Before = [&](const Decl *D) {
+      return !inPart(P, D->getLocation()) && !madeAfter(P, D);
+    };
     llvm::DenseSet<std::pair<unsigned, IdentifierInfo *>> Seen;
+    auto Require = [&](const NamedDecl &ND) {
+      DeclarationDependency::Space In = nameSpaceOf(ND);
+      if (!Seen.insert({unsigned(In), ND.getIdentifier()}).second)
+        return true;
+      const Decl *AtEntry = ND.getMostRecentDecl();
+      while (AtEntry && !Before(AtEntry))
+        AtEntry = AtEntry->getPreviousDecl();
+      std::optional<std::string> F = declarationFingerprint(
+          AtEntry ? *cast<NamedDecl>(AtEntry) : ND, Before);
+      if (!F)
+        return false;
+      W.Declarations.push_back({In, ND.getName().str(), std::move(*F)});
+      return true;
+    };
+    if (Named) {
+      W.Failure = Writer.getPartNameReferenceFailure().str();
+      W.ByName = Writer.getPartNameReferences().size();
+      for (const NamedDecl *ND : Writer.getPartNameReferences())
+        if (W.Failure.empty() && !Require(*ND))
+          W.Failure = std::string(ND->getDeclKindName()) + " '" +
+                      ND->getNameAsString() + "': it has no fingerprint";
+      return W;
+    }
+    // A deep copy: anything written that the header's region did not
+    // produce.
     for (Decl *D :
          CI.getASTContext().getTranslationUnitDecl()->noload_decls()) {
-      if (D->isFromASTFile() || !Writer.wasDeclEmitted(D) ||
-          inPart(P, D->getLocation()))
+      if (D->isFromASTFile() || Writer.isDeclPredefined(D) ||
+          !Writer.wasDeclEmitted(D) || !Before(D))
         continue;
-      auto *ND = dyn_cast<NamedDecl>(D);
-      if (!ND)
-        continue;
-      std::optional<std::string> F = declarationFingerprint(*ND);
-      if (!F)
-        continue;
-      DeclarationDependency::Space In = nameSpaceOf(*ND);
-      if (!Seen.insert({unsigned(In), ND->getIdentifier()}).second)
-        continue;
-      Deps.Declarations.push_back({In, ND->getName().str(), std::move(*F)});
+      if (auto *ND = dyn_cast<NamedDecl>(D))
+        if (ND->getIdentifier())
+          Require(*ND);
     }
-
-    PushRequest R;
-    R.Filename = P.Stored;
-    R.ModuleName = Name;
-    R.Deps = std::move(Deps);
-    R.Data.assign(Buffer.begin(), Buffer.end());
-    ++Counts.Exported;
-    Counts.Exports.push_back(P.Stored + ": " + std::to_string(Buffer.size()) +
-                             " bytes in " + std::to_string(Micros) + " us");
-    Deliver(std::move(R));
+    return W;
   }
 
   CompilerInstance &CI;
   SourceManager &SM;
   ASTCacheDependencyTracker &Tracker;
   std::function<void(PushRequest &&)> Deliver;
+  /// Whether a part refers to outside declarations by name (the default) or
+  /// holds deep copies of them.
+  bool ByName;
   /// Set by exportNext for the file about to be entered.
   const FileEntry *Expected = nullptr;
   std::string ExpectedPath;
@@ -408,7 +524,9 @@ PartExporter::install(CompilerInstance &CI,
   Preprocessor &PP = CI.getPreprocessor();
   auto Tracker = std::make_unique<ASTCacheDependencyTracker>(PP);
   ASTCacheDependencyTracker &T = *Tracker;
-  auto E = std::make_unique<Exporter>(CI, T, std::move(Deliver));
+  const char *Outside = std::getenv("CLANG_HEADER_CACHE_OUTSIDE");
+  bool ByName = !Outside || llvm::StringRef(Outside) != "copy";
+  auto E = std::make_unique<Exporter>(CI, T, std::move(Deliver), ByName);
   Exporter &Ex = *E;
   T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID); });
   PP.setExpansionCandidateObserver(T);

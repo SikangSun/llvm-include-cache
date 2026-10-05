@@ -309,11 +309,13 @@ public:
       OS << "  served " << Line << "\n";
     if (Exporter) {
       const PartExporter::Stats &E = Exporter->stats();
-      OS << "header cache: exported " << E.Exported << " parts, declined "
-         << E.Declined << "\n";
+      OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
+         << " with deep copies), declined " << E.Declined << "\n";
       if (LogServed) {
         for (const std::string &Line : E.Exports)
           OS << "  exported " << Line << "\n";
+        for (const std::string &Line : E.Copies)
+          OS << "  deep copies in " << Line << "\n";
         for (const std::string &Line : E.Declines)
           OS << "  not exported " << Line << "\n";
       }
@@ -394,6 +396,10 @@ public:
         Exporter->exportNext(File);
       return nullptr;
     }
+    // A header being exported cannot hold a served one: its part would hold
+    // the import, not the declarations.
+    if (Exporter)
+      Exporter->served();
 
     // What the header does to its includer's macros and pragma state, which
     // entering the file would have done. The module's macros are made visible

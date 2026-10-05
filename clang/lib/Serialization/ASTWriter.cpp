@@ -1136,6 +1136,7 @@ void ASTWriter::WriteBlockInfoBlock() {
   RECORD(DECL_HLSL_BUFFER);
   RECORD(DECL_OPENACC_DECLARE);
   RECORD(DECL_OPENACC_ROUTINE);
+  RECORD(DECL_NAME_REFERENCE);
 
   // Statements and Exprs can occur in the Decls and Types block.
   AddStmtsExprs(Stream, Record);
@@ -2692,10 +2693,15 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
       // of an ordinary compile, whose macros have no module of their own.
       // We preserve the final state of defined macros, and we do not emit ones
       // that are undefined.
+      //
+      // A part is written after its header ends, when later text, or a
+      // header loaded since, may have redefined the macro: the part's state
+      // is its own last directive.
+      if (PartMacros)
+        while (MD && !PartMacros(MD))
+          MD = MD->getPrevious();
       if (!MD || shouldIgnoreMacro(MD, IsModule, PP) ||
           MD->getKind() == MacroDirective::MD_Undefine)
-        continue;
-      if (PartMacros && !PartMacros(MD))
         continue;
       AddSourceLocation(MD->getLocation(), Record);
       Record.push_back(MD->getKind());
@@ -3921,14 +3927,25 @@ public:
   /// of a translation unit, those the part wrote.
   SmallVector<NamedDecl *, 16> declsFor(const IdentifierInfo *II) {
     SmallVector<NamedDecl *, 16> Decls(IdResolver->decls(II));
-    // A part imports nothing, so it cannot name a declaration from a module
-    // file either: one the compile loaded after the part's header ended.
-    if (Writer.isWritingPart())
-      llvm::erase_if(Decls, [&](NamedDecl *D) {
-        NamedDecl *Local = getDeclForLocalLookup(PP.getLangOpts(), D);
-        return Local->isFromASTFile() || !Writer.wasDeclEmitted(Local);
-      });
-    return Decls;
+    if (!Writer.isWritingPart())
+      return Decls;
+    // The chain holds each entity's latest declaration when the part is
+    // written, after its header ended: a redeclaration of size_t in a later
+    // header, or one a module loaded since holds, may have replaced the
+    // header's own. The part lists the latest declaration it holds, and
+    // none when it holds none.
+    SmallVector<NamedDecl *, 16> Held;
+    for (NamedDecl *D : Decls) {
+      for (Decl *R = getDeclForLocalLookup(PP.getLangOpts(), D); R;
+           R = R->getPreviousDecl()) {
+        if (R->isFromASTFile() || !Writer.wasDeclEmitted(R))
+          continue;
+        if (!llvm::is_contained(Held, R))
+          Held.push_back(cast<NamedDecl>(R));
+        break;
+      }
+    }
+    return Held;
   }
 
   static hash_value_type ComputeHash(const IdentifierInfo* II) {
@@ -5505,7 +5522,14 @@ ASTWriter::WriteAST(llvm::PointerUnion<Sema *, Preprocessor *> Subject,
 
   PP = &PPRef;
   this->WritingModule = WritingModule;
+  if (PartDecls) {
+    PartSema = SemaPtr;
+    PartNameReferences.clear();
+    PartNameReferenceFailure.clear();
+    PartDroppedLocations = 0;
+  }
   ASTFileSignature Signature = WriteASTCore(SemaPtr, isysroot, WritingModule);
+  PartSema = nullptr;
   PP = nullptr;
   this->WritingModule = nullptr;
   this->BaseDirectory.clear();
@@ -5567,8 +5591,12 @@ void ASTWriter::computeNonAffectingInputFiles() {
     if (!SLoc->isFile()) {
       // A part keeps only the macro expansions inside it; a location in any
       // other is written as the place that macro was used
-      // (getAdjustedLocation).
-      if (!PartKeepsExpansion || PartKeepsExpansion(SLoc->getOffset()))
+      // (getAdjustedLocation). It drops one inside it too when the macro is
+      // spelled in a loaded module file: a part imports nothing, so it
+      // cannot refer to that location.
+      if (!PartKeepsExpansion || (PartKeepsExpansion(SLoc->getOffset()) &&
+                                  !SrcMgr.isLoadedSourceLocation(
+                                      SLoc->getExpansion().getSpellingLoc())))
         continue;
     } else {
       const SrcMgr::FileInfo &File = SLoc->getFile();
@@ -6075,14 +6103,30 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
   RecordData SpecialTypes;
   if (SemaPtr) {
     ASTContext &Context = SemaPtr->Context;
-    AddTypeRef(Context, Context.getRawCFConstantStringType(), SpecialTypes);
-    AddTypeRef(Context, Context.getFILEType(), SpecialTypes);
-    AddTypeRef(Context, Context.getjmp_bufType(), SpecialTypes);
-    AddTypeRef(Context, Context.getsigjmp_bufType(), SpecialTypes);
+    // A part carries a special type, such as FILE, only when it declares
+    // the type itself: stdio.h's part tells a loading compile what FILE is,
+    // and anet.h's part does not refer to FILE at all.
+    auto Special = [&](QualType T) {
+      if (PartDecls && !T.isNull()) {
+        const Decl *D = nullptr;
+        if (const auto *TT = T->getAs<TypedefType>())
+          D = TT->getDecl();
+        else
+          D = T->getAsTagDecl();
+        if (D && !isDeclPredefined(D) && !isPartLocal(D))
+          T = QualType();
+      }
+      return T;
+    };
+    AddTypeRef(Context, Special(Context.getRawCFConstantStringType()),
+               SpecialTypes);
+    AddTypeRef(Context, Special(Context.getFILEType()), SpecialTypes);
+    AddTypeRef(Context, Special(Context.getjmp_bufType()), SpecialTypes);
+    AddTypeRef(Context, Special(Context.getsigjmp_bufType()), SpecialTypes);
     AddTypeRef(Context, Context.ObjCIdRedefinitionType, SpecialTypes);
     AddTypeRef(Context, Context.ObjCClassRedefinitionType, SpecialTypes);
     AddTypeRef(Context, Context.ObjCSelRedefinitionType, SpecialTypes);
-    AddTypeRef(Context, Context.getucontext_tType(), SpecialTypes);
+    AddTypeRef(Context, Special(Context.getucontext_tType()), SpecialTypes);
   }
 
   if (SemaPtr)
@@ -6780,6 +6824,13 @@ ASTWriter::getRawSourceLocationEncoding(SourceLocation Loc) {
 
   // See SourceLocationEncoding.h for the encoding details.
   if (PP->getSourceManager().isLoadedSourceLocation(Loc) && Loc.isValid()) {
+    // A part imports nothing, so a location in a loaded module file has no
+    // encoding in it. A part refers to such declarations by name, and drops
+    // the macro expansions spelled there, so none should be left.
+    if (PartDecls && !getChain()) {
+      ++PartDroppedLocations;
+      return SourceLocationEncoding::encode(SourceLocation(), 0, 0);
+    }
     assert(getChain());
     auto SLocMapI = getChain()->GlobalSLocOffsetMap.find(
         SourceManager::MaxLoadedOffset - Loc.getOffset() - 1);
@@ -7023,8 +7074,9 @@ LocalDeclID ASTWriter::GetDeclRef(const Decl *D) {
   }
 
   // If D comes from an AST file, its declaration ID is already known and
-  // fixed.
-  if (D->isFromASTFile()) {
+  // fixed. A part imports nothing, so it refers to such a declaration by
+  // name instead, under an ID of its own.
+  if (D->isFromASTFile() && !PartOutsideByName) {
     if (isWritingStdCXXNamedModules() && D->getOwningModule())
       TouchedTopLevelModules.insert(D->getOwningModule()->getTopLevelModule());
 
@@ -7054,7 +7106,7 @@ LocalDeclID ASTWriter::getDeclID(const Decl *D) {
 
   // If D comes from an AST file, its declaration ID is already known and
   // fixed.
-  if (D->isFromASTFile())
+  if (D->isFromASTFile() && !PartOutsideByName)
     return LocalDeclID(D->getGlobalID());
 
   assert(DeclIDs.contains(D) && "Declaration not emitted!");
@@ -7067,6 +7119,11 @@ bool ASTWriter::wasDeclEmitted(const Decl *D) const {
   assert(DoneWritingDeclsAndTypes &&
          "wasDeclEmitted should only be called after writing declarations");
 
+  // A part that refers to an outside declaration by name does not hold it:
+  // no lookup table, identifier chain or list in the part names it.
+  if (PartOutsideByName)
+    return DeclIDs.contains(D) && !isPartNameReference(D);
+
   if (D->isFromASTFile())
     return true;
 
@@ -7075,6 +7132,24 @@ bool ASTWriter::wasDeclEmitted(const Decl *D) const {
           GeneratingReducedBMI || PartDecls) &&
          "The declaration within modules can only be omitted in reduced BMI.");
   return Emitted;
+}
+
+bool ASTWriter::isPartLocal(const Decl *D) const {
+  assert(PartDecls && "not writing a part");
+  // A declaration inside another belongs where the outermost one does: a
+  // member where its struct is, a parameter where its function is.
+  const Decl *Top = D;
+  while (const DeclContext *DC = Top->getLexicalDeclContext()) {
+    if (DC->isTranslationUnit())
+      break;
+    Top = cast<Decl>(DC);
+  }
+  return !Top->isFromASTFile() && PartDecls(Top);
+}
+
+bool ASTWriter::isPartNameReference(const Decl *D) const {
+  return PartDecls && PartOutsideByName && !isDeclPredefined(D) &&
+         !isPartLocal(D);
 }
 
 void ASTWriter::associateDeclWithFile(const Decl *D, LocalDeclID ID) {

@@ -2622,6 +2622,19 @@ public:
   /// imported.
   Sema *getSema() { return SemaObj; }
 
+  /// The declaration \p II names at file scope in \p S, in the tag name
+  /// space if \p Tag and the ordinary one otherwise, or null. A block-scope
+  /// declaration that hides it is passed over. With \p CreateBuiltin, a
+  /// builtin other than a library function is declared if it is not yet,
+  /// as a use of it in the source would.
+  ///
+  /// A header cache part names an outside declaration this way: the
+  /// exporting compile checks that the name finds the declaration, the
+  /// loading compile checks that it finds one with the same fingerprint,
+  /// and the reader resolves the part's DECL_NAME_REFERENCE records to it.
+  static NamedDecl *lookupAtFileScope(Sema &S, IdentifierInfo &II, bool Tag,
+                                      bool CreateBuiltin);
+
   /// Get the identifier resolver used for name lookup / updates
   /// in the translation unit scope. We have one of these even if we don't
   /// have a Sema object.

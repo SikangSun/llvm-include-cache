@@ -3911,6 +3911,64 @@ void ASTReader::markIncompleteDeclChain(Decl *D) {
 }
 
 /// Read the declaration at the given offset from the AST file.
+/// The declaration a DECL_NAME_REFERENCE record names in this compile, or
+/// null.
+static NamedDecl *resolveNameReference(ASTReader &Reader,
+                                       ASTRecordReader &Record) {
+  auto Kind = Decl::Kind(Record.readInt());
+  auto How = NameReferenceKind(Record.readInt());
+  Decl *Parent = Record.readDecl();
+  NamedDecl *Found = nullptr;
+  switch (How) {
+  case NameReferenceKind::Named: {
+    bool Tag = Record.readInt();
+    IdentifierInfo *II = Record.readIdentifier();
+    if (!II)
+      return nullptr;
+    if (!Parent) {
+      if (Sema *S = Reader.getSema())
+        Found = ASTReader::lookupAtFileScope(*S, *II, Tag,
+                                             /*CreateBuiltin=*/false);
+      break;
+    }
+    auto *RD = dyn_cast<RecordDecl>(Parent);
+    if (!RD || !(RD = RD->getDefinition()))
+      return nullptr;
+    for (NamedDecl *Member : RD->lookup(II))
+      if (Member->getKind() == Kind) {
+        Found = Member;
+        break;
+      }
+    break;
+  }
+  case NameReferenceKind::TagOfTypedef:
+    if (auto *TD = dyn_cast_or_null<TypedefNameDecl>(Parent))
+      Found = TD->getUnderlyingType()->getAsTagDecl();
+    break;
+  case NameReferenceKind::Unnamed: {
+    unsigned Index = Record.readInt();
+    auto *RD = dyn_cast_or_null<RecordDecl>(Parent);
+    if (!RD || !(RD = RD->getDefinition()))
+      return nullptr;
+    for (Decl *Member : RD->decls()) {
+      auto *ND = dyn_cast<NamedDecl>(Member);
+      if (!ND || ND->getKind() != Kind || !ND->getDeclName().isEmpty())
+        continue;
+      if (Index-- == 0) {
+        Found = ND;
+        break;
+      }
+    }
+    break;
+  }
+  case NameReferenceKind::Unnameable:
+    return nullptr;
+  }
+  if (Found && Found->getKind() != Kind)
+    return nullptr;
+  return Found;
+}
+
 Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
   SourceLocation DeclLoc;
   RecordLocation Loc = DeclCursorForID(ID, DeclLoc);
@@ -3954,6 +4012,18 @@ Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
   case DECL_SPECIALIZATIONS:
   case DECL_PARTIAL_SPECIALIZATIONS:
     llvm_unreachable("Record cannot be de-serialized with readDeclRecord");
+  case DECL_NAME_REFERENCE: {
+    // A declaration from outside a header cache part. The loading compile
+    // checked, before it loaded the part, that the name finds a declaration
+    // with the same fingerprint, so a failure here is a bug.
+    NamedDecl *Found = resolveNameReference(*this, Record);
+    if (!Found)
+      llvm::report_fatal_error(
+          Twine("header cache part ") + Loc.F->ModuleName +
+          ": a declaration it refers to by name is not in this compile");
+    LoadedDecl(translateGlobalDeclIDToIndex(ID), Found);
+    return Found;
+  }
   case DECL_TYPEDEF:
     D = TypedefDecl::CreateDeserialized(Context, ID);
     break;

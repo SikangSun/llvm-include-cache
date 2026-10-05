@@ -75,6 +75,7 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/Token.h"
+#include "clang/Sema/Lookup.h"
 #include "clang/Sema/ObjCMethodList.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/Sema.h"
@@ -8429,6 +8430,38 @@ Decl *ASTReader::GetExistingDecl(GlobalDeclID ID) {
   return DeclsLoaded[Index];
 }
 
+/// Whether \p D is declared at file scope: in the translation unit, or in a
+/// struct, union or enum there, whose tags and enumerators C puts in the
+/// enclosing scope.
+static bool isAtFileScope(const NamedDecl *D) {
+  for (const DeclContext *DC = D->getDeclContext();; DC = DC->getParent()) {
+    if (DC->isTranslationUnit())
+      return true;
+    if (!isa<TagDecl>(DC))
+      return false;
+  }
+}
+
+NamedDecl *ASTReader::lookupAtFileScope(Sema &S, IdentifierInfo &II, bool Tag,
+                                        bool CreateBuiltin) {
+  unsigned IDNS = Tag ? Decl::IDNS_Tag : Decl::IDNS_Ordinary;
+  for (auto I = S.IdResolver.begin(&II), E = S.IdResolver.end(); I != E; ++I) {
+    NamedDecl *D = *I;
+    if (D->isInIdentifierNamespace(IDNS) && isAtFileScope(D) && S.isVisible(D))
+      return D;
+  }
+  if (!CreateBuiltin || Tag)
+    return nullptr;
+  unsigned ID = II.getBuiltinID();
+  if (!ID || S.Context.BuiltinInfo.isPredefinedLibFunction(ID))
+    return nullptr;
+  LookupResult R(S, DeclarationName(&II), SourceLocation(),
+                 Sema::LookupOrdinaryName);
+  if (!S.LookupBuiltin(R))
+    return nullptr;
+  return R.getAsSingle<NamedDecl>();
+}
+
 Decl *ASTReader::GetDecl(GlobalDeclID ID) {
   if (ID < NUM_PREDEF_DECL_IDS)
     return GetExistingDecl(ID);
@@ -8443,7 +8476,8 @@ Decl *ASTReader::GetDecl(GlobalDeclID ID) {
 
   if (!DeclsLoaded[Index]) {
     ReadDeclRecord(ID);
-    if (DeserializationListener)
+    // A reference by name resolves to a declaration this compile made.
+    if (DeserializationListener && DeclsLoaded[Index]->isFromASTFile())
       DeserializationListener->DeclRead(ID, DeclsLoaded[Index]);
   }
 

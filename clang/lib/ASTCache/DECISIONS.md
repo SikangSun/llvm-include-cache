@@ -1127,7 +1127,8 @@ I want to finish the first debugging version this week").
   (`CLANG_HEADER_CACHE_EXPORT_PARTS`): unset, serve and export misses until
   the first load; `0`, serve only; `populate`, serve nothing and export every
   listed header no stored copy fits. Parts that import the copies they refer
-  to (the import graph of 2.1) would remove the limit; not built.
+  to (the import graph of 2.1) would remove the limit; not built. 2.18
+  removes it another way: a part refers to a loaded declaration by name.
 
 Six redis files on one daemon (`scratch/e2e/export_e2e.py`, debug clang,
 `-O2 -S`), every listed header (`-ask-cutoff-us 0`): pass 1 times the
@@ -1151,6 +1152,140 @@ one is never asked about. Rejections count candidates, and most were other
 variants of the same header (`__need_size_t`, `__USE_GNU`); 23 were outside
 declarations that differed (`_IO_FILE`, `stack_t`, `vprintf`), which a load
 would have turned into a merge error.
+
+### 2.18 A part refers to outside declarations by name (approved and built 2026-10-05)
+
+User, 2026-10-05: "Yes keep default, with deep copy as a safety net option,
+thus the default becomes an semi-intrusive, but tolerated, optimization. You
+can also check if this leads to a performance increase. This way we will
+have to make sure that dependency is gauranteeing semantic correctness."
+Earlier the same day: "we should support deep copy (folding) and cross
+reference ID for future flexibility. Keep both capabilities."
+
+**The mechanism.** Clang serializes a reference to a declaration as a
+declaration ID. Until now, a part's writer gave every declaration it reached
+an ID and wrote the declaration itself: a deep copy of `size_t` from
+`stddef.h` went into `anet.h`'s part. The loading compile merged the copy
+with its own `size_t`. Now:
+
+- *Writer.* For a declaration outside the header's region, the writer emits a
+  `DECL_NAME_REFERENCE` record instead of the declaration
+  (`ASTWriter::WritePartNameReference`). The record holds the declaration's
+  kind and how to find it: a name looked up at file scope, in the tag or the
+  ordinary name space (`size_t`, `struct sockaddr`, the enumerator `RED`); a
+  member of a struct found by name (the field `sa_family`, with the struct as
+  its parent); the unnamed struct a typedef names (`fd_set`'s); or an unnamed
+  member by position (an anonymous union inside a struct). Types need nothing
+  new: a `TypedefType` or `RecordType` refers to its declaration by ID, so a
+  type built on a name reference becomes the loading compile's own type.
+- *Reader.* `ASTReader::ReadDeclRecord` resolves the record in the loading
+  compile and returns the compile's own declaration
+  (`ASTReader::lookupAtFileScope`), much as `getPredefinedDecl` does for the
+  translation unit. Nothing is merged. The part's own declarations point at
+  the compile's `size_t`, as they would after a textual include.
+- *Redeclarations.* A part's declaration that redeclares an outside one
+  (`bits/stdlib-bsearch.h` defines the `bsearch` that `stdlib.h` declared)
+  lists the outside one as its first declaration. The reader attaches the
+  part's declaration to the end of the compile's chain, as it does for a
+  module that redeclares an imported declaration.
+- *Declarations made after the header.* A part is written at the first
+  top-level declaration after its header ends. A part never refers to a
+  declaration made after the header, not even through a redeclaration chain
+  (`ASTWriter::setPartOutside`). Before this, the deep copy of a chain could
+  carry the main file's definition: `sds.c` defines `SDS_NOINIT` right after
+  including `sds.h`, which declares it.
+- *Loaded declarations.* A declaration from a loaded module file is referred
+  to the same way. So a compile now keeps exporting after its first hit; the
+  limit in 2.17 is gone in this mode. This is the property section 3 says a
+  PCM lacks: a reference to a declaration the loading compile parsed as text.
+- *The safety net.* `CLANG_HEADER_CACHE_OUTSIDE=copy` writes deep copies, as
+  before. A part with a declaration the writer cannot name -- a field of a
+  variable's unnamed struct, an `overloadable` function -- is written with
+  deep copies too, or declined after a load. Cross-reference IDs need a
+  writer with a module chain; not built.
+
+**What guarantees correctness.** The part's declarations were compiled
+against the exporting compile's outside declarations; loaded, they use the
+loading compile's. A hit is right only if those are the same where it
+matters.
+
+- Every name reference leads to a file-scope name: a field leads to its
+  struct, an unnamed struct to its typedef. Each such name is a
+  `DeclarationDependency` with a fingerprint. The hit check looks the name up
+  with the same function the reader resolves it with, at the `#include`, and
+  requires the same fingerprint. So the reader finds the declaration the
+  check approved.
+- The fingerprint now covers what a part can hold as constants. A part holds
+  `char data[BUFN]` as an array of 4, and `char raw[sizeof(struct pt)]` as an
+  array of 8. Added: an enumerator's value; a struct's layout (size,
+  alignment, field offsets), which shows `packed` and `aligned` that the ODR
+  hash leaves out; a typedef's `aligned` attribute; the hash of a variable's
+  initializer.
+- The fingerprint is taken as of the header's start. Before, `bsearch` was
+  fingerprinted with the header's own definition, so a compile where
+  `bsearch` was only declared at that point rejected the part.
+- Not covered: other attributes of an outside declaration, such as
+  `deprecated`. They change diagnostics, not code: the loaded declarations
+  use the live declaration, attributes included.
+
+**Bugs found by exporting after a load,** all fixed, each with a test:
+
+- *A served header inside the header.* Serving a part the compile already
+  loaded loads no new module file, so the exporter did not see it. The
+  outer part held an import declaration instead of the inner header's
+  declarations; `stack_t.h` then found no `size_t`. The server now tells the
+  exporter about every serve.
+- *Macros.* The writer wrote each macro's latest directive. A header loaded
+  after the region can redefine the macro, and then the region's own
+  `#define` was dropped. The writer now writes the region's last directive.
+- *Name chains.* The identifier table listed each name's latest declaration
+  at write time, which can be a later header's. The part now lists its own
+  latest redeclaration.
+- *Special types.* Clang writes `FILE`, `jmp_buf` and `ucontext_t` into every
+  precompiled file, for builtins. Every part then required `FILE`. A part now
+  writes them only when it declares them.
+
+**Results.** Six redis files on one daemon (`scratch/e2e/export_e2e.py`, debug
+clang), every listed header (`-ask-cutoff-us 0`). Pass 1 times the headers and
+serves what is stored. Pass 2 populates. Pass 3 serves. Both modes, with and
+without `-g`: all 72 compiles gave assembly identical to a plain compile's.
+In pass 3 every lookup hit in both modes.
+
+| File | Pass 1 hits, by name | Pass 1 hits, copy |
+|---|---|---|
+| `sds.c` | 23 / 153 | 8 / 153 |
+| `zmalloc.c` | 88 / 189 | 18 / 202 |
+| `util.c` | 118 / 187 | 16 / 221 |
+| `ae.c` | 104 / 154 | 15 / 179 |
+| `object.c` | 158 / 279 | 18 / 307 |
+
+Pass 1 is the first build with a cache: by name, each compile exports its
+misses and later compiles are served them.
+
+Size, with pass 1 not exporting so both modes write the same 421 parts:
+25.06 MB by name, 25.91 MB by copy, 3% less. A part refers to about five
+outside declarations on average (2,263 references in 421 parts); most of a
+part is its fixed tables and the header's own declarations.
+
+Speed (`scratch/e2e/bench_outside.py`, release clang, no assertions). A
+fresh daemon per mode is populated with `-fsyntax-only`. Each file is then
+compiled served (no exports) and plainly, seven times each; medians, in ms.
+
+| File | Syntax: plain | by name | copy | `-O2 -S`: plain | by name | copy |
+|---|---|---|---|---|---|---|
+| `anet.c` | 41 | 39 | 39 | 124 | 129 | 131 |
+| `sds.c` | 38 | 33 | 34 | 291 | 294 | 294 |
+| `zmalloc.c` | 42 | 34 | 34 | 173 | 178 | 179 |
+| `util.c` | 71 | 46 | 46 | 286 | 271 | 271 |
+| `ae.c` | 37 | 30 | 30 | 117 | 122 | 122 |
+| `object.c` | 114 | 54 | 57 | 349 | 347 | 356 |
+
+Loading by name is no faster than loading copies, except `object.c` by
+3 ms: five copies per part cost little to merge. The gain is in the first
+build, where by name a compile keeps exporting after its first hit (the pass
+1 table above). Served, the front end is faster than plain: `object.c` 114 to
+54 ms. At `-O2`, code generation dominates, and three files are 4 to 5 ms
+slower served than plain; not yet looked into.
 
 ## 3. Things that turned out to be wrong
 

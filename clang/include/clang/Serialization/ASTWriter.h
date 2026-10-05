@@ -190,6 +190,24 @@ private:
   std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
   std::function<bool(FileEntryRef)> PartKeepsHeaderInfo;
 
+  /// When writing a part: whether a declaration from outside it is written
+  /// as a reference by name rather than as a deep copy, and which
+  /// declarations the compile made after the part's header ended. See
+  /// setPartOutside.
+  bool PartOutsideByName = false;
+  std::function<bool(const Decl *)> PartLater;
+
+  /// The Sema of the compile being written, while writing a part.
+  Sema *PartSema = nullptr;
+
+  /// The outside declarations a part refers to by name, and why one could
+  /// not be, if one could not.
+  std::vector<const NamedDecl *> PartNameReferences;
+  std::string PartNameReferenceFailure;
+
+  /// Locations in a loaded module file the part wrote as invalid ones.
+  unsigned PartDroppedLocations = 0;
+
   /// Mapping from input file entries to the index into the
   /// offset table where information about that input file is stored.
   llvm::DenseMap<const FileEntry *, uint32_t> InputFileIDs;
@@ -789,7 +807,13 @@ public:
     if (D->isFromASTFile())
       return false;
     auto I = DeclIDs.find(D);
-    return (I == DeclIDs.end() || I->second >= clang::NUM_PREDEF_DECL_IDS);
+    if (I != DeclIDs.end() && I->second < clang::NUM_PREDEF_DECL_IDS)
+      return false;
+    // A part writes neither a declaration made after its header ended nor
+    // one it refers to by name.
+    if (PartDecls && ((PartLater && PartLater(D)) || isPartNameReference(D)))
+      return false;
+    return true;
   };
 
   void AddLookupOffsets(const LookupBlockOffsets &Offsets,
@@ -952,8 +976,57 @@ public:
   }
   bool isWritingPart() const { return bool(PartDecls); }
 
+  /// How a part refers to a declaration from outside it.
+  ///
+  /// By name (\p ByName): the part holds a DECL_NAME_REFERENCE record, and
+  /// the loading compile resolves the name to its own declaration. A
+  /// declaration from a loaded module file is referred to the same way, so
+  /// a part can be written after the compile loaded one.
+  ///
+  /// By deep copy (otherwise): the part holds a copy of the declaration,
+  /// which the loading compile merges with its own. This cannot refer to a
+  /// declaration from a loaded module file.
+  ///
+  /// \p Later says which declarations the compile made after the part's
+  /// header ended, such as a definition in the main file of a function the
+  /// header declared. A part never refers to one, not even through a
+  /// redeclaration chain.
+  void setPartOutside(bool ByName, std::function<bool(const Decl *)> Later) {
+    PartOutsideByName = ByName;
+    PartLater = std::move(Later);
+  }
+
+  /// The outside declarations the part just written refers to by name, in
+  /// the order written.
+  ArrayRef<const NamedDecl *> getPartNameReferences() const {
+    return PartNameReferences;
+  }
+
+  /// Empty when every outside declaration could be referred to by name;
+  /// otherwise, the first that could not, and why. The part is not usable
+  /// then.
+  StringRef getPartNameReferenceFailure() const {
+    return PartNameReferenceFailure;
+  }
+
+  /// How many locations in a loaded module file the part just written holds
+  /// as invalid ones. Expected to be zero.
+  unsigned getPartDroppedLocations() const { return PartDroppedLocations; }
+
+  /// Whether the part being written holds \p D itself, rather than a
+  /// reference to it or nothing.
+  bool isPartLocal(const Decl *D) const;
+
+  /// Whether the part being written refers to \p D by name.
+  bool isPartNameReference(const Decl *D) const;
+
   bool getDoneWritingDeclsAndTypes() const { return DoneWritingDeclsAndTypes; }
 
+private:
+  /// Write the DECL_NAME_REFERENCE record for \p D.
+  uint64_t WritePartNameReference(ASTContext &Context, const Decl *D);
+
+public:
   bool isDeclPredefined(const Decl *D) const {
     return PredefinedDecls.count(D);
   }

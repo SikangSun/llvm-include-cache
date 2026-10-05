@@ -17,6 +17,7 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
+#include "clang/Serialization/ASTReader.h"
 #include "llvm/Support/raw_socket_stream.h"
 
 using namespace clang;
@@ -306,32 +307,23 @@ MismatchReason clang::ast_cache::matchesLiveState(
     }
   }
 
-  // Each declaration the part carries a copy of merges, on load, with this
-  // compile's own declaration of the name, so there must be one it merges
-  // with. A struct fd_set with other members, or an fscanf with another asm
-  // label, would stop the compile instead.
+  // The part's own declarations were compiled against the outside
+  // declarations it refers to. Loading it resolves each name to this
+  // compile's own declaration (or merges the part's copy with it), so the
+  // name must find one with the same fingerprint: a struct fd_set with other
+  // members, or an fscanf with another asm label, would compile differently.
+  // The lookup is the one the reader resolves the names with.
   for (const DeclarationDependency &D : Deps.Declarations) {
-    LookupResult R(*S, DeclarationName(&Idents.get(D.Name)), SourceLocation(),
-                   D.In == DeclarationDependency::Space::Tag
-                       ? Sema::LookupTagName
-                       : Sema::LookupOrdinaryName);
-    S->LookupName(R, S->TUScope);
-    bool Matched = false;
-    std::string Seen;
-    for (NamedDecl *Live : R) {
-      std::optional<std::string> F = declarationFingerprint(*Live);
-      if (!F)
-        continue;
-      if (fingerprintSatisfies(D.Fingerprint, *F)) {
-        Matched = true;
-        break;
-      }
-      Seen = *F;
-    }
-    if (!Matched)
+    NamedDecl *Live = ASTReader::lookupAtFileScope(
+        *S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
+        /*CreateBuiltin=*/true);
+    std::optional<std::string> F;
+    if (Live)
+      F = declarationFingerprint(*Live);
+    if (!F || !fingerprintSatisfies(D.Fingerprint, *F))
       return Because(MismatchReason::Declaration,
                      D.Name + " was " + D.Fingerprint + ", is " +
-                         (Seen.empty() ? std::string("not declared") : Seen));
+                         (F ? *F : std::string("not declared")));
   }
 
   return MismatchReason::None;
