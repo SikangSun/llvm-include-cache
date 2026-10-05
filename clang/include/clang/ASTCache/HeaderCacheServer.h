@@ -42,9 +42,9 @@ void installHeaderCacheHook(CompilerInstance &CI);
 /// Whether a compile exports the headers it reads (PartExporter).
 enum class ExportMode {
   None,
-  /// Serve what fits, and export each listed header no stored copy fits,
-  /// until the compile loads its first copy: a part cannot refer to a loaded
-  /// copy's declarations.
+  /// Serve what fits, and export each listed header no stored copy fits.
+  /// With CLANG_HEADER_CACHE_OUTSIDE=copy, only until the compile loads its
+  /// first copy: a deep copy cannot be of a loaded declaration.
   Misses,
   /// Serve nothing; export every listed header no stored copy fits.
   PopulateOnly,

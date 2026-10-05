@@ -43,7 +43,7 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
   case MismatchReason::Include:
     return "an #include inside the header finds a different file";
   case MismatchReason::Declaration:
-    return "a declaration the part carries differs here or is missing";
+    return "an outside declaration the part refers to differs or is missing";
   }
   return "unknown";
 }

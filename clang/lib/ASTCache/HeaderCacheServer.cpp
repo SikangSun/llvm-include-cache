@@ -329,9 +329,7 @@ public:
   }
 
   /// Exports each listed header this compile has to read itself. With
-  /// \p PopulateOnly, serves nothing: a part cannot refer to a loaded copy's
-  /// declarations, since a part imports nothing, so a compile that has loaded
-  /// one exports no more. A populating compile exports every listed header no
+  /// \p PopulateOnly, serves nothing, and exports every listed header no
   /// stored copy fits, for the compiles after it to serve.
   void exportMisses(PartExporter &E, bool PopulateOnly) {
     Exporter = &E;
