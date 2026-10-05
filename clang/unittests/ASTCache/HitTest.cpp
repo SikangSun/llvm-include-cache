@@ -67,14 +67,16 @@ private:
 class CachedAction : public SyntaxOnlyAction {
 public:
   CachedAction(std::unique_ptr<CacheClient> Client, std::set<std::string> &Out,
-               std::string JobsDir = "")
-      : Client(std::move(Client)), Out(Out), JobsDir(std::move(JobsDir)) {}
+               std::string JobsDir = "", bool ExportParts = false)
+      : Client(std::move(Client)), Out(Out), JobsDir(std::move(JobsDir)),
+        ExportParts(ExportParts) {}
 
   bool BeginSourceFileAction(CompilerInstance &CI) override {
     CI.getPreprocessor().addPPCallbacks(
         std::make_unique<EnteredFiles>(CI.getSourceManager(), Out));
     installHeaderCacheHook(CI, std::move(Client), /*ReportStats=*/false,
-                           JobsDir);
+                           JobsDir,
+                           ExportParts ? ExportMode::Misses : ExportMode::None);
     return true;
   }
 
@@ -82,6 +84,7 @@ private:
   std::unique_ptr<CacheClient> Client;
   std::set<std::string> &Out;
   std::string JobsDir;
+  bool ExportParts;
 };
 
 class HitTest : public ::testing::Test {
@@ -181,7 +184,7 @@ protected:
     CI.createVirtualFileSystem(VFS);
     CI.createFileManager();
 
-    CachedAction Action(client(), Entered, RecordJobsTo);
+    CachedAction Action(client(), Entered, RecordJobsTo, ExportParts);
     return CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
   }
 
@@ -212,6 +215,8 @@ protected:
   std::string Dir, SocketPath, RegionPath;
   /// Flags added to every compile, before the file.
   std::vector<std::string> ExtraArgs;
+  /// When set, compiles export each listed header they read (PartExporter).
+  bool ExportParts = false;
   /// When set, compiles record their jobs in this directory.
   std::string RecordJobsTo;
   std::unique_ptr<CacheDaemon> Daemon;
@@ -1062,3 +1067,78 @@ TEST_F(HitTest, AMacroFromAServedCopyComparesByItsText) {
 }
 
 } // namespace
+
+/// Compiles that export their misses, against a daemon that lists every
+/// header a compile has timed.
+class ExportTest : public AskListTest {
+protected:
+  void SetUp() override {
+    AskListTest::SetUp();
+    ExportParts = true;
+  }
+};
+
+TEST_F(ExportTest, AMissExportsAPartTheNextCompileServes) {
+  // The first compile only times the headers, which puts them on the
+  // ask-list. The second asks, misses, and exports each header's part. The
+  // third is served from the parts: use.h's declarations, its macro, its
+  // static inline function, and the u32 it takes from types.h.
+  std::string Types = write("types.h", "#ifndef TYPES_H\n#define TYPES_H\n"
+                                       "typedef unsigned int u32;\n#endif\n");
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "#define USE_OK 1\n"
+                                   "u32 count(void);\n"
+                                   "static inline u32 twice(u32 x) {\n"
+                                   "  return 2 * x;\n}\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Types +
+                          "\"\n"
+                          "#include \"" +
+                          Use +
+                          "\"\n"
+                          "u32 f(void) { return twice(count()) + "
+                          "USE_OK; }\n");
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is stored yet";
+  EXPECT_GE(Daemon->stats().Entries, 2u) << "the misses were not exported";
+  EXPECT_FALSE(reads(Main, Use)) << "use.h's part was not served";
+}
+
+TEST_F(ExportTest, APartIsNotServedWhereAnOutsideStructDiffers) {
+  // use.h's part carries a copy of struct pt, which use.h's declarations
+  // refer to. A compile whose struct pt has other members cannot take it:
+  // the copy would not merge with its own struct pt.
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "int area(struct pt *p);\n#endif\n");
+  std::string A = write("a.c", "struct pt { int x, y; };\n"
+                               "#include \"" +
+                                   Use +
+                                   "\"\n"
+                                   "int f(struct pt *p) { return area(p); }\n");
+  std::string B = write("b.c", "struct pt { long x, y, z; };\n"
+                               "#include \"" +
+                                   Use +
+                                   "\"\n"
+                                   "int f(struct pt *p) { return area(p); }\n");
+  EXPECT_TRUE(reads(A, Use));
+  EXPECT_TRUE(reads(A, Use));
+  ASSERT_GE(Daemon->stats().Entries, 1u) << "use.h was not exported";
+  EXPECT_FALSE(reads(A, Use)) << "the same struct pt should have been served";
+  EXPECT_TRUE(reads(B, Use)) << "a part carrying another struct pt was served";
+}
+
+TEST_F(ExportTest, APartIsNotServedUnderAnotherName) {
+  // A part holds use.h under the name its compile opened it by, which
+  // __FILE__ and debug information repeat. A compile that names use.h
+  // otherwise reads it.
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "int used(void);\n#endif\n");
+  write("rel.c", "#include \"use.h\"\nint f(void) { return used(); }\n");
+  std::string Abs = write("abs.c", "#include \"" + Use +
+                                       "\"\nint f(void) { return used(); }\n");
+  std::set<std::string> E1, E2, E3;
+  ASSERT_TRUE(compile("rel.c", E1, /*WorkingDir=*/Dir));
+  ASSERT_TRUE(compile("rel.c", E2, /*WorkingDir=*/Dir));
+  ASSERT_GE(Daemon->stats().Entries, 1u) << "use.h was not exported";
+  EXPECT_TRUE(reads(Abs, Use)) << "a part holding ./use.h served /.../use.h";
+}

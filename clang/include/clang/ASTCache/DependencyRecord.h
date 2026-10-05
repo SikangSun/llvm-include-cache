@@ -127,11 +127,17 @@ struct IncludeDependency {
   int32_t Includer = -1;
   /// The real path of the file found. Empty when __has_include found nothing.
   std::string Found;
+  /// The name the lookup found the file by, "./ae.h" or
+  /// "/usr/include/stdio.h". A part exported from the real compile holds its
+  /// files under these names, which __FILE__ and debug information repeat, so
+  /// a hit requires the same names. Empty for a copy the separate producer
+  /// built, whose names are its own.
+  std::string Name;
 
   friend bool operator==(const IncludeDependency &A,
                          const IncludeDependency &B) {
     return A.K == B.K && A.Angled == B.Angled && A.Spelled == B.Spelled &&
-           A.Includer == B.Includer && A.Found == B.Found;
+           A.Includer == B.Includer && A.Found == B.Found && A.Name == B.Name;
   }
 };
 
@@ -157,6 +163,27 @@ struct FileNameDependency {
   friend bool operator==(const FileNameDependency &A,
                          const FileNameDependency &B) {
     return A.Which == B.Which && A.File == B.File && A.Text == B.Text;
+  }
+};
+
+/// A declaration from outside the header that the header's part carries a
+/// copy of, because the part's own declarations refer to it: anet.h declares
+/// functions taking uint32_t, so anet.h's part holds stdint.h's typedef of
+/// uint32_t. Loading the part merges each copy with this compile's own
+/// declaration of the name, so a hit requires one, with the same fingerprint
+/// (declarationFingerprint): a struct fd_set with other members, or an
+/// fscanf with another asm label, cannot merge, and would stop the compile.
+struct DeclarationDependency {
+  /// Which C name space the name is looked up in: struct, union and enum
+  /// tags are one, everything else the other.
+  enum class Space : uint8_t { Ordinary, Tag };
+  Space In = Space::Ordinary;
+  std::string Name;
+  std::string Fingerprint;
+
+  friend bool operator==(const DeclarationDependency &A,
+                         const DeclarationDependency &B) {
+    return A.In == B.In && A.Name == B.Name && A.Fingerprint == B.Fingerprint;
   }
 };
 
@@ -202,6 +229,12 @@ struct HeaderDependencySet {
   std::vector<InclusionDependency> Inclusion;
   std::vector<IncludeDependency> Includes;
   std::vector<FileNameDependency> FileNames;
+  std::vector<DeclarationDependency> Declarations;
+
+  /// The name the compile that exported the part opened the header by
+  /// ("./anet.h"); a hit requires the same. Empty for a copy the separate
+  /// producer built.
+  std::string HeaderName;
 
   /// Pragma state where the header was reached. This is an *input* to the
   /// header's compilation -- "#pragma pack(1)" before an #include changes the

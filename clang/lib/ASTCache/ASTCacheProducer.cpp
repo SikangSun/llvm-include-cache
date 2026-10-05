@@ -78,11 +78,6 @@ struct ProduceOutcome {
   std::vector<MacroEffect> MacroEffects;
 };
 
-/// Builtins whose value depends on the compile that includes the header
-/// rather than on the header. DECISIONS.md 2.7 has the reasoning, including
-/// why __LINE__ is not here. __FILE__ and __FILE_NAME__ are not either: their
-/// text depends on the name the compile reaches the header by, which a hit
-/// can check (FileNameDependency).
 constexpr llvm::StringLiteral TranslationUnitVaryingBuiltins[] = {
     "__COUNTER__", "__INCLUDE_LEVEL__", "__BASE_FILE__",
     "__DATE__",    "__TIME__",          "__TIMESTAMP__"};
@@ -524,6 +519,10 @@ llvm::Error writeFile(llvm::StringRef Path, llvm::StringRef Text) {
 }
 
 } // namespace
+
+bool clang::ast_cache::isTranslationUnitVaryingBuiltin(llvm::StringRef Name) {
+  return llvm::is_contained(TranslationUnitVaryingBuiltins, Name);
+}
 
 std::string clang::ast_cache::moduleNameFor(const ProduceRequest &Req) {
   // Each field is tagged and NUL-terminated, so ("ab", "c") and ("a", "bc")

@@ -76,6 +76,7 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
     W.str(D.Spelled);
     W.u32(static_cast<uint32_t>(D.Includer));
     W.str(D.Found);
+    W.str(D.Name);
   }
 
   W.u32(static_cast<uint32_t>(Deps.FileNames.size()));
@@ -84,6 +85,15 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
     W.u32(static_cast<uint32_t>(D.File));
     W.str(D.Text);
   }
+
+  W.u32(static_cast<uint32_t>(Deps.Declarations.size()));
+  for (const DeclarationDependency &D : Deps.Declarations) {
+    W.u8(static_cast<uint8_t>(D.In));
+    W.str(D.Name);
+    W.str(D.Fingerprint);
+  }
+
+  W.str(Deps.HeaderName);
 }
 
 std::optional<HeaderDependencySet>
@@ -164,6 +174,7 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
     if (D.Includer < -1 || D.Includer >= static_cast<int32_t>(I))
       return std::nullopt;
     D.Found = R.str().str();
+    D.Name = R.str().str();
     Deps.Includes.push_back(std::move(D));
   }
 
@@ -179,6 +190,19 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
     D.Text = R.str().str();
     Deps.FileNames.push_back(std::move(D));
   }
+
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    DeclarationDependency D;
+    uint8_t Raw = R.u8();
+    if (Raw > static_cast<uint8_t>(DeclarationDependency::Space::Tag))
+      return std::nullopt;
+    D.In = static_cast<DeclarationDependency::Space>(Raw);
+    D.Name = R.str().str();
+    D.Fingerprint = R.str().str();
+    Deps.Declarations.push_back(std::move(D));
+  }
+
+  Deps.HeaderName = R.str().str();
 
   // Trailing bytes mean the writer and reader disagree about the shape even
   // though the version matched, so the decode is not trustworthy.

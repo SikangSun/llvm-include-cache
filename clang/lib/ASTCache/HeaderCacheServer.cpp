@@ -10,6 +10,7 @@
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/CacheClient.h"
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/ASTCache/PartExporter.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/Module.h"
@@ -306,7 +307,31 @@ public:
       OS << "    " << Line << "\n";
     for (const std::string &Line : Served)
       OS << "  served " << Line << "\n";
+    if (Exporter) {
+      const PartExporter::Stats &E = Exporter->stats();
+      OS << "header cache: exported " << E.Exported << " parts, declined "
+         << E.Declined << "\n";
+      if (LogServed) {
+        for (const std::string &Line : E.Exports)
+          OS << "  exported " << Line << "\n";
+        for (const std::string &Line : E.Declines)
+          OS << "  not exported " << Line << "\n";
+      }
+    }
   }
+
+  /// Exports each listed header this compile has to read itself. With
+  /// \p PopulateOnly, serves nothing: a part cannot refer to a loaded copy's
+  /// declarations, since a part imports nothing, so a compile that has loaded
+  /// one exports no more. A populating compile exports every listed header no
+  /// stored copy fits, for the compiles after it to serve.
+  void exportMisses(PartExporter &E, bool PopulateOnly) {
+    Exporter = &E;
+    this->PopulateOnly = PopulateOnly;
+  }
+
+  /// Stores a part this compile exported.
+  void push(const PushRequest &R) { Client->push(R); }
 
   Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc,
                    ConstSearchDirIterator CurDir) override {
@@ -348,9 +373,13 @@ public:
     HeaderDependencySet Deps;
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc};
+    bool AnyFits = false;
     Client->lookup(
         Path, PP, &CI.getSema(), &Deps,
         [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
+          AnyFits = true;
+          if (PopulateOnly)
+            return false;
           Target = load(Bytes, ModuleName);
           if (Target && LogServed)
             Served.push_back(Path + " from " + ModuleName.str());
@@ -358,8 +387,13 @@ public:
         },
         &Site);
     PP.setCounterValue(Counter);
-    if (!Target)
+    if (!Target) {
+      // A miss where a copy could have stood in: save this header's part of
+      // this compile for the next one (DECISIONS.md 2.17).
+      if (Exporter && !(PopulateOnly && AnyFits))
+        Exporter->exportNext(File);
       return nullptr;
+    }
 
     // What the header does to its includer's macros and pragma state, which
     // entering the file would have done. The module's macros are made visible
@@ -490,9 +524,12 @@ private:
     // so nothing tries to find or build it again by name.
     MM.cacheModuleLoad(*CI.getPreprocessor().getIdentifierInfo(MF->ModuleName),
                        Top);
+    // A copy the producer built keeps the header in its target submodule;
+    // a part exported from a real compile is the header, whole.
     Module *Target = Top->findSubmodule(TargetSubmoduleName);
-    if (Target)
-      LoadedTargets[MF->ModuleName] = Target;
+    if (!Target)
+      Target = Top;
+    LoadedTargets[MF->ModuleName] = Target;
     return Target;
   }
 
@@ -515,6 +552,9 @@ private:
   /// they were built with other compiler options.
   unsigned LoadsRefused = 0;
   unsigned NotListed = 0;
+  /// Null unless this compile exports its misses.
+  PartExporter *Exporter = nullptr;
+  bool PopulateOnly = false;
 
   struct OpenFile {
     /// Null for a buffer with no file behind it, such as the predefines.
@@ -595,12 +635,18 @@ private:
 
 void clang::ast_cache::installHeaderCacheHook(
     CompilerInstance &CI, std::unique_ptr<CacheClient> Client, bool ReportStats,
-    llvm::StringRef JobsDir) {
+    llvm::StringRef JobsDir, ExportMode Export) {
   if (!Client || !CI.hasPreprocessor())
     return;
   bool Detailed = Client->loggingRejections();
   auto Server =
       std::make_unique<HeaderCacheServer>(CI, std::move(Client), Detailed);
+  if (Export != ExportMode::None) {
+    HeaderCacheServer *S = Server.get();
+    S->exportMisses(
+        PartExporter::install(CI, [S](PushRequest &&R) { S->push(R); }),
+        Export == ExportMode::PopulateOnly);
+  }
   std::unique_ptr<JobRecorder> Recorder;
   if (!JobsDir.empty())
     Recorder = std::make_unique<JobRecorder>(CI, JobsDir.str());
@@ -617,10 +663,9 @@ void clang::ast_cache::installHeaderCacheHook(
 //   CLANG_HEADER_CACHE_EXPORT=<header>=<out.pcm>
 //   CLANG_HEADER_CACHE_LOAD=<header>=<in.pcm>
 //
-// <header> is an absolute path. The export is written when the header's file
-// ends. The parser reads one token ahead, so that is only safe for a header
-// whose last declaration is finished before its file is: prototypes and
-// macros, not a function body last.
+// <header> is an absolute path. The export is the one a compile makes at a
+// miss (PartExporter), written to a file instead of pushed, and the load
+// checks nothing: the two are for looking at a part, not for serving one.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -632,91 +677,6 @@ std::pair<std::string, std::string> experimentSetting(const char *Var) {
   auto [Header, File] = llvm::StringRef(V).split('=');
   return {Header.str(), File.str()};
 }
-
-class ExportExperiment : public PPCallbacks {
-public:
-  ExportExperiment(CompilerInstance &CI, std::string Header, std::string Out)
-      : CI(CI), Header(std::move(Header)), Out(std::move(Out)) {}
-
-  void FileChanged(SourceLocation Loc, FileChangeReason Reason,
-                   SrcMgr::CharacteristicKind, FileID PrevFID) override {
-    SourceManager &SM = CI.getSourceManager();
-    if (Reason == EnterFile) {
-      FileID FID = SM.getFileID(Loc);
-      OptionalFileEntryRef F = SM.getFileEntryRefForID(FID);
-      if (Done || Open.isValid() || !F ||
-          absolutePath(CI.getFileManager(), F->getName()) != Header)
-        return;
-      Open = FID;
-      Begin = SM.getSLocEntry(FID).getOffset();
-      return;
-    }
-    if (Reason != ExitFile || !Open.isValid() || PrevFID != Open)
-      return;
-    // Every location made while the header was open, in it or in a file
-    // first entered under it, has an offset in [Begin, End).
-    End = SM.getNextLocalOffset();
-    Open = FileID();
-    Done = true;
-    write();
-  }
-
-private:
-  bool inPart(SourceLocation L) const {
-    if (L.isInvalid())
-      return false;
-    L = CI.getSourceManager().getExpansionLoc(L);
-    SourceLocation::UIntTy Raw = L.getRawEncoding();
-    return Begin <= Raw && Raw < End;
-  }
-
-  void write() {
-    if (!CI.hasSema()) {
-      llvm::errs() << "header cache export: no Sema\n";
-      return;
-    }
-    Preprocessor &PP = CI.getPreprocessor();
-    ModuleMap &MM = PP.getHeaderSearchInfo().getModuleMap();
-    std::string Name = "__hcx_" + llvm::utohexstr(llvm::xxh3_64bits(Header));
-    Module *M = MM.createModule(Name, /*Parent=*/nullptr,
-                                /*IsFramework=*/false, /*IsExplicit=*/false);
-    M->PresumedModuleMapFile = "<header-cache-export>";
-
-    SmallVector<char, 0> Buffer;
-    llvm::BitstreamWriter Stream(Buffer);
-    ASTWriter Writer(Stream, Buffer, CI.getModuleCache(), CI.getCodeGenOpts(),
-                     {}, /*IncludeTimestamps=*/false);
-    Writer.setPartFilter(
-        [this](const Decl *D) { return inPart(D->getLocation()); },
-        [this](const MacroDirective *MD) { return inPart(MD->getLocation()); },
-        [this](SourceLocation::UIntTy Offset) {
-          return Begin <= Offset && Offset < End;
-        });
-    auto Start = std::chrono::steady_clock::now();
-    Writer.WriteAST(&CI.getSema(), Out, M, /*isysroot=*/"");
-    auto Micros = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - Start)
-                      .count();
-
-    std::error_code EC;
-    llvm::raw_fd_ostream OS(Out, EC);
-    if (EC) {
-      llvm::errs() << "header cache export: " << Out << ": " << EC.message()
-                   << "\n";
-      return;
-    }
-    OS.write(Buffer.data(), Buffer.size());
-    llvm::errs() << "header cache export: " << Header << " -> " << Out << ", "
-                 << Buffer.size() << " bytes in " << Micros << " us, module "
-                 << Name << "\n";
-  }
-
-  CompilerInstance &CI;
-  std::string Header, Out;
-  FileID Open;
-  SourceLocation::UIntTy Begin = 0, End = 0;
-  bool Done = false;
-};
 
 class LoadExperiment : public HeaderCacheHook {
 public:
@@ -775,9 +735,23 @@ private:
 void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
   // The 2.17 experiment, above.
   if (auto [Header, Out] = experimentSetting("CLANG_HEADER_CACHE_EXPORT");
-      !Header.empty() && CI.hasPreprocessor())
-    CI.getPreprocessor().addPPCallbacks(
-        std::make_unique<ExportExperiment>(CI, Header, Out));
+      !Header.empty() && CI.hasPreprocessor()) {
+    PartExporter &E = PartExporter::install(CI, [Out = Out](PushRequest &&R) {
+      std::error_code EC;
+      llvm::raw_fd_ostream OS(Out, EC);
+      if (EC) {
+        llvm::errs() << "header cache export: " << Out << ": " << EC.message()
+                     << "\n";
+        return;
+      }
+      OS << R.Data;
+      llvm::errs() << "header cache export: " << R.Filename << " -> " << Out
+                   << ", " << R.Data.size() << " bytes, "
+                   << R.Deps.Declarations.size()
+                   << " outside declarations, module " << R.ModuleName << "\n";
+    });
+    E.exportWhenEntered(Header);
+  }
   if (auto [Header, In] = experimentSetting("CLANG_HEADER_CACHE_LOAD");
       !Header.empty() && CI.hasPreprocessor()) {
     CI.getPreprocessor().setHeaderCacheHook(
@@ -805,6 +779,13 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
   // A directory to record, for every header this compile reads, the job that
   // would build its saved copy.
   const char *Jobs = std::getenv("CLANG_HEADER_CACHE_JOBS");
+  // A compile exports each listed header it has to read itself, unless told
+  // not to; "populate" exports without serving (DECISIONS.md 2.17).
+  const char *ExportVar = std::getenv("CLANG_HEADER_CACHE_EXPORT_PARTS");
+  llvm::StringRef ExportSetting = ExportVar ? ExportVar : "";
+  ExportMode Export = ExportSetting == "0"          ? ExportMode::None
+                      : ExportSetting == "populate" ? ExportMode::PopulateOnly
+                                                    : ExportMode::Misses;
   installHeaderCacheHook(CI, std::move(*Client), !Level.empty(),
-                         Jobs ? Jobs : "");
+                         Jobs ? Jobs : "", Export);
 }

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/ASTCache/CacheClient.h"
+#include "clang/ASTCache/DeclFingerprint.h"
 #include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/MacroTokens.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
@@ -39,6 +40,8 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
     return "__FILE__ would name a file differently";
   case MismatchReason::Include:
     return "an #include inside the header finds a different file";
+  case MismatchReason::Declaration:
+    return "a declaration the part carries differs here or is missing";
   }
   return "unknown";
 }
@@ -86,6 +89,7 @@ FileEntryRef refOnEntry(const SourceManager &SM, FileEntryRef File) {
 /// first entry that found a different file, or -1.
 int redoLookups(
     const HeaderDependencySet &Deps, Preprocessor &PP, const IncludeSite &Site,
+    bool CheckNames,
     std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
         &Found) {
   HeaderSearch &HS = PP.getHeaderSearchInfo();
@@ -130,6 +134,8 @@ int redoLookups(
         /*IsMapped=*/nullptr, /*IsFrameworkFound=*/nullptr);
     std::string Path = File ? FM.getCanonicalName(*File).str() : "";
     if (Path != D.Found)
+      return static_cast<int>(I);
+    if (CheckNames && File && File->getName() != D.Name)
       return static_cast<int>(I);
     Found.push_back({File, CurDir});
   }
@@ -256,20 +262,31 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // include path, which nothing else compares. The stored parse also holds
   // the text each __FILE__ produced, which is the name the producer's compile
   // opened the file by.
-  if (!Deps.Includes.empty() || !Deps.FileNames.empty()) {
+  if (!Deps.Includes.empty() || !Deps.FileNames.empty() ||
+      !Deps.HeaderName.empty()) {
     if (!Site)
       return Because(MismatchReason::Include,
                      "no #include site to redo the header's lookups from");
+    // A part exported from a real compile holds its files under the names
+    // that compile opened them by, which __FILE__ and debug information
+    // repeat; a copy the separate producer built holds its own, and only the
+    // files themselves are compared.
+    bool CheckNames = !Deps.HeaderName.empty();
+    if (CheckNames && Site->File.getName() != Deps.HeaderName)
+      return Because(MismatchReason::Include, "the header was opened as " +
+                                                  Deps.HeaderName + ", is " +
+                                                  Site->File.getName());
     std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>> Found;
-    int Bad = redoLookups(Deps, PP, *Site, Found);
+    int Bad = redoLookups(Deps, PP, *Site, CheckNames, Found);
     if (Bad >= 0) {
       const IncludeDependency &D = Deps.Includes[Bad];
       std::string Written =
           D.Angled ? "<" + D.Spelled + ">" : "\"" + D.Spelled + "\"";
+      std::string Was = D.Found.empty() ? std::string("nothing")
+                        : CheckNames    ? D.Name
+                                        : D.Found;
       return Because(MismatchReason::Include,
-                     Written + " found " +
-                         (D.Found.empty() ? std::string("nothing") : D.Found) +
-                         ", finds something else");
+                     Written + " found " + Was + ", finds something else");
     }
 
     SourceManager &SM = PP.getSourceManager();
@@ -287,6 +304,34 @@ MismatchReason clang::ast_cache::matchesLiveState(
         return Because(MismatchReason::FileName,
                        "__FILE__ was \"" + D.Text + "\", is \"" + Live + "\"");
     }
+  }
+
+  // Each declaration the part carries a copy of merges, on load, with this
+  // compile's own declaration of the name, so there must be one it merges
+  // with. A struct fd_set with other members, or an fscanf with another asm
+  // label, would stop the compile instead.
+  for (const DeclarationDependency &D : Deps.Declarations) {
+    LookupResult R(*S, DeclarationName(&Idents.get(D.Name)), SourceLocation(),
+                   D.In == DeclarationDependency::Space::Tag
+                       ? Sema::LookupTagName
+                       : Sema::LookupOrdinaryName);
+    S->LookupName(R, S->TUScope);
+    bool Matched = false;
+    std::string Seen;
+    for (NamedDecl *Live : R) {
+      std::optional<std::string> F = declarationFingerprint(*Live);
+      if (!F)
+        continue;
+      if (fingerprintSatisfies(D.Fingerprint, *F)) {
+        Matched = true;
+        break;
+      }
+      Seen = *F;
+    }
+    if (!Matched)
+      return Because(MismatchReason::Declaration,
+                     D.Name + " was " + D.Fingerprint + ", is " +
+                         (Seen.empty() ? std::string("not declared") : Seen));
   }
 
   return MismatchReason::None;

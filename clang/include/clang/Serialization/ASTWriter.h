@@ -188,6 +188,7 @@ private:
   std::function<bool(const Decl *)> PartDecls;
   std::function<bool(const MacroDirective *)> PartMacros;
   std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
+  std::function<bool(FileEntryRef)> PartKeepsHeaderInfo;
 
   /// Mapping from input file entries to the index into the
   /// offset table where information about that input file is stored.
@@ -934,13 +935,20 @@ public:
   /// \p KeepsExpansion says, by its starting offset, which local macro
   /// expansions keep their entry in the source-location table. A location in
   /// a dropped one is written as the place the macro was used.
+  ///
+  /// \p KeepsHeaderInfo, when set, says which files keep their entry in the
+  /// header-search table: the include guard, #pragma once and "already
+  /// included" marks a loading compile takes over. A part keeps those of the
+  /// files it read, so a loading compile does not skip a file it never read.
   void
   setPartFilter(std::function<bool(const Decl *)> Decls,
                 std::function<bool(const MacroDirective *)> Macros,
-                std::function<bool(SourceLocation::UIntTy)> KeepsExpansion) {
+                std::function<bool(SourceLocation::UIntTy)> KeepsExpansion,
+                std::function<bool(FileEntryRef)> KeepsHeaderInfo = nullptr) {
     PartDecls = std::move(Decls);
     PartMacros = std::move(Macros);
     PartKeepsExpansion = std::move(KeepsExpansion);
+    PartKeepsHeaderInfo = std::move(KeepsHeaderInfo);
   }
   bool isWritingPart() const { return bool(PartDecls); }
 

@@ -64,6 +64,8 @@ described soundly costs a cache miss, never a wrong answer.
 | `ASTCacheProducer.*` | compiles one header alone and records what it needed |
 | `CacheClient.*` | asks the daemon, picks a candidate, loads it |
 | `HeaderCacheServer.*` | the compiler's side at an `#include`: asks, loads, replays the header's effects, times headers, records jobs |
+| `PartExporter.*` | at a miss, writes the header's own part of the real compile and its metadata, and hands it to the server to push |
+| `DeclFingerprint.*` | what must match for a declaration a part carries to merge with the loading compile's own |
 
 The daemon never interprets a record. It matches on filename and returns every
 entry it holds; choosing between them needs the compile's live macro table and
@@ -136,11 +138,18 @@ CLANG_HEADER_CACHE=/tmp/clang-header-cache.sock clang -fmodules \
 `CLANG_HEADER_CACHE_STATS=1` prints hits and rejection counts when the compile
 ends; `2` also names the macro behind each rejection.
 
-An experiment for exporting a header's own part from the real compile
-(DECISIONS.md §2.17), with no daemon: `CLANG_HEADER_CACHE_EXPORT=<abs
-header>=<out.pcm>` writes the part when the header's file ends, and
+A compile fills the cache itself (DECISIONS.md §2.17): each listed header
+it has to read, it exports as its own part and pushes to the daemon.
+`CLANG_HEADER_CACHE_EXPORT_PARTS` picks how: unset, serve what fits and export
+misses until the compile loads its first copy; `0`, serve only; `populate`,
+serve nothing and export every listed header no stored copy fits. A first
+build with `populate` and a second without is the way to fill and then use the
+cache. `scratch/e2e/export_e2e.py` does this for redis.
+
+For looking at one part with no daemon: `CLANG_HEADER_CACHE_EXPORT=<abs
+header>=<out.pcm>` writes the part to a file, and
 `CLANG_HEADER_CACHE_LOAD=<abs header>=<in.pcm>` serves the header from it in a
-later compile. Safe only for a header that does not end in a function body.
+later compile, checking nothing.
 `CLANG_HEADER_CACHE_JOBS=<dir>` makes the compile write, for every header it
 reads, the job that builds that header's saved copy; the populate tool runs
 them with the build's flags added:
@@ -169,6 +178,7 @@ Working: recording, the protocol, the daemon, the producer, the client's
 matching and loading, and serving an `#include` from the cache -- written in a
 `.c` file or in another header -- with the header's macro effects replayed.
 
-Not done: filling the cache during a build (a compile records its jobs, and
-something else runs them), and the conflicts between saved copies built after
-different `.c` files (DECISIONS.md §3). NEXT.md has the order.
+Also working: filling the cache from the real compile (exported parts), which
+removed the conflicts between saved copies built after different `.c` files.
+Not done: a part that refers to a copy the compile loaded (imports), so a
+compile stops exporting at its first hit. NEXT.md has the order.

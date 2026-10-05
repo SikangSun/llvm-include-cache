@@ -46,6 +46,8 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
       F.Closure.insert(FID);
       F.ClosureFiles.insert(&FE->getFileEntry());
     }
+    if (TrackOnly && !TrackOnly(FID))
+      return;
 
     Frame New;
     New.FID = FID;
@@ -79,6 +81,7 @@ void ASTCacheDependencyTracker::closeFrame(Frame &F) {
   Rec.HeaderPath = std::move(F.Path);
   Rec.Deps = std::move(F.Deps);
   Completed.push_back(std::move(Rec));
+  CompletedFIDs.push_back(F.FID);
 }
 
 void ASTCacheDependencyTracker::finalize() {
@@ -126,9 +129,11 @@ void ASTCacheDependencyTracker::recordLookup(SourceLocation Loc,
                                              OptionalFileEntryRef Found) {
   SourceManager &SM = PP.getSourceManager();
   FileID Where = SM.getFileID(SM.getExpansionLoc(Loc));
-  std::string FoundPath;
-  if (Found)
+  std::string FoundPath, FoundName;
+  if (Found) {
     FoundPath = PP.getFileManager().getCanonicalName(*Found).str();
+    FoundName = Found->getName().str();
+  }
 
   for (size_t I = 0; I != Stack.size(); ++I) {
     Frame &F = Stack[I];
@@ -146,6 +151,7 @@ void ASTCacheDependencyTracker::recordLookup(SourceLocation Loc,
     Dep.Angled = Angled;
     Dep.Spelled = Spelled.str();
     Dep.Found = FoundPath;
+    Dep.Name = FoundName;
     if (Where != F.FID) {
       auto It = F.EntryOf.find(Where);
       // A file in the region that no recorded lookup entered.
@@ -485,6 +491,14 @@ void ASTCacheDependencyTracker::recordDeductionGuideNameQuery(
 void ASTCacheDependencyTracker::poisonOpenFrames() {
   for (Frame &F : Stack)
     F.Poisoned = true;
+}
+
+const HeaderDependencySet *
+ASTCacheDependencyTracker::recordFor(FileID FID) const {
+  for (size_t I = 0; I != CompletedFIDs.size(); ++I)
+    if (CompletedFIDs[I] == FID)
+      return &Completed[I].Deps;
+  return nullptr;
 }
 
 const HeaderDependencySet *

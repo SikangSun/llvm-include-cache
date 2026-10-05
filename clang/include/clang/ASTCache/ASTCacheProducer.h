@@ -199,6 +199,14 @@ inline ProduceResult produceHeader(llvm::StringRef HeaderPath,
   return produceHeader(Req);
 }
 
+/// Whether \p Name is a builtin macro whose value depends on the compile that
+/// includes the header rather than on the header: __COUNTER__,
+/// __INCLUDE_LEVEL__, __BASE_FILE__, __DATE__, __TIME__, __TIMESTAMP__. A
+/// header that expands one is not saved. DECISIONS.md 2.7 has the reasoning,
+/// including why __LINE__ is not here; __FILE__ and __FILE_NAME__ are not
+/// either, since a hit checks their text (FileNameDependency).
+bool isTranslationUnitVaryingBuiltin(llvm::StringRef Name);
+
 /// The module name a saved copy is built under: "__hc_" followed by 16 hex
 /// digits of an xxh3 hash of the request's header, flags, and context, taken
 /// exactly as given. Two different requests get two different names, which

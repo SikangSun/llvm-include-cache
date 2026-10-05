@@ -2270,6 +2270,8 @@ void ASTWriter::WriteHeaderSearch(const HeaderSearch &HS) {
       continue; // Header file info is tracked by the owning module file.
     if (!HFI->isCompilingModuleHeader && !HFI->IsLocallyIncluded)
       continue; // Header file info is tracked by the including module file.
+    if (PartKeepsHeaderInfo && !PartKeepsHeaderInfo(*File))
+      continue; // A file outside the part being written.
 
     // Massage the file path into an appropriate form.
     StringRef Filename = File->getName();
@@ -3919,10 +3921,12 @@ public:
   /// of a translation unit, those the part wrote.
   SmallVector<NamedDecl *, 16> declsFor(const IdentifierInfo *II) {
     SmallVector<NamedDecl *, 16> Decls(IdResolver->decls(II));
+    // A part imports nothing, so it cannot name a declaration from a module
+    // file either: one the compile loaded after the part's header ended.
     if (Writer.isWritingPart())
       llvm::erase_if(Decls, [&](NamedDecl *D) {
-        return !Writer.wasDeclEmitted(
-            getDeclForLocalLookup(PP.getLangOpts(), D));
+        NamedDecl *Local = getDeclForLocalLookup(PP.getLangOpts(), D);
+        return Local->isFromASTFile() || !Writer.wasDeclEmitted(Local);
       });
     return Decls;
   }
@@ -4430,6 +4434,10 @@ public:
 
       if (Writer.getDoneWritingDeclsAndTypes() &&
           !Writer.wasDeclEmitted(DeclForLocalLookup))
+        continue;
+
+      // A part imports nothing; see ASTIdentifierTableTrait::declsFor.
+      if (Writer.isWritingPart() && DeclForLocalLookup->isFromASTFile())
         continue;
 
       // Try to avoid writing internal decls to reduced BMI.

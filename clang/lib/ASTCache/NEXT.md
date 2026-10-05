@@ -59,25 +59,23 @@ None of this waits on the layout question in §3.
   as opened. Seven redis headers served back into their own `.c` file give
   identical assembly with and without `-g`.
 
-## Blocking a benchmark run
+## Built 2026-10-05: export at a miss (first debugging version)
 
-The export at a miss (`DECISIONS.md` §2.17, approved 2026-10-02), which
-replaces the separate compile and with it the conflicts between copies
-built after different `.c` files (§3). Target: a first debugging version the
-week of 2026-10-05. What it needs:
+`DECISIONS.md` §2.17. Exported parts replace the separate compile; six redis
+files on one daemon give identical assembly in all 18 compiles, `object.c`
+included. Not yet removed: the producer, job files and the populate tool,
+which still work.
 
-1. Export at a miss, at the first top-level declaration boundary after the
-   header ends, and push the part with its metadata.
-2. The dependency tracker running in the real compile for the headers it
-   exports, with the macro effects, pragma snapshots and the
-   `__COUNTER__`-family decline the producer had.
-3. Outside declarations as dependencies: name and fingerprint.
-4. The name each recorded lookup found, compared at a hit, not only the real
-   path: a part holds files under the names its compile opened them by.
-5. Included-file marks limited to the header's region.
-6. A compile that already loaded a copy writes the part as importing every
-   loaded module. First version: export only from a compile that has loaded
-   none.
+## Next
+
+1. **Parts that import the copies they refer to.** A part imports nothing,
+   so a compile stops exporting at its first hit; a build has to populate
+   first (`CLANG_HEADER_CACHE_EXPORT_PARTS=populate`). With imports, any
+   compile could export its misses.
+2. **A release build** for timings, and a benchmark run over all of redis.
+3. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
+4. **Remove the producer**, job recording and the populate tool once parts
+   cover everything they did.
 
 ## What changes in what exists
 

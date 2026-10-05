@@ -903,7 +903,7 @@ each header's `#pragma once`, `#import` and included marks, and Clang applies
 them when it reads the header info. A guarded header's second `#include` is
 skipped because replay defines its guard macro.
 
-### 2.17 Export only the header's own part, from the real compile (proposed 2026-10-02)
+### 2.17 Export only the header's own part, from the real compile (proposed 2026-10-02; first version built 2026-10-05)
 
 **Proposed, awaiting approval.** The user: "given the sizes, reduced BMI mode
 is a must". This replaces the separate compile of 2.1 and the context of 2.9.
@@ -1083,6 +1083,74 @@ list, the header-search table and the file entries, for every file read so
 far. Dropping the files the part never refers to needs the set of locations
 the part writes before the writer starts, which it computes as it goes; not
 attempted.
+
+**First debugging version, built 2026-10-05** (user: "yes let's build ...
+I want to finish the first debugging version this week").
+
+- *When.* A header on the ask-list, at a declaration boundary, that no
+  stored copy fits, is exported (`PartExporter`, `HeaderCacheServer::tryServe`
+  calling `exportNext`). Its region is the offsets handed out between entering
+  and leaving it. The part is written at the first top-level declaration the
+  parser finishes after the header ends, or at the end of the translation
+  unit. That notification comes from an AST consumer registered as a
+  frontend plugin (`header-cache-export`), which every compile gets and which
+  does nothing in a compile without an exporter.
+- *Recording.* The dependency tracker runs in the real compile, but keeps a
+  frame only for the headers being exported (`trackOnly`); with no frame open
+  every hook returns at once. The exporter takes the pragma snapshots, the
+  macro effects and the `__COUNTER__`-family decline the producer used to.
+- *Writing.* `setPartFilter` as in the experiment, plus a fourth predicate:
+  the header-search table keeps only files entered in the region, so a
+  loading compile marks as included only what reading the header would have.
+  A part never names a declaration from a loaded copy: those are left out of
+  the lookup tables and C name chains (one can be in a lookup result when a
+  copy was loaded after the header ended, through the parser's lookahead).
+- *Metadata.* `DeclarationDependency`: every written declaration from
+  outside the region, with a fingerprint (`declarationFingerprint`: kind,
+  canonical type, asm label, and the ODR hash of a definition). At a hit the
+  name is looked up at file scope, and the live declaration must have the same
+  fingerprint, or a definition where the part carries only a declaration.
+  `IncludeDependency::Name` and `HeaderDependencySet::HeaderName`: a part
+  holds its files under the names its compile opened them by, so a hit
+  requires the same names (only for parts; a producer copy's names are its
+  own). The module name hashes the stored path, the compile's module hash
+  (`CompilerInvocation::getModuleHash`) and the metadata, so the same part from
+  two compiles is one entry. Encoding version 6.
+- *Serving.* A part is its module's top level; `load` takes the top module
+  when there is no `target` submodule.
+- *A limit.* A part imports nothing, so it cannot refer to a declaration from
+  a copy this compile loaded. A compile that has loaded a copy before a header
+  ends does not export that header ("a saved copy was loaded before the
+  header"). In practice the first hit ends a compile's exports: on `anet.c`, a
+  compile that exported as it went soon hit its own part of the unguarded
+  `stddef.h`, and declined 171 of the rest. So there are three modes
+  (`CLANG_HEADER_CACHE_EXPORT_PARTS`): unset, serve and export misses until
+  the first load; `0`, serve only; `populate`, serve nothing and export every
+  listed header no stored copy fits. Parts that import the copies they refer
+  to (the import graph of 2.1) would remove the limit; not built.
+
+Six redis files on one daemon (`scratch/e2e/export_e2e.py`, debug clang,
+`-O2 -S`), every listed header (`-ask-cutoff-us 0`): pass 1 times the
+headers, pass 2 populates, pass 3 serves. All 18 compiles gave assembly
+identical to a plain compile's, the populating ones included. `object.c`,
+which stopped with conflicts between copies built after different `.c`
+files (section 3), compiles. The daemon held 492 parts of 278 headers,
+31 MB.
+
+| File | Pass 3 hits / lookups |
+|---|---|
+| `anet.c` | 21 / 23 |
+| `sds.c` | 16 / 20 |
+| `zmalloc.c` | 22 / 26 |
+| `util.c` | 34 / 40 |
+| `ae.c` | 12 / 12 |
+| `object.c` | 6 / 6 |
+
+A lookup is one per header the compile reached; a header inside a served
+one is never asked about. Rejections count candidates, and most were other
+variants of the same header (`__need_size_t`, `__USE_GNU`); 23 were outside
+declarations that differed (`_IO_FILE`, `stack_t`, `vprintf`), which a load
+would have turned into a merge error.
 
 ## 3. Things that turned out to be wrong
 

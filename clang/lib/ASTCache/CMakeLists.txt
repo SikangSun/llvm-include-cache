@@ -8,13 +8,16 @@ add_clang_library(clangASTCache
   CacheClient.cpp
   CacheDaemon.cpp
   CacheProtocol.cpp
+  DeclFingerprint.cpp
   DependencySerialization.cpp
   HeaderCacheServer.cpp
   MacroTokens.cpp
+  PartExporter.cpp
   PragmaStateCheck.cpp
   SharedRegion.cpp
 
   LINK_LIBS
+  clangAST
   clangBasic
   clangDriver
   clangOptions

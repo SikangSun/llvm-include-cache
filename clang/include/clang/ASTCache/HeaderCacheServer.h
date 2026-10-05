@@ -39,13 +39,27 @@ class CacheClient;
 /// Signature matches CompilerInstance::PreprocessorCreatedCallback.
 void installHeaderCacheHook(CompilerInstance &CI);
 
+/// Whether a compile exports the headers it reads (PartExporter).
+enum class ExportMode {
+  None,
+  /// Serve what fits, and export each listed header no stored copy fits,
+  /// until the compile loads its first copy: a part cannot refer to a loaded
+  /// copy's declarations.
+  Misses,
+  /// Serve nothing; export every listed header no stored copy fits.
+  PopulateOnly,
+};
+
 /// The same, with the client supplied rather than built from the
 /// environment. For tests, which run their own daemon. A non-empty \p JobsDir
-/// records jobs there.
+/// records jobs there. cc1 exports misses unless
+/// CLANG_HEADER_CACHE_EXPORT_PARTS is "0", and only populates if it is
+/// "populate".
 void installHeaderCacheHook(CompilerInstance &CI,
                             std::unique_ptr<CacheClient> Client,
                             bool ReportStats = false,
-                            llvm::StringRef JobsDir = {});
+                            llvm::StringRef JobsDir = {},
+                            ExportMode Export = ExportMode::None);
 
 } // namespace ast_cache
 } // namespace clang

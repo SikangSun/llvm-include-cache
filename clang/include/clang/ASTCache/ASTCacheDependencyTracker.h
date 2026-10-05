@@ -41,6 +41,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -214,6 +215,19 @@ public:
   /// line or resolved through the search path.
   const HeaderDependencySet *findByPath(llvm::StringRef PathSuffix) const;
 
+  /// The dependency set recorded for the file entered as \p FID, once it has
+  /// been left; nullptr if it was not tracked, is still open, or was poisoned.
+  const HeaderDependencySet *recordFor(FileID FID) const;
+
+  /// Track only the files \p Track accepts. Every file entered still joins
+  /// the closure of every open frame, so a tracked header's record is the
+  /// same; untracked files only get no record of their own. A compile that
+  /// exports a few headers tracks just those, and pays almost nothing
+  /// elsewhere: with no frame open, every hook returns at once.
+  void trackOnly(std::function<bool(FileID)> Track) {
+    TrackOnly = std::move(Track);
+  }
+
 private:
   /// One header's in-flight state, live between its EnterFile and ExitFile.
   struct Frame {
@@ -279,6 +293,9 @@ private:
   Preprocessor &PP;
   llvm::SmallVector<Frame, 8> Stack;
   std::vector<HeaderRecord> Completed;
+  /// The file each Completed record is for, by the same index.
+  std::vector<FileID> CompletedFIDs;
+  std::function<bool(FileID)> TrackOnly;
   /// The entries InclusionDirective just made, as (frame, index), waiting
   /// for the file they found to be entered.
   const FileEntry *PendingFile = nullptr;

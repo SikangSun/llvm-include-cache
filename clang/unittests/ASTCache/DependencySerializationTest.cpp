@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/ASTCache/DependencySerialization.h"
+#include "clang/ASTCache/DeclFingerprint.h"
 #include "gtest/gtest.h"
 #include <string>
 
@@ -44,12 +45,17 @@ HeaderDependencySet makeFullSet() {
                          InclusionDependency::Reason::PragmaOnce});
   D.MacroEffects.push_back({"GUARD_H", true});
   D.MacroEffects.push_back({"LIMIT", false});
-  D.Includes.push_back(
-      {IncludeDependency::Kind::Include, false, "sub/x.h", -1, "/src/sub/x.h"});
+  D.Includes.push_back({IncludeDependency::Kind::Include, false, "sub/x.h", -1,
+                        "/src/sub/x.h", "./sub/x.h"});
   D.Includes.push_back(
       {IncludeDependency::Kind::HasIncludeNext, true, "cfg.h", 0, ""});
   D.FileNames.push_back({FileNameDependency::Macro::File, -1, "./ae_epoll.c"});
   D.FileNames.push_back({FileNameDependency::Macro::FileName, 0, "x.h"});
+  D.Declarations.push_back({DeclarationDependency::Space::Ordinary, "uint32_t",
+                            "typedef unsigned int"});
+  D.Declarations.push_back(
+      {DeclarationDependency::Space::Tag, "fd_set", "struct defined 1234"});
+  D.HeaderName = "./anet.h";
   return D;
 }
 
@@ -83,6 +89,8 @@ void expectEqual(const HeaderDependencySet &A, const HeaderDependencySet &B) {
   }
   EXPECT_EQ(A.Includes, B.Includes);
   EXPECT_EQ(A.FileNames, B.FileNames);
+  EXPECT_EQ(A.Declarations, B.Declarations);
+  EXPECT_EQ(A.HeaderName, B.HeaderName);
 }
 
 TEST(DependencySerializationTest, EmptySetRoundTrips) {
@@ -255,6 +263,43 @@ TEST(DependencySerializationTest, AnIndexThatPointsForwardIsRejected) {
   D = makeFullSet();
   D.FileNames[1].File = 2;
   EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+}
+
+TEST(DependencySerializationTest, OutOfRangeNameSpaceIsRejected) {
+  std::string Data = encode(makeFullSet());
+  HeaderDependencySet Other = makeFullSet();
+  Other.Declarations[0].In = DeclarationDependency::Space::Tag;
+  std::string Alt = encode(Other);
+  ASSERT_EQ(Data.size(), Alt.size());
+  size_t Diff = std::string::npos;
+  for (size_t I = 0; I != Data.size(); ++I)
+    if (Data[I] != Alt[I]) {
+      ASSERT_EQ(Diff, std::string::npos)
+          << "expected exactly one differing byte";
+      Diff = I;
+    }
+  ASSERT_NE(Diff, std::string::npos);
+  Data[Diff] = static_cast<char>(200);
+  EXPECT_FALSE(decodeDependencySet(Data).has_value());
+}
+
+TEST(DeclFingerprintTest, ADeclarationMergesWithADefinitionNotTheOtherWay) {
+  // Equal fingerprints always satisfy.
+  EXPECT_TRUE(fingerprintSatisfies("struct defined 12", "struct defined 12"));
+  // A part carrying only a declaration merges with a live definition of the
+  // same kind and type.
+  EXPECT_TRUE(fingerprintSatisfies("struct declared", "struct defined 12"));
+  EXPECT_TRUE(fingerprintSatisfies("function int (int) asm(f) declared",
+                                   "function int (int) asm(f) defined 7"));
+  // A part carrying a definition would complete or contradict a live one.
+  EXPECT_FALSE(fingerprintSatisfies("struct defined 12", "struct declared"));
+  EXPECT_FALSE(fingerprintSatisfies("struct defined 12", "struct defined 13"));
+  // Another type, another asm label, another kind.
+  EXPECT_FALSE(fingerprintSatisfies("function int (int) declared",
+                                    "function long (int) defined 7"));
+  EXPECT_FALSE(fingerprintSatisfies("function int (int) asm(a) declared",
+                                    "function int (int) asm(b) declared"));
+  EXPECT_FALSE(fingerprintSatisfies("struct declared", "union defined 3"));
 }
 
 TEST(DependencySerializationTest, HugeCountDoesNotOverAllocate) {
