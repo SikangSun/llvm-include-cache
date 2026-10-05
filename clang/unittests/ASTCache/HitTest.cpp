@@ -1176,6 +1176,54 @@ TEST_F(ExportTest, APartThatDefinesAnOutsideStructIsServed) {
   EXPECT_FALSE(reads(A, Use)) << "use.h's part was not served";
 }
 
+/// Moves \p Path's modification time \p Seconds later, leaving its text.
+void moveModificationTime(const std::string &Path, int Seconds) {
+  int FD;
+  ASSERT_FALSE(llvm::sys::fs::openFileForReadWrite(
+      Path, FD, llvm::sys::fs::CD_OpenExisting, llvm::sys::fs::OF_None));
+  llvm::sys::fs::file_status Status;
+  ASSERT_FALSE(llvm::sys::fs::status(FD, Status));
+  EXPECT_FALSE(llvm::sys::fs::setLastAccessAndModificationTime(
+      FD, Status.getLastModificationTime() + std::chrono::seconds(Seconds)));
+  llvm::sys::fs::closeFile(FD);
+}
+
+TEST_F(ExportTest, APartIsNotServedAfterAFileItHoldsChanged) {
+  // A part holds the parse of its header, and of every file the header
+  // included, as they were when the part was saved. A plain compile reads
+  // them again; a hit requires each one's size and modification time
+  // unchanged.
+  std::string Alone = write("alone.h", "#ifndef ALONE_H\n#define ALONE_H\n"
+                                       "int alone(void);\n#endif\n");
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "int inner(void);\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                       "#include \"" +
+                           Inner + "\"\nint outer(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Alone + "\"\n#include \"" + Outer +
+                          "\"\nint f(void) { return alone() + "
+                          "outer() + inner(); }\n");
+  EXPECT_TRUE(reads(Main, Alone)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Alone)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Main, Alone)) << "alone.h's part was not served";
+  EXPECT_FALSE(reads(Main, Outer)) << "outer.h's part was not served";
+
+  // The same text, a later time: the part saved before does not fit. The
+  // compile that reads alone.h saves a new part, which the next one is
+  // served.
+  moveModificationTime(Alone, 100);
+  EXPECT_TRUE(reads(Main, Alone)) << "served after alone.h was touched";
+  EXPECT_FALSE(reads(Main, Alone)) << "the new part was not served";
+
+  // inner.h gains a line, and so another size. outer.h's part holds
+  // inner.h's old text, so it does not fit.
+  write("inner.h", "#ifndef INNER_H\n#define INNER_H\n/* edited */\n"
+                   "int inner(void);\n#endif\n");
+  EXPECT_TRUE(reads(Main, Outer)) << "served after inner.h changed";
+}
+
 TEST_F(ExportTest, APartIsNotServedWhereAnOutsideEnumeratorDiffers) {
   // struct buf's array bound comes from the enumerator BUFN, which the part
   // refers to by name. The bound is a constant in the part, so a compile

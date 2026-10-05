@@ -38,6 +38,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <chrono>
+#include <map>
 #include <mutex>
 
 using namespace clang;
@@ -117,7 +118,7 @@ public:
       if (!FE)
         return;
       for (Part &P : Open)
-        P.Files.insert(&FE->getFileEntry());
+        hold(P, *FE);
       bool ByPath =
           !ExpectedPath.empty() &&
           absolutePath(CI.getFileManager(), FE->getName()) == ExpectedPath;
@@ -187,8 +188,10 @@ private:
     PragmaSnapshot Entry, Exit;
     llvm::SetVector<const IdentifierInfo *> Touched;
     std::vector<MacroEffect> Effects;
-    /// Every file entered while the header was open, the header included.
+    /// Every file entered while the header was open, the header included,
+    /// and each one's size and modification time by real path.
     llvm::DenseSet<const FileEntry *> Files;
+    std::map<std::string, FileStamp> Stamps;
     /// Non-empty: why the part is not saved.
     std::string Decline;
 
@@ -196,6 +199,15 @@ private:
       return Begin <= Offset && Offset < End;
     }
   };
+
+  /// \p P holds the parse of \p File's text as it is now.
+  void hold(Part &P, FileEntryRef File) {
+    if (!P.Files.insert(&File.getFileEntry()).second)
+      return;
+    std::string Path = CI.getFileManager().getCanonicalName(File).str();
+    P.Stamps[Path] = {Path, static_cast<uint64_t>(File.getSize()),
+                      static_cast<int64_t>(File.getModificationTime())};
+  }
 
   /// Whether \p L, where a macro was used if it is in one, falls in \p P.
   bool inPart(const Part &P, SourceLocation L) const {
@@ -233,7 +245,7 @@ private:
     P.IncludeLoc = SM.getIncludeLoc(FID);
     P.Begin = SM.getSLocEntry(FID).getOffset();
     P.ModulesAtBegin = modulesLoaded();
-    P.Files.insert(&FE.getFileEntry());
+    hold(P, FE);
     if (!CI.hasSema()) {
       P.Decline = "no Sema when the header was entered";
     } else {
@@ -302,6 +314,8 @@ private:
     Deps.Exit = P.Exit;
     Deps.MacroEffects = P.Effects;
     Deps.HeaderName = P.Name;
+    for (auto &[Path, Stamp] : P.Stamps)
+      Deps.Files.push_back(Stamp);
 
     // The same header, metadata and compiler options give the same name in
     // any compile, which lets the daemon recognise a part it already holds.

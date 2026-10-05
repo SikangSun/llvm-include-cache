@@ -94,6 +94,13 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
   }
 
   W.str(Deps.HeaderName);
+
+  W.u32(static_cast<uint32_t>(Deps.Files.size()));
+  for (const FileStamp &F : Deps.Files) {
+    W.str(F.Path);
+    W.u64(F.Size);
+    W.u64(static_cast<uint64_t>(F.ModTime));
+  }
 }
 
 std::optional<HeaderDependencySet>
@@ -203,6 +210,14 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
   }
 
   Deps.HeaderName = R.str().str();
+
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    FileStamp F;
+    F.Path = R.str().str();
+    F.Size = R.u64();
+    F.ModTime = static_cast<int64_t>(R.u64());
+    Deps.Files.push_back(std::move(F));
+  }
 
   // Trailing bytes mean the writer and reader disagree about the shape even
   // though the version matched, so the decode is not trustworthy.

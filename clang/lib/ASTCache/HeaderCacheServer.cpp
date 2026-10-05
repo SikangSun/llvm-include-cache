@@ -297,7 +297,8 @@ public:
          << LoadsRefused << "\n";
     OS << "header cache time: " << ms(LookupMicros) << " ms in lookups ("
        << ms(S.DaemonMicros) << " waiting for the daemon, " << ms(S.CheckMicros)
-       << " checking candidates, " << ms(LoadMicros) << " loading), "
+       << " checking candidates, " << ms(S.FileCheckMicros)
+       << " of it checking files, " << ms(LoadMicros) << " loading), "
        << ms(S.ReportMicros) << " reporting timings, " << ms(S.ConnectMicros)
        << " connecting\n";
     if (EffectsWithoutDefinition)

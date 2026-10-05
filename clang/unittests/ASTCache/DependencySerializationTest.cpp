@@ -56,6 +56,8 @@ HeaderDependencySet makeFullSet() {
   D.Declarations.push_back(
       {DeclarationDependency::Space::Tag, "fd_set", "struct defined 1234"});
   D.HeaderName = "./anet.h";
+  D.Files.push_back({"/src/redis/src/anet.h", 2491, 1759600000});
+  D.Files.push_back({"/usr/include/stdio.h", 0, -1});
   return D;
 }
 
@@ -91,6 +93,7 @@ void expectEqual(const HeaderDependencySet &A, const HeaderDependencySet &B) {
   EXPECT_EQ(A.FileNames, B.FileNames);
   EXPECT_EQ(A.Declarations, B.Declarations);
   EXPECT_EQ(A.HeaderName, B.HeaderName);
+  EXPECT_EQ(A.Files, B.Files);
 }
 
 TEST(DependencySerializationTest, EmptySetRoundTrips) {

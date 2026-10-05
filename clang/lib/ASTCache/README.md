@@ -137,7 +137,8 @@ CLANG_HEADER_CACHE=/tmp/clang-header-cache.sock clang -fmodules \
 
 `CLANG_HEADER_CACHE_STATS=1` prints hits and rejection counts when the compile
 ends, and where the cache's time went (waiting for the daemon, checking
-candidates, loading); `2` also names the macro behind each rejection.
+candidates and, part of that, checking files, loading); `2` also names the
+macro behind each rejection.
 
 A compile fills the cache itself (DECISIONS.md §2.17): each listed header
 it has to read, it exports as its own part and pushes to the daemon.

@@ -75,6 +75,11 @@ first hit. The fingerprint gained layout, enumerator values, typedef
 alignment and initializers, and is taken as of the header's start. Six redis
 files: 72 compiles across both modes, with and without `-g`, all identical.
 
+## Built 2026-10-05: a hit checks the part's files
+
+`DECISIONS.md` §2.19. A part records each file's size and modification time;
+a hit requires them unchanged, as Clang's modules check their input files.
+
 ## Next
 
 1. **Cross-reference IDs** for outside declarations (the user's "keep both
@@ -82,9 +87,13 @@ files: 72 compiles across both modes, with and without `-g`, all identical.
 2. **A benchmark run over all of redis**, with the release build
    (`build_rel`, 2026-10-05). The `-O2` slowdown was the benchmark's own
    flags (`DECISIONS.md` §2.18).
-3. **Cheaper hit checks** (proposed 2026-10-05, not approved). Redoing the
-   recorded `#include` lookups is most of the hook's time; a daemon round
-   trip per lookup is the rest on a miss (`DECISIONS.md` §2.18).
+3. **An optimization for recompilation** (deferred by the user,
+   `DECISIONS.md` §2.19): skip the file checks and redone header searches in
+   a build whose start shows no source file changed. Measured cost it would
+   save: 4.2 to 6.1 ms per compile on redis.
+   **Cache queries without the socket** (proposed 2026-10-05, not
+   approved): the daemon's table in the shared region instead of a round
+   trip per query.
 4. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
 5. **Remove the producer**, job recording and the populate tool once parts
    cover everything they did.

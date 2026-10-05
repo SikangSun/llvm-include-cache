@@ -1322,6 +1322,69 @@ ms:
   With nothing stored and every header listed (`-ask-cutoff-us 0`), that is
   217 to 362 round trips and 3.6 to 6.8 ms per compile, which no hit repays.
 
+### 2.19 A hit checks that the part's files did not change (approved and built 2026-10-05)
+
+**The gap.** A plain compile reads every file it includes, so it always uses
+the current text. A hit used the text the part was saved from and never
+checked that the files were unchanged. The design assumes no source file
+changes during a build (2.12), but a benchmark that skips the check gets a
+speedup by assuming what a plain compile pays to know. User, 2026-10-05:
+"Yes this is the same as Apple's approach, we need to add this."
+
+**The mechanism.** Clang's own modules check their input files by size and
+modification time when a module is loaded. A part now does the same:
+
+- *At export*, the exporter records a `FileStamp` for the header and every
+  file entered while it was open: the real path, the size, and the
+  modification time in seconds (`PartExporter::hold`). The stamps are part of
+  the metadata, so a part saved after a file changed gets another module
+  name. Encoding version 7.
+- *At a hit*, after redoing the header searches, `matchesLiveState` looks up
+  each stamped path in the compile's file manager and requires the same size
+  and modification time (`MismatchReason::FileChanged`). The file manager
+  stats a file once per compile; the header searches just before have
+  already stat'ed most of them.
+- *Not seen*: an edit within the same second that keeps the size, as with
+  Clang's modules.
+
+**What stays as it is.** The header searches are still redone at every hit.
+Comparing directory modification times instead (idea A) is outside this
+project's scope; the cost is eaten as it is. User: "Idea A also fits well,
+but this is technically outside the space of our project. We will eat this
+cost naively."
+
+**Deferred: an optimization for recompilation.** If a criterion holds at the
+start of the whole build -- the build tool knows no source file changed
+since a point -- compiles in that build could skip both the file checks and
+the redone searches. Clang's module cache has a form of this
+(`-fmodules-validate-once-per-build-session`). User: "We can also add a
+recompilation optimization that somehow skips this check intra-executable
+compilation ... We will save the optimization to later." The cost it would
+save, measured below, is recorded for that.
+
+**Cost** (`CLANG_HEADER_CACHE_STATS=1` now prints it as "checking files";
+release build, full cache, default cutoff, `-fsyntax-only`):
+
+| File | Checking files | All checking | All of the cache's time |
+|---|---|---|---|
+| `anet.c` | 4.2 ms | 6.3 ms | 10.5 ms |
+| `util.c` | 4.5 ms | 7.2 ms | 12.0 ms |
+| `object.c` | 6.1 ms | 8.1 ms | 10.9 ms |
+
+The stamps add little to the searches (4.1 to 6.6 ms before the stamps
+existed): the searches stat each file the stamps then compare. Served
+compiles are still faster than plain ones at `-O2` (medians of 21, ms):
+`anet.c` 125.2 to 120.8, `ae.c` 120.1 to 110.1, `zmalloc.c` 175.4 to 165.7,
+`util.c` 292.6 to 260.9. The six redis files, with and without `-g`: all 36
+compiles identical, the same hits as before.
+
+**A limit this showed.** After a header changes, the compile reads it as
+text and saves a new part, unless a header inside it is served from its own
+part: a part cannot hold a served header (2.18). So after `inner.h` changes,
+`outer.h`, which includes it, gets a new part, but after `outer.h` alone
+changes, it does not while `inner.h` is served. Parts that import the parts
+they contain would remove this (2.1); not designed.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.

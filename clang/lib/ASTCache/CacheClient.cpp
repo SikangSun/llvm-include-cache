@@ -44,6 +44,8 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
     return "an #include inside the header finds a different file";
   case MismatchReason::Declaration:
     return "an outside declaration the part refers to differs or is missing";
+  case MismatchReason::FileChanged:
+    return "a file the part holds changed since the part was saved";
   }
   return "unknown";
 }
@@ -149,7 +151,7 @@ int redoLookups(
 MismatchReason clang::ast_cache::matchesLiveState(
     const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
     llvm::StringRef NotAMacroNames, std::string *Detail,
-    const IncludeSite *Site) {
+    const IncludeSite *Site, uint64_t *FileMicros) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -260,6 +262,21 @@ MismatchReason clang::ast_cache::matchesLiveState(
   if (capturePragmaState(*S) != Deps.Entry)
     return Because(MismatchReason::PragmaState, "#pragma pack or float state");
 
+  // Checking files is timed on its own: it is what a build that knows no
+  // file changed since it began could skip (DECISIONS.md 2.19).
+  auto FilesStart = std::chrono::steady_clock::now();
+  struct AddTime {
+    uint64_t *To;
+    std::chrono::steady_clock::time_point Start;
+    ~AddTime() {
+      if (To)
+        *To += std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - Start)
+                   .count();
+    }
+  };
+  std::optional<AddTime> FileTime(AddTime{FileMicros, FilesStart});
+
   // The files the header's own #includes find depend on this compile's
   // include path, which nothing else compares. The stored parse also holds
   // the text each __FILE__ produced, which is the name the producer's compile
@@ -307,6 +324,24 @@ MismatchReason clang::ast_cache::matchesLiveState(
                        "__FILE__ was \"" + D.Text + "\", is \"" + Live + "\"");
     }
   }
+
+  // The part holds the parse of each file's text when it was saved. A plain
+  // compile reads the file again; a hit requires it unchanged, by size and
+  // modification time, as Clang's own modules check their input files. The
+  // file manager stats a file once per compile, the header searches above
+  // included.
+  FileManager &FM = PP.getFileManager();
+  for (const FileStamp &F : Deps.Files) {
+    OptionalFileEntryRef Live =
+        FM.getOptionalFileRef(F.Path, /*OpenFile=*/false);
+    if (!Live)
+      return Because(MismatchReason::FileChanged, F.Path + " is gone");
+    if (static_cast<uint64_t>(Live->getSize()) != F.Size ||
+        static_cast<int64_t>(Live->getModificationTime()) != F.ModTime)
+      return Because(MismatchReason::FileChanged,
+                     F.Path + " changed since the part was saved");
+  }
+  FileTime.reset();
 
   // The part's own declarations were compiled against the outside
   // declarations it refers to. Loading it resolves each name to this
@@ -416,8 +451,9 @@ llvm::StringRef CacheClient::lookup(
     }
     std::string Detail;
     auto Checking = std::chrono::steady_clock::now();
-    MismatchReason Why = matchesLiveState(
-        E.Deps, PP, S, Names, LogRejections ? &Detail : nullptr, Site);
+    MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names,
+                                          LogRejections ? &Detail : nullptr,
+                                          Site, &Counters.FileCheckMicros);
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;

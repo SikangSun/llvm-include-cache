@@ -60,6 +60,7 @@ enum class MismatchReason {
   FileName,
   Include,
   Declaration,
+  FileChanged,
 };
 
 llvm::StringRef describe(MismatchReason R);
@@ -90,11 +91,16 @@ struct IncludeSite {
 /// \p Site is where the header is being included. Deps.Includes and
 /// Deps.FileNames are checked from there, and metadata with either is
 /// rejected without one.
+///
+/// \p FileMicros, when non-null, is increased by the time spent checking
+/// files: redoing the header's searches and comparing each file's size and
+/// modification time.
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
                                 Preprocessor &PP, Sema *S,
                                 llvm::StringRef NotAMacroNames = {},
                                 std::string *Detail = nullptr,
-                                const IncludeSite *Site = nullptr);
+                                const IncludeSite *Site = nullptr,
+                                uint64_t *FileMicros = nullptr);
 
 class CacheClient {
 public:
@@ -153,16 +159,18 @@ public:
     unsigned Lookups = 0;
     unsigned Hits = 0;
     unsigned CandidatesRejected = 0;
-    unsigned RejectedFor[9] = {};
+    unsigned RejectedFor[10] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".
     std::vector<std::string> Rejections;
     /// Wall time, in microseconds: waiting for the daemon to answer lookups,
-    /// checking candidates against the live state, sending this compile's
-    /// header timings, and connecting.
-    uint64_t DaemonMicros = 0, CheckMicros = 0, ReportMicros = 0,
-             ConnectMicros = 0;
+    /// checking candidates against the live state and, part of that,
+    /// checking files (redoing header searches, comparing sizes and
+    /// modification times), sending this compile's header timings, and
+    /// connecting.
+    uint64_t DaemonMicros = 0, CheckMicros = 0, FileCheckMicros = 0,
+             ReportMicros = 0, ConnectMicros = 0;
   };
   const Stats &stats() const { return Counters; }
 

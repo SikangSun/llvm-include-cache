@@ -187,6 +187,24 @@ struct DeclarationDependency {
   }
 };
 
+/// A file whose text a part holds the parse of, with its size and
+/// modification time when the part was saved. A plain compile reads every
+/// file it includes, so it always uses the current text; a hit uses the text
+/// the part was saved from, so it requires each file unchanged. Clang's own
+/// modules check their input files the same way. An edit within the same
+/// second that keeps the size is not seen, as with Clang's modules.
+struct FileStamp {
+  /// The real path.
+  std::string Path;
+  uint64_t Size = 0;
+  /// Seconds since the epoch, as FileEntry::getModificationTime gives it.
+  int64_t ModTime = 0;
+
+  friend bool operator==(const FileStamp &A, const FileStamp &B) {
+    return A.Path == B.Path && A.Size == B.Size && A.ModTime == B.ModTime;
+  }
+};
+
 /// The pragma state that was active at a single point, reduced to the values
 /// that actually reach a Decl. Only the small-value pragmas are represented:
 /// a header reached under one of the others (#pragma clang attribute push,
@@ -230,6 +248,9 @@ struct HeaderDependencySet {
   std::vector<IncludeDependency> Includes;
   std::vector<FileNameDependency> FileNames;
   std::vector<DeclarationDependency> Declarations;
+  /// Each file the part holds the parse of: the header and every file
+  /// entered while it was open. Empty for a copy the separate producer built.
+  std::vector<FileStamp> Files;
 
   /// The name the compile that exported the part opened the header by
   /// ("./anet.h"); a hit requires the same. Empty for a copy the separate
