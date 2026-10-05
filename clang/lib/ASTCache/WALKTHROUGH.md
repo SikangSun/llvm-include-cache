@@ -33,6 +33,7 @@ The commits after `2a4866313`, in order:
 | `9f46203f6` | 2026-10-05 | Export a header's part at a miss: first debugging version |
 | `0afcadce2` | 2026-10-05 | A part refers to outside declarations by name |
 | `f05e79584` | 2026-10-05 | Print where the cache's time goes |
+| `719ac5638` | 2026-10-05 | A hit checks that the part's files did not change |
 
 To read one change in the code: `git show <commit> -- <file>`. Commits that
 only changed documents are left out of this table.
@@ -121,13 +122,16 @@ name, and the loading compile uses its own declaration of each name
   stopped exporting at its first hit.
 - **NEW (`f05e79584`):** `CLANG_HEADER_CACHE_STATS=1` prints where the cache's
   time went in the compile (§6.6).
+- **NEW (`719ac5638`):** a hit checks that each file the part holds has the
+  size and modification time it had when the part was saved (§6.4).
 - The separate producer and `clang-header-cache-populate` (§5.1, §6.5) still
   work. Nothing needs them now that compiles export parts.
-- 139 unit tests, all passing (§8). 115 existed at `2a4866313`.
+- 140 unit tests, all passing (§8). 115 existed at `2a4866313`.
 
 **Does not exist** (§10 has the full list): the `__COUNTER__` dependency,
-persistence across a daemon restart, eviction from a full region, and a run
-over a whole build with compiles in parallel.
+persistence across a daemon restart, eviction from a full region, a run over
+a whole build with compiles in parallel, and the deferred optimization for
+recompilation.
 
 ---
 
@@ -280,6 +284,7 @@ set with the header's path.
 | **NEW (`9b86dcc4e`)** `IncludeDependency` | One `#include`, `#include_next`, `__has_include` or `__has_include_next` the header's region ran, and the file it found. |
 | **NEW (`9b86dcc4e`)** `FileNameDependency` | One `__FILE__` or `__FILE_NAME__` the region expanded, and the text it produced. |
 | **NEW (`9f46203f6`)** `DeclarationDependency` | One outside declaration a part refers to, by name space, name and fingerprint. |
+| **NEW (`719ac5638`)** `FileStamp` | One file a part holds the parse of: its real path, size and modification time when the part was saved. |
 
 Design notes worth knowing. `SymbolDependency::Classification` mirrors
 `clang::NameClassificationKind`'s integer values rather than including
@@ -331,6 +336,14 @@ compiled against an equal one.
 
 **NEW (`9f46203f6`): `HeaderName`.** The name the exporting compile opened
 the header by. A hit of a part requires the same.
+
+**NEW (`719ac5638`): file stamps.** A plain compile reads every file it
+includes, so it always uses the current text. A hit uses the text the part
+was saved from. So `Files` holds a `FileStamp` for the header and every file
+entered while it was open, and a hit requires each file's size and
+modification time unchanged (§6.4). Clang's own modules check their input
+files the same way. An edit within the same second that keeps the size is
+not seen, as with Clang's modules.
 
 ### 4.2 `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` (311) and `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` (510)
 
@@ -438,10 +451,11 @@ decodes a whole structure and checks once. A decoder that returned what it had
 managed to read would produce a partial record, which is the unsafe direction
 (§4.2).
 
-**CHANGED:** the encoding version is 6; it was 4 at `2a4866313`. Version 5
+**CHANGED:** the encoding version is 7; it was 4 at `2a4866313`. Version 5
 (`9b86dcc4e`) adds the `IncludeDependency` and `FileNameDependency` lists.
 Version 6 (`9f46203f6`) adds the `DeclarationDependency` list,
-`IncludeDependency::Name` and `HeaderName`. The decoder rejects an `Includer`
+`IncludeDependency::Name` and `HeaderName`. Version 7 (`719ac5638`) adds the
+file stamps. The decoder rejects an `Includer`
 or `File` index that points at an entry after its own: a hit would redo a
 search from the wrong file.
 
@@ -602,7 +616,9 @@ design and the measurements.
 
 - *The metadata.* The tracker's record for the header (§4.2, with
   `trackOnly` set to the headers being exported), plus the effects, the
-  pragma snapshots, and `HeaderName`.
+  pragma snapshots, and `HeaderName`. **NEW (`719ac5638`):** and a file stamp
+  for each file the region entered, taken as the file is entered
+  (`hold`).
 - *The module name.* `__hcp_` plus 16 hex digits of xxh3 over the absolute
   path, the compile's module hash (`CompilerInvocation::getModuleHash`) and
   the encoded metadata. The same part from two compiles gets the same name,
@@ -880,6 +896,10 @@ and a check that cannot run must reject. In order:
    (`refOnEntry`).
 8. **NEW (`9b86dcc4e`): `__FILE__`.** Each recorded text is computed again
    from the name the file has in this compile (`fileMacroText`) and compared.
+   **NEW (`719ac5638`): file stamps.** Each stamped path is looked up in the
+   compile's file manager, which stats a file once per compile (the header
+   searches in step 7 have already stat'ed most of them), and must have the
+   recorded size and modification time.
 9. **NEW (`9f46203f6`, `0afcadce2`): outside declarations.** Each name is
    looked up with `ASTReader::lookupAtFileScope`, the reader's own lookup
    (§5.4), with builtin creation allowed; the declaration found must satisfy
@@ -895,13 +915,14 @@ macro bit still says it is not a macro.
 `CLANG_HEADER_CACHE_STATS=2` each rejection also says what failed:
 `` `_BSD_SOURCE` was defined, is not ``, `` `<cfg.h>` found ./a/cfg.h, finds
 something else ``. **NEW** reasons: `FileName`, `Include` (`9b86dcc4e`),
-`Declaration` (`9f46203f6`).
+`Declaration` (`9f46203f6`), `FileChanged` (`719ac5638`).
 
 **NEW (`f05e79584`): time counters.** `Stats` holds the wall time spent
 waiting for the daemon's replies, checking candidates, reporting timings and
-connecting. Measured on redis with a full cache, checking dominates, and
-step 7 is most of it: 328 to 605 repeated header searches per compile, 4 to
-6.6 ms (DECISIONS 2.18).
+connecting. **NEW (`719ac5638`):** and, part of checking, checking files
+(steps 7 and 8). Measured on redis with a full cache, checking dominates,
+and checking files is most of it: 328 to 605 repeated header searches and
+the stamps, 4.2 to 6.1 ms per compile (DECISIONS 2.19).
 
 ### 6.5 `clang/tools/clang-header-cache-populate/` (262 + 13)
 
@@ -997,8 +1018,9 @@ for serving one.
 rejected and why, headers not on the ask-list. **NEW (`9f46203f6`):** parts
 exported and declined, with each reason at level 2. **NEW (`f05e79584`):** one
 line of time, for example
-`header cache time: 10.6 ms in lookups (0.8 waiting for the daemon, 7.8
-checking candidates, 1.3 loading), 0.1 reporting timings, 0.3 connecting`.
+`header cache time: 10.9 ms in lookups (0.7 waiting for the daemon, 8.1
+checking candidates, 6.1 of it checking files, 1.4 loading), 0.0 reporting
+timings, 0.2 connecting` (`object.c`; "checking files" since `719ac5638`).
 
 ---
 
@@ -1022,10 +1044,10 @@ Daemon options: `-socket` (default `/tmp/clang-header-cache.sock`),
 
 ---
 
-## 8. Tests — 139, all passing
+## 8. Tests — 140, all passing
 
 `clang/unittests/ASTCache/` (plus `CMakeLists.txt`, 26 lines, and one line in
-`clang/unittests/CMakeLists.txt`). 115 tests existed at `2a4866313`; the 24
+`clang/unittests/CMakeLists.txt`). 115 tests existed at `2a4866313`; the 25
 new ones are listed after each table row.
 
 | File | Tests | What they pin down |
@@ -1034,15 +1056,16 @@ new ones are listed after each table row.
 | | **NEW (`9b86dcc4e`), 4** | A `__FILE__` and a `__FILE_NAME__` in the header record their text; each `__FILE__` names the search that found its file; every header search records what it found, a guard-skipped `#include` and a `__has_include` that found nothing included; a `#line` name is not recorded. |
 | `SymbolDependencyTest.cpp` (180) | 4 | The `T * p;` ambiguity: a typedef from the includer is a dependency; one the header declares itself is not; the resolved type's identity is recorded; a typedef from a sub-header is internal to the parent. |
 | `DependencySerializationTest.cpp` (318) | 17 | Round trips; embedded NULs survive; unknown states, damaged lists, truncation, a version mismatch, trailing bytes and out-of-range values are rejected rather than partially decoded; a corrupt count does not size an allocation. |
-| | **NEW, 4** | An out-of-range macro kind and an index pointing forward are rejected (`9b86dcc4e`); an out-of-range name space is rejected, and `fingerprintSatisfies`: a declaration is satisfied by a definition, not the reverse, and type, asm label and kind must match (`9f46203f6`). The full round trip covers every new field. |
+| | **NEW, 4** | An out-of-range macro kind and an index pointing forward are rejected (`9b86dcc4e`); an out-of-range name space is rejected, and `fingerprintSatisfies`: a declaration is satisfied by a definition, not the reverse, and type, asm label and kind must match (`9f46203f6`). The full round trip covers every new field, the file stamps included (`719ac5638`). |
 | `CacheProtocolTest.cpp` (405) | 22 | Message framing and daemon behaviour: names and effects kept in the region, a clean miss, every candidate returned, duplicates discarded but the same metadata with another module name kept, stored bytes come back exactly, garbage closes the connection, the ask-list. |
 | `EndToEndTest.cpp` (350) | 7 | Push through a real socket, then reject the entry on each kind of mismatch in turn, and choose correctly between candidates. |
 | `ProducerTest.cpp` (434) | 14 | The separate producer: context, effects, pragma state, nested headers, module names, `#include_next`, `__COUNTER__`, job files. |
 | `LoadTest.cpp` (216) | 1 | A PCM loads from bytes in memory partway through a compile, and its declarations work with that compile's own types. |
-| `HitTest.cpp` (1259) | 41 | Served without the file being opened; not served inside a function body; a mismatching record is not used; every syntactic case; effects (`#undef`, later definition wins, guards and `#pragma once`, the counter); the ask-list; nested headers; the region check; a copy loaded once; a macro compared by its text. |
+| `HitTest.cpp` (1307) | 42 | Served without the file being opened; not served inside a function body; a mismatching record is not used; every syntactic case; effects (`#undef`, later definition wins, guards and `#pragma once`, the counter); the ask-list; nested headers; the region check; a copy loaded once; a macro compared by its text. |
 | | **NEW (`9b86dcc4e`), 3** | A header using `__FILE__` is served under the name it was built by and read under another; the same for a file beside the header; a copy built with `-Ia` is served under `-Ia` and read under `-Ib`, where `<cfg.h>` finds another file. |
 | | **NEW (`9f46203f6`), 3** | `ExportTest`: a miss exports parts the next compile serves, a static inline function and a macro among them; a part is not served where an outside `struct pt` has other members; a part holding `./use.h` is not served to a compile that opens `/…/use.h`. |
 | | **NEW (`0afcadce2`), 5** | `ExportTest`: a header is exported after the compile loads a part, and served next; a header with a served header inside is not exported; a part whose header defines a struct declared before it is served; a part is not served where an outside enumerator has another value, or where an outside struct is `packed`. |
+| | **NEW (`719ac5638`), 1** | `ExportTest`: a part is not served after its header's modification time moves, and a new part is served next; a part is not served after a file its header includes changes size. |
 | `PartExportTest.cpp` (372) | 5 | **NEW.** Through the experiment's variables (§7). A part holding a function body, a macro and a struct whose type comes from an expansion before the header serves the compile it came from (`9b86dcc4e`); a part written with deep copies holds the outside declaration it uses but not the outside file's macros (`9b86dcc4e`). Loaded, a part's declarations use the compile's own `outside_t`, `struct pt`, field `x` and enumerator `RED`; with deep copies, `outside_t` is a copy; in both modes, the main file's definition of a function the header declared stays out of the part (`0afcadce2`). |
 
 ---
@@ -1098,21 +1121,29 @@ assertions; medians of 21 interleaved runs, in ms):
 
 With `-fsyntax-only`, `object.c` goes from 114 to 54 ms. The cache's own time
 per compile is 10.5 to 12.8 ms, most of it checking candidates, and most of
-that the repeated header searches (§6.4). These timings do not include a
-check that each file's contents are unchanged since its part was saved,
-which a fair comparison needs; it is not built (§10).
+that the repeated header searches (§6.4).
+
+**NEW (`719ac5638`):** these timings lacked the check that each file is
+unchanged since its part was saved, which a plain compile gets by reading
+the file. With it, served compiles are still faster at `-O2` (medians of 21,
+ms): `anet.c` 125.2 to 120.8, `ae.c` 120.1 to 110.1, `zmalloc.c` 175.4 to
+165.7, `util.c` 292.6 to 260.9. Checking files costs 4.2 to 6.1 ms per
+compile. The six files, with and without `-g`: all 36 compiles identical,
+the same hits as before.
 
 ---
 
 ## 10. What does not exist yet
 
-1. **A check that a file's contents did not change** since its part was
-   saved. A hit never checks it; a plain compile reads every file. Proposed
-   2026-10-05: compare each file's size and modification time, saved at
-   export. Not approved yet.
-2. **Cheaper header-search checks.** Proposed 2026-10-05, not approved:
-   compare directory modification times instead of redoing every search, or
-   check each file and directory once per build in the daemon.
+1. **An optimization for recompilation** (deferred by the user, DECISIONS
+   2.19): in a build whose start shows no source file changed, skip the file
+   checks and the redone header searches. It would save 4.2 to 6.1 ms per
+   compile on redis. Comparing directory modification times instead of
+   redoing searches is outside the project's scope.
+2. **A changed header with a served header inside is not saved again**
+   (DECISIONS 2.19): after `outer.h` changes, it is read as text and not
+   re-saved while `inner.h` inside it is served. Parts that import the parts
+   they contain would remove this; not designed.
 3. **Cache queries without the socket**: the daemon's table in the shared
    region. Proposed, not approved.
 4. **Cross-reference IDs** for outside declarations, the third way to refer
@@ -1185,6 +1216,9 @@ Kept because each one is a mistake that could recur.
   its part was already loaded; the region's own `#define` was dropped when a
   later header replayed the macro; a name chain could list none of the part's
   declarations of `size_t` (§5.2, §5.3).
+- **NEW: a hit did not check that the part's files were unchanged**, while a
+  plain compile reads every file; the timings left that cost out. Built in
+  `719ac5638`.
 - **NEW: "served compiles are 4 to 5 ms slower at `-O2`" was the benchmark's
   own fault** (`f05e79584`): it filled the cache with `-fsyntax-only`, so its
   `-O2` compiles missed every header that tests `__OPTIMIZE__`.
@@ -1227,6 +1261,8 @@ that last refreshed this file is not listed in its own table.
 | [`0afcadce2`](https://github.com/SikangSun/llvm-include-cache/commit/0afcadce281bfd348e97710320397de048048aa8) | [clang] Header cache: a part refers to outside declarations by name |
 | [`5b241c272`](https://github.com/SikangSun/llvm-include-cache/commit/5b241c27257fb2a7bad784ff68eb5339fbe37da3) | [clang] Header cache: walkthrough covers references by name (0afcadce2) |
 | [`f05e79584`](https://github.com/SikangSun/llvm-include-cache/commit/f05e7958451f6f98bc02415483b0e5d451f34c2f) | [clang] Header cache: print where the hook's time goes |
+| [`a61f9de8f`](https://github.com/SikangSun/llvm-include-cache/commit/a61f9de8f2992bde88c7c433410e32df0ddbed54) | [clang] Header cache: rebuild the walkthrough; mark what is new since 2a4866313 |
+| [`719ac5638`](https://github.com/SikangSun/llvm-include-cache/commit/719ac5638448e3855cacce0d63f926a376b50933) | [clang] Header cache: a hit checks that the part's files did not change |
 
 Which commits changed each file, oldest first:
 
@@ -1235,13 +1271,13 @@ Which commits changed each file, oldest first:
 | `clang/include/clang/ASTCache/ASTCacheDependencyTracker.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
 | `clang/include/clang/ASTCache/ASTCacheProducer.h` | `91182dc08` `a5a384e19` `ea53c042d` `2a4866313` `9f46203f6` |
 | `clang/include/clang/ASTCache/ByteStream.h` | `91182dc08` `1291faa49` |
-| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `f05e79584` |
+| `clang/include/clang/ASTCache/CacheClient.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `f05e79584` `719ac5638` |
 | `clang/include/clang/ASTCache/CacheDaemon.h` | `91182dc08` `1291faa49` `2a4866313` |
 | `clang/include/clang/ASTCache/CacheProtocol.h` | `91182dc08` `1291faa49` `2a4866313` |
 | `clang/include/clang/ASTCache/DeclFingerprint.h` | `9f46203f6` `0afcadce2` |
-| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
-| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
-| `clang/include/clang/ASTCache/HeaderCacheServer.h` | `ab65051ab` `2a4866313` `9f46203f6` this commit |
+| `clang/include/clang/ASTCache/DependencyRecord.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `719ac5638` |
+| `clang/include/clang/ASTCache/DependencySerialization.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `719ac5638` |
+| `clang/include/clang/ASTCache/HeaderCacheServer.h` | `ab65051ab` `2a4866313` `9f46203f6` `a61f9de8f` |
 | `clang/include/clang/ASTCache/MacroTokens.h` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` |
 | `clang/include/clang/ASTCache/PartExporter.h` | `9f46203f6` `0afcadce2` |
 | `clang/include/clang/ASTCache/PragmaStateCheck.h` | `91182dc08` |
@@ -1263,21 +1299,21 @@ Which commits changed each file, oldest first:
 | `clang/lib/ASTCache/ASTCacheDependencyTracker.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
 | `clang/lib/ASTCache/ASTCacheProducer.cpp` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
 | `clang/lib/ASTCache/CMakeLists.txt` | `91182dc08` `ab65051ab` `9f46203f6` |
-| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` this commit |
+| `clang/lib/ASTCache/CacheClient.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` `a61f9de8f` `719ac5638` |
 | `clang/lib/ASTCache/CacheDaemon.cpp` | `91182dc08` `1291faa49` `2a4866313` |
 | `clang/lib/ASTCache/CacheProtocol.cpp` | `91182dc08` `1291faa49` `2a4866313` |
-| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` |
+| `clang/lib/ASTCache/DECISIONS.md` | `91182dc08` `a5a384e19` `ea53c042d` `f976d8fd4` `95232c6b6` `ab65051ab` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` `719ac5638` |
 | `clang/lib/ASTCache/DeclFingerprint.cpp` | `9f46203f6` `0afcadce2` |
-| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
+| `clang/lib/ASTCache/DependencySerialization.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `719ac5638` |
 | `clang/lib/ASTCache/FORMALIZATION.md` | `26a28d8ea` |
-| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` this commit |
+| `clang/lib/ASTCache/HeaderCacheServer.cpp` | `ab65051ab` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` `a61f9de8f` `719ac5638` |
 | `clang/lib/ASTCache/MacroTokens.cpp` | `91182dc08` `2a4866313` `9b86dcc4e` |
-| `clang/lib/ASTCache/NEXT.md` | `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` |
-| `clang/lib/ASTCache/PartExporter.cpp` | `9f46203f6` `0afcadce2` |
+| `clang/lib/ASTCache/NEXT.md` | `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` `719ac5638` |
+| `clang/lib/ASTCache/PartExporter.cpp` | `9f46203f6` `0afcadce2` `719ac5638` |
 | `clang/lib/ASTCache/PragmaStateCheck.cpp` | `91182dc08` |
-| `clang/lib/ASTCache/README.md` | `91182dc08` `a5a384e19` `ea53c042d` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` |
+| `clang/lib/ASTCache/README.md` | `91182dc08` `a5a384e19` `ea53c042d` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `f05e79584` `719ac5638` |
 | `clang/lib/ASTCache/SharedRegion.cpp` | `91182dc08` `2a4866313` |
-| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` `6996c31c7` `880757f46` `7b5230e84` `7c820ad9c` `aeee051cc` `5b241c272` this commit |
+| `clang/lib/ASTCache/WALKTHROUGH.md` | `7032a4b76` `6996c31c7` `880757f46` `7b5230e84` `7c820ad9c` `aeee051cc` `5b241c272` `a61f9de8f` this commit |
 | `clang/lib/CMakeLists.txt` | `91182dc08` |
 | `clang/lib/Frontend/CompilerInstance.cpp` | `ab65051ab` |
 | `clang/lib/Lex/CMakeLists.txt` | `91182dc08` |
@@ -1306,9 +1342,9 @@ Which commits changed each file, oldest first:
 | `clang/unittests/ASTCache/ASTCacheDependencyTrackerTest.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` |
 | `clang/unittests/ASTCache/CMakeLists.txt` | `91182dc08` `a5a384e19` `f976d8fd4` `ab65051ab` `9b86dcc4e` |
 | `clang/unittests/ASTCache/CacheProtocolTest.cpp` | `91182dc08` `1291faa49` `2a4866313` |
-| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` |
+| `clang/unittests/ASTCache/DependencySerializationTest.cpp` | `91182dc08` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `719ac5638` |
 | `clang/unittests/ASTCache/EndToEndTest.cpp` | `91182dc08` `1291faa49` `2a4866313` |
-| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` |
+| `clang/unittests/ASTCache/HitTest.cpp` | `ab65051ab` `1291faa49` `2a4866313` `9b86dcc4e` `9f46203f6` `0afcadce2` `719ac5638` |
 | `clang/unittests/ASTCache/LoadTest.cpp` | `f976d8fd4` `95232c6b6` |
 | `clang/unittests/ASTCache/PartExportTest.cpp` | `9b86dcc4e` `0afcadce2` |
 | `clang/unittests/ASTCache/ProducerTest.cpp` | `a5a384e19` `ea53c042d` `f976d8fd4` `2a4866313` |
