@@ -289,10 +289,16 @@ private:
   }
 
   void writeReady() {
+    if (Ready.empty())
+      return;
+    auto Start = std::chrono::steady_clock::now();
     std::vector<Part> Parts;
     Parts.swap(Ready);
     for (Part &P : Parts)
       write(P);
+    Counts.Micros += std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - Start)
+                         .count();
   }
 
   void decline(const Part &P, const llvm::Twine &Why) {

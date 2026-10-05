@@ -92,15 +92,44 @@ struct IncludeSite {
 /// Deps.FileNames are checked from there, and metadata with either is
 /// rejected without one.
 ///
-/// \p FileMicros, when non-null, is increased by the time spent checking
-/// files: redoing the header's searches and comparing each file's size and
-/// modification time.
+/// Where checking candidates spends its time, one entry per step, in the
+/// order matchesLiveState runs them.
+struct CheckCost {
+  enum Step {
+    /// Each name an #if or #ifdef tested is still defined, or not.
+    Conditions,
+    /// Each macro the header expanded expands to the same tokens, each name
+    /// it read as plain text is still not a macro, and each #include it
+    /// skipped is still skippable.
+    Macros,
+    /// Each name that decided a parse (T * p;) is still a type, the same
+    /// one, and #pragma pack and the floating-point pragmas are unchanged.
+    TypeNamesAndPragmas,
+    /// Each #include in the header, searched for again in this compile's
+    /// -I directories, finds the same file.
+    HeaderSearches,
+    /// Each __FILE__ in the header gives the same text.
+    FileNames,
+    /// Each file the part holds has the size and modification time it had
+    /// when the part was saved.
+    FileStamps,
+    /// Each outside declaration the part refers to by name has the same
+    /// fingerprint in this compile.
+    Declarations,
+    NumSteps
+  };
+  uint64_t Nanos[NumSteps] = {};
+  unsigned SearchesRedone = 0;
+  unsigned FilesCompared = 0;
+};
+
+/// \p Cost, when non-null, is increased by the time each step takes.
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
                                 Preprocessor &PP, Sema *S,
                                 llvm::StringRef NotAMacroNames = {},
                                 std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
-                                uint64_t *FileMicros = nullptr);
+                                CheckCost *Cost = nullptr);
 
 class CacheClient {
 public:
@@ -165,12 +194,13 @@ public:
     /// is not".
     std::vector<std::string> Rejections;
     /// Wall time, in microseconds: waiting for the daemon to answer lookups,
-    /// checking candidates against the live state and, part of that,
-    /// checking files (redoing header searches, comparing sizes and
-    /// modification times), sending this compile's header timings, and
-    /// connecting.
-    uint64_t DaemonMicros = 0, CheckMicros = 0, FileCheckMicros = 0,
-             ReportMicros = 0, ConnectMicros = 0;
+    /// checking candidates against the live state, sending this compile's
+    /// header timings, and connecting.
+    uint64_t DaemonMicros = 0, CheckMicros = 0, ReportMicros = 0,
+             ConnectMicros = 0;
+    /// Candidates checked, and the check's time step by step.
+    unsigned CandidatesChecked = 0;
+    CheckCost Check;
   };
   const Stats &stats() const { return Counters; }
 

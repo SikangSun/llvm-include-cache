@@ -297,10 +297,20 @@ public:
          << LoadsRefused << "\n";
     OS << "header cache time: " << ms(LookupMicros) << " ms in lookups ("
        << ms(S.DaemonMicros) << " waiting for the daemon, " << ms(S.CheckMicros)
-       << " checking candidates, " << ms(S.FileCheckMicros)
-       << " of it checking files, " << ms(LoadMicros) << " loading), "
+       << " checking candidates, " << ms(LoadMicros) << " loading), "
        << ms(S.ReportMicros) << " reporting timings, " << ms(S.ConnectMicros)
        << " connecting\n";
+    const CheckCost &C = S.Check;
+    auto Step = [&](CheckCost::Step T) { return ms(C.Nanos[T] / 1000); };
+    OS << "header cache check time: " << S.CandidatesChecked
+       << " candidates, ms in: " << Step(CheckCost::Conditions)
+       << " conditions, " << Step(CheckCost::Macros) << " macros, "
+       << Step(CheckCost::TypeNamesAndPragmas) << " type names and pragmas, "
+       << Step(CheckCost::HeaderSearches) << " header searches ("
+       << C.SearchesRedone << " redone), " << Step(CheckCost::FileNames)
+       << " __FILE__, " << Step(CheckCost::FileStamps) << " file stamps ("
+       << C.FilesCompared << " compared), " << Step(CheckCost::Declarations)
+       << " declarations\n";
     if (EffectsWithoutDefinition)
       OS << "  macro effects without a definition in the module: "
          << EffectsWithoutDefinition << "\n";
@@ -317,7 +327,8 @@ public:
     if (Exporter) {
       const PartExporter::Stats &E = Exporter->stats();
       OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
-         << " with deep copies), declined " << E.Declined << "\n";
+         << " with deep copies), declined " << E.Declined << ", "
+         << ms(E.Micros) << " ms writing and pushing\n";
       if (LogServed) {
         for (const std::string &Line : E.Exports)
           OS << "  exported " << Line << "\n";

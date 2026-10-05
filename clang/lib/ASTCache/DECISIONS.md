@@ -1353,30 +1353,59 @@ project's scope; the cost is eaten as it is. User: "Idea A also fits well,
 but this is technically outside the space of our project. We will eat this
 cost naively."
 
-**Deferred: an optimization for recompilation.** If a criterion holds at the
-start of the whole build -- the build tool knows no source file changed
-since a point -- compiles in that build could skip both the file checks and
-the redone searches. Clang's module cache has a form of this
-(`-fmodules-validate-once-per-build-session`). User: "We can also add a
-recompilation optimization that somehow skips this check intra-executable
-compilation ... We will save the optimization to later." The cost it would
-save, measured below, is recorded for that.
+**Deferred: check files once per build, not once per compile.** The daemon
+outlives the compiles, so it can hold what one build learns from the file
+system: each file's size and modification time, and what each header search
+found. The first compile in a build that needs a fact reads the file system
+and gives the fact to the daemon; every later compile in that build takes it
+from the daemon. The assumption is the one a build already makes: no file
+changes while the build runs. A first build gains as much as a rebuild,
+since it too is many compiles. Clang's module cache has a form of this
+(`-fbuild-session-timestamp` with
+`-fmodules-validate-once-per-build-session`). User, 2026-10-05, first:
+"We will save the optimization to later"; then: "we can make this for cold
+compilation instead of recompilation, if following the same philosophy we
+simply stored read data on the server, which the server can serve without
+the compiler worrying, per complete make ... Our goal is to cut down the
+granularity and enable first compilation optimizations." Not designed: how
+the daemon learns where a build starts and ends.
 
-**Cost** (`CLANG_HEADER_CACHE_STATS=1` now prints it as "checking files";
-release build, full cache, default cutoff, `-fsyntax-only`):
+**Cost.** `CLANG_HEADER_CACHE_STATS=1` prints each check step's time on its
+own line, and the time spent exporting. A one-thread build of redis-server's
+117 `.c` files in the Makefile's order (`scratch/e2e/build_bench.py`; release
+build, `-O2 -c`, default cutoff), the cache's time summed over the build,
+median of 3 builds:
 
-| File | Checking files | All checking | All of the cache's time |
-|---|---|---|---|
-| `anet.c` | 4.2 ms | 6.3 ms | 10.5 ms |
-| `util.c` | 4.5 ms | 7.2 ms | 12.0 ms |
-| `object.c` | 6.1 ms | 8.1 ms | 10.9 ms |
+| Step | First build (empty daemon) | Rebuild (same daemon) |
+|---|---|---|
+| Connecting, once per compile | 27 ms | 26 ms |
+| Waiting for the daemon (3,643 / 3,645 cache queries) | 313 ms | 322 ms |
+| Checking candidates (4,547 / 4,780) | 844 ms | 903 ms |
+| -- macro conditions | 29 ms | 31 ms |
+| -- macros: expansions, not-a-macro names, skipped `#include`s | 318 ms | 346 ms |
+| -- type names and pragma state | 14 ms | 15 ms |
+| -- header searches redone (37,872 / 39,915) | 374 ms | 399 ms |
+| -- file stamps compared (21,689 / 22,901) | 14 ms | 15 ms |
+| -- outside declarations' fingerprints | 97 ms | 100 ms |
+| Loading parts (2,683 / 2,899 hits) | 252 ms | 271 ms |
+| Rest of the cache queries: reading metadata, macro effects | 167 ms | 177 ms |
+| Exporting parts: writing and pushing (278 / 33 parts) | 1,038 ms | 135 ms |
+| Reporting header timings | 20 ms | 18 ms |
+| All of the above | 2,660 ms | 1,852 ms |
 
-The stamps add little to the searches (4.1 to 6.6 ms before the stamps
-existed): the searches stat each file the stamps then compare. Served
-compiles are still faster than plain ones at `-O2` (medians of 21, ms):
-`anet.c` 125.2 to 120.8, `ae.c` 120.1 to 110.1, `zmalloc.c` 175.4 to 165.7,
-`util.c` 292.6 to 260.9. The six redis files, with and without `-g`: all 36
-compiles identical, the same hits as before.
+The build itself: plain clang 30.04 s; the first build 30.26 s (+0.7%); the
+rebuild 28.35 s (-5.6%). With `-fsyntax-only`: 9.75 s, 9.89 s and 8.23 s
+(-15.6%). Every object of both cache builds is byte-identical to plain
+clang's. A once-per-build check would remove at most the two file rows:
+0.39 s of the first build. Exporting costs more than that.
+
+Before the steps were timed apart, the searches and stamps together were 4.2
+ms (`anet.c`), 4.5 ms (`util.c`) and 6.1 ms (`object.c`) per compile with
+`-fsyntax-only`; the stamps add little because the searches stat each file
+the stamps then compare. Served compiles are still faster than plain ones at
+`-O2` (medians of 21, ms): `anet.c` 125.2 to 120.8, `ae.c` 120.1 to 110.1,
+`zmalloc.c` 175.4 to 165.7, `util.c` 292.6 to 260.9. The six redis files,
+with and without `-g`: all 36 compiles identical, the same hits as before.
 
 **A limit this showed.** After a header changes, the compile reads it as
 text and saves a new part, unless a header inside it is served from its own

@@ -151,7 +151,7 @@ int redoLookups(
 MismatchReason clang::ast_cache::matchesLiveState(
     const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
     llvm::StringRef NotAMacroNames, std::string *Detail,
-    const IncludeSite *Site, uint64_t *FileMicros) {
+    const IncludeSite *Site, CheckCost *Cost) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -168,6 +168,29 @@ MismatchReason clang::ast_cache::matchesLiveState(
                    "no Sema to check pragma state");
 
   IdentifierTable &Idents = PP.getIdentifierTable();
+
+  // Charges the time from one step's start to the next step's start, or to
+  // the return.
+  struct Laps {
+    CheckCost *To;
+    unsigned Step = CheckCost::Conditions;
+    std::chrono::steady_clock::time_point Start =
+        std::chrono::steady_clock::now();
+    void next(CheckCost::Step S) {
+      charge();
+      Step = S;
+    }
+    void charge() {
+      if (!To)
+        return;
+      auto Now = std::chrono::steady_clock::now();
+      To->Nanos[Step] +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(Now - Start)
+              .count();
+      Start = Now;
+    }
+    ~Laps() { charge(); }
+  } Lap{Cost};
 
   // The identifier for \p Name, brought up to date first. A hit earlier in
   // this compile loads a module, which can define a name the compile had
@@ -188,6 +211,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
                      D.MacroName + (D.WasDefined ? " was defined, is not"
                                                  : " was not defined, is"));
   }
+
+  Lap.next(CheckCost::Macros);
 
   // A name the stored parse read as plain text must still be plain text here.
   // isMacroDefined tests the identifier's macro bit first, which is clear for
@@ -238,6 +263,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
                        Name + " was not a macro, is");
   }
 
+  Lap.next(CheckCost::TypeNamesAndPragmas);
+
   // Symbol dependencies last: the only ones that cost a name lookup.
   {
     for (const SymbolDependency &D : Deps.Symbol) {
@@ -262,20 +289,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
   if (capturePragmaState(*S) != Deps.Entry)
     return Because(MismatchReason::PragmaState, "#pragma pack or float state");
 
-  // Checking files is timed on its own: it is what a build that knows no
-  // file changed since it began could skip (DECISIONS.md 2.19).
-  auto FilesStart = std::chrono::steady_clock::now();
-  struct AddTime {
-    uint64_t *To;
-    std::chrono::steady_clock::time_point Start;
-    ~AddTime() {
-      if (To)
-        *To += std::chrono::duration_cast<std::chrono::microseconds>(
-                   std::chrono::steady_clock::now() - Start)
-                   .count();
-    }
-  };
-  std::optional<AddTime> FileTime(AddTime{FileMicros, FilesStart});
+  Lap.next(CheckCost::HeaderSearches);
 
   // The files the header's own #includes find depend on this compile's
   // include path, which nothing else compares. The stored parse also holds
@@ -297,6 +311,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
                                                   Site->File.getName());
     std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>> Found;
     int Bad = redoLookups(Deps, PP, *Site, CheckNames, Found);
+    if (Cost)
+      Cost->SearchesRedone += Bad < 0 ? Found.size() : Bad + 1;
     if (Bad >= 0) {
       const IncludeDependency &D = Deps.Includes[Bad];
       std::string Written =
@@ -308,6 +324,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
                      Written + " found " + Was + ", finds something else");
     }
 
+    Lap.next(CheckCost::FileNames);
     SourceManager &SM = PP.getSourceManager();
     for (const FileNameDependency &D : Deps.FileNames) {
       OptionalFileEntryRef File =
@@ -330,8 +347,11 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // modification time, as Clang's own modules check their input files. The
   // file manager stats a file once per compile, the header searches above
   // included.
+  Lap.next(CheckCost::FileStamps);
   FileManager &FM = PP.getFileManager();
   for (const FileStamp &F : Deps.Files) {
+    if (Cost)
+      ++Cost->FilesCompared;
     OptionalFileEntryRef Live =
         FM.getOptionalFileRef(F.Path, /*OpenFile=*/false);
     if (!Live)
@@ -341,7 +361,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
       return Because(MismatchReason::FileChanged,
                      F.Path + " changed since the part was saved");
   }
-  FileTime.reset();
+  Lap.next(CheckCost::Declarations);
 
   // The part's own declarations were compiled against the outside
   // declarations it refers to. Loading it resolves each name to this
@@ -450,10 +470,11 @@ llvm::StringRef CacheClient::lookup(
       }
     }
     std::string Detail;
+    ++Counters.CandidatesChecked;
     auto Checking = std::chrono::steady_clock::now();
     MismatchReason Why = matchesLiveState(E.Deps, PP, S, Names,
                                           LogRejections ? &Detail : nullptr,
-                                          Site, &Counters.FileCheckMicros);
+                                          Site, &Counters.Check);
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
       ++Counters.CandidatesRejected;

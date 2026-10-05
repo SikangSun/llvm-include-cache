@@ -54,6 +54,8 @@ public:
     /// "<header>: <bytes> bytes in <us> us, <n> by name", one per exported
     /// part.
     std::vector<std::string> Exports;
+    /// Wall time writing parts and pushing them to the daemon.
+    uint64_t Micros = 0;
   };
 
   /// Installs an exporter on \p CI's preprocessor, which owns it. \p Deliver

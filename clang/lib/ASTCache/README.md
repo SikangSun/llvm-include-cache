@@ -136,9 +136,11 @@ CLANG_HEADER_CACHE=/tmp/clang-header-cache.sock clang -fmodules \
 ```
 
 `CLANG_HEADER_CACHE_STATS=1` prints hits and rejection counts when the compile
-ends, and where the cache's time went (waiting for the daemon, checking
-candidates and, part of that, checking files, loading); `2` also names the
-macro behind each rejection.
+ends, and where the cache's time went: waiting for the daemon, checking
+candidates (each check step on its own line), loading, and exporting; `2`
+also names the macro behind each rejection. `scratch/e2e/build_bench.py`
+builds redis-server one compile at a time with plain clang, as a first build
+and as a rebuild, and sums these times.
 
 A compile fills the cache itself (DECISIONS.md §2.17): each listed header
 it has to read, it exports as its own part and pushes to the daemon.
