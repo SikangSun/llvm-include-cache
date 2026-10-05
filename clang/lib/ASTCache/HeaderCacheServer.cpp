@@ -300,7 +300,7 @@ public:
        << ms(S.DaemonMicros) << " waiting for the daemon, " << ms(S.CheckMicros)
        << " checking candidates, " << ms(LoadMicros) << " loading), "
        << ms(S.ReportMicros) << " reporting timings, " << ms(S.ConnectMicros)
-       << " connecting\n";
+       << " connecting, " << ms(ReplayMicros) << " replaying hits' effects\n";
     const CheckCost &C = S.Check;
     auto Step = [&](CheckCost::Step T) { return ms(C.Nanos[T] / 1000); };
     OS << "header cache check time: " << S.CandidatesChecked
@@ -427,7 +427,12 @@ public:
         &Site);
     uint64_t Took = micros(Asked);
     LookupMicros += Took;
-    if (LogServed) {
+    // Notes this query, with LogServed. Replay is the time a hit spent
+    // replaying the header's macro effects and pragma state, which is not
+    // part of Took.
+    auto Log = [&](uint64_t Replay) {
+      if (!LogServed)
+        return;
       const CacheClient::Stats &After = Client->stats();
       QueryLines.push_back(
           Path + (Target ? " hit" : " miss") +
@@ -436,10 +441,12 @@ public:
           " check=" + std::to_string(After.CheckMicros - CheckBefore) +
           " checked=" +
           std::to_string(After.CandidatesChecked - CheckedBefore) + " load=" +
-          std::to_string(HitLoadMicros) + " bytes=" + std::to_string(HitBytes));
-    }
+          std::to_string(HitLoadMicros) + " replay=" + std::to_string(Replay) +
+          " bytes=" + std::to_string(HitBytes));
+    };
     PP.setCounterValue(Counter);
     if (!Target) {
+      Log(0);
       // A miss where a copy could have stood in: save this header's part of
       // this compile for the next one (DECISIONS.md 2.17).
       if (Exporter && !(PopulateOnly && AnyFits))
@@ -455,9 +462,13 @@ public:
     // entering the file would have done. The module's macros are made visible
     // first, so the directives replayed below override them rather than the
     // other way around.
+    auto Replaying = std::chrono::steady_clock::now();
     PP.makeModuleVisible(Target, IncludeLoc);
     replayMacroEffects(Deps.MacroEffects, *Target, IncludeLoc);
     applyPragmaDelta(CI.getSema(), Deps.Entry, Deps.Exit);
+    uint64_t Replay = micros(Replaying);
+    ReplayMicros += Replay;
+    Log(Replay);
     return Target;
   }
 
@@ -616,6 +627,9 @@ private:
   unsigned EffectsWithoutDefinition = 0;
   /// Wall time in lookups, the loads they made included, and in the loads.
   uint64_t LookupMicros = 0, LoadMicros = 0;
+  /// Wall time after hits making the PCM's macros visible and replaying the
+  /// header's macro effects and pragma state; not part of LookupMicros.
+  uint64_t ReplayMicros = 0;
 
   static uint64_t micros(std::chrono::steady_clock::time_point Start) {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -651,7 +665,8 @@ private:
   uint64_t TextMicros = 0;
   unsigned TextReads = 0;
   /// With LogServed: "<header> hit|miss total= ask= check= checked= load=
-  /// bytes=" per lookup (times in us; checked = saved PCMs checked), and
+  /// replay= bytes=" per lookup (times in us; checked = saved PCMs checked;
+  /// replay comes after total and is not part of it), and
   /// "<header> <us> depth <n>" per header read as text, n = 0 outermost.
   std::vector<std::string> QueryLines, TextLines;
   /// Files entered and not yet left, innermost last.
