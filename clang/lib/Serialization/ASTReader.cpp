@@ -143,6 +143,7 @@
 #include <vector>
 
 using namespace clang;
+
 using namespace clang::serialization;
 using namespace clang::serialization::reader;
 using llvm::BitstreamCursor;
@@ -4846,10 +4847,14 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
 
   unsigned NumModules = ModuleMgr.size();
   SmallVector<ImportedModule, 4> Loaded;
-  if (ASTReadResult ReadResult =
-          ReadASTCore(FileName, Type, ImportLoc,
-                      /*ImportedBy=*/nullptr, Loaded, 0, 0, ASTFileSignature(),
-                      ClientLoadCapabilities)) {
+  std::optional<llvm::TimeTraceScope> CoreScope;
+  CoreScope.emplace("ReadAST Core");
+  ASTReadResult CoreResult =
+      ReadASTCore(FileName, Type, ImportLoc,
+                  /*ImportedBy=*/nullptr, Loaded, 0, 0, ASTFileSignature(),
+                  ClientLoadCapabilities);
+  CoreScope.reset();
+  if (ASTReadResult ReadResult = CoreResult) {
     ModuleMgr.removeModules(ModuleMgr.begin() + NumModules);
 
     // If we find that any modules are unusable, the global index is going
@@ -4903,6 +4908,8 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
   }
 
   // Preload source locations and interesting indentifiers.
+  std::optional<llvm::TimeTraceScope> PreloadScope;
+  PreloadScope.emplace("ReadAST Preload");
   for (ImportedModule &M : Loaded) {
     ModuleFile &F = *M.Mod;
 
@@ -4951,6 +4958,7 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
     }
   }
 
+  PreloadScope.reset();
   // Builtins and library builtins have already been initialized. Mark all
   // identifiers as out-of-date, so that they are deserialized on first use.
   if (Type == MK_PCH || Type == MK_Preamble || Type == MK_MainFile)
@@ -5201,7 +5209,10 @@ ASTReader::ReadASTCore(StringRef FileName,
     switch (Entry.ID) {
     case CONTROL_BLOCK_ID:
       HaveReadControlBlock = true;
-      switch (ReadControlBlock(F, Loaded, ImportedBy, ClientLoadCapabilities)) {
+      switch ([&] {
+        llvm::TimeTraceScope ControlScope("ReadAST ControlBlock");
+        return ReadControlBlock(F, Loaded, ImportedBy, ClientLoadCapabilities);
+      }()) {
       case Success:
         // Check that we didn't try to load a non-module AST file as a module.
         //

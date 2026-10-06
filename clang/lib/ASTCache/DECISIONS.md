@@ -1528,6 +1528,79 @@ compile that loads it. So:
 - An index over the loaded PCMs' name tables would cut the 200 us part, and
   with it the threshold.
 
+### 2.21 Where the cache's own time goes, and what repeats (2026-10-06)
+
+Front end only: a first build of redis-server's 117 files with
+`-fsyntax-only`, the fixed cutoff, one compile at a time. Plain clang's
+front end is 8.40 s (start-up excluded); the cache spends 4.88 s to save
+4.93 s. Totals are from untraced builds; the splits come from one build
+traced with the named scopes added in this commit
+(`scratch/e2e/profile/phase_run.py`) and from temporary counters, since
+removed. User, 2026-10-06: "These are implementation optimizations which
+are separate from actual optimizations. We are still working at the base
+product." Nothing below is built.
+
+**Cache queries: 1.54 s (18%).** At each listed `#include` the compile sends
+the header's path; the daemon copies, encodes and sends the metadata of
+every saved PCM of that header; the compile decodes it, checks each PCM in
+turn, and loads the first that passes (3,706 queries, 4,524 PCMs checked,
+2,723 hits).
+
+| Step | Time | What repeats |
+|---|---|---|
+| Ask the daemon | 297 ms (80 us per query) | A stored PCM's metadata never changes, yet it is encoded, copied over the socket and decoded again for every query |
+| Decode the reply and the effects, copy the metadata | about 190 ms (52 us per query) | As above |
+| Check: names that must not be macros | about 310 ms (113 us per PCM checked) | Each name not yet in the compile is searched for in every loaded PCM, again for each PCM checked |
+| Check: header searches | 385 ms | 37,809 searches, 19,776 distinct: 48% repeat one the compile already did |
+| Check: outside declarations | 98 ms | 31,254 checks, 16,059 distinct: 49% repeat |
+| Check: the rest | about 80 ms | |
+| Load (`ReadAST`) | 262 ms (96 us per hit) | The control block (26 us) compares the same compiler options for every PCM |
+
+**Writing PCMs: 1.08 s (13%).** At a miss the compile parses the header as
+text and notes the source-location range the header occupied. After the
+next top-level declaration, it runs Clang's AST writer over its whole state
+with a filter that keeps what lies in that range, then sends the bytes to
+the daemon, which copies them into shared memory and acknowledges (290 PCMs,
+4.0 ms each, traced):
+
+| Writer phase | Per PCM | What repeats |
+|---|---|---|
+| Macros (`WritePreprocessor`) | 1,070 us | Scans every macro in the compile to find the PCM's |
+| Source locations | 745 us | Scans every file and macro-expansion entry of the compile |
+| Declarations and types | 733 us | Not split further |
+| Collecting identifiers | 445 us | Scans the compile's whole identifier table |
+| Input files that matter | 116 us | Scans every file of the compile |
+| Record-name table | 65 us | The same 12 KB in every PCM, read only by tools that print a PCM |
+| Identifier table, options, the rest | about 240 us | |
+| Sending to the daemon | 477 us | Two copies (socket, then shared memory); the compile waits for the acknowledgement |
+
+The four scans are 2.4 ms of the 4.0 ms. A compile that writes k PCMs scans
+its state k times, and the state grows: `bitops.c` writes 71 PCMs for
+`<immintrin.h>`.
+
+**Slower parsing of the remaining text (1.70 s, 20%) and the rest
+(0.56 s).** These overlap the rows above: the lookups below also run inside
+checks and replay.
+
+| Mechanism | Time | What repeats |
+|---|---|---|
+| A name not yet in the compile is searched for in every loaded PCM (`ASTReader::get`) | 975 ms, 987,398 lookups | 18.6 million probes into PCM name tables, about 17 per lookup; nearly all find nothing |
+| After each load, names the compile knows and the PCM also has are marked out of date and later searched again in the PCMs loaded since | 408 ms, 118,229 refreshes | A refresh repeats a search whose answer rarely changes |
+| Replay: per effect, find the name, then add a directive | 778 ms, 302,037 effects, 111 per hit | The name lookup searches all loaded PCMs though the PCM being replayed defines it; the same effects recur across hits |
+| Dependency tracking | about 260 ms | Every header is tracked, though only headers that missed a query are written |
+
+**Implementation fixes, not built** (savings estimated, overlapping):
+
+| Fix | Removes | Up to |
+|---|---|---|
+| One index of names over the loaded PCMs, built as each loads (the shape of Clang's global module index) | Probes of PCMs that lack the name; most refreshes | about 1.0 s |
+| Write a PCM from its own source range instead of scanning the compile | The four scans | about 0.6 s |
+| Keep each PCM's metadata in shared memory; the reply carries offsets | Encoding, copying and decoding per query | about 0.3 s |
+| Remember header searches and declaration checks within a compile | The 48% and 49% repeats | about 0.2 s |
+| Replay: find each effect's name in its own PCM; skip effects already in force | Part of replay | part of 0.78 s |
+| Track dependencies only around headers that will be written | Most of the tracking | about 0.2 s |
+| Drop the record-name table; send to the daemon without waiting | | about 0.15 s |
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.

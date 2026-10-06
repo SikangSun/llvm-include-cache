@@ -5522,7 +5522,10 @@ ASTWriter::WriteAST(llvm::PointerUnion<Sema *, Preprocessor *> Subject,
   Stream.Emit((unsigned)'C', 8);
   Stream.Emit((unsigned)'H', 8);
 
-  WriteBlockInfoBlock();
+  {
+    llvm::TimeTraceScope S("WriteAST BlockInfo");
+    WriteBlockInfoBlock();
+  }
 
   PP = &PPRef;
   this->WritingModule = WritingModule;
@@ -6047,9 +6050,17 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
 
   // This needs to be done very early, since everything that writes
   // SourceLocations or FileIDs depends on it.
-  computeNonAffectingInputFiles();
+  {
+    llvm::TimeTraceScope S("WriteAST NonAffectingInputs");
+    computeNonAffectingInputFiles();
+  }
 
-  writeUnhashedControlBlock(*PP);
+  {
+    llvm::TimeTraceScope S("WriteAST UnhashedControl");
+    writeUnhashedControlBlock(*PP);
+  }
+  std::optional<llvm::TimeTraceScope> CollectScope;
+  CollectScope.emplace("WriteAST CollectIdentifiers");
 
   // Don't reuse type ID and Identifier ID from readers for C++ standard named
   // modules since we want to support no-transitive-change model for named
@@ -6136,8 +6147,12 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
   if (SemaPtr)
     PrepareWritingSpecialDecls(*SemaPtr);
 
+  CollectScope.reset();
   // Write the control block
-  WriteControlBlock(*PP, isysroot);
+  {
+    llvm::TimeTraceScope S("WriteAST ControlBlock");
+    WriteControlBlock(*PP, isysroot);
+  }
 
   // Write the remaining AST contents.
   Stream.FlushToWord();
@@ -6226,21 +6241,39 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
                               Buffer.data(), Buffer.size());
   }
 
-  if (SemaPtr)
+  if (SemaPtr) {
+    llvm::TimeTraceScope S("WriteAST DeclsAndTypes");
     WriteDeclAndTypes(SemaPtr->Context);
+  }
 
-  WriteFileDeclIDsMap();
-  WriteSourceManagerBlock(PP->getSourceManager());
+  {
+    llvm::TimeTraceScope S("WriteAST FileDeclIDs");
+    WriteFileDeclIDsMap();
+  }
+  {
+    llvm::TimeTraceScope S("WriteAST SourceManager");
+    WriteSourceManagerBlock(PP->getSourceManager());
+  }
   if (SemaPtr)
     WriteComments(SemaPtr->Context);
-  WritePreprocessor(*PP, isModule);
-  WriteHeaderSearch(PP->getHeaderSearchInfo());
+  {
+    llvm::TimeTraceScope S("WriteAST Preprocessor");
+    WritePreprocessor(*PP, isModule);
+  }
+  {
+    llvm::TimeTraceScope S("WriteAST HeaderSearch");
+    WriteHeaderSearch(PP->getHeaderSearchInfo());
+  }
   if (SemaPtr) {
     WriteSelectors(*SemaPtr);
     WriteReferencedSelectorsPool(*SemaPtr);
     WriteLateParsedTemplates(*SemaPtr);
   }
-  WriteIdentifierTable(*PP, SemaPtr ? &SemaPtr->IdResolver : nullptr, isModule);
+  {
+    llvm::TimeTraceScope S("WriteAST IdentifierTable");
+    WriteIdentifierTable(*PP, SemaPtr ? &SemaPtr->IdResolver : nullptr,
+                         isModule);
+  }
   if (SemaPtr) {
     WriteFPPragmaOptions(SemaPtr->CurFPFeatureOverrides());
     WriteOpenCLExtensions(*SemaPtr);
@@ -6249,8 +6282,10 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
   }
 
   // If we're emitting a module, write out the submodule information.
-  if (WritingModule)
+  if (WritingModule) {
+    llvm::TimeTraceScope S("WriteAST Submodules");
     WriteSubmodules(WritingModule, SemaPtr ? &SemaPtr->Context : nullptr);
+  }
 
   Stream.EmitRecord(SPECIAL_TYPES, SpecialTypes);
 

@@ -252,6 +252,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   }
 
   // Several hundred names for a system header, so after the short lists.
+  std::optional<llvm::TimeTraceScope> NamesScope;
+  NamesScope.emplace("HeaderCache Check NotAMacro");
   if (!NotAMacroNames.empty()) {
     std::optional<llvm::SmallVector<llvm::StringRef, 0>> Names =
         splitNameList(NotAMacroNames);
@@ -264,6 +266,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
                        Name + " was not a macro, is");
   }
 
+  NamesScope.reset();
   Lap.next(CheckCost::TypeNamesAndPragmas);
 
   // Symbol dependencies last: the only ones that cost a name lookup.

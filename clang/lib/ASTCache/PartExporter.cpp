@@ -317,6 +317,8 @@ private:
     if (!CI.hasSema())
       return decline(P, "no Sema");
 
+    std::optional<llvm::TimeTraceScope> DepsScope;
+    DepsScope.emplace("HeaderCache ExportMetadata");
     HeaderDependencySet Deps = *Rec;
     Deps.Entry = P.Entry;
     Deps.Exit = P.Exit;
@@ -346,6 +348,7 @@ private:
                                 /*IsFramework=*/false, /*IsExplicit=*/false);
     M->PresumedModuleMapFile = "<header-cache-part>";
 
+    DepsScope.reset();
     Written W = writePart(P, M, ByName);
     if (ByName && !W.Failure.empty()) {
       if (P.ModulesAtBegin)
@@ -371,6 +374,7 @@ private:
               " locations in module files dropped";
     Counts.Exports.push_back(std::move(Line));
     dump(P, R, W.Sizes);
+    llvm::TimeTraceScope PushScope("HeaderCache Push");
     Deliver(std::move(R));
   }
 
@@ -478,6 +482,7 @@ private:
                    std::chrono::steady_clock::now() - Start)
                    .count();
     W.DroppedLocations = Writer.getPartDroppedLocations();
+    llvm::TimeTraceScope OutsideScope("HeaderCache ExportOutsideDecls");
     for (const PartSize &Z : Sizes)
       W.Sizes.push_back(describeSize(P, Named, Z));
 

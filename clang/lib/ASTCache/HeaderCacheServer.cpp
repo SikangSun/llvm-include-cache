@@ -45,6 +45,7 @@
 #include <optional>
 
 using namespace clang;
+
 using namespace clang::ast_cache;
 
 namespace {
@@ -463,9 +464,18 @@ public:
     // first, so the directives replayed below override them rather than the
     // other way around.
     auto Replaying = std::chrono::steady_clock::now();
-    PP.makeModuleVisible(Target, IncludeLoc);
-    replayMacroEffects(Deps.MacroEffects, *Target, IncludeLoc);
-    applyPragmaDelta(CI.getSema(), Deps.Entry, Deps.Exit);
+    {
+      llvm::TimeTraceScope S("HeaderCache MakeVisible");
+      PP.makeModuleVisible(Target, IncludeLoc);
+    }
+    {
+      llvm::TimeTraceScope S("HeaderCache ReplayEffects");
+      replayMacroEffects(Deps.MacroEffects, *Target, IncludeLoc);
+    }
+    {
+      llvm::TimeTraceScope S("HeaderCache PragmaDelta");
+      applyPragmaDelta(CI.getSema(), Deps.Entry, Deps.Exit);
+    }
     uint64_t Replay = micros(Replaying);
     ReplayMicros += Replay;
     Timings.Hits.push_back({Path, Took + Replay});
