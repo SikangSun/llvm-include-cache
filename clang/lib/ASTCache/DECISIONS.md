@@ -1792,6 +1792,93 @@ at `-g`. The `config.c` debug-information difference (§4) did not appear
 in this build. Its cause, names of outside declarations resolved lazily, is
 not fixed, so it can return wherever a part names an outside declaration.
 
+### 2.24 Load speed: what PCM does at a load, and the options (analysis, 2026-10-06)
+
+User, 2026-10-06: "break down parts of PCM that can be used in isolation
+(flags checking, etc) and analyze whether there is a way to achieve maximum
+load speed ... it seems to me PCM's design is not build for load speed".
+Nothing below is built.
+
+**No import-speed mode.** Clang's switches for loading a PCM only skip
+validation: `-fno-validate-pch` (options and input files),
+`-fmodules-validate-once-per-build-session`, and the system-header and
+content-hash input checks. The reader is always lazy. The global module
+index, one table saying which PCMs know a name, exists only for Clang's
+on-disk module cache, which the header cache does not use.
+
+**Where the PCM reader's time goes.** One first build of redis-server
+(`-fsyntax-only`, §2.23's folding), with temporary timers in the reader's
+entry points, each call charged to the outermost entry point, then removed
+(`scratch/e2e/profile/reader_prof.py`). 302 PCMs loaded.
+
+| Reader work | Calls | Time |
+|---|---|---|
+| Find a name not yet in the compile: search every loaded PCM's name table (`get`) | 399,052 | 424 ms |
+| After each load, re-search names the compile already knows (`updateOutOfDateIdentifier`) | 75,173 | 259 ms |
+| Open a PCM (`ReadAST`): control block and option checks, tables, source locations | 302 | 87 ms |
+| List a context's declarations, source-location entries, the rest | | 108 ms |
+| **Total** | | **878 ms** |
+
+What runs inside those calls, counted wherever it ran:
+
+| Nested work | Calls | Time |
+|---|---|---|
+| Decode macro histories (`resolvePendingMacro`) | 293,764 | 300 ms |
+| Decode declarations, with their types (`ReadDeclRecord`) | 123,560 | 253 ms |
+| … of which merging redeclarations (`findExisting`, `mergeRedeclarable`) | | 19 ms |
+
+So: decoding macros and declarations is about 550 ms, searching name tables
+and bookkeeping about 240 ms, opening PCMs 87 ms. Merging is 19 ms: PPH,
+for C++, found merging a quarter to a third of its load time; in this C
+build it is small. The cache's own load-side
+steps come on top, and partly overlap the above (replay and checks trigger
+lazy reads): asking the daemon 164 ms, checking metadata 546 ms, replaying
+macro effects 614 ms (§2.23's medians). Everything a load costs is about
+2 s of the 8.3 s front end; that is the most a faster load could save.
+
+**PCM's parts, and which can stand alone.**
+
+| Part | At a load | Alone? |
+|---|---|---|
+| Option records (language, target, preprocessor, header search) | Compared with the loading compile's | Yes. One hash of the options (Clang's module hash), compared once per compile, does the same job |
+| Input-file list | Input files checked at a load unless validation is off | Yes; the cache already checks stamps itself (§2.19) |
+| Record-name table (BLOCKINFO) | Unused; for tools that print a PCM | Drop |
+| Name tables, one per PCM | Searched lazily, PCM by PCM | The hash table is generic; the per-PCM search is the cost. One index over all loaded PCMs removes it |
+| Macro histories, per name | Decoded lazily, then replayed by the cache as local directives | Yes. The metadata could carry each macro's tokens and the hit create the definition directly |
+| Declarations and types | Decoded on first use; redeclarations merged | No. Any format must build these nodes and merge them; this is the code ASTReader is |
+| Source-location table | Allocated at load, entries decoded on use | Needed for diagnostics and `-g` |
+
+**Prior work.**
+
+| System | How it loads | Result | Limit |
+|---|---|---|---|
+| GCC precompiled headers | A memory image of the compiler's heap; pointers fixed up from GCC's type descriptions (`gengtype`) | Fast | One per compile, before any code: the image is the whole state, so nothing is merged |
+| MSVC precompiled headers | The same: a heap snapshot, relocated if mapped elsewhere | Fast | One per compile |
+| Clang PCH and modules | The lazy bitstream reader used here | Cheap open; cost spread over use | Built for many modules a compile mostly does not use |
+| GCC compile server (Bothner, Apple, 2003) | A server keeps parsed header fragments in memory and reuses one when its macro context matches; no file format | About 10x on repeat compiles of Apple's Carbon headers | Never merged into GCC |
+| Zapcc (a Clang fork, 2018) | A compile server keeps parsed headers in memory | 2-5x on full C++ builds | Caching is off for C; heavy changes to Clang |
+| PPH (Google, GCC, 2011-12) | Per-header files of streamed trees, merged into the compile | Parse time halved; merging a quarter to a third of load time and the main source of bugs; under a fifth of files reused | Abandoned |
+| Texas persistent store (Wilson, 1991) | Pointers swizzled when a page is faulted in | No cost after the fault | Needs every pointer's type described |
+
+The user's "serialization in Java that autofills addresses" is pointer
+swizzling. It needs every pointer field of every class described, which
+Java has by reflection and GCC by `gengtype`; Clang's AST has neither, and
+a restored image still has to be merged into a compile that already has
+state. GCC and MSVC load fast because they never merge.
+
+**Options for loading faster.**
+
+| Option | Removes | Up to | Work |
+|---|---|---|---|
+| A. One name index over the loaded PCMs | Per-PCM searches and most re-searches | about 0.25 s | Small; Clang's global module index is the model |
+| B. Macros outside PCM: tokens in the metadata, definitions created at the hit | Macro-history decoding and most of replay | about 0.3 to 0.6 s | Medium |
+| C. Options and files checked outside PCM, once per compile; no record names | PCM's validation | under 0.05 s | Small |
+| D. A format of our own for declarations and types | Bitstream decoding | part of 0.25 s | Large: a serializer for every C declaration, type, statement and expression, plus merging |
+| E. A compile server (Bothner, Zapcc) | Loading itself, and writing PCMs | about 2 s, plus writing (1.2 s) | An architecture change: compiles run inside one long-lived process |
+
+A to C keep PCM only for what is hard to replace, declarations and types,
+and take the rest out of it.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
