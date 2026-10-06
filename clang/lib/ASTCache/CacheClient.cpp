@@ -462,6 +462,8 @@ llvm::StringRef CacheClient::lookup(
   if (!Resp)
     return {};
 
+  LastCandidates = Resp->Entries.size();
+  LastRejection = MismatchReason::None;
   for (const CacheEntryRef &E : Resp->Entries) {
     // The names this entry requires not to be macros are in the region. If the
     // offset addresses nothing written, they cannot be checked, and checking
@@ -488,6 +490,8 @@ llvm::StringRef CacheClient::lookup(
     }
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
+      if (LastRejection == MismatchReason::None)
+        LastRejection = Why;
       ++Counters.CandidatesRejected;
       ++Counters.RejectedFor[static_cast<unsigned>(Why)];
       if (LogRejections)

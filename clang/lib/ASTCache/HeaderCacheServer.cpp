@@ -373,9 +373,11 @@ public:
     // A header no compile has found slow is parsed without asking: parsing
     // it costs less than the round trip and the load would (DECISIONS.md
     // 2.14). The list is in shared memory; this costs no socket traffic.
+    NextReason.clear();
     std::string Path = storedName(File);
     if (!Client->isListed(Path)) {
       ++NotListed;
+      NextReason = "not-listed";
       return nullptr;
     }
 
@@ -386,12 +388,15 @@ public:
     DeclBoundaryObserver *Boundary = PP.getDeclBoundaryObserver();
     if (!Boundary || !Boundary->isAtDeclarationBoundary()) {
       ++SkippedAtBoundary;
+      NextReason = "inside-a-declaration";
       return nullptr;
     }
 
     // Deciding between stored entries reads the live symbol table.
-    if (!CI.hasSema())
+    if (!CI.hasSema()) {
+      NextReason = "no-sema";
       return nullptr;
+    }
 
     // Loading a module file sets __COUNTER__ to the value its producer ended
     // with, which counts the uses in the context the copy was built after.
@@ -448,6 +453,11 @@ public:
     PP.setCounterValue(Counter);
     if (!Target) {
       Log(0);
+      if (LogServed)
+        NextReason = Client->lastCandidates() == 0 ? std::string("no-saved-PCM")
+                     : Client->lastRejection() != MismatchReason::None
+                         ? "rejected:" + describe(Client->lastRejection()).str()
+                         : std::string("load-refused");
       // A miss where a copy could have stood in: save this header's part of
       // this compile for the next one (DECISIONS.md 2.17).
       if (Exporter && !(PopulateOnly && AnyFits))
@@ -488,7 +498,10 @@ public:
   void headerEntered(OptionalFileEntryRef File) {
     Open.push_back({File ? &File->getFileEntry() : nullptr,
                     File ? File->getName().str() : std::string(),
-                    std::chrono::steady_clock::now(), cacheMicros()});
+                    std::chrono::steady_clock::now(), cacheMicros(), 0,
+                    NextReason.empty() ? std::string("not-asked")
+                                       : std::move(NextReason)});
+    NextReason.clear();
   }
 
   void headerExited() {
@@ -505,9 +518,16 @@ public:
       TextMicros += Micros - (cacheMicros() - F.CacheAtStart);
       ++TextReads;
     }
+    // Its own time: the headers inside it and the cache's work while it was
+    // open taken out, so the own times of all reads add up to the time spent
+    // reading headers as text.
+    uint64_t Own = Micros - F.ChildMicros - (cacheMicros() - F.CacheAtStart);
+    if (!Open.empty())
+      Open.back().ChildMicros += Micros - (cacheMicros() - F.CacheAtStart);
     if (F.Entry && LogServed)
       TextLines.push_back(storedName(F.Name) + " " + std::to_string(Micros) +
-                          " depth " + std::to_string(Open.size()));
+                          " depth " + std::to_string(Open.size()) + " own " +
+                          std::to_string(Own) + " why " + F.Reason);
     // Only a header's first entry in this compile is its parse; a later one
     // of an unguarded header says nothing about what a saved copy saves.
     if (!F.Entry || !Timed.insert(F.Entry).second)
@@ -666,11 +686,19 @@ private:
     std::chrono::steady_clock::time_point Start;
     /// cacheMicros() when the file was entered.
     uint64_t CacheAtStart;
+    /// Time in the headers it included, the cache's work in them excluded.
+    uint64_t ChildMicros;
+    /// Why the cache did not serve it (LogServed only): not-listed,
+    /// inside-a-declaration, no-saved-PCM, rejected:<check>, load-refused,
+    /// or not-asked when the cache was not consulted.
+    std::string Reason;
   };
+  std::string NextReason;
   /// The cache's own time so far: lookups, the loads they made included,
   /// and writing parts.
   uint64_t cacheMicros() const {
-    return LookupMicros + (Exporter ? Exporter->stats().Micros : 0);
+    return LookupMicros + ReplayMicros +
+           (Exporter ? Exporter->stats().Micros : 0);
   }
   /// Time reading outermost headers as text, the cache's own work inside
   /// them excluded, and how many such reads.

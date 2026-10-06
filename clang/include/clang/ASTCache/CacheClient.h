@@ -204,6 +204,11 @@ public:
   };
   const Stats &stats() const { return Counters; }
 
+  /// What the latest lookup found: how many saved PCMs the daemon returned,
+  /// and why the first rejected one was rejected (None if none was).
+  unsigned lastCandidates() const { return LastCandidates; }
+  MismatchReason lastRejection() const { return LastRejection; }
+
   /// Keep a line per rejected candidate naming what failed. Off by default:
   /// it builds a string for every rejection.
   void logRejections(bool On) { LogRejections = On; }
@@ -216,6 +221,8 @@ private:
   SharedRegion Region;
   Stats Counters;
   bool LogRejections = false;
+  unsigned LastCandidates = 0;
+  MismatchReason LastRejection = MismatchReason::None;
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;
   uint64_t AskListVersion = 0;
