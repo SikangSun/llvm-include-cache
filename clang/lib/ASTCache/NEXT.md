@@ -90,6 +90,16 @@ one-thread first build of redis-server: front end 0.13 s faster (now 0.07 s
 slower than plain clang's 9.77 s), full `-O2` build 0.08 s faster (now
 0.12 s faster than plain clang's 31.65 s).
 
+## Built 2026-10-06: fold everything
+
+`DECISIONS.md` §2.23. Inside a header the compile will write, nothing is
+asked or served; everything is parsed from the files, so the part is a
+complete folded copy. `server.h` now has a copy per include order (8 in
+redis) and is served in 62 of 70 compiles. A one-thread first build of
+redis-server: front end 1.69 s faster than plain clang's 10.01 s (-17%),
+full `-O2` build 1.88 s faster than 31.83 s (-5.9%). Objects identical at
+`-O2` and `-g`.
+
 ## Next
 
 1. **Cross-reference IDs** for outside declarations (the user's "keep both
@@ -115,16 +125,10 @@ slower than plain clang's 9.77 s), full `-O2` build 0.08 s faster (now
 4. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
 5. **Remove the producer**, job recording and the populate tool once parts
    cover everything they did.
-6. **Copies that fit more compiles** (discussed 2026-10-06, not decided).
-   A compile cannot write a header's copy when a header inside it was
-   served: 684 of 961 writes in a first build of redis, and the reason
-   `server.h` has one usable copy, from the one file with an unusual include
-   order. A *folded* copy (the header and every header inside it, one PCM,
-   as now) needs the inside read as text by the writing compile; a *linked*
-   copy (the header's own lines, linking the PCMs of the headers inside)
-   can be written from any compile, but each linked PCM costs about 0.3 ms
-   to open and in slower name lookups. Undecided: folded, linked, or linked
-   only for headers whose own lines cost more than a PCM.
+6. **Copies that fit more compiles.** Decided 2026-10-06: fold everything
+   (built, above). Linked copies stay unbuilt: each linked PCM would cost
+   about 0.3 ms to open and in slower name lookups. Still open: memory --
+   `server.h`'s 8 folded copies are 1.5 to 2.4 MB each.
 
 ## What changes in what exists
 

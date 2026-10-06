@@ -96,6 +96,10 @@ public:
         P.Decline = "a saved copy was served inside the header";
   }
 
+  bool writing() const override {
+    return llvm::any_of(Open, [](const Part &P) { return P.Decline.empty(); });
+  }
+
   void exportWhenEntered(std::string Path) override {
     ExpectedPath = std::move(Path);
   }

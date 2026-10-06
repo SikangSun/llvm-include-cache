@@ -1169,13 +1169,15 @@ TEST_F(ExportTest, APartIsNotServedWhereAMacroItsResultNeededDiffers) {
   EXPECT_TRUE(reads(B, Nul)) << "a part without MYNULL's lines was served";
 }
 
-TEST_F(ExportTest, AHeaderAServedHeaderIsInsideIsNotExported) {
-  // main.c is served inner.h, then misses outer.h, inside which inner.h is
-  // served again from the part already loaded, which loads no module file.
-  // outer.h's part would hold that import, not inner.h's declarations, so
-  // outer.h is not exported; other.c reads it instead of being served a
-  // part that leaves my_size undeclared.
-  std::string Inner = write("inner.h", "typedef unsigned long my_size;\n");
+TEST_F(ExportTest, AHeaderIsFoldedWithTheHeadersInsideItReadAsText) {
+  // inner.h has a copy that fits inside outer.h. main.c misses outer.h and
+  // writes its part, a folded copy, so it reads inner.h as text there
+  // instead of being served it: a served inner.h would leave its
+  // declarations in its own PCM, which outer.h's part cannot hold. other.c
+  // is then served outer.h, inner.h included, opening neither file.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#endif\n");
   std::string Outer =
       write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
                        "#include \"" +
@@ -1183,7 +1185,7 @@ TEST_F(ExportTest, AHeaderAServedHeaderIsInsideIsNotExported) {
                            "\"\n"
                            "my_size outer_len(void);\n#endif\n");
   std::string Main =
-      write("main.c", "#include \"" + Inner + "\"\n#include \"" + Outer +
+      write("main.c", "#include \"" + Outer +
                           "\"\n"
                           "my_size f(void) { return outer_len(); }\n");
   std::string OnlyInner = write(
@@ -1195,10 +1197,17 @@ TEST_F(ExportTest, AHeaderAServedHeaderIsInsideIsNotExported) {
   EXPECT_TRUE(reads(Main, Outer)) << "nothing is listed yet";
   EXPECT_TRUE(reads(OnlyInner, Inner)) << "nothing is stored yet";
   ASSERT_EQ(Daemon->stats().Entries, 1u) << "inner.h was not exported alone";
-  EXPECT_TRUE(reads(Main, Outer)) << "outer.h is not stored yet";
-  EXPECT_EQ(Daemon->stats().Entries, 1u)
-      << "outer.h was exported around a served inner.h";
-  EXPECT_TRUE(reads(Other, Outer));
+
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered));
+  EXPECT_TRUE(Entered.count(Inner))
+      << "inner.h was served inside outer.h, which was being written";
+  EXPECT_EQ(Daemon->stats().Entries, 2u) << "outer.h was not exported";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(Other, Entered));
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's folded copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened after all";
 }
 
 TEST_F(ExportTest, APartThatDefinesAnOutsideStructIsServed) {

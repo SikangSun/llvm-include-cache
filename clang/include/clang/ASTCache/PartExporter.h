@@ -74,6 +74,12 @@ public:
   /// copy may be one the compile loaded before, which loads no module file.
   virtual void served() = 0;
 
+  /// Whether a header this compile is exporting is open: one that missed,
+  /// was entered, and has not been declined. Its part is a folded copy -- it
+  /// holds every header inside it -- so the headers inside must be read as
+  /// text, not served.
+  virtual bool writing() const = 0;
+
   /// Export the header whose absolute path is \p Path the first time it is
   /// entered, whatever the cache says. For CLANG_HEADER_CACHE_EXPORT.
   virtual void exportWhenEntered(std::string Path) = 0;

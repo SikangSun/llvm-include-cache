@@ -293,7 +293,8 @@ public:
     OS << "header cache: " << S.Hits << " hits / " << S.Lookups << " lookups, "
        << S.CandidatesRejected << " candidates rejected, " << SkippedAtBoundary
        << " not at a declaration boundary, " << NotListed
-       << " not on the ask-list\n";
+       << " not on the ask-list, " << InsideWritten
+       << " inside a header being written\n";
     if (LoadsRefused)
       OS << "  refused by the module reader (built with other options?): "
          << LoadsRefused << "\n";
@@ -378,6 +379,18 @@ public:
     if (!Client->isListed(Path)) {
       ++NotListed;
       NextReason = "not-listed";
+      return nullptr;
+    }
+
+    // Inside a header this compile will write, everything is read as text:
+    // its part is a folded copy, and the writer can fold in only what the
+    // compile parsed itself -- a served header's declarations would be
+    // written as references to its PCM, which no part can carry. Nothing is
+    // asked either, and the header is not exported on its own; the folded
+    // copy holds it.
+    if (Exporter && !PopulateOnly && Exporter->writing()) {
+      ++InsideWritten;
+      NextReason = "inside-a-header-being-written";
       return nullptr;
     }
 
@@ -675,6 +688,9 @@ private:
   /// they were built with other compiler options.
   unsigned LoadsRefused = 0;
   unsigned NotListed = 0;
+  /// Listed headers read as text because a header this compile will write
+  /// was open.
+  unsigned InsideWritten = 0;
   /// Null unless this compile exports its misses.
   PartExporter *Exporter = nullptr;
   bool PopulateOnly = false;
@@ -689,8 +705,9 @@ private:
     /// Time in the headers it included, the cache's work in them excluded.
     uint64_t ChildMicros;
     /// Why the cache did not serve it (LogServed only): not-listed,
-    /// inside-a-declaration, no-saved-PCM, rejected:<check>, load-refused,
-    /// or not-asked when the cache was not consulted.
+    /// inside-a-header-being-written, inside-a-declaration, no-saved-PCM,
+    /// rejected:<check>, load-refused, or not-asked when the cache was not
+    /// consulted.
     std::string Reason;
   };
   std::string NextReason;

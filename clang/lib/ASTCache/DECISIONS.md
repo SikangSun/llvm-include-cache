@@ -1717,6 +1717,81 @@ Correctness: at `-O2`, all 117 objects are identical to plain clang's; at
 this change (§4). Clang's preprocessor and lexer tests pass, except one
 HIP test that needs `clang-offload-bundler`, which this build lacks.
 
+### 2.23 Fold everything: inside a header being written, read the text (approved and built 2026-10-06)
+
+User, 2026-10-06: "just parse startover then. Don't read another PCM, parse
+the actual file and write it, duh. We don't even have linking, so what's the
+point not doing this? This would be the complete implementation of the
+fold-everything technique".
+
+**The problem.** A part is a *folded copy*: the header and every header
+included inside it, in one PCM. Clang's writer writes a declaration that
+came from a loaded PCM as a reference to that PCM, never as its contents, so
+a folded copy can be written only by a compile that read every header
+inside it as text. A compile that was served one of them refused to write
+the outer header (`served()`, "a saved copy was served inside the header").
+In a first build of redis that refused 700 of 965 writes. After the second
+compile, most headers inside `server.h` were served, so no later compile
+could write `server.h`; its one copy came from `memory_prefetch.c`, whose
+include order no other file shares, and `server.h` was never served.
+
+**The change.** From the moment a header misses and its part is opened
+until the header ends, the hook neither asks the daemon nor serves:
+everything inside is parsed from the files (`PartExporter::writing`,
+reason `inside-a-header-being-written`). The headers inside are not exported
+on their own; the folded copy holds them. A populate-only compile, which
+never serves, is unchanged.
+
+**The cost** is paid once per include order: the writing compile reads the
+inside as text instead of loading copies, and writes a large part (26 ms
+for a 2 MB `server.h` part).
+
+**Results.** A first build of redis-server's 117 files (`-fsyntax-only`,
+fixed cutoff, stats level 2, the same 117 warm-up compiles before each):
+
+| First build of redis | §2.22 only | Folding too |
+|---|---|---|
+| Lookups | 3,568 | 483 |
+| Hits | 2,603 | 298 |
+| `server.h` served | 0 of 75 | 62 of 70 |
+| `server.h` parts written | 2 | 8 (1.5 to 2.4 MB each) |
+| Copies rejected | 1,808 | 835 |
+| Writes refused | 700 | 0 |
+| Time reading outermost headers as text | 3,546 ms | 2,460 ms |
+
+Fewer, larger hits: most compiles load `server.h`'s folded copy and ask
+about nothing inside it. Each of the 8 `server.h` parts was written by the
+first compile with a new include order before `server.h`
+(`memory_prefetch.c`, `iothread.c`,
+`estore.c`, `t_zset.c`, `rio.c`, `redis-check-rdb.c`, `tls.c`, `commands.c`).
+
+**Time.** Plain clang, the cache with §2.22 only, and with folding too, as
+first builds of redis-server's 117 files, interleaved file by file and
+pinned to one core; five builds each, medians
+(`scratch/e2e/profile/fix1_bench.py`):
+
+| One-thread first build of redis-server | Plain clang | §2.22 only | Folding too |
+|---|---|---|---|
+| Front end only (`-fsyntax-only`) | 10.01 s | +0.10 s | -1.69 s (-17%) |
+| Full build (`-O2 -c`) | 31.83 s | -0.04 s | -1.88 s (-5.9%) |
+
+Folding minus §2.22 only was -1.76 to -1.87 s in every front-end build and
+-1.80 to -1.98 s in every full build. Where it comes from, front end only,
+medians:
+
+| The cache's time | §2.22 only | Folding too |
+|---|---|---|
+| Queries: asking, checking, loading | 1,713 ms | 944 ms |
+| Replaying macro effects | 741 ms | 614 ms |
+| Writing parts | 1,058 ms | 1,199 ms |
+| Reading outermost headers as text | 3,759 ms | 2,631 ms |
+| Hits | 2,687 | 302 |
+
+Correctness: all 117 objects are identical to plain clang's at `-O2` and
+at `-g`. The `config.c` debug-information difference (§4) did not appear
+in this build. Its cause, names of outside declarations resolved lazily, is
+not fixed, so it can return wherever a part names an outside declaration.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
@@ -1985,6 +2060,17 @@ copy built with `-Ia` is served under `-Ia` and not under `-Ib`, where
   - The same 12 KB record-name table in every PCM, 13% of the stored bytes.
   - Names of outside declarations resolve lazily, which changes `-g` output
     (the `config.c` item above).
+
+  The user's hypothesis, same day: keep the parts of PCM that check
+  correctness and read and write binary objects with a standard serializer
+  ("like serialization in Java that autofills addresses"); loading should
+  not be painful, and PCM carries considerations "(like correctness across
+  hardware) that we can escape". To weigh then: a restored memory image
+  still has to be merged into a compile that already has state -- types and
+  identifiers are unique per compile, redeclarations form chains, Sema's
+  name lookup must find the new declarations -- and that merge is what
+  ASTReader's lazy machinery spreads over the compile. GCC's precompiled
+  headers are a memory image, and allow one per compile, before any code.
 - `-g` changes one redis object (found 2026-10-05, the whole-redis first
   build). In `config.c`'s debug information, `size_t` points at the
   redeclaration in `glob.h:29` instead of `__stddef_size_t.h:18`. A part
