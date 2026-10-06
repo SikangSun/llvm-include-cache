@@ -171,6 +171,8 @@ container and the validation get replaced (`DECISIONS.md` §3).
 
 ## Decisions needed
 
+- **Whether to keep PCM as the format** (raised by the user 2026-10-06,
+  deferred; the costs so far are listed in `DECISIONS.md` §4).
 - Is D the direction, and do the two measurements run now?
 - The §2.15 mechanism: separate modules in the generated module map, the
   fallback to folding, and merging a referenced child's record into its

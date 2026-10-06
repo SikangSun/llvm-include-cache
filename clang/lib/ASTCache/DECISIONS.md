@@ -1969,6 +1969,22 @@ copy built with `-Ia` is served under `-Ia` and not under `-Ib`, where
 
 ## 4. Open
 
+- PCM as the format (user, 2026-10-06: "I'm really starting to consider
+  using something other than PCM. This format is giving me more headaches
+  than help. Keep the problem we will deal with it later"). Deferred. What
+  PCM has cost so far:
+  - Clang's writer writes a declaration that came from another PCM as a
+    reference to it, never as its contents, so a folded copy can be written
+    only by a compile that read every header inside it as text (684 of 961
+    writes refused in a first build of redis, NEXT.md item 6).
+  - Each loaded PCM has a fixed cost (about 80 us to open, the same option
+    checks every time), and in C every name lookup searches every loaded
+    PCM's name table (§2.20, §2.21).
+  - The writer scans the whole compile's state for each PCM: 2.4 ms of the
+    4.0 ms it takes to write one (§2.21).
+  - The same 12 KB record-name table in every PCM, 13% of the stored bytes.
+  - Names of outside declarations resolve lazily, which changes `-g` output
+    (the `config.c` item above).
 - `-g` changes one redis object (found 2026-10-05, the whole-redis first
   build). In `config.c`'s debug information, `size_t` points at the
   redeclaration in `glob.h:29` instead of `__stddef_size_t.h:18`. A part
