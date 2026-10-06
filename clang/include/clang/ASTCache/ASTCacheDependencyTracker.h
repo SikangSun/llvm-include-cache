@@ -115,8 +115,33 @@ public:
              const MacroDefinition &MD) override;
   void Ifndef(SourceLocation Loc, const Token &MacroNameTok,
               const MacroDefinition &MD) override;
+
+  /// A defined() test is held until its #if or #elif is evaluated, and
+  /// recorded only if DefinedOperatorsNeeded then says the result needed it.
+  /// Clang's __stddef_null.h tests
+  ///   #if !defined(NULL) || !__building_module(_Builtin_stddef)
+  /// whose right side is true in every compile that is not building Clang's
+  /// own stddef module: the lines are kept whatever NULL is, so recording
+  /// "NULL was defined" would only reject the header where NULL is not.
+  ///
+  /// A test the result did not need is dropped without counting as the
+  /// frame's first test of the name, so a later test of it is still
+  /// recorded. Only defined() answers are dropped: whether each other name in
+  /// the expression is a macro, and what it expands to, decides the
+  /// expression's tokens, and stays recorded through expansionCandidate and
+  /// UndefinedIdentifierInDirective.
   void Defined(const Token &MacroNameTok, const MacroDefinition &MD,
                SourceRange Range) override;
+  void DefinedOperatorsNeeded(bool Known,
+                              ArrayRef<SourceLocation> Needed) override;
+
+  /// Held tests left over when the #if or #elif's outcome is reported --
+  /// which would mean the evaluator returned without naming what it needed
+  /// -- are all recorded.
+  void If(SourceLocation Loc, SourceRange ConditionRange,
+          ConditionValueKind ConditionValue) override;
+  void Elif(SourceLocation Loc, SourceRange ConditionRange,
+            ConditionValueKind ConditionValue, SourceLocation IfLoc) override;
 
   /// #elifdef/#elifndef are definedness tests exactly like #ifdef/#ifndef and
   /// are recorded the same way.
@@ -257,6 +282,13 @@ private:
 
   /// Records a definedness test into every open frame it is external to.
   void recordConditional(const Token &MacroNameTok, const MacroDefinition &MD);
+  /// The same, for \p II found defined or not, in a state set by a directive
+  /// in \p Origin (see stateOrigin).
+  void recordConditional(const IdentifierInfo *II, bool WasDefined,
+                         FileID Origin);
+
+  /// Records every held defined() test.
+  void recordHeldTests();
 
   /// The file whose directive gave \p II the state just observed: the
   /// #define behind \p MD or, when \p II is not defined, the #undef that
@@ -303,6 +335,17 @@ private:
   /// Set by MacroExpands for __has_include_next, read by the HasInclude call
   /// that follows it.
   bool NextHasIncludeIsNext = false;
+  /// The defined() tests of the expression being evaluated, waiting for
+  /// DefinedOperatorsNeeded.
+  struct HeldTest {
+    /// The location of the 'defined' token, which names the test in
+    /// DefinedOperatorsNeeded.
+    SourceLocation Loc;
+    const IdentifierInfo *II;
+    bool WasDefined;
+    FileID Origin;
+  };
+  llvm::SmallVector<HeldTest, 4> Held;
 };
 
 } // namespace ast_cache

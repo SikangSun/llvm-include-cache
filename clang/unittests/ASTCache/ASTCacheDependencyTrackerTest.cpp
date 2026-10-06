@@ -438,6 +438,178 @@ TEST_F(ASTCacheDependencyTrackerTest, AnUndefInsideTheHeaderPinsTheName) {
   EXPECT_EQ(cond(*D, "DEBUG"), nullptr);
 }
 
+// A defined() test is recorded only if the #if's result needed it; see
+// PPCallbacks::DefinedOperatorsNeeded.
+
+/// Clang's __stddef_null.h.
+static const char StddefNull[] =
+    "#if !defined(NULL) || !__building_module(_Builtin_stddef)\n"
+    "#undef NULL\n#define NULL ((void*)0)\n#endif\n";
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       ADefinedTheResultDidNotNeedIsNotRecorded) {
+  // NULL is defined, so the left side is false, and the right side is true
+  // in any compile not building Clang's stddef module: the lines are kept
+  // whatever NULL is.
+  addFile("/h.h", StddefNull);
+  auto Recs = run("#include \"h.h\"\n", "#define NULL 0\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_EQ(cond(*D, "NULL"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, ASideNotEvaluatedLiveCanDecide) {
+  // With NULL undefined the left side is true and the right side is not
+  // evaluated live. The right side is true with no defined() test, and gives
+  // the same value where it is live, so it decides.
+  addFile("/h.h", StddefNull);
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_EQ(cond(*D, "NULL"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, ASideThatSkippedADivisionCannotDecide) {
+  // Not live, 1 / 0 is taken as 0 and the right side as true. Live, it is an
+  // error, so the right side cannot stand in for the left.
+  addFile("/h.h", "#if defined(A) || !(1 / 0)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, OfTwoTrueSidesOfAnOrOneIsRecorded) {
+  // Undefining either alone keeps the result; undefining both does not. So
+  // dropping each test whose flip alone changes nothing would drop both, and
+  // serve a compile with neither defined. One side's test stays.
+  addFile("/h.h", "#if defined(A) || defined(B)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n#define B\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  const ConditionalDependency *C = cond(*D, "A");
+  ASSERT_NE(C, nullptr);
+  EXPECT_TRUE(C->WasDefined);
+  EXPECT_EQ(cond(*D, "B"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, AFalseRightSideOfAnAndDecidesAlone) {
+  addFile("/h.h", "#if defined(A) && defined(B)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_EQ(cond(*D, "A"), nullptr);
+  const ConditionalDependency *C = cond(*D, "B");
+  ASSERT_NE(C, nullptr);
+  EXPECT_FALSE(C->WasDefined);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, AFalseLeftSideOfAnAndDecidesAlone) {
+  addFile("/h.h", "#if defined(A) && defined(B)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define B\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+  EXPECT_EQ(cond(*D, "B"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, ATrueAndNeedsBothSides) {
+  addFile("/h.h", "#if defined(A) && defined(B)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n#define B\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+  EXPECT_NE(cond(*D, "B"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, AFalseOrNeedsBothSides) {
+  addFile("/h.h", "#if defined(A) || defined(B)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+  EXPECT_NE(cond(*D, "B"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       AConditionalNeedsItsConditionAndTheArmItChose) {
+  addFile("/h.h", "#if defined(C) ? defined(X) : defined(Y)\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define C\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "C"), nullptr);
+  EXPECT_NE(cond(*D, "X"), nullptr);
+  EXPECT_EQ(cond(*D, "Y"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, ArithmeticNeedsBothSides) {
+  addFile("/h.h", "#if defined(A) + defined(B) == 1\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+  EXPECT_NE(cond(*D, "B"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, NestedOperatorsCompose) {
+  // C alone makes the && false, so nothing inside the || is needed.
+  addFile("/h.h", "#if (defined(A) || defined(B)) && defined(C)\n"
+                  "int x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_EQ(cond(*D, "A"), nullptr);
+  EXPECT_EQ(cond(*D, "B"), nullptr);
+  const ConditionalDependency *C = cond(*D, "C");
+  ASSERT_NE(C, nullptr);
+  EXPECT_FALSE(C->WasDefined);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       ANameInASideTheResultDidNotNeedStaysRecorded) {
+  // FLAG is not a defined() test, and whether it is a macro decides the
+  // expression's tokens: "#define FLAG 1 ? 0 : 0" would turn the line into
+  // "defined(A) || 1 ? 0 : 0", which is 0. So it stays recorded, though the
+  // right side was dead.
+  addFile("/h.h", "#if defined(A) || FLAG\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+  EXPECT_TRUE(notAMacro(*D, "FLAG"));
+}
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       AnUndefinedNameThatDecidesIsRecordedWhenADefinedIsNot) {
+  addFile("/h.h", "#if defined(A) || !FLAG\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_EQ(cond(*D, "A"), nullptr);
+  EXPECT_NE(cond(*D, "FLAG"), nullptr);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest,
+       ATestTheResultDidNotNeedDoesNotHideALaterOne) {
+  // Only a frame's first test of a name is recorded. A dropped test must not
+  // count as that first test, or the #ifdef below would go unrecorded.
+  addFile("/h.h", "#if !defined(N) || 1\n#endif\n#ifdef N\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define N\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  const ConditionalDependency *C = cond(*D, "N");
+  ASSERT_NE(C, nullptr);
+  EXPECT_TRUE(C->WasDefined);
+}
+
+TEST_F(ASTCacheDependencyTrackerTest, AnExpressionThatFailsKeepsEveryTest) {
+  addFile("/h.h", "#if defined(A) ||\nint x;\n#endif\n");
+  auto Recs = run("#include \"h.h\"\n", "#define A\n");
+  const HeaderDependencySet *D = find(Recs, "h.h");
+  ASSERT_NE(D, nullptr);
+  EXPECT_NE(cond(*D, "A"), nullptr);
+}
+
 TEST_F(ASTCacheDependencyTrackerTest,
        AOnceFileReadTwiceInsideAHeaderIsNoDependency) {
   // parent.h reads once.h and then includes it again. The skip is parent.h's

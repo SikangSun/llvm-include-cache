@@ -13,6 +13,7 @@
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -85,6 +86,7 @@ void ASTCacheDependencyTracker::closeFrame(Frame &F) {
 }
 
 void ASTCacheDependencyTracker::finalize() {
+  recordHeldTests();
   // Innermost first, matching the order ordinary ExitFile closes produce.
   while (!Stack.empty()) {
     closeFrame(Stack.back());
@@ -221,8 +223,12 @@ void ASTCacheDependencyTracker::recordConditional(const Token &MacroNameTok,
   const IdentifierInfo *II = MacroNameTok.getIdentifierInfo();
   if (!II)
     return;
+  recordConditional(II, static_cast<bool>(MD), stateOrigin(II, MD));
+}
 
-  FileID Origin = stateOrigin(II, MD);
+void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
+                                                  bool WasDefined,
+                                                  FileID Origin) {
   for (Frame &F : Stack) {
     // The first test in a frame decides, as for syntactic dependencies: a
     // state the frame's own text set before testing it stays pinned however
@@ -233,9 +239,15 @@ void ASTCacheDependencyTracker::recordConditional(const Token &MacroNameTok,
       continue;
     ConditionalDependency Dep;
     Dep.MacroName = II->getName().str();
-    Dep.WasDefined = static_cast<bool>(MD);
+    Dep.WasDefined = WasDefined;
     F.Deps.Conditional.push_back(std::move(Dep));
   }
+}
+
+void ASTCacheDependencyTracker::recordHeldTests() {
+  for (const HeldTest &T : Held)
+    recordConditional(T.II, T.WasDefined, T.Origin);
+  Held.clear();
 }
 
 FileID ASTCacheDependencyTracker::stateOrigin(const IdentifierInfo *II,
@@ -264,7 +276,34 @@ void ASTCacheDependencyTracker::Ifndef(SourceLocation Loc,
 void ASTCacheDependencyTracker::Defined(const Token &MacroNameTok,
                                          const MacroDefinition &MD,
                                          SourceRange Range) {
-  recordConditional(MacroNameTok, MD);
+  const IdentifierInfo *II = MacroNameTok.getIdentifierInfo();
+  if (Stack.empty() || !II)
+    return;
+  // The state is read now: the expression is still being evaluated, and
+  // nothing in it can change a macro.
+  Held.push_back(
+      {Range.getBegin(), II, static_cast<bool>(MD), stateOrigin(II, MD)});
+}
+
+void ASTCacheDependencyTracker::DefinedOperatorsNeeded(
+    bool Known, ArrayRef<SourceLocation> Needed) {
+  for (const HeldTest &T : Held)
+    if (!Known || llvm::is_contained(Needed, T.Loc))
+      recordConditional(T.II, T.WasDefined, T.Origin);
+  Held.clear();
+}
+
+void ASTCacheDependencyTracker::If(SourceLocation Loc,
+                                   SourceRange ConditionRange,
+                                   ConditionValueKind ConditionValue) {
+  recordHeldTests();
+}
+
+void ASTCacheDependencyTracker::Elif(SourceLocation Loc,
+                                     SourceRange ConditionRange,
+                                     ConditionValueKind ConditionValue,
+                                     SourceLocation IfLoc) {
+  recordHeldTests();
 }
 
 void ASTCacheDependencyTracker::Elifdef(SourceLocation Loc,

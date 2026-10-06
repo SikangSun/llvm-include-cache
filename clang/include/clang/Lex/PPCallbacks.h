@@ -380,6 +380,32 @@ public:
   /// '&&', say) did not influence the outcome and is not reported.
   virtual void UndefinedIdentifierInDirective(const Token &IdentifierTok) {}
 
+  /// Hook called when an \#if or \#elif expression has been evaluated,
+  /// naming the 'defined' operators its result needed.
+  ///
+  /// Each Defined call made while evaluating the expression reported one
+  /// operator; it is named here by the location of its 'defined' token, the
+  /// begin of the range Defined received. \p Needed holds the operators the
+  /// result depends on: wherever each of them gives the same answer, the
+  /// expression gives the same result, whatever the others answer. Only the
+  /// short-circuiting operators leave operands out. "A || B" that was true
+  /// needs the operators of one true operand, the one with fewer, and none
+  /// of the other's; false, it needs both. '&&' is the same with true and
+  /// false swapped, and "C ? X : Y" needs C's and those of the arm C chose.
+  /// Every other operator needs both of its operands. An operand that was not
+  /// evaluated live -- B in "1 || B" -- can decide too, since its value is
+  /// the one a live evaluation gives, unless it skipped a division by zero,
+  /// which live is an error.
+  ///
+  /// This narrows only the 'defined' answers. Whether each other identifier
+  /// in the expression is a macro, and what it expands to, decides which
+  /// tokens the expression is made of, so a consumer must keep all of those.
+  ///
+  /// \p Known is false when the expression could not be evaluated; then
+  /// every 'defined' operator counts as needed.
+  virtual void DefinedOperatorsNeeded(bool Known,
+                                      ArrayRef<SourceLocation> Needed) {}
+
   /// Hook called when a '__has_embed' directive is read.
   virtual void HasEmbed(SourceLocation Loc, StringRef FileName, bool IsAngled,
                         OptionalFileEntryRef File) {}
@@ -711,6 +737,12 @@ public:
   void UndefinedIdentifierInDirective(const Token &IdentifierTok) override {
     First->UndefinedIdentifierInDirective(IdentifierTok);
     Second->UndefinedIdentifierInDirective(IdentifierTok);
+  }
+
+  void DefinedOperatorsNeeded(bool Known,
+                              ArrayRef<SourceLocation> Needed) override {
+    First->DefinedOperatorsNeeded(Known, Needed);
+    Second->DefinedOperatorsNeeded(Known, Needed);
   }
 
   void SourceRangeSkipped(SourceRange Range, SourceLocation EndifLoc) override {

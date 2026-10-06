@@ -1131,6 +1131,44 @@ TEST_F(ExportTest, APartIsExportedAfterTheCompileLoadsOne) {
   EXPECT_FALSE(reads(Main, Use)) << "use.h's part was not served";
 }
 
+/// nul.h is Clang's __stddef_null.h under a name of its own, with \p Right
+/// as the right side of its #if.
+static std::string nullHeader(llvm::StringRef Right) {
+  return ("#ifndef NUL_H\n#define NUL_H\n#if !defined(MYNULL) || " + Right +
+          "\n#undef MYNULL\n#define MYNULL ((void *)0)\n#endif\n"
+          "void *nul_get(void);\n#endif\n")
+      .str();
+}
+
+TEST_F(ExportTest, APartIsServedWhereAMacroItsResultDidNotNeedDiffers) {
+  // The #if is true in any compile not building Clang's stddef module, so
+  // the part a.c exports with MYNULL defined fits b.c, where it is not. b.c
+  // compiles only if the hit leaves MYNULL defined, as the text would.
+  std::string Nul =
+      write("nul.h", nullHeader("!__building_module(_Builtin_stddef)"));
+  std::string A = write("a.c", "#define MYNULL 0\n#include \"" + Nul +
+                                   "\"\nvoid *f(void) { return MYNULL; }\n");
+  std::string B = write("b.c", "#include \"" + Nul +
+                                   "\"\nvoid *g(void) { return MYNULL; }\n");
+  EXPECT_TRUE(reads(A, Nul)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Nul)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(B, Nul)) << "the part was rejected over MYNULL";
+}
+
+TEST_F(ExportTest, APartIsNotServedWhereAMacroItsResultNeededDiffers) {
+  // With a right side that is false, MYNULL decides: a.c skips the lines
+  // that b.c needs.
+  std::string Nul = write("nul.h", nullHeader("0"));
+  std::string A = write("a.c", "#define MYNULL 0\n#include \"" + Nul +
+                                   "\"\nvoid *f(void) { return 0; }\n");
+  std::string B = write("b.c", "#include \"" + Nul +
+                                   "\"\nvoid *g(void) { return MYNULL; }\n");
+  EXPECT_TRUE(reads(A, Nul)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Nul)) << "nothing is stored yet";
+  EXPECT_GE(Daemon->stats().Entries, 1u) << "a.c did not export nul.h";
+  EXPECT_TRUE(reads(B, Nul)) << "a part without MYNULL's lines was served";
+}
+
 TEST_F(ExportTest, AHeaderAServedHeaderIsInsideIsNotExported) {
   // main.c is served inner.h, then misses outer.h, inside which inner.h is
   // served again from the part already loaded, which loads no module file.

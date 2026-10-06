@@ -49,6 +49,13 @@ class PPValue {
 public:
   llvm::APSInt Val;
 
+  /// The 'defined' operators this value needs, by the location of their
+  /// 'defined' token. See PPCallbacks::DefinedOperatorsNeeded.
+  SmallVector<SourceLocation, 2> Needs;
+  /// A division or remainder by zero was skipped in this value because it
+  /// was not evaluated live. Live, it is an error rather than a value.
+  bool SkippedDivision = false;
+
   // Default ctor - Construct an 'invalid' PPValue.
   PPValue(unsigned BitWidth) : Val(BitWidth) {}
 
@@ -219,6 +226,7 @@ static bool EvaluateDefined(PPValue &Result, Token &PeekTok, DefinedTracker &DT,
   // Success, remember that we saw defined(X).
   DT.State = DefinedTracker::DefinedMacro;
   DT.TheMacro = II;
+  Result.Needs.assign(1, beginLoc);
   return false;
 }
 
@@ -235,6 +243,8 @@ static bool EvaluateValue(PPValue &Result, Token &PeekTok, DefinedTracker &DT,
   DT.State = DefinedTracker::Unknown;
 
   Result.setIdentifier(nullptr);
+  Result.Needs.clear();
+  Result.SkippedDivision = false;
 
   if (PeekTok.is(tok::code_completion)) {
     if (PP.getCodeCompletionHandler())
@@ -579,6 +589,28 @@ static unsigned getPrecedence(tok::TokenKind Kind) {
   }
 }
 
+/// For '||' (\p Settling true) or '&&' (\p Settling false): when one operand
+/// whose value is \p Settling decides the result by itself, drops the other
+/// operand's 'defined' operators. Of two such operands the one needing fewer
+/// decides. An operand that was not evaluated live decides as well -- dead
+/// and live evaluation give the same value -- unless it skipped a division by
+/// zero.
+static void keepDecidingOperand(PPValue &LHS, PPValue &RHS, bool Settling) {
+  auto Decides = [Settling](const PPValue &V) {
+    return (V.Val != 0) == Settling && !V.SkippedDivision;
+  };
+  bool L = Decides(LHS), R = Decides(RHS);
+  PPValue *Dropped = nullptr;
+  if (L && (!R || LHS.Needs.size() <= RHS.Needs.size()))
+    Dropped = &RHS;
+  else if (R)
+    Dropped = &LHS;
+  if (Dropped) {
+    Dropped->Needs.clear();
+    Dropped->SkippedDivision = false;
+  }
+}
+
 static void diagnoseUnexpectedOperator(Preprocessor &PP, PPValue &LHS,
                                        Token &Tok) {
   if (Tok.is(tok::l_paren) && LHS.getIdentifier())
@@ -727,7 +759,8 @@ static bool EvaluateDirectiveSubExpr(PPValue &LHS, unsigned MinPrec,
         PP.Diag(OpLoc, diag::err_pp_remainder_by_zero)
           << LHS.getRange() << RHS.getRange();
         return true;
-      }
+      } else
+        RHS.SkippedDivision = true;
       break;
     case tok::slash:
       if (RHS.Val != 0) {
@@ -739,7 +772,8 @@ static bool EvaluateDirectiveSubExpr(PPValue &LHS, unsigned MinPrec,
         PP.Diag(OpLoc, diag::err_pp_division_by_zero)
           << LHS.getRange() << RHS.getRange();
         return true;
-      }
+      } else
+        RHS.SkippedDivision = true;
       break;
 
     case tok::star:
@@ -814,10 +848,12 @@ static bool EvaluateDirectiveSubExpr(PPValue &LHS, unsigned MinPrec,
     case tok::ampamp:
       Res = (LHS.Val != 0 && RHS.Val != 0);
       Res.setIsUnsigned(false);  // C99 6.5.13p3, result is always int (signed)
+      keepDecidingOperand(LHS, RHS, /*Settling=*/false);
       break;
     case tok::pipepipe:
       Res = (LHS.Val != 0 || RHS.Val != 0);
       Res.setIsUnsigned(false);  // C99 6.5.14p3, result is always int (signed)
+      keepDecidingOperand(LHS, RHS, /*Settling=*/true);
       break;
     case tok::comma:
       // Comma is invalid in pp expressions in c89/c++ mode, but is valid in C99
@@ -855,6 +891,11 @@ static bool EvaluateDirectiveSubExpr(PPValue &LHS, unsigned MinPrec,
       // Now that we have the condition, the LHS and the RHS of the :, evaluate.
       Res = LHS.Val != 0 ? RHS.Val : AfterColonVal.Val;
       RHS.setEnd(AfterColonVal.getRange().getEnd());
+      // The condition and the arm it chose.
+      if (LHS.Val == 0) {
+        RHS.Needs = std::move(AfterColonVal.Needs);
+        RHS.SkippedDivision = AfterColonVal.SkippedDivision;
+      }
 
       // Usual arithmetic conversions (C99 6.3.1.8p1): result is unsigned if
       // either operand is unsigned.
@@ -879,6 +920,8 @@ static bool EvaluateDirectiveSubExpr(PPValue &LHS, unsigned MinPrec,
     // Put the result back into 'LHS' for our next iteration.
     LHS.Val = Res;
     LHS.setEnd(RHS.getRange().getEnd());
+    LHS.Needs.append(RHS.Needs.begin(), RHS.Needs.end());
+    LHS.SkippedDivision |= RHS.SkippedDivision;
     RHS.setIdentifier(nullptr);
   }
 }
@@ -900,6 +943,15 @@ Preprocessor::EvaluateDirectiveExpression(IdentifierInfo *&IfNDefMacro,
   bool DisableMacroExpansionAtStartOfDirective = DisableMacroExpansion;
   DisableMacroExpansion = false;
 
+  // Every way out reports which 'defined' operators the result needed; with
+  // no result, all of them.
+  auto ReportNeeded = [this](const PPValue *Result) {
+    if (Callbacks)
+      Callbacks->DefinedOperatorsNeeded(
+          Result != nullptr, Result ? ArrayRef<SourceLocation>(Result->Needs)
+                                    : ArrayRef<SourceLocation>());
+  };
+
   // Peek ahead one token.
   LexNonComment(Tok);
 
@@ -916,6 +968,7 @@ Preprocessor::EvaluateDirectiveExpression(IdentifierInfo *&IfNDefMacro,
 
     // Restore 'DisableMacroExpansion'.
     DisableMacroExpansion = DisableMacroExpansionAtStartOfDirective;
+    ReportNeeded(nullptr);
 
     // We cannot trust the source range from the value because there was a
     // parse error. Track the range manually -- the end of the directive is the
@@ -939,6 +992,7 @@ Preprocessor::EvaluateDirectiveExpression(IdentifierInfo *&IfNDefMacro,
 
     // Restore 'DisableMacroExpansion'.
     DisableMacroExpansion = DisableMacroExpansionAtStartOfDirective;
+    ReportNeeded(&ResVal);
     bool IsNonZero = ResVal.Val != 0;
     SourceRange ValRange = ResVal.getRange();
     return {std::move(ResVal.Val), IsNonZero, DT.IncludedUndefinedIds,
@@ -955,6 +1009,7 @@ Preprocessor::EvaluateDirectiveExpression(IdentifierInfo *&IfNDefMacro,
 
     // Restore 'DisableMacroExpansion'.
     DisableMacroExpansion = DisableMacroExpansionAtStartOfDirective;
+    ReportNeeded(nullptr);
     return {std::nullopt,
             false,
             DT.IncludedUndefinedIds,
@@ -974,6 +1029,7 @@ Preprocessor::EvaluateDirectiveExpression(IdentifierInfo *&IfNDefMacro,
 
   // Restore 'DisableMacroExpansion'.
   DisableMacroExpansion = DisableMacroExpansionAtStartOfDirective;
+  ReportNeeded(&ResVal);
   bool IsNonZero = ResVal.Val != 0;
   SourceRange ValRange = ResVal.getRange();
   return {std::move(ResVal.Val), IsNonZero, DT.IncludedUndefinedIds, ValRange};

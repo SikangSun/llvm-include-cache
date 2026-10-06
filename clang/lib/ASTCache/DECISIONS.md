@@ -1601,6 +1601,122 @@ checks and replay.
 | Track dependencies only around headers that will be written | Most of the tracking | about 0.2 s |
 | Drop the record-name table; send to the daemon without waiting | | about 0.15 s |
 
+### 2.22 Record only the `defined` tests an `#if`'s result needed (approved and built 2026-10-06)
+
+User, 2026-10-06, on the proposal: "The matching should based on the result
+I agree", and, approving it: "We definitely need to take in account of
+expressions".
+
+**The problem.** Every macro an `#if` tested with `defined` was recorded as a
+condition, so a copy fit only compiles where each was in the same state.
+That is sound, but asks more than the result needs. Clang's own
+`__stddef_null.h`:
+
+    #if !defined(NULL) || !__building_module(_Builtin_stddef)
+
+The right side is 1 in every compile that is not building Clang's stddef
+module, so the lines are kept whatever NULL is. Recording "NULL was defined"
+rejected the copy wherever NULL was not. `__stddef_size_t.h`,
+`__stddef_wchar_t.h`, `__stddef_ptrdiff_t.h` and `stddef.h` have the same
+shape with `__has_feature(modules)`, true under `-fmodules`.
+
+**The rule.** Clang's `#if` evaluator (`PPExpressions.cpp`) now tracks, for
+each subexpression, which `defined` operators its value needs, and reports
+them when the expression is done (`PPCallbacks::DefinedOperatorsNeeded`).
+The tracker holds each `defined` test until then and records only the
+needed ones.
+
+| Expression | Result | `defined` tests needed |
+|---|---|---|
+| `A \|\| B` | true | those of one true side, the one with fewer |
+| `A \|\| B` | false | both sides' |
+| `A && B` | false | those of one false side, the one with fewer |
+| `A && B` | true | both sides' |
+| `C ? X : Y` | either | C's and the chosen arm's |
+| `!A`, `-A`, `(A)` | either | A's |
+| any other operator | either | both sides' |
+
+**Why the result stays the same.** If each needed test gives the same
+answer, each row gives the same value: for "`A || B` true because B is
+true", B is still true, so `A || B` is still true whatever A is. The rows
+nest, so the whole expression gives the same result, the same lines are
+kept, and the rest of the argument is the one before this change (macros
+used in the text, header searches, file stamps and declarations are checked
+as before).
+
+**Three ways to get it wrong, and why this does not.**
+1. *Testing one macro at a time.* `defined(A) || defined(B)` with both
+   defined: flipping either alone keeps the result, flipping both does not.
+   The rule keeps one whole side.
+2. *Dropping what a name expands to.* A name in the expression that becomes
+   a macro changes the expression: with `#define X 1 ? 0 : 0`, `X || 1`
+   reads `1 ? 0 : 0 || 1`, which is 0. Only `defined` answers are dropped,
+   since `defined` never expands its operand. Every other name stays
+   recorded by `expansionCandidate`, in an evaluated side or not.
+3. *Hiding a later test.* Only a frame's first test of a name is recorded.
+   A dropped test does not count as that first test.
+
+**A side Clang did not evaluate can decide.** In `1 || B`, B is evaluated
+without diagnostics ("not live"). Its value is still the one a live
+evaluation gives, with one exception: a division or remainder by zero gives
+0 there, where live it is an error. So a side that skipped such a division
+cannot decide. The first version allowed only evaluated sides to decide;
+that kept "`_PTRDIFF_T` was not defined" and its kind wherever the
+always-true side came second and was not evaluated.
+
+**An expression that fails to evaluate keeps every test.**
+
+**Compile options.** `__has_feature`, `__building_module` and the like read
+compile options, which were never recorded, before or after this change.
+Both rely on the PCM loader's option check. `-fmodules` is checked. Not
+checked, before or after: whether the compile is building a module
+(`CompilingModule` is a benign option), which only an `-emit-module` compile
+could differ in (§4).
+
+**Results.** A first build of redis-server's 117 files (`-fsyntax-only`,
+fixed cutoff), the same 117 warm-up compiles before each, so both builds
+list nearly the same headers:
+
+| First build of redis | Before | After |
+|---|---|---|
+| Lookups | 3,643 | 3,568 |
+| Copies rejected | 1,864 | 1,808 |
+| … whose first failed condition was "NULL was defined" | 210 | 0 |
+| … "`_SIZE_T` was defined" (`types.h`) | 71 | 0 |
+| Hits | 2,682 | 2,603 |
+| Time reading outermost headers as text (stats level 2) | 3,685 ms | 3,546 ms |
+
+As expected, most copies freed from these conditions fail on a later one.
+`server.h`'s copy now fails first on "`__STDDEF_H` was defined": the guard
+of Clang's `__stddef_header_macro.h`, a genuine include-order condition (the
+copy was written by `memory_prefetch.c`, which includes `stddef.h` before
+`server.h`). The hits differ mostly by `syslog.h` (73 fewer), whose first
+timing fell under the cutoff in this build and not in the other: noise in
+the ask-list (§4).
+
+**Time.** Plain clang, the cache before this change and after it, as
+first builds of redis-server's 117 files, interleaved file by file and
+pinned to one core; five builds each, medians
+(`scratch/e2e/profile/fix1_bench.py`):
+
+| One-thread first build of redis-server | Plain clang | Cache before | Cache after |
+|---|---|---|---|
+| Front end only (`-fsyntax-only`) | 9.77 s | +0.20 s | +0.07 s |
+| Full build (`-O2 -c`) | 31.65 s | -0.04 s | -0.12 s |
+
+Front end only, after minus before was -0.11 to -0.23 s in every build
+(median -0.13 s); the full build, -0.13 to +0.05 s (median -0.08 s). The
+cache's own steps take the same time before and after (queries 1,629 and
+1,628 ms, writing 1,061 and 1,052 ms, replay 733 and 734 ms). The saving is
+in the time reading headers as text (3,817 and 3,685 ms), which includes
+recording conditions: `stddef.h`'s ten-test `#if`, read about 2,000 times a
+build, records one test where a `__need_` macro is set.
+
+Correctness: at `-O2`, all 117 objects are identical to plain clang's; at
+`-g`, only `config.c` differs, the debug-information difference known before
+this change (§4). Clang's preprocessor and lexer tests pass, except one
+HIP test that needs `clang-offload-bundler`, which this build lacks.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
@@ -1853,6 +1969,32 @@ copy built with `-Ia` is served under `-Ia` and not under `-Ib`, where
 
 ## 4. Open
 
+- `-g` changes one redis object (found 2026-10-05, the whole-redis first
+  build). In `config.c`'s debug information, `size_t` points at the
+  redeclaration in `glob.h:29` instead of `__stddef_size_t.h:18`. A part
+  names an outside declaration (§2.18), and the loading compile resolves the
+  name lazily, when the declaration is first needed; by then the name's
+  latest declaration is `glob.h`'s. `-O2` objects are unaffected. Proposed:
+  resolve each name when the part loads. Not approved.
+- Module names collide (found 2026-10-05): a part's module name hashes the
+  header, the module hash and its encoded metadata, before the outside
+  declarations are known, so two parts that differ only there get one name.
+  4 of 245 parts in the whole-redis build (`dict.h`, `object.h`,
+  `cluster_asm.h`, `sys/wait.h`). Proposed: include the declarations'
+  fingerprints in the name. Not approved.
+- Whether a compile is building a module is not compared at load
+  (`CompilingModule` is a benign option), so a copy written by an
+  `-emit-module` compile could be loaded by an ordinary one, and
+  `__building_module(X)` would differ (§2.22). The hook does not refuse to
+  run in such compiles. Proposed: it refuses. Not approved.
+- The ask-list is decided by the first time any compile reports for a
+  header (`CacheDaemon::handleTiming`), one reading. Near the cutoff that is
+  luck: `syslog.h` was listed in one first build and not in the next. A
+  build whose first compile runs cold reads `stddef.h` in about 580 us
+  instead of about 130 us, lists it, and then serves it 2,043 times at about
+  1 ms a hit, though its text takes 32 us (found 2026-10-06, §2.22).
+  Proposed: list a header by a typical reading, such as the median of its
+  first few. Not approved.
 - The `pop_macro` hole: a macro's textual definition location is not trustworthy
   as provenance after `#pragma push_macro`/`pop_macro`. Fix agreed (record the
   popped macro as an ExpandsTo syntactic dependency), not written.
