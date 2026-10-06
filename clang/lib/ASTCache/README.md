@@ -125,8 +125,11 @@ clang-header-cache-populate -Xcc -Isrc src/*.h
 
 A compile uses the cache when `CLANG_HEADER_CACHE` names the daemon's socket.
 It asks only about headers on the daemon's ask-list: those some compile took at
-least `-ask-cutoff-us` (default 226) to read. `-list-stored` also lists every
-header with a stored copy, for trying things out. The compiler asks the daemon
+least `-ask-cutoff-us` (default 226) to read. `-drop-costly` (off by default)
+also drops a header once its measured hits cost more than parsing it, with
+`-later-cost-us` (default 200) for what a loaded PCM adds to the rest of the
+compile (DECISIONS.md §2.20). `-list-stored` also lists every header with a
+stored copy, for trying things out. The compiler asks the daemon
 which shared-memory region it writes, and refuses one that is not that
 daemon's.
 

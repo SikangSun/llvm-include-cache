@@ -468,6 +468,7 @@ public:
     applyPragmaDelta(CI.getSema(), Deps.Entry, Deps.Exit);
     uint64_t Replay = micros(Replaying);
     ReplayMicros += Replay;
+    Timings.Hits.push_back({Path, Took + Replay});
     Log(Replay);
     return Target;
   }
@@ -508,9 +509,10 @@ public:
   /// Tells the daemon how long this compile took to read each header, so it
   /// can list the slow ones for later compiles.
   void mainFileEnded() {
-    if (!Timings.Headers.empty())
+    if (!Timings.Headers.empty() || !Timings.Hits.empty())
       Client->reportTimings(Timings);
     Timings.Headers.clear();
+    Timings.Hits.clear();
   }
 
 private:

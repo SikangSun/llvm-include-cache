@@ -95,6 +95,13 @@ a hit requires them unchanged, as Clang's modules check their input files.
    **Cache queries without the socket** (proposed 2026-10-05, not
    approved): the daemon's table in the shared region instead of a round
    trip per query.
+   **The cutoff** (`DECISIONS.md` §2.20): the per-header cutoff is built
+   and measured no faster than plain clang, so it is off. Its rule uses a
+   header's first parse time, which can be far below the usual one; the
+   most any cutoff can still gain on redis is about 0.1 to 0.2 s.
+   **What a hit costs** (§2.20): about 1 ms on average; replaying macro
+   effects (277 us) and later name lookups (~200 us per loaded PCM) are the
+   largest single steps after checking (322 us).
 4. **The `__COUNTER__` dependency** (§2.7, decided): still declined.
 5. **Remove the producer**, job recording and the populate tool once parts
    cover everything they did.

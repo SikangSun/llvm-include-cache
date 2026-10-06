@@ -57,6 +57,19 @@ static cl::opt<bool> ListStored(
              "or not (for clang-header-cache-populate and tests)"),
     cl::init(false), cl::cat(Category));
 
+static cl::opt<bool> DropCostly(
+    "drop-costly",
+    cl::desc("Drop a header from the ask-list once its hits cost more than "
+             "parsing it: its first parse time is below its average hit cost "
+             "plus -later-cost-us (DECISIONS.md 2.20; off by default)"),
+    cl::init(false), cl::cat(Category));
+
+static cl::opt<unsigned long long>
+    LaterCost("later-cost-us",
+              cl::desc("What one loaded PCM adds to the rest of a compile, in "
+                       "microseconds"),
+              cl::init(DefaultLaterCostMicros), cl::cat(Category));
+
 static CacheDaemon *TheDaemon = nullptr;
 
 /// Signal handling exists for one reason: the socket file has to come off
@@ -78,6 +91,8 @@ int main(int argc, char **argv) {
   CacheDaemon::Options Opts;
   Opts.AskCutoffMicros = AskCutoff;
   Opts.ListStored = ListStored;
+  Opts.DropCostly = DropCostly;
+  Opts.LaterCostMicros = LaterCost;
   Expected<std::unique_ptr<CacheDaemon>> D =
       CacheDaemon::create(RegionPath, RegionSize, Opts);
   if (!D) {
@@ -112,7 +127,10 @@ int main(int argc, char **argv) {
            << " KiB of metadata in the daemon's memory\n"
            << "timed   " << S.HeadersTimed << " headers from "
            << S.TimingReports << " compiles; " << S.HeadersListed
-           << " on the ask-list\n";
+           << " on the ask-list; " << S.HitsTimed << " hits timed, "
+           << S.HeadersDropped
+           << " headers dropped as costing more than "
+              "parsing\n";
   }
   return 0;
 }

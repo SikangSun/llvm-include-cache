@@ -1415,6 +1415,119 @@ part: a part cannot hold a served header (2.18). So after `inner.h` changes,
 changes, it does not while `inner.h` is served. Parts that import the parts
 they contain would remove this (2.1); not designed.
 
+### 2.20 What a hit costs, and a per-header cutoff (built 2026-10-06, off)
+
+**What a hit costs, step by step.** Means over the 2,693 hits of one first
+build of redis-server's 117 files (release build, `-O2 -c`, fixed 226 us
+cutoff); `CLANG_HEADER_CACHE_STATS=2` prints each query's steps. The check's
+sub-steps are split by the build's per-step totals.
+
+| Step | What it does | us per hit |
+|---|---|---|
+| Ask the daemon | Send the header's path over the socket; the daemon replies with the metadata of every saved PCM of that header | 83 |
+| Check metadata | Compare each saved PCM's conditions with this compile | 322 |
+| -- `#if` names | Each name the header's `#if`/`#ifdef` tested is still defined, or not | 11 |
+| -- macros | Each macro it used expands the same; each plain-text name is still not a macro | 122 |
+| -- type names, pragmas | `T * p;` names are the same types; `#pragma pack` unchanged | 5 |
+| -- header searches | Each `#include` in the PCM is found again in the `-I` directories | 142 |
+| -- file stamps | Each file in the PCM has the same size and modification time | 5 |
+| -- outside declarations | Each declaration from before the header has the same type and layout | 36 |
+| Read metadata, other | Name lists from shared memory, decoding | 44 |
+| Load the PCM | `ReadAST` from shared memory: 80 us plus 0.22 us per KB | 97 |
+| Replay | Make the PCM's macros visible, replay the header's `#define`/`#undef`, restore pragmas | 277 |
+| Later name lookups | Estimate; see below | ~200 |
+| **All** | | **~1,020** |
+
+A miss costs 169 us (980 misses). Replay ran after the query timer until
+`d773ff4f9`, so earlier figures left it out.
+
+**Later name lookups.** In C, when the parser meets a name not yet in
+memory, `ASTReader::get` (`ASTReader.cpp:9213`) searches the name table of
+every loaded PCM in turn; no global index covers our in-memory PCMs. So each
+loaded PCM adds to every new name parsed after it. Measured with
+`scratch/e2e/profile/later.py`: `body.h` (600 functions, about 4,200 new
+names) after N small headers:
+
+| PCMs loaded | `body.h`, headers as text | `body.h`, headers from PCMs | Per PCM |
+|---|---|---|---|
+| 25 | 60.8 ms | 68.2 ms | 296 us |
+| 100 | 60.9 ms | 77.3 ms | 164 us |
+| 400 | 69.1 ms | 142.8 ms | 184 us |
+
+A fit over the 117 redis compiles gives 196 us per loaded PCM (r = 0.53).
+
+**The cutoff these costs imply.** The 226 us cutoff (2.14) was clang-18's
+load time alone. With every step counted, a hit pays off from about 0.5 to
+1 ms of parse time (medians per hit, same build):
+
+| Parse time in plain clang | Hits | Parse | Query | Replay | Later | Net |
+|---|---|---|---|---|---|---|
+| 226-500 us | 844 | 384 us | 270 us | 75 us | ~200 us | about -160 us |
+| 0.5-1 ms | 717 | 771 us | 516 us | 84 us | ~200 us | about 0 |
+| 1-5 ms | 894 | 1,357 us | 532 us | 180 us | ~200 us | about +450 us |
+| 5-20 ms | 121 | 13,030 us | 2,227 us | 1,031 us | ~200 us | about +9,600 us |
+
+Without any cutoff (every header queried), the first build took 37.63 s
+against plain clang's 31.87 s: tiny headers such as `bits/wordsize.h` (5 us,
+744 hits) were served inside glibc headers, which then could not get PCMs.
+
+**The per-header cutoff.** Proposed 2026-10-05; user, 2026-10-06: "This is
+fine. Try to run this and see whether we get a better time than Clang with
+this one optimization." Each compile also reports every hit's cost (query
+plus replay) in its `TimingReport`. The daemon drops a header from the
+ask-list once the header's first parse time is below its average hit cost
+plus 200 us (`-later-cost-us`); a compile's hits are counted together, and
+dropping is final, as listing is. `-drop-costly` turns it on.
+
+**Measured: no gain, so off by default.** Five first builds, the three modes
+interleaved file by file and pinned to one core
+(`scratch/e2e/profile/interleave_bench.py`): plain clang 31.54 s (median);
+the fixed cutoff 0.14 s faster (every build, -0.18 to -0.10 s); the
+per-header cutoff +0.01 s (-0.20 to +0.08 s). All objects identical. Two
+reasons:
+
+- The rule uses the header's first parse time, which can be far below its
+  usual one when some of its includes were already read. `signal.h` parsed
+  in 2.7 ms first, 5.0 ms on average where it was later hit, and its hits
+  cost 3.0 ms: dropped, while each hit saved about 2 ms.
+- The fixed cutoff already keeps out the many tiny headers, so the hits
+  that lose time are few: about 840 hits losing about 160 us each. A perfect
+  rule would gain about 0.1 to 0.2 s of 31.5 s.
+
+**Parse-time distribution** (redis, current clang, 31,748 parses in 117
+compiles, 8.15 s of header parsing; each microsecond counted once, under the
+header whose own text it was spent on):
+
+| Parse time, the header's includes counted in | Parses | Own parse time held |
+|---|---|---|
+| under 226 us | 77.1% | 10.1% |
+| 226 us-1 ms | 14.2% | 17.7% |
+| 1-5 ms | 6.6% | 35.6% |
+| over 5 ms | 2.1% | 36.6% |
+
+Serving every parse above 1 ms (8.7% of parses), each with the headers it
+includes, would cover 98.8% of header parse time; above 5 ms (2.1%), 93.6%.
+The 10 slowest of 497 headers hold 43.7% of own parse time, the top 100
+hold 89.6%. `server.h` alone holds 15.7%. 2.14 measured the same shape with
+clang-18 across five projects (77.0% of parses below 226 us).
+
+**What this means for PCMs that import PCMs.** An imported PCM skips the
+query but still costs its load and its later lookups: about 0.3 ms in every
+compile that loads it. So:
+
+- Worth it where the alternative is parsing text. `server.h` never gets a
+  PCM because headers inside it are served; its own text costs 18 ms per
+  compile (1,278 ms over 70 compiles), and the PCMs inside it are loaded
+  already. One more PCM, importing them, would save about 1.2 s per build.
+- Not worth it to split one PCM into many. Each extra PCM costs about
+  0.3 ms per compile, so a header worth its own PCM must parse in more than
+  about 0.3 ms; `immintrin.h` as 71 PCMs instead of one would cost about
+  21 ms more per compile that includes it.
+- Splitting removes repeated declarations (3.74 MB after a first build), at
+  0.3 ms per extra PCM per compile: worth it only where memory is the limit.
+- An index over the loaded PCMs' name tables would cut the 200 us part, and
+  with it the threshold.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.

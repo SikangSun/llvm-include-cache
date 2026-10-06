@@ -50,12 +50,26 @@ namespace ast_cache {
 /// is on the ask-list.
 constexpr uint64_t DefaultAskCutoffMicros = 226;
 
+/// What a loaded PCM costs the rest of a compile: in C, each name the parser
+/// meets for the first time is searched for in every loaded PCM's name
+/// table (ASTReader::get). Measured at 150-300 us per PCM for 4,200 new
+/// names, and about 196 us per PCM across the redis compiles (DECISIONS.md
+/// 2.20).
+constexpr uint64_t DefaultLaterCostMicros = 200;
+
 struct CacheDaemonOptions {
   uint64_t AskCutoffMicros = DefaultAskCutoffMicros;
   /// Also list every header the moment a copy of it is stored, timed or not.
   /// For the populate tool and tests, where no compile has reported a time
   /// yet; a build leaves it off.
   bool ListStored = false;
+  /// Drop a header from the ask-list once its hits are measured to cost
+  /// more than parsing it: when its first parse time is below its average
+  /// hit cost plus LaterCostMicros (DECISIONS.md 2.20). Off: on redis it
+  /// measured no faster than plain clang, where the fixed cutoff alone is
+  /// 0.14 s faster.
+  bool DropCostly = false;
+  uint64_t LaterCostMicros = DefaultLaterCostMicros;
 };
 
 class CacheDaemon {
@@ -96,6 +110,10 @@ public:
     uint64_t TimingReports = 0;
     uint64_t HeadersTimed = 0;
     uint64_t HeadersListed = 0;
+    /// Headers dropped from the ask-list because their hits cost more than
+    /// parsing them.
+    uint64_t HeadersDropped = 0;
+    uint64_t HitsTimed = 0;
   };
   Stats stats() const;
 
@@ -129,6 +147,9 @@ private:
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
   bool listLocked(llvm::StringRef Path);
+  /// Drops \p Path from the ask-list if its hits cost more than parsing it;
+  /// true if it was dropped. Mutex held.
+  bool dropIfCostlyLocked(llvm::StringRef Path);
   /// Publishes the whole ask-list as a new version. Mutex held.
   void publishLocked();
 
@@ -152,6 +173,10 @@ private:
   /// The ask-list, in the order headers joined it.
   std::vector<std::string> Listed;
   llvm::StringSet<> ListedSet;
+  /// Each header's hits so far: their count and total cost.
+  llvm::StringMap<std::pair<uint64_t, uint64_t>> HitCosts;
+  /// Headers dropped from the ask-list. Dropping is final, as listing is.
+  llvm::StringSet<> Dropped;
 
   std::atomic<bool> Stopping{false};
   /// Owned by run(); shutdown() on it makes a blocked accept return.

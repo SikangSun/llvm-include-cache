@@ -121,9 +121,12 @@ struct HeaderTiming {
 };
 
 /// Sent once when a compile's main file ends: every header the compile read,
-/// with its time, so the daemon can list the slow ones.
+/// with its time, so the daemon can list the slow ones; and every hit, with
+/// what it cost -- the cache query and replaying the header's effects -- so
+/// the daemon can drop a header whose hits cost more than they save.
 struct TimingReport {
   std::vector<HeaderTiming> Headers;
+  std::vector<HeaderTiming> Hits;
 };
 
 /// The daemon's answer to a client that has just connected: the region file

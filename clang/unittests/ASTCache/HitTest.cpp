@@ -822,12 +822,15 @@ TEST_F(HitTest, ACopyBuiltWithOtherOptionsIsPassedOverNotAnError) {
 }
 
 /// The ask-list as a build uses it: a header is asked about only once some
-/// compile has reported reading it slowly.
+/// compile has reported reading it slowly. The test headers parse in a few
+/// microseconds, so a measured hit would drop them from the list; these
+/// tests are about asking and serving, so dropping is off.
 class AskListTest : public HitTest {
 protected:
   CacheDaemon::Options daemonOptions() override {
     CacheDaemon::Options O;
     O.AskCutoffMicros = Cutoff;
+    O.DropCostly = false;
     return O;
   }
   uint64_t Cutoff = 0;

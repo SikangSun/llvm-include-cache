@@ -134,6 +134,20 @@ TEST(CacheProtocolTest, TimingReportRoundTrips) {
   EXPECT_EQ(Got->Headers[1].Micros, 612u);
 }
 
+TEST(CacheProtocolTest, TimingReportCarriesHitCosts) {
+  TimingReport Report;
+  Report.Headers = {{"/src/server.h", 41250}};
+  Report.Hits = {{"/usr/include/stdio.h", 530}, {"/src/rio.h", 2251}};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Headers.size(), 1u);
+  ASSERT_EQ(Got->Hits.size(), 2u);
+  EXPECT_EQ(Got->Hits[0].Path, "/usr/include/stdio.h");
+  EXPECT_EQ(Got->Hits[1].Micros, 2251u);
+}
+
 TEST(CacheProtocolTest, HelloReplyRoundTrips) {
   llvm::SmallVector<char, 0> Out;
   encodeHelloReply({"/dev/shm/x.region", 0x0123456789abcdefull}, Out);
@@ -187,9 +201,10 @@ protected:
   }
   void TearDown() override { llvm::sys::fs::remove_directories(TestDir); }
 
-  void report(std::vector<HeaderTiming> Headers) {
+  void report(std::vector<HeaderTiming> Headers,
+              std::vector<HeaderTiming> Hits = {}) {
     llvm::SmallVector<char, 0> Msg;
-    encodeTimingReport({std::move(Headers)}, Msg);
+    encodeTimingReport({std::move(Headers), std::move(Hits)}, Msg);
     auto Reply = Daemon->handleMessage(body(Msg));
     ASSERT_TRUE(Reply.has_value());
     EXPECT_EQ(peekMessageKind(body(*Reply)), MessageKind::TimingAck);
@@ -232,6 +247,19 @@ protected:
     auto Reply = Daemon->handleMessage(body(Msg));
     ASSERT_TRUE(Reply.has_value());
     EXPECT_EQ(peekMessageKind(body(*Reply)), MessageKind::PushAck);
+  }
+
+  /// Replaces the daemon with one created with \p O.
+  void useDaemon(const CacheDaemon::Options &O) {
+    llvm::sys::fs::remove(RegionPath);
+    auto D = CacheDaemon::create(RegionPath, 1u << 20, O);
+    ASSERT_TRUE(bool(D)) << llvm::toString(D.takeError());
+    Daemon = std::move(*D);
+  }
+  static CacheDaemon::Options dropCostly() {
+    CacheDaemon::Options O;
+    O.DropCostly = true;
+    return O;
   }
 
   std::string TestDir, RegionPath;
@@ -349,6 +377,38 @@ TEST_F(DaemonTest, AHeadersFirstTimeIsTheOneKept) {
   report({{"/src/fast.h", 40}});
   report({{"/src/fast.h", 90000}});
   EXPECT_TRUE(askList().empty());
+}
+
+TEST_F(DaemonTest, AHeaderWhoseHitsCostMoreThanItsParseIsDropped) {
+  // A hit costs its query and replay, plus what the loaded PCM adds to the
+  // rest of the compile. mid.h parses in 400 us; a 300 us hit plus 200 us
+  // later costs more, so asking about mid.h only loses time.
+  useDaemon(dropCostly());
+  report({{"/src/slow.h", 5000}, {"/src/mid.h", 400}});
+  EXPECT_EQ(askList(), (std::vector<std::string>{"/src/slow.h", "/src/mid.h"}));
+  report({}, {{"/src/slow.h", 1000}, {"/src/mid.h", 300}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/slow.h"});
+  EXPECT_EQ(Daemon->stats().HeadersDropped, 1u);
+  // Dropping is final, as listing is.
+  report({{"/src/mid.h", 90000}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/slow.h"});
+}
+
+TEST_F(DaemonTest, TheAverageHitCostDecides) {
+  // The first hit loads the PCM; a later one in the same compile reuses it.
+  useDaemon(dropCostly());
+  report({{"/src/h.h", 1000}});
+  report({}, {{"/src/h.h", 900}});
+  EXPECT_TRUE(askList().empty()) << "900 + 200 us is more than 1000 us";
+  report({{"/src/k.h", 1000}});
+  report({}, {{"/src/k.h", 900}, {"/src/k.h", 100}, {"/src/k.h", 100}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/k.h"})
+      << "an average of 367 + 200 us is less than 1000 us";
+}
+
+TEST_F(DaemonTest, DroppingIsOffByDefault) {
+  report({{"/src/mid.h", 400}}, {{"/src/mid.h", 300}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/mid.h"});
 }
 
 TEST_F(DaemonTest, StoredHeadersAreListedWhenAskedTo) {

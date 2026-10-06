@@ -34,10 +34,30 @@ CacheDaemon::create(llvm::StringRef RegionPath, uint64_t RegionSize,
 }
 
 bool CacheDaemon::listLocked(llvm::StringRef Path) {
-  if (!ListedSet.insert(Path).second)
+  if (Dropped.contains(Path) || !ListedSet.insert(Path).second)
     return false;
   Listed.push_back(Path.str());
   Counters.HeadersListed = Listed.size();
+  return true;
+}
+
+bool CacheDaemon::dropIfCostlyLocked(llvm::StringRef Path) {
+  if (!Opts.DropCostly || !ListedSet.contains(Path))
+    return false;
+  auto Parse = FirstTiming.find(Path);
+  auto Hits = HitCosts.find(Path);
+  if (Parse == FirstTiming.end() || Hits == HitCosts.end())
+    return false;
+  // A hit replaces the parse, and costs its query, its replay and what the
+  // loaded PCM adds to every later name lookup in the compile.
+  uint64_t HitCost = Hits->second.second / Hits->second.first;
+  if (Parse->second >= HitCost + Opts.LaterCostMicros)
+    return false;
+  ListedSet.erase(Path);
+  llvm::erase(Listed, Path);
+  Dropped.insert(Path);
+  Counters.HeadersListed = Listed.size();
+  ++Counters.HeadersDropped;
   return true;
 }
 
@@ -67,6 +87,21 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
       if (H.Micros >= Opts.AskCutoffMicros)
         Changed |= listLocked(H.Path);
     }
+    // All of a compile's hits count before any header is judged: the first
+    // hit on a header loads its PCM, a later one in the same compile reuses
+    // it.
+    llvm::StringSet<> HitHeaders;
+    for (const HeaderTiming &H : Report.Hits) {
+      if (H.Path.empty())
+        continue;
+      auto &[Count, Total] = HitCosts[H.Path];
+      ++Count;
+      Total += H.Micros;
+      ++Counters.HitsTimed;
+      HitHeaders.insert(H.Path);
+    }
+    for (const auto &H : HitHeaders)
+      Changed |= dropIfCostlyLocked(H.getKey());
     Counters.HeadersTimed = FirstTiming.size();
     if (Changed)
       publishLocked();

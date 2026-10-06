@@ -106,10 +106,12 @@ void clang::ast_cache::encodePushAck(llvm::SmallVectorImpl<char> &Out) {
 void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
                                           llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::TimingReport, [&](ByteWriter &W) {
-    W.u32(static_cast<uint32_t>(Report.Headers.size()));
-    for (const HeaderTiming &H : Report.Headers) {
-      W.str(H.Path);
-      W.u64(H.Micros);
+    for (const std::vector<HeaderTiming> *L : {&Report.Headers, &Report.Hits}) {
+      W.u32(static_cast<uint32_t>(L->size()));
+      for (const HeaderTiming &H : *L) {
+        W.str(H.Path);
+        W.u64(H.Micros);
+      }
     }
   });
 }
@@ -221,13 +223,15 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
   if (!expectKind(R, MessageKind::TimingReport))
     return std::nullopt;
   TimingReport Report;
-  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
-    HeaderTiming H;
-    H.Path = R.str().str();
-    H.Micros = R.u64();
-    Report.Headers.push_back(std::move(H));
+  for (std::vector<HeaderTiming> *L : {&Report.Headers, &Report.Hits}) {
+    for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+      HeaderTiming H;
+      H.Path = R.str().str();
+      H.Micros = R.u64();
+      L->push_back(std::move(H));
+    }
   }
-  if (!R.atEnd())
+  if (!R.ok() || !R.atEnd())
     return std::nullopt;
   return Report;
 }
