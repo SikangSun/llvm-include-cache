@@ -1855,9 +1855,9 @@ macro effects 614 ms (§2.23's medians). Everything a load costs is about
 | GCC precompiled headers | A memory image of the compiler's heap; pointers fixed up from GCC's type descriptions (`gengtype`) | Fast | One per compile, before any code: the image is the whole state, so nothing is merged |
 | MSVC precompiled headers | The same: a heap snapshot, relocated if mapped elsewhere | Fast | One per compile |
 | Clang PCH and modules | The lazy bitstream reader used here | Cheap open; cost spread over use | Built for many modules a compile mostly does not use |
-| GCC compile server (Bothner, Apple, 2003) | A server keeps parsed header fragments in memory and reuses one when its macro context matches; no file format | About 10x on repeat compiles of Apple's Carbon headers | Never merged into GCC |
-| Zapcc (a Clang fork, 2018) | A compile server keeps parsed headers in memory | 2-5x on full C++ builds | Caching is off for C; heavy changes to Clang |
-| PPH (Google, GCC, 2011-12) | Per-header files of streamed trees, merged into the compile | Parse time halved; merging a quarter to a third of load time and the main source of bugs; under a fifth of files reused | Abandoned |
+| GCC compile server (Bothner, Apple, 2003) | A server keeps parsed header fragments in memory and reuses one when its macro context matches; no file format | 10x for a file holding only `#include <Carbon/Carbon.h>`; 20% less user time on 14 of GCC's own files; 40% slower on 121 (GNU/Linux, blamed on the cache locality of GCC's data as the server's memory grew); the paper calls detailed numbers "premature and misleading" | One working directory and one set of flags per server; undo of in-place changes to shared trees not built; never merged |
+| Zapcc (a Clang fork, 2018) | A compile server keeps parsed headers in memory; after each compile it undoes what the `.c` file added | 2-5x on full C++ builds; about 2x on LLVM | Caching off for C ("no acceleration at all for plain C projects"); one server per parallel job, each with its own cache; resets when flags change; earlier compiles' declarations stay visible; heavy changes to Clang |
+| PPH (Google, GCC, 2011-12) | Per-header files of streamed trees, merged into the compile | Parse time halved; loading 31-57% slower than PCH; merging a quarter to a third of load time and the main source of bugs; under a fifth of files reused | Abandoned. Google first tried a compile server and dropped it as "too difficult to maintain in our build system, primarily due to issues in the repeatability of failures" (N3426) |
 | Texas persistent store (Wilson, 1991) | Pointers swizzled when a page is faulted in | No cost after the fault | Needs every pointer's type described |
 
 The user's "serialization in Java that autofills addresses" is pointer
@@ -1878,6 +1878,97 @@ state. GCC and MSVC load fast because they never merge.
 
 A to C keep PCM only for what is hard to replace, declarations and types,
 and take the rest out of it.
+
+E is ruled out (user, 2026-10-07: "we can't do Bothner because it's not
+build system transparent ... We will voluntarily take the cost"). The user
+wants loading of declarations and types made finer and cheaper, beyond what
+PCM does, and macro replay much shorter, by decoding macro definitions
+directly (B).
+
+Checked against the sources 2026-10-07 (Bothner's GCC Summit paper and his
+December 2003 status mail; N3426; Zapcc's README and its 2015 cfe-dev post).
+Both compile servers were drop-in at the command line: `make CC='gcc
+--server'` for Bothner, `zapcc` in place of `clang` for Zapcc ("Zapcc works
+within your existing build"). Google's stated reason for dropping its
+server was the repeatability of failures, not the build-system interface.
+Their limits were elsewhere: one parsed state per server, so a parallel
+build runs a server per job, each warming its own cache; one set of flags
+per server; state left behind by earlier compiles; and memory that grows.
+
+### 2.25 The ceiling: how fast the cache could get (analysis, 2026-10-07)
+
+User, 2026-10-07: "analyze what our optimization performance may be. I think
+it's going to be about 2.5x. At best we can aim for 3x". Nothing below is
+built.
+
+**How it was measured.** Each project's compiles were run as plain clang and
+with the cache observing only: the daemon lists no header, so nothing is
+asked, served or written, and the hook times every header read
+(`scratch/e2e/multi/ceiling_run.py`; observing adds 0.5% to 6%, all of it
+taken off header time, so the ceilings err low). Header time is the time
+inside headers included from the `.c` file. If every header cost nothing,
+a build would take plain minus header time. The cache's own time by kind
+comes from its stats in the builds of §3's results
+(`ceiling_report.py`). Full builds use each project's own flags (`-O2`,
+cpython `-O3`, with or without `-g`); the front end is `-fsyntax-only`.
+
+| Project | Header time, full build | Header time, front end | Now, full | Now, front end | Ceiling, full | Ceiling, front end |
+|---|---|---|---|---|---|---|
+| redis | 25% | 74% | 1.05x | 1.19x | 1.33x | 3.86x |
+| nginx | 36% | 73% | 1.10x | 1.24x | 1.56x | 3.77x |
+| curl | 39% | 70% | 1.24x | 1.44x | 1.63x | 3.32x |
+| git | 46% | 87% | 1.23x | 1.43x | 1.84x | 7.66x |
+| postgres | 42% | 79% | 1.10x | 1.17x | 1.72x | 4.66x |
+| cpython | 30% | 82% | 1.11x | 1.30x | 1.43x | 5.59x |
+
+Header time is a share of plain clang's time. Now is plain over cache,
+medians of three builds. Ceiling is plain over plain minus header time.
+A full build's ceiling is low because everything else -- the `.c` file's own
+code, code generation and optimization, none of which a header cache
+touches -- is 54% to 75% of it.
+
+**The two sides of the gain.** The cache already skips 65% to 94% of
+header time in full builds. What it gives back is the larger loss: per
+second of header time skipped, 0.47 to 0.74 s of its own time.
+
+| Full build | Header time skipped | Cache's own time | Lookups | Replay | Writing | The rest |
+|---|---|---|---|---|---|---|
+| redis | 5.65 s | 3.89 s | 1.07 s | 0.68 s | 1.35 s | 0.79 s |
+| nginx | 6.19 s | 4.22 s | 2.43 s | 1.41 s | 0.15 s | 0.23 s |
+| curl | 19.84 s | 9.28 s | 4.36 s | 3.20 s | 1.00 s | 0.72 s |
+| git | 71.94 s | 39.06 s | 10.35 s | 17.40 s | 10.81 s | 0.50 s |
+| postgres | 75.84 s | 52.83 s | 18.96 s | 8.68 s | 22.96 s | 2.23 s |
+| cpython | 36.04 s | 18.98 s | 6.40 s | 3.31 s | 7.87 s | 1.39 s |
+
+The rest is mostly slower parsing of the remaining text after loads. git's
+replay is 5 ms per hit. postgres wrote 3,108 copies in 1,341 compiles;
+44,786 candidates were rejected because a macro's definedness differed.
+
+**Projection.** Fixes: the implementation fixes of §2.21 and §2.24 (A to C,
+metadata in shared memory, remembered searches, writing from the copy's own
+range, tracking only around written headers), taken to cut lookups by 50%,
+replay 70%, writing 70% and the rest 60%, the shares estimated on redis;
+the cache's time is taken to scale with the header time it skips. Fit:
+every header served except the first parse of each distinct header
+included from a `.c` file, optimistic where macros genuinely differ
+(postgres's `FRONTEND`). First-build ceiling: fit with no cost at all.
+
+| Project | Fixes, full | Fixes and fit, full | First-build ceiling, full | Fixes, front end | Fixes and fit, front end | First-build ceiling, front end |
+|---|---|---|---|---|---|---|
+| redis | 1.13x | 1.18x | 1.27x | 1.56x | 1.92x | 2.80x |
+| nginx | 1.25x | 1.34x | 1.56x | 1.75x | 2.07x | 3.67x |
+| curl | 1.41x | 1.45x | 1.62x | 2.04x | 2.17x | 3.23x |
+| git | 1.50x | 1.57x | 1.82x | 2.60x | 3.04x | 7.03x |
+| postgres | 1.28x | 1.42x | 1.67x | 1.67x | 2.17x | 4.02x |
+| cpython | 1.20x | 1.28x | 1.38x | 1.79x | 2.38x | 3.90x |
+
+The user's 2.5x to 3x fits the front end with every fix and a good fit;
+full builds stay under 1.6x, and no header cache can take them past 1.84x.
+Going further in a full build means skipping work after parsing, such as
+compiling a header's `static inline` functions again in every `.c` file
+that uses them (Zapcc caches generated code for this reason); not measured.
+Machine load: the front-end builds shared the machine with 17 others and
+the full builds with 7; alone, redis is 1.20x front end and 1.06x full.
 
 ## 3. Things that turned out to be wrong
 
@@ -2128,6 +2219,87 @@ found its file instead of a path under the header's directory, so
 which one includer cannot reproduce, so such a frame is poisoned. Test: a
 copy built with `-Ia` is served under `-Ia` and not under `-Ib`, where
 `<cfg.h>` finds another file.
+
+### Parts that broke compiles in other projects (found 2026-10-07)
+
+The first builds of five more projects -- git, nginx, curl, postgres and
+cpython, each project's own compile commands replayed in build order
+(`scratch/e2e/multi/replay_bench.py`) -- found three bugs redis never hit.
+All three are fixed; tests in `HitTest.cpp`.
+
+**A part kept the writing compile's own files.** A part's source-location
+table and input files held every file the writing compile had opened: its
+`.c` file and the headers read before the part, under the names they were
+opened by, `base64.c`. A compile in another directory loaded the part, laid
+out a struct from it -- which asks the diagnostic state along the header's
+include chain, even for a warning that is off -- and reached the writer's
+`.c` file, which the name did not find from there: "fatal error: malformed
+or corrupted precompiled file: could not find file 'base64.c'". 1,025 of
+postgres's 1,341 compiles failed and one of curl's; redis compiles every
+file in one directory, where each such name happened to resolve. A part now
+keeps only the files entered inside it (`computeNonAffectingInputFiles`),
+and its header, its include location dropped with the file that held it,
+takes the loading compile's `#include` as its include location
+(`ASTReader::ReadSLocEntry` already does that for a module's own file). A
+macro expansion inside the part spelled in a dropped file keeps only the
+place it was used, and any other location in a dropped file is written as
+none and counted (`PartDroppedLocations`).
+
+**A part was written before its last function's body.** A part is written at
+the first top-level declaration finished after its header ends. git's
+`fsmonitor.h` ends with the definition of `mark_fsmonitor_invalid`. The
+parser reads one token past that function's `}`, which entered the next
+`#include` -- served -- and loading that part handed its definitions that
+must be emitted (git's `_` from `gettext.h`) to the compile's consumers.
+`ASTConsumer::HandleInterestingDecl` forwards to `HandleTopLevelDecl`, so
+the exporter took it for a finished declaration and wrote `fsmonitor.h`
+before `mark_fsmonitor_invalid` had its body. Compiles served that part
+called a `static inline` function they never emitted ("has internal linkage
+but is not defined"): an object that does not link. git (2 objects) and
+cpython (8). The exporter now ignores declarations handed over from loaded
+module files.
+
+**A part's variable definitions were not emitted.** postgres's generated
+`kwlist_d.h` defines `const ScanKeywordList ScanKeywords = {...}`, and
+postgres compiles `keywords.c` three times; the third, served the part,
+produced a 1.9 KB object instead of 10 KB, with no `ScanKeywords` and none
+of the arrays and function it refers to. For a module, Clang emits such a
+definition as an initializer of the module, where the module is imported
+(`CodeGenModule::EmitTopLevelDecl`, `Decl::Import`), and the reader does not
+hand it over on load (`ASTReader::isConsumerInterestedIn`). Clang lists a
+module's initializers only for a module it builds, which a part is not. The
+exporter now adds each file-scope variable definition in the part that must
+be emitted to the part's module initializers. Tentative definitions --
+`int x;` at file scope -- were dropped the same way (a part writes none of
+Sema's lists); a part now keeps its own, which the loading compile completes
+at the end of its translation unit.
+
+**Result after the three fixes** (2026-10-07). One-thread first builds,
+each project's own compile commands, plain clang and the cache interleaved
+file by file, pinned to one core; three builds each, medians; objects of
+the first build compared byte for byte (`scratch/e2e/multi/replay_bench.py`,
+logs in the scratchpad's `multi4/`):
+
+| Project | Compiles | Plain clang | Cache minus plain | Range over 3 builds | Failed | Objects differing |
+|---|---|---|---|---|---|---|
+| git | 567 | 174.14 s | -32.55 s (-18.7%) | -31.66 to -32.88 s | 0 | 0 |
+| curl | 479 | 54.68 s | -10.56 s (-19.3%) | -9.84 to -10.73 s | 0 | 0 |
+| postgres | 1,341 | 253.66 s | -23.01 s (-9.1%) | -20.72 to -23.35 s | 0 | 0 |
+| cpython | 401 | 175.57 s | -16.62 s (-9.5%) | -16.31 to -17.07 s | 0 | 3, one debug column each |
+| nginx | 126 | 21.59 s | -1.97 s (-9.1%) | -1.91 to -2.07 s | 0 | 0 |
+
+redis-server's 117 objects are identical to plain clang's at `-O2` and `-g`.
+
+cpython's three objects (`dictobject.c`, `object.c`, `typeobject.c`, all
+`-g -O3`) differ in one byte of `.debug_line`. At `pycore_object.h:701`,
+`Py_SET_REFCNT(op, Py_REFCNT(op) - 1);`, plain clang gives the load column
+23, the inner `Py_REFCNT`; the cache gives column 5, `Py_SET_REFCNT`.
+`Py_SET_REFCNT` is defined in `refcount.h`, outside `pycore_object.h`'s
+folded copy, so the first fix keeps only the place its expansion was used,
+and a location inside its argument (`SourceManager::getFileLoc` follows a
+macro argument to where it is spelled) falls back to that place. Code is
+identical. Not fixed: keeping such an expansion's spelling needs a stand-in
+for the dropped file, a design change.
 
 ## 4. Open
 

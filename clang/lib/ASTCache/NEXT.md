@@ -100,6 +100,17 @@ redis-server: front end 1.69 s faster than plain clang's 10.01 s (-17%),
 full `-O2` build 1.88 s faster than 31.83 s (-5.9%). Objects identical at
 `-O2` and `-g`.
 
+## Fixed 2026-10-07: three bugs found on five more projects
+
+`DECISIONS.md` §3, "Parts that broke compiles in other projects". A part
+kept the writing compile's own files (postgres: 1,025 of 1,341 compiles
+failed); a part was written before its last function's body (git, cpython:
+objects that do not link); a part's variable definitions were not emitted
+(postgres's `ScanKeywords`). After the fixes, one-thread first builds,
+medians of three: git -18.7%, curl -19.3%, postgres -9.1%, cpython -9.5%,
+nginx -9.1%; no failures; objects identical except one `-g` column in three
+cpython objects (cause known, not fixed).
+
 ## Next
 
 1. **Cross-reference IDs** for outside declarations (the user's "keep both
@@ -175,6 +186,17 @@ container and the validation get replaced (`DECISIONS.md` §3).
 
 ## Decisions needed
 
+All open questions, numbered, with every optimization sorted into techniques
+and implementation fixes: `REPORT.md` (2026-10-07).
+
+- **What the finding is** (user, 2026-10-07: a server-client design cannot
+  outperform a monolithic compile server; the problem becomes integrating a
+  monolithic design transparently). Review in `DECISIONS.md` §2.24: per hit
+  the user is right (about 2.7 s of redis's 10.0 s front end is the format's
+  cost); per build, a server per parallel job loses sharing. Proposed: measure
+  the crossover by `-j`.
+- **The `-g` column loss** in cpython: keep it as a known limitation, or give
+  dropped files a stand-in so expansions keep their spelling.
 - **Whether to keep PCM as the format** (raised by the user 2026-10-06,
   deferred; the costs so far are listed in `DECISIONS.md` §4).
 - Is D the direction, and do the two measurements run now?
