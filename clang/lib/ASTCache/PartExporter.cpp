@@ -352,6 +352,19 @@ private:
                                 /*IsFramework=*/false, /*IsExplicit=*/false);
     M->PresumedModuleMapFile = "<header-cache-part>";
 
+    // A variable definition that must be emitted -- postgres's kwlist_d.h
+    // defines `const ScanKeywordList ScanKeywords = {...}` -- reaches the
+    // object of a compile that loads the part the way a module's does: as an
+    // initializer of the module, emitted where it is imported. Clang lists a
+    // module's initializers only for a module it builds, which a part is not.
+    ASTContext &Ctx = CI.getASTContext();
+    for (Decl *D : Ctx.getTranslationUnitDecl()->noload_decls())
+      if (auto *VD = dyn_cast<VarDecl>(D))
+        if (VD->isFileVarDecl() &&
+            VD->isThisDeclarationADefinition() == VarDecl::Definition &&
+            inPart(P, VD->getLocation()) && Ctx.DeclMustBeEmitted(VD))
+          Ctx.addModuleInitializer(M, VD);
+
     DepsScope.reset();
     Written W = writePart(P, M, ByName);
     if (ByName && !W.Failure.empty()) {
@@ -375,7 +388,7 @@ private:
                        std::to_string(W.ByName) + " by name";
     if (W.DroppedLocations)
       Line += ", " + std::to_string(W.DroppedLocations) +
-              " locations in module files dropped";
+              " locations dropped (in module files or outside the part)";
     Counts.Exports.push_back(std::move(Line));
     dump(P, R, W.Sizes);
     llvm::TimeTraceScope PushScope("HeaderCache Push");
@@ -569,6 +582,15 @@ public:
       E->declarationFinished();
     return true;
   }
+
+  /// A declaration a loaded module file hands over, one that must be
+  /// emitted, is not one the parser finished. A header that ended inside a
+  /// function definition -- the parser reads one token past its last `}`,
+  /// and that token can be the next #include, served -- is still waiting
+  /// for the function's body, and must not be written yet: git's
+  /// fsmonitor.h was saved with its last function, mark_fsmonitor_invalid,
+  /// declared but not defined.
+  void HandleInterestingDecl(DeclGroupRef) override {}
 
   void HandleTranslationUnit(ASTContext &) override {
     if (Exporter *E = exporterFor(CI))

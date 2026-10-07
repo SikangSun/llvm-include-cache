@@ -216,8 +216,9 @@ private:
   std::vector<const NamedDecl *> PartNameReferences;
   std::string PartNameReferenceFailure;
 
-  /// Locations in a loaded module file the part wrote as invalid ones.
-  unsigned PartDroppedLocations = 0;
+  /// Locations in a loaded module file, or in a file outside the part, the
+  /// part wrote as invalid ones.
+  mutable unsigned PartDroppedLocations = 0;
 
   /// Where to note what each declaration and macro of a part took, if
   /// anywhere. See setPartSizes.
@@ -972,8 +973,9 @@ public:
   /// ordinary compile, which builds no module; requires a WritingModule.
   ///
   /// \p KeepsExpansion says, by its starting offset, which local macro
-  /// expansions keep their entry in the source-location table. A location in
-  /// a dropped one is written as the place the macro was used.
+  /// expansions and files keep their entry in the source-location table: the
+  /// part's own. A location in a dropped expansion is written as the place
+  /// the macro was used; a location in a dropped file, as no location.
   ///
   /// \p KeepsHeaderInfo, when set, says which files keep their entry in the
   /// header-search table: the include guard, #pragma once and "already

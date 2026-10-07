@@ -5601,9 +5601,13 @@ void ASTWriter::computeNonAffectingInputFiles() {
       // (getAdjustedLocation). It drops one inside it too when the macro is
       // spelled in a loaded module file: a part imports nothing, so it
       // cannot refer to that location.
-      if (!PartKeepsExpansion || (PartKeepsExpansion(SLoc->getOffset()) &&
-                                  !SrcMgr.isLoadedSourceLocation(
-                                      SLoc->getExpansion().getSpellingLoc())))
+      // So does one spelled in a file the part drops, below: a macro the
+      // part used but did not define.
+      SourceLocation Spelling = SLoc->getExpansion().getSpellingLoc();
+      if (!PartKeepsExpansion ||
+          (PartKeepsExpansion(SLoc->getOffset()) &&
+           !SrcMgr.isLoadedSourceLocation(Spelling) &&
+           IsSLocAffecting[SrcMgr.getFileID(Spelling).ID]))
         continue;
     } else {
       const SrcMgr::FileInfo &File = SLoc->getFile();
@@ -5611,20 +5615,31 @@ void ASTWriter::computeNonAffectingInputFiles() {
       if (!Cache->OrigEntry)
         continue;
 
-      // Don't prune anything other than module maps.
-      if (!isModuleMap(File.getFileCharacteristic()))
-        continue;
+      if (PartKeepsExpansion && !PartKeepsExpansion(SLoc->getOffset())) {
+        // A part keeps only the files entered inside it. Any other -- the
+        // .c file, a header read before the part -- belongs to the compile
+        // that wrote it: a compile loading the part elsewhere may not find
+        // it by the name it was opened under, and has its own anyway. The
+        // header's own entry, its include location dropped with the file
+        // that held it, takes the loading compile's #include as its
+        // include location.
+        IsSLocFileEntryAffecting[I] = false;
+      } else {
+        // Don't prune anything other than module maps.
+        if (!isModuleMap(File.getFileCharacteristic()))
+          continue;
 
-      // Don't prune module maps if all are guaranteed to be affecting.
-      if (!AffectingModuleMaps)
-        continue;
+        // Don't prune module maps if all are guaranteed to be affecting.
+        if (!AffectingModuleMaps)
+          continue;
 
-      // Don't prune module maps that are affecting.
-      if (AffectingModuleMaps->DefinitionFileIDs.contains(FID))
-        continue;
+        // Don't prune module maps that are affecting.
+        if (AffectingModuleMaps->DefinitionFileIDs.contains(FID))
+          continue;
 
-      IsSLocFileEntryAffecting[I] =
-          AffectingModuleMaps->DefinitionFiles.contains(*Cache->OrigEntry);
+        IsSLocFileEntryAffecting[I] =
+            AffectingModuleMaps->DefinitionFiles.contains(*Cache->OrigEntry);
+      }
     }
 
     IsSLocAffecting[I] = false;
@@ -5761,8 +5776,18 @@ void ASTWriter::PrepareWritingSpecialDecls(Sema &SemaRef) {
   }
 
   // A part, like a reduced BMI, holds what its declarations reach, not every
-  // declaration Sema keeps a list of.
-  if (GeneratingReducedBMI || PartDecls)
+  // declaration Sema keeps a list of -- except its own tentative definitions,
+  // `int x;` at file scope, which a compile loading it emits at the end of
+  // its translation unit, as it would have from the text.
+  if (PartDecls) {
+    for (auto I = SemaRef.TentativeDefinitions.begin(nullptr, true),
+              E = SemaRef.TentativeDefinitions.end();
+         I != E; ++I)
+      if (PartDecls(*I))
+        GetDeclRef(*I);
+    return;
+  }
+  if (GeneratingReducedBMI)
     return;
 
   // Writing all of the tentative definitions in this file, in
@@ -6805,16 +6830,25 @@ unsigned ASTWriter::getAdjustedNumCreatedFIDs(FileID FID) const {
 SourceLocation ASTWriter::getAdjustedLocation(SourceLocation Loc) const {
   if (Loc.isInvalid())
     return Loc;
-  // A part drops the macro expansions outside it. A location in one becomes
-  // the place the macro was used, which is the file, line and column a
-  // presumed location -- and so debug information -- reports for it anyway.
-  // Such an expansion was used outside the part too, so that place is in a
-  // file, and files are kept.
-  if (PartKeepsExpansion && Loc.isMacroID()) {
+  // A part drops the macro expansions outside it, and those spelled in a
+  // file it drops. A location in one becomes the place the macro was used,
+  // which is what a presumed location reports for it -- but not always what
+  // debug information reports: inside a macro's argument, that is where the
+  // argument was written (SourceManager::getFileLoc), and that place is lost
+  // when the macro taking the argument is dropped (cpython's
+  // Py_SET_REFCNT(op, Py_REFCNT(op) - 1), DECISIONS.md section 3). A place
+  // in a file the part drops is written as no location.
+  if (PartKeepsExpansion) {
     const SourceManager &SM = PP->getSourceManager();
-    if (!SM.isLoadedSourceLocation(Loc) &&
+    if (Loc.isMacroID() && !SM.isLoadedSourceLocation(Loc) &&
         !IsSLocAffecting[SM.getFileID(Loc).ID])
       Loc = SM.getExpansionLoc(Loc);
+    // A location in a file the part dropped has no place in it.
+    if (Loc.isFileID() && !SM.isLoadedSourceLocation(Loc) &&
+        !IsSLocAffecting[SM.getFileID(Loc).ID]) {
+      ++PartDroppedLocations;
+      return SourceLocation();
+    }
   }
   return Loc.getLocWithOffset(-getAdjustment(Loc.getOffset()));
 }
@@ -7216,7 +7250,12 @@ void ASTWriter::associateDeclWithFile(const Decl *D, LocalDeclID ID) {
   if (FID.isInvalid())
     return;
   assert(SM.getSLocEntry(FID).isFile());
-  assert(IsSLocAffecting[FID.ID]);
+  // A part drops the files outside it; a declaration copied from one keeps no
+  // location there (getAdjustedLocation).
+  if (!IsSLocAffecting[FID.ID]) {
+    assert(isWritingPart() && "declaration in a non-affecting file");
+    return;
+  }
 
   std::unique_ptr<DeclIDInFileInfo> &Info = FileDeclIDs[FID];
   if (!Info)

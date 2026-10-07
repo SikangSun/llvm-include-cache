@@ -16,6 +16,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/ASTConsumer.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Decl.h"
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/CacheClient.h"
 #include "clang/ASTCache/CacheDaemon.h"
@@ -63,13 +66,43 @@ private:
   std::set<std::string> &Out;
 };
 
+/// Records the variables a compile generating code would be told to emit
+/// that a syntax-only one never sees emitted: a module's initializers, at
+/// each import, and the tentative definitions completed at the end.
+class EmitRecorder : public ASTConsumer {
+public:
+  explicit EmitRecorder(std::set<std::string> &Out) : Out(Out) {}
+
+  void HandleImplicitImportDecl(ImportDecl *D) override {
+    for (Decl *I :
+         D->getASTContext().getModuleInitializers(D->getImportedModule()))
+      if (auto *ND = dyn_cast<NamedDecl>(I))
+        Out.insert(ND->getName().str());
+  }
+
+  void CompleteTentativeDefinition(VarDecl *D) override {
+    Out.insert(D->getName().str());
+  }
+
+private:
+  std::set<std::string> &Out;
+};
+
 /// Installs the hit path and the file recorder on the compile.
 class CachedAction : public SyntaxOnlyAction {
 public:
   CachedAction(std::unique_ptr<CacheClient> Client, std::set<std::string> &Out,
-               std::string JobsDir = "", bool ExportParts = false)
+               std::string JobsDir = "", bool ExportParts = false,
+               std::set<std::string> *Emitted = nullptr)
       : Client(std::move(Client)), Out(Out), JobsDir(std::move(JobsDir)),
-        ExportParts(ExportParts) {}
+        ExportParts(ExportParts), Emitted(Emitted) {}
+
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
+                                                 StringRef File) override {
+    if (Emitted)
+      return std::make_unique<EmitRecorder>(*Emitted);
+    return SyntaxOnlyAction::CreateASTConsumer(CI, File);
+  }
 
   bool BeginSourceFileAction(CompilerInstance &CI) override {
     CI.getPreprocessor().addPPCallbacks(
@@ -85,6 +118,7 @@ private:
   std::set<std::string> &Out;
   std::string JobsDir;
   bool ExportParts;
+  std::set<std::string> *Emitted;
 };
 
 class HitTest : public ::testing::Test {
@@ -184,7 +218,8 @@ protected:
     CI.createVirtualFileSystem(VFS);
     CI.createFileManager();
 
-    CachedAction Action(client(), Entered, RecordJobsTo, ExportParts);
+    Emitted.clear();
+    CachedAction Action(client(), Entered, RecordJobsTo, ExportParts, &Emitted);
     return CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
   }
 
@@ -219,6 +254,9 @@ protected:
   bool ExportParts = false;
   /// When set, compiles record their jobs in this directory.
   std::string RecordJobsTo;
+  /// The variables the last compile would have been told to emit, beyond
+  /// what it parsed: module initializers and tentative definitions.
+  std::set<std::string> Emitted;
   std::unique_ptr<CacheDaemon> Daemon;
   std::thread Server;
 };
@@ -1167,6 +1205,84 @@ TEST_F(ExportTest, APartIsNotServedWhereAMacroItsResultNeededDiffers) {
   EXPECT_TRUE(reads(A, Nul)) << "nothing is stored yet";
   EXPECT_GE(Daemon->stats().Entries, 1u) << "a.c did not export nul.h";
   EXPECT_TRUE(reads(B, Nul)) << "a part without MYNULL's lines was served";
+}
+
+TEST_F(ExportTest, AServedPartEmitsItsVariableDefinitions) {
+  // def.h defines def_value and tentatively defines tent_value, which every
+  // compile that includes it must emit. A compile served def.h's part emits
+  // def_value as an initializer of the part's module, at the import, as
+  // Clang does for any module -- the part must list it, since Clang lists a
+  // module's initializers only for a module it builds -- and tent_value at
+  // the end, as a tentative definition the part handed over. postgres's
+  // kwlist_d.h lost `const ScanKeywordList ScanKeywords` this way.
+  std::string Def = write("def.h", "#ifndef DEF_H\n#define DEF_H\n"
+                                   "int def_value = 42;\nint tent_value;\n"
+                                   "#endif\n");
+  std::string A = write("a.c", "#include \"" + Def + "\"\n");
+  std::string B = write("b.c", "#include \"" + Def + "\"\n");
+  EXPECT_TRUE(reads(A, Def)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Def)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(B, Def)) << "def.h's part was not served";
+  EXPECT_TRUE(Emitted.count("def_value"))
+      << "the served part does not emit def_value";
+  EXPECT_TRUE(Emitted.count("tent_value"))
+      << "the served part does not emit tent_value";
+}
+
+TEST_F(ExportTest, AHeaderEndingInAFunctionIsSavedWithItsBody) {
+  // last.h ends with a function definition. The parser reads one token past
+  // its last `}`, and here that token is next.h's #include, served: loading
+  // next.h's part hands its definition of next_value, which must be
+  // emitted, to the compile's consumers -- before last_fn's body is
+  // attached. last.h must not be written then, or it is saved with last_fn
+  // declared but not defined, and a compile served it calls a function it
+  // never emits.
+  std::string Next = write("next.h", "#ifndef NEXT_H\n#define NEXT_H\n"
+                                     "int next_value(void) { return 4; }\n"
+                                     "#endif\n");
+  std::string Last = write("last.h", "#ifndef LAST_H\n#define LAST_H\n"
+                                     "static inline int last_fn(int x) {\n"
+                                     "  return x + 1;\n}\n#endif\n");
+  std::string N = write("n.c", "#include \"" + Next + "\"\n");
+  std::string X = write("x.c", "#include \"" + Last + "\"\n#include \"" + Next +
+                                   "\"\nint x(void) { return last_fn(1); }\n");
+  std::string Y = write("y.c", "#include \"" + Last +
+                                   "\"\nint y(void) { return last_fn(2); }\n");
+  EXPECT_TRUE(reads(N, Next)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(N, Next)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(X, Next)) << "next.h's part was not served";
+  EXPECT_TRUE(reads(X, Last)) << "last.h is not stored yet";
+  ExtraArgs = {"-Werror=undefined-internal"};
+  EXPECT_FALSE(reads(Y, Last)) << "last.h's part was not served";
+}
+
+TEST_F(ExportTest, APartServesACompileInAnotherDirectory) {
+  // one/first.c writes shared.h's part; two/second.c, compiled from a
+  // directory with no first.c in it, is served the part and lays out the
+  // struct, which looks up the diagnostic state along shared.h's include
+  // chain. A part keeps only the files entered inside it: had it kept
+  // first.c, under the relative name the compile opened it by, that walk
+  // would stop the compile, since the name finds nothing from two/.
+  ASSERT_FALSE(llvm::sys::fs::create_directories(Dir + "/one"));
+  ASSERT_FALSE(llvm::sys::fs::create_directories(Dir + "/two"));
+  std::string Shared = write("shared.h", "#ifndef SHARED_H\n#define SHARED_H\n"
+                                         "struct shared { char c; int a; };\n"
+                                         "#endif\n");
+  write("one/first.c",
+        "#include \"" + Shared + "\"\nint one(void) { return 1; }\n");
+  write("two/second.c", "#include \"" + Shared +
+                            "\"\nint two(void) { return sizeof(struct "
+                            "shared); }\n");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile("first.c", Entered, Dir + "/one"))
+      << "nothing is listed yet";
+  ASSERT_TRUE(compile("first.c", Entered, Dir + "/one"))
+      << "nothing is stored yet";
+  EXPECT_GE(Daemon->stats().Entries, 1u) << "shared.h was not exported";
+
+  Entered.clear();
+  ASSERT_TRUE(compile("second.c", Entered, Dir + "/two"));
+  EXPECT_FALSE(Entered.count(Shared)) << "shared.h was not served";
 }
 
 TEST_F(ExportTest, AHeaderIsFoldedWithTheHeadersInsideItReadAsText) {
