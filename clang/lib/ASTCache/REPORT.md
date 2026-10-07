@@ -1,7 +1,7 @@
 # Header cache: correctness, optimizations and open questions
 
 Written 2026-10-07 and updated the same evening, to work from on
-2026-10-08. The correctness problems explained and ranked (section 2), every
+2026-10-08; updated again after your answers (Q8 to Q11, Q34, I8). The correctness problems explained and ranked (section 2), every
 optimization ranked by the time it could remove, measured (section 3),
 sorted into techniques and implementation fixes (section 4), the proposed
 switches for ablation (section 5), and every open question (section 6).
@@ -43,8 +43,9 @@ others (Q24).
 
 Correctness: no compile fails; every object is byte-identical to plain
 clang's except three cpython objects, which differ in one debug-line column
-each (Q7). The three fixes behind this are pushed to the fork (`3716d1a71`).
-Section 2 lists what the benchmarks do not reach.
+each (Q7). The three fixes behind this are pushed to the fork (`3716d1a71`),
+and so are the fixes for Q35 and Q9 (section 2). Section 2 lists what the
+benchmarks do not reach.
 
 **The ceiling** (§2.25). If every hit cost nothing and every header were
 skipped, a full build could be 1.33x (redis) to 1.84x (git) faster: headers
@@ -59,136 +60,248 @@ side.
 
 ## 2. Correctness problems, explained and ranked
 
-Each was reproduced on 2026-10-07 with a few lines of C, a fresh daemon that
-lists every header, and plain clang on the same file
-(`scratch/e2e/qtests/`: one directory per problem, `harness.py` runs them). Ranked by how much they
-change and how often they can happen.
+Each was reproduced with a few lines of C, a fresh daemon that lists every
+header, and plain clang on the same file (`scratch/e2e/qtests/`: one
+directory per problem, `harness.py` runs them). In each test `a.c` is
+compiled first and writes the copy, and `b.c` is served it. Ranked by how
+much they change and how often they can happen.
 
-| Rank | Problem | What changes | How often |
-|---|---|---|---|
-| 1 | Q34, Q35: a header's diagnostics are lost on a hit | Warnings disappear; under `-Werror` a compile plain clang fails succeeds | Any header with a warning |
-| 2 | Q9: two copies get one name | Silent wrong code | Needs one unguarded header twice in a compile, with an outside declaration changed in between |
-| 3 | Q11: `pop_macro` of a value pushed outside | Silent wrong code | No header in the six projects does it |
-| 4 | Q10: the cache runs inside module builds | Clang crashed | Only builds that build Clang modules |
-| 5 | Q8: outside names resolved late | Different but valid code; debug lines move | A redeclaration after the `#include` |
-| 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects |
-| 7 | Q12: `__COUNTER__` | Nothing: such headers are not cached | No header in the six projects uses it |
+| Rank | Problem | What changes | How often | Status |
+|---|---|---|---|---|
+| 1 | Q34, Q35: a header's diagnostics are lost on a hit | Warnings disappear; under `-Werror` a compile plain clang fails succeeds | Any header with a warning | Q35 fixed 2026-10-07. Q34 designed, waiting for approval |
+| 2 | Q9: two copies of a header share a name | Wrong code, no diagnostic | One unguarded header twice in a compile, an outside declaration changed in between | Fixed 2026-10-07 |
+| 3 | Q11: `push_macro` and `pop_macro` | Wrong code, no diagnostic, in three of the four ways headers use them | No header compiled in the six projects uses them | Fix proposed |
+| 4 | Q10: the cache runs inside compiles that build a Clang module | Clang crashed | Only builds that use Clang modules | Fix proposed |
+| 5 | Q8: a name a copy refers to is looked up later than plain clang looks it up | Different but valid code; debug lines move | A declaration made again after the `#include` | Fix proposed |
+| 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects | Design change |
+| 7 | Q12: `__COUNTER__` | Nothing: such headers are not cached | No header in the six projects uses it | -- |
+| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | Not measured | Open |
 
-Checked and fine: parallel first builds. Eight compiles at a time sharing one
-daemon (`par_check.py`): git, curl and postgres have no failures and
-byte-identical objects; cpython differs only in the three Q7 columns and in
+Checked and fine: parallel first builds, 16 compiles at a time sharing one
+daemon (`par_check.py`), with the fixes below: no failures, and every object
+byte-identical to plain clang's except cpython's Q7 columns and
 `getbuildinfo.c`, which embeds the time it was compiled.
 
 ### Q34 and Q35: a header's diagnostics are lost on a hit
 
 **Mechanism.** Clang prints a warning while it parses the text that causes
 it. A hit skips the header's text, so its warnings never print. Clang's own
-modules behave the same way. Separately, the compile that reads a header as
-text writes its copy when the header ends, whether or not that compile has
-failed (Q35). A hard error marks the copy, and the reader refuses it later
-("module file ... contains compiler errors", printed as an extra error). A
-warning that `-Werror` turned into an error does not mark it.
+modules behave the same way.
 
-**Reproduced.** `w.h`: `static inline int w(int x) { int unused_local; return x; }`.
+**Reproduced** (`qtests/qw`). `w.h`: `static inline int w(int x) { int unused_local; return x; }`.
 
-| Flags | Plain clang on `b.c` | Served `b.c` |
+| Flags | Plain clang on `b.c` | `b.c` served `a.c`'s copy |
 |---|---|---|
 | `-Wall` | warning: unused variable `unused_local` | no warning |
 | `-Wall -Werror` | error, exit 1 | no diagnostic, exit 0 |
 
-Under `-Werror`, the first compile fails but writes the copy, and every
-later compile is served it and succeeds.
+**Q35, fixed 2026-10-07.** A compile that had a real error still wrote
+copies. Clang marks a module written after an error as holding errors, and a
+later compile offered it refused it with an error of its own, printed on top
+of the header's (`qtests/qe`). Now nothing is written after a real error. A
+warning that `-Werror` made an error is not one: Clang itself does not count
+it ("warnings which have been upgraded to errors do not prevent
+compilation"), and the header's declarations are what they would have been.
+Unit test: `ExportTest.ACompileWithAnErrorWritesNoPart`.
 
-**Fixes.** Q35: write nothing after an error, `-Werror` ones included
-(small). Q34: either never write a copy of a header that warned, or store the
-header's diagnostics in the metadata and print them again on a hit, as
-ccache replays a compile's output. Warnings depend on `-W` flags, so a stored
-copy would also have to match them.
+**Q34, design.** Your decision (2026-10-07): store the warnings, "for only
+flags that require printing out the error".
 
-### Q9: two copies of a header get one name
+1. **Collect.** In the compile that reads a header as text and writes its
+   copy, each warning Clang reports while the header is open is saved with
+   the copy: which warning, where, its text and its notes.
+2. **Print again.** At a hit, each saved warning is reported again through
+   the compile's own flags: `-Werror` makes it an error and fails the
+   compile, as plain clang does; `-w` hides it.
+3. **Match only on the flags that decide what prints.** A copy fits only a
+   compile in which the same warnings are on at that `#include`: the
+   command line's `-W` flags and any `#pragma GCC diagnostic` in force
+   there. `-Werror`, `-Wno-error=...` and formatting flags are not compared,
+   because step 2 applies them. Each of the six projects compiles with one
+   set of warning flags, except postgres (6 of 1,341 compiles use another)
+   and cpython (1 of 401); 7 `.c` files set a warning pragma before a later
+   `#include` (curl 4, cpython 3).
+4. A header that leaves a warning pragma in force for its includer is not
+   written, as a header that leaves `#pragma pack` pushed is not.
+
+Cost: a copy with no warnings stores nothing; a hit compares one number.
+
+### Q9: two copies of a header share a name (fixed 2026-10-07)
 
 **Mechanism.** A copy is named by a hash of its header, the compiler options
 and its metadata, taken before the outside declarations it refers to are
-added. Two copies that differ only in those declarations get one name. The
-daemon keeps both. Inside one compile, the hook remembers loaded copies by
-name, so an unguarded header such as `stddef.h` included twice reuses its
-first copy; with a collision, the second hit gets the wrong copy.
+known, so two copies that differ only in those share a name. Inside one
+compile the hook reuses a loaded copy by name, so an unguarded header
+included twice took its first copy again.
 
-**Reproduced.** Unguarded `h.h`: `extern __typeof__(f) *fp;`. `a.c` has
-`int f();` before it, `b.c` has `int f(int);`: two copies, one name. `c.c`
-includes `h.h` after `int f();` and again after `int f(int);`, then calls
-`fp(1.0f)`. Plain clang: the second include redeclares `fp` as
-`int (*)(int)` and the call passes the int 1. Served: the second hit reuses
-the first copy, `fp` stays unprototyped, and the call passes the double 1.0:
-the callee reads garbage. No diagnostic.
+**Reproduced** (`qtests/q9`). Unguarded `h.h`: `extern __typeof__(f) *fp;`.
+`a.c` has `int f();` before it, `b.c` has `int f(int);`: two copies, one
+name. `c.c` includes `h.h` after `int f();` and again after `int f(int);`,
+then calls `fp(1.0f)`. Plain clang: the second include declares `fp` again
+as `int (*)(int)`, and the call passes the int 1. Served: the second hit
+took the first copy again, `fp` kept no prototype, and the call passed the
+double 1.0, so the callee reads garbage. No diagnostic.
 
-**Seen.** 4 of 245 copies in the whole-redis build share a name (§4); no
-wrong code in the benchmarks.
+**Fix.** A name already loaded in the compile is reused only for the same
+copy (the same bytes); another copy under that name is passed over, and the
+header is read as text. Loading the second copy as well is not an option:
+Clang merges two copies' declarations only when they are the same, so there
+would be two `fp`'s, and a use of `fp` is "ambiguous" (tried: naming copies
+after their outside declarations led there). Plain clang reads the second
+include as text and makes its `fp` a redeclaration of the first, and so
+does the cache now. A header included again under other macros, as expat
+includes `xmltok_impl.c` three times, has copies of other names and is
+still served.
 
-**Fix.** Name a copy after its outside declarations are known (their
-fingerprints in the hash). Small.
+**Checked.** `c.c`'s object is identical to plain clang's. Unit tests:
+`ExportTest.ASecondCopyOfAHeaderIsNotTakenForTheFirst`,
+`ExportTest.AHeaderIncludedUnderTwoMacroStatesIsServedBothTimes`. Six first
+builds, 16 compiles at a time: no failures, and the rule passed over no
+copy. A first version that allowed one copy of a header per compile read
+63 fitting copies as text in the same builds (cpython 59, expat's
+`xmltok_impl.c` among them; git 3; postgres 1).
 
-### Q11: a header pops a macro its includer pushed
+### Q11: `push_macro` and `pop_macro`
 
-**Mechanism.** `#pragma push_macro("X")` saves X's definition on a stack;
-`#pragma pop_macro("X")` restores it. A header that pops X depends on what
-its includer pushed, but a hit compares only the macro state at the
-`#include`, never the stack. And `pop_macro` defines X without the callback
-the cache records effects from, so the restored X is not replayed either.
+**What they do.** `#pragma push_macro("X")` saves X's current definition on
+a stack kept for X; `#pragma pop_macro("X")` puts the saved definition back.
+The usual use: a header needs a name its includer may have defined as a
+macro, so it saves it, replaces it, and restores it at its end.
 
-**Reproduced.** `p.h`: `#pragma pop_macro("X")`, then
-`static inline int px(void) { return X; }`. `a.c` pushes `X` = 1 and sets
-`X` = 1; `b.c` pushes `X` = 5 and sets `X` = 1. Both have `X` = 1 at the
-`#include`, so `b.c` is served `a.c`'s copy. `b.c` returns `px() * 100 + X`:
-plain clang 505, served 140, with a new "ambiguous expansion" warning.
+```c
+// s.h
+#pragma push_macro("X")   // save the includer's X
+#undef X
+#define X 2               // the header's own X
+static inline int sx(void) { return X; }   // compiled as return 2
+#pragma pop_macro("X")    // the includer's X is back
+```
 
-**Seen.** No header in the six projects pops a value pushed outside it.
-`xxhash.h` pushes and pops its own, in a branch not compiled on x86.
+**What a served header must do.** What the text does: inside the header X is
+2; after it, X is whatever it was before.
 
-**Fixes.** Decline a header that uses `push_macro` or `pop_macro` (smallest;
-loses almost nothing), or record the stack as a dependency and a pop as an
-effect.
+**Tested: the four ways headers use them** (`qtests/q11*`).
 
-### Q10: the cache runs inside compiles that build a module
+| Use | Test | Plain clang | Served | Same? |
+|---|---|---|---|---|
+| A header saves, changes and restores X; the includer defines X. The usual use | `q11s`: `b.c` has `#define X 1`, includes `s.h`, returns `sx() * 10 + X` | 21 | 60 | No |
+| The same; the includer has no X | `q11u` | X undefined after | X undefined after | Yes |
+| One header saves and changes X, another restores it | `q11p`: `begin.h`, `end.h`; `b.c` has X = 5 | 25 | 60 | No |
+| A header restores what its includer saved | `q11`: `p.h` pops; `a.c` saved 1, `b.c` saved 5 | 505 | 140 | No |
 
-**Mechanism.** A compile that builds a Clang module (`-emit-module`, or one
-Clang starts to build a module implicitly) looks like any other compile to
-the hook. It writes copies there and serves them to later module builds.
-`__building_module(M)` in an `#if` is not recorded either.
+**Why.** A copy keeps, for each macro the header touched, the state the
+header left it in, as a definition the copy holds. After `pop_macro`, that
+state is the includer's own definition: `#define X 1`, written in `a.c`. The
+copy does not hold `a.c`, so the token `1` loses its place, and the served
+compile reads garbage where its text was: X expands to 40 in all three
+wrong rows (60 = 2 × 10 + 40; 140 = 1 × 100 + 40). The last two rows have a
+second problem: what `pop_macro` restores comes from a stack its includer
+filled, and a hit never compares that stack.
 
-**Reproduced.** A module whose one header tests `__building_module(M)`, built
-three times through the cache: the second build wrote a copy, and the third
-was served it and crashed (segmentation fault, "malformed or corrupted
-precompiled file: 'too many submodules'"). An ordinary compile was not
-served the module build's copy: the reader refused it.
+**Fix proposed.**
 
-**Fix.** The hook does nothing in a compile that builds a module. Small.
+1. A macro that ends the header as it began (the same definition, or
+   undefined both times) is no effect of the header: nothing is replayed for
+   it, and the copy holds no definition of it. This fixes the usual use and
+   costs nothing at a hit.
+2. A copy never holds a definition written outside it.
+3. Rows 3 and 4, a push left on the stack at the header's end or a pop of
+   what was pushed before the header: either decline the header, as the
+   cache already declines one that leaves `#pragma pack` pushed, or record
+   pushes and pops as two more kinds of effect, and the definition a header
+   pops from outside as a dependency, compared at the `#include` like any
+   other macro. Either costs nothing for headers that do not use the
+   pragmas.
 
-### Q8: an outside declaration is resolved when first needed
+**Seen.** No header compiled in the six projects uses them. `xxhash.h` does,
+in a branch not compiled on x86, and so does readline.
 
-**Mechanism.** A copy refers to a declaration its includer already had, such
-as `fatal` declared in the `.c` file before the `#include`, by name. The
-loading compile resolves the name lazily, when the code using it is first
-needed, often at the end of the translation unit. By then the name finds its
-latest redeclaration, which may come after the `#include`. Plain clang bound
-the reference where the header was parsed.
+### Q10: the cache runs inside compiles that build a Clang module
 
-**Reproduced.** `b.c`: `void fatal(const char *);`, then `#include "h.h"`
-(whose `static inline int check(int)` calls `fatal`), then
-`_Noreturn void fatal(const char *);`. Served: the call is `noreturn` and the
-code after it is unreachable. Plain clang: an ordinary call. In the same run,
-a typedef redeclared after the header moved `size_t`'s debug line from 1 to
-5, which is redis's `config.c` difference.
+**What a Clang module is.** Clang has a feature of its own called modules,
+separate from this cache. A library lists its headers in a file called a
+module map. With `-fmodules`, the first time a compile includes one of those
+headers, Clang compiles all of them once, in a compile of their own -- a
+*module build* -- and saves the result as a `.pcm` file. Later includes of
+those headers load the `.pcm` instead of reading the text. Our copies use
+the same file format, but they are a different thing: a copy holds one
+header as one compile parsed it; a Clang module holds a whole library and is
+made by a compile of its own.
 
-**Is it wrong?** The extra facts come from the program's own later
-declarations, so the code stays valid for a correct program. But objects
-differ from plain clang's and debug lines move.
+**Who uses them in C.** Builds that pass `-fmodules` and have module maps:
+mostly Apple platforms, whose system headers come with module maps, and
+Objective-C projects. Clang's own headers (`stddef.h`, `stdarg.h`, ...) come
+with a module map too, so any compile with `-fmodules` builds those as
+modules unless `-fno-implicit-module-maps` is given.
 
-**Fix.** Use, for each name, the declaration the hit's check already looked
-up at the `#include` (the check finds every outside declaration a copy
-needs, to compare fingerprints). That pins what plain clang would have
-bound, and costs no lookup of its own: the lazy resolutions it replaces take
-about 0.5 us each, at most 0.03 s per project.
+**What goes wrong.** The hook runs in every compile Clang runs, module builds
+included, and treats a module build like any other compile: it saves copies
+of the library's headers and serves them to later module builds. A module
+build that is served a copy writes a Clang module built from our copy
+instead of from the headers' text, which Clang's module writer was not made
+for.
+
+**Reproduced** (`qtests/q10`). A library of one header, built as a Clang
+module three times through the cache (`clang -cc1 -emit-module`): the first
+build timed the header, the second saved a copy of it, and the third was
+served that copy and crashed (segmentation fault; "malformed or corrupted
+precompiled file: 'too many submodules'"). An ordinary compile including
+the header was not served the module build's copy.
+
+**Not seen in our runs.** The scripts pass `-fno-implicit-module-maps`, and
+none of the six projects uses Clang modules.
+
+**Fix proposed.** The hook does nothing in a module build. A module build
+runs once per library, so nothing is lost.
+
+### Q8: a name a copy refers to is looked up later than plain clang looks it up
+
+**What `_Noreturn` means.** In C11, `_Noreturn` on a function declaration
+promises that the function never returns to its caller, as `exit()` never
+does. The compiler relies on the promise: after a call to such a function,
+it deletes the code that would run next.
+
+**C lets a function be declared again, and a later declaration can add a
+fact.** The test (`qtests/q8`):
+
+```c
+// b.c
+void fatal(const char *msg);            // line 2: an ordinary function
+#include "h.h"                          // line 3
+_Noreturn void fatal(const char *msg);  // line 4: the same function, now promised never to return
+int use_b(int x) { return check(x) + 1; }
+
+// h.h
+static inline int check(int x) {
+  if (x < 0)
+    fatal("negative");
+  return x * 2;
+}
+```
+
+**Plain clang** reads `h.h` at line 3. At `fatal("negative")` it connects
+the call to the `fatal` it knows then, line 2's. The machine code for
+`check` calls `fatal` and then carries on.
+
+**A served compile.** `h.h`'s copy cannot hold `fatal`'s declaration, which
+belongs to `b.c`, so it holds the name `fatal` and finds it in the compile
+that loads it. It does so when it first needs `check`'s body: when `b.c`
+generates machine code, after line 4. So it finds line 4's `_Noreturn`
+declaration, and the machine code for `check` calls `fatal` and stops there:
+the compiler deleted what came after the call.
+
+**Is it wrong?** Not for a correct program: if `fatal` returned, `b.c` would
+have broken its own promise, which C leaves undefined anyway. But the object
+differs from plain clang's. The same thing moves debug information: in the
+same test, `size_t` is declared again after the `#include` (lines 1 and 5),
+and a served compile's debug information names line 5 where plain clang's
+names line 1. That is how redis's `config.c` differed from plain clang.
+
+**Fix proposed.** To check that a copy fits, the cache already looks up
+every name the copy refers to, at the `#include` (here `fatal` at line 3,
+finding line 2's declaration). Keep those results and connect the copy's
+names to them instead of looking the names up again later. The later lookups
+it replaces cost about 0.5 us each, at most 0.03 s per project.
 
 ### Q7: a column inside a macro argument
 
@@ -209,6 +322,32 @@ keep their spelling. A design change.
 Not a correctness problem now: a header that uses `__COUNTER__` is never
 saved. None of the six projects' headers uses it; in `/usr/include` only
 glib's `gmacros.h` does. It matters for qemu and the Linux kernel (§2.7).
+
+### Q36: a copy assumes the names it declares are new (found 2026-10-07)
+
+**Mechanism.** A copy's own declarations were new where it was written. A
+compile served it may already have a declaration of the same name, from its
+`.c` file or another header. Clang merges the two when they are the same,
+the usual case. When they differ in a way C allows, plain clang makes the
+header's a redeclaration of the earlier one, and may warn; a served compile
+does neither.
+
+**Reproduced.** `x.h`: `int g();` and `extern int (*fp)();`. `y.h`:
+`int g(int);` and `extern int (*fp)(int);`. `a.c` includes only `y.h` and
+writes its copy; `b.c` includes `x.h`, then `y.h`, and is served `y.h`'s
+copy.
+
+| Test | Plain clang on `b.c` | Served |
+|---|---|---|
+| `qtests/q9b`, the function `g` only | warning: `g` without a prototype conflicts with a later declaration | no warning; code identical |
+| `qtests/q9c`, the variable `fp` too | compiles | error: reference to `fp` is ambiguous |
+
+**How often.** No failure in the six projects. It needs two declarations of
+one name that differ but are compatible, one of them inside a copy.
+
+**Fix (idea).** Record the names a copy declares and check at a hit that the
+compile has no declaration of them yet. Each such lookup searches every
+loaded copy now, so this is affordable only after I1 (one name index).
 
 ## 3. Optimizations ranked by what they could remove
 
@@ -248,6 +387,26 @@ Notes on the top three:
   among the loaded copies. The rare effect that does change something -- an
   `#undef` of a macro the includer defined, or a name another loaded copy
   also defines -- has to be found by a test cheaper than the lookup.
+  Where replay's time goes, six first builds, untimed:
+
+  | Replay | Seconds |
+  |---|---|
+  | All of it: 19,002 hits, about 876 effects each | 34.65 |
+  | Finding each effect's name | 29.18 |
+  | Updating the macro table | 1.06 |
+  | The rest: the loop, refreshing names, finding the copy's macro | 4.41 |
+
+  Your proposal (2026-10-07): replay as a small loop that switches on a
+  compact list and writes the macro table directly, each definition decoded
+  when its name is first used. The loop exists already
+  (`replayMacroEffects`); what costs is finding each name, because Clang
+  builds a name's entry from every loaded copy the first time anything asks
+  for it. Two ways not to ask: (a) at export, mark the effects that loading
+  the copy already applies, and replay only the rest; (b) your design, T8's
+  option B: the definitions in our metadata, written into the table through
+  a lookup of the compile's own table only. Both remove nearly all of the
+  34.65 s. (b) also turns `push_macro` and `pop_macro` (Q11) into two more
+  cases of the loop, and is the larger change.
 - **I5.** Of what the writer visits for each copy, 98% to 99.6% of the
   source-location entries and 82% to 98% of the macros belong to other
   headers. A copy's own range is known when the header ends.
@@ -397,25 +556,36 @@ Explained and ranked in section 2; each fix is approved one at a time.
    it).
 7. **Q7. A column inside a macro argument** (section 2, rank 6). Fix is a
    design change: keep dropped files as stand-ins.
-8. **Q8. Outside names resolved late** (rank 5). Reproduced in code, not
-   only debug information. Fix: use the declarations the hit's check found.
-9. **Q9. Two copies get one name** (rank 2). Reproduced as wrong code. Fix:
-   name a copy after its outside declarations are known.
-10. **Q10. Module builds** (rank 4). Reproduced as a crash. Fix: the hook
-    does nothing in a compile that builds a module.
-11. **Q11. `pop_macro`** (rank 3). Reproduced as wrong code. Fix: decline
-    a header that uses `push_macro` or `pop_macro`, or record the stack.
+8. **Q8. A name looked up later than plain clang looks it up** (rank 5).
+   Explained again with the test. Fix proposed: keep the declarations the
+   hit's check found at the `#include`. Approve?
+9. **Q9. Two copies share a name** (rank 2). Fixed 2026-10-07: another copy
+   under a name already loaded is passed over and the header read as text.
+   Naming copies after their outside declarations was tried first: it
+   turned the wrong code into a compile error (two `fp`'s).
+10. **Q10. Module builds** (rank 4). Explained again: what a Clang module
+    is. Fix proposed: the hook does nothing in a module build. Approve?
+11. **Q11. `push_macro` and `pop_macro`** (rank 3). The usual use -- a
+    header saves, changes and restores a macro -- is wrong code too (new).
+    Fix proposed: a macro that ends the header as it began is no effect,
+    and a copy never holds a definition written outside it. For the split
+    uses: decline, or record pushes and pops? Approve 1 and 2, and choose
+    for 3.
 12. **Q12. `__COUNTER__`.** Not a problem in the six projects: none of their
     headers uses it.
-34. **Q34. A served header's warnings are lost** (rank 1, new). Fix: never
-    save a header that warned, or store its diagnostics and print them
-    again at a hit.
-35. **Q35. A compile with errors still writes copies** (rank 1, new). Fix:
-    write nothing after an error. Small; fixes the `-Werror` outcome.
+34. **Q34. A served header's warnings are lost** (rank 1). Your decision:
+    store them. Design in section 2, matching only on which warnings are
+    on. Approve?
+35. **Q35. A compile with errors still writes copies** (rank 1). Fixed
+    2026-10-07: nothing is written after a real error.
+36. **Q36. A copy assumes the names it declares are new** (new). A lost
+    warning, or for a variable a compile error. Measure how often, or wait
+    for I1?
 
 ### C. Proposals waiting for approval
 
-13. **Q13. Macro option B** (T8). The largest single overhead in git.
+13. **Q13. Macro option B** (T8), your replay design (section 3.1, I8).
+    Build (a) now as I8 and your design later as T8, or your design now?
 14. **Q14. The eager-names experiment** (I11). Done: no gain (section 3.1).
     Close.
 15. **Q15. The check at the `#define`** (T9). Its value depends on Q26.
