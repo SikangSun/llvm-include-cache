@@ -314,6 +314,10 @@ public:
        << " __FILE__, " << Step(CheckCost::FileStamps) << " file stamps ("
        << C.FilesCompared << " compared), " << Step(CheckCost::Declarations)
        << " declarations\n";
+    if (OtherCopySameName)
+      OS << "  fitting copies passed over, another copy of the same name "
+            "loaded: "
+         << OtherCopySameName << "\n";
     if (EffectsWithoutDefinition)
       OS << "  macro effects without a definition in the module: "
          << EffectsWithoutDefinition << "\n";
@@ -613,9 +617,25 @@ private:
     // same name is a fatal error, and the first already holds the same
     // declarations, so the hit only needs them visible again and the effects
     // replayed.
+    //
+    // Another copy can have the same name: a name is taken before the outside
+    // declarations a copy refers to are known, so two copies of a header
+    // that differ only in those share it. Such a copy is not the loaded one.
+    // In `int f(); #include "h.h" int f(int); #include "h.h"`, with h.h
+    // `extern __typeof__(f) *fp;`, the loaded copy's fp has no prototype and
+    // the second copy's has f(int)'s; taking the first again leaves fp
+    // without one (REPORT.md Q9). Loading the second too would declare a
+    // second fp, since Clang merges two copies' declarations only when they
+    // are the same. Plain clang reads the second include as text, which
+    // makes its fp a redeclaration of the first, and so does this compile.
     auto Known = LoadedTargets.find(ModuleName);
-    if (Known != LoadedTargets.end())
-      return Known->second;
+    if (Known != LoadedTargets.end()) {
+      if (Known->second.Bytes.data() == Bytes.data() ||
+          Known->second.Bytes == Bytes)
+        return Known->second.Target;
+      ++OtherCopySameName;
+      return nullptr;
+    }
 
     if (!CI.getASTReader())
       CI.createASTReader();
@@ -651,7 +671,7 @@ private:
     Module *Target = Top->findSubmodule(TargetSubmoduleName);
     if (!Target)
       Target = Top;
-    LoadedTargets[MF->ModuleName] = Target;
+    LoadedTargets[MF->ModuleName] = {Target, Bytes};
     return Target;
   }
 
@@ -659,8 +679,16 @@ private:
   std::unique_ptr<CacheClient> Client;
   /// Only to give each loaded entry a name of its own.
   unsigned Loaded = 0;
-  /// Each saved copy loaded so far, by module name, for a hit on it again.
-  llvm::StringMap<Module *> LoadedTargets;
+  /// Each saved copy loaded so far, by module name, for a hit on it again:
+  /// the submodule served and the bytes it was read from.
+  struct LoadedCopy {
+    Module *Target;
+    llvm::StringRef Bytes;
+  };
+  llvm::StringMap<LoadedCopy> LoadedTargets;
+  /// Fitting copies passed over because another copy of the same name was
+  /// loaded (see load).
+  unsigned OtherCopySameName = 0;
   /// Each hit's header and module, for CLANG_HEADER_CACHE_STATS=2: which
   /// copy a compile used is what a failure after a hit needs traced to.
   bool LogServed;

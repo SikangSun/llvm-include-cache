@@ -315,6 +315,12 @@ private:
   void write(Part &P) {
     if (!P.Decline.empty())
       return decline(P, P.Decline);
+    // After an error nothing is written: Clang marks a module written then as
+    // holding errors, and a compile offered it refuses it with an error of
+    // its own (REPORT.md Q35). A warning that -Werror made an error is not
+    // one here, as for Clang: the declarations are what they would have been.
+    if (CI.getDiagnostics().hasUncompilableErrorOccurred())
+      return decline(P, "the compile has an error");
     const HeaderDependencySet *Rec = Tracker.recordFor(P.FID);
     if (!Rec)
       return decline(P, "the dependency tracker could not describe it");

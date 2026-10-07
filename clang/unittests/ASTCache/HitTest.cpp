@@ -1471,3 +1471,59 @@ TEST_F(ExportTest, APartIsNotServedUnderAnotherName) {
   ASSERT_GE(Daemon->stats().Entries, 1u) << "use.h was not exported";
   EXPECT_TRUE(reads(Abs, Use)) << "a part holding ./use.h served /.../use.h";
 }
+
+TEST_F(ExportTest, ASecondCopyOfAHeaderIsNotTakenForTheFirst) {
+  // h.h is unguarded and refers to f, declared outside it, by name. a.c's
+  // part has f without a prototype, b.c's has f(int), and nothing else tells
+  // them apart, so they share a name. c.c includes h.h after each
+  // declaration. Taking a.c's part again would leave fp without a
+  // prototype; loading b.c's too would declare a second fp. c.c reads h.h
+  // the second time, and its fp has f(int)'s prototype.
+  std::string H = write("h.h", "extern __typeof__(f) *fp;\n");
+  std::string A = write("a.c", "int f();\n#include \"" + H + "\"\n");
+  std::string B = write("b.c", "int f(int);\n#include \"" + H + "\"\n");
+  std::string C = write(
+      "c.c",
+      "int f();\n#include \"" + H + "\"\nint f(int);\n#include \"" + H +
+          "\"\n_Static_assert(!__builtin_types_compatible_p("
+          "__typeof__(fp), int (*)(double)), \"fp has no prototype\");\n");
+  EXPECT_TRUE(reads(A, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, H)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(B, H)) << "a.c's part fits b.c";
+  ASSERT_EQ(Daemon->stats().Entries, 2u) << "h.h was not exported twice";
+  EXPECT_TRUE(reads(C, H)) << "c.c was served both parts";
+}
+
+TEST_F(ExportTest, ACompileWithAnErrorWritesNoPart) {
+  // e.h does not compile. A part written after the error would be marked as
+  // holding errors, and the next compile offered it would refuse it with an
+  // error of its own, on top of e.h's.
+  std::string E = write("e.h", "#ifndef E_H\n#define E_H\n"
+                               "static inline int broken(void) {\n"
+                               "  return undeclared;\n}\n"
+                               "int fine(int x);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + E +
+                                   "\"\nint a(int x) { return fine(x); }\n");
+  std::set<std::string> Entered;
+  EXPECT_FALSE(compile(A, Entered)) << "e.h compiled";
+  EXPECT_FALSE(compile(A, Entered)) << "e.h compiled";
+  EXPECT_TRUE(Entered.count(E)) << "e.h was not read";
+  EXPECT_EQ(Daemon->stats().Entries, 0u) << "a part was written after an error";
+}
+
+TEST_F(ExportTest, AHeaderIncludedUnderTwoMacroStatesIsServedBothTimes) {
+  // name.h is included twice, as expat includes xmltok_impl.c three times,
+  // each time declaring other names. Its two parts have names of their own,
+  // and both are served in one compile.
+  std::string Name = write("name.h", "int NAME(void);\n");
+  std::string A = write("a.c", "#define NAME first\n#include \"" + Name +
+                                   "\"\n#undef NAME\n#define NAME second\n"
+                                   "#include \"" +
+                                   Name +
+                                   "\"\nint f(void) { return first() + "
+                                   "second(); }\n");
+  EXPECT_TRUE(reads(A, Name)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Name)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 2u) << "name.h was not exported twice";
+  EXPECT_FALSE(reads(A, Name)) << "a part of name.h was not served";
+}
