@@ -289,7 +289,12 @@ public:
                     bool LogServed, WarningPragmaTracker &Pragmas)
       : CI(CI), Client(std::move(Client)), LogServed(LogServed),
         Pragmas(Pragmas),
-        WarningFlags(warningFlagsHash(CI.getDiagnosticOpts())) {}
+        WarningFlags(warningFlagsHash(CI.getDiagnosticOpts())) {
+    // For measuring what skipping saves: CLANG_HEADER_CACHE_REPLAY_ALL=1
+    // replays every effect, as before it (REPORT.md I8).
+    const char *All = std::getenv("CLANG_HEADER_CACHE_REPLAY_ALL");
+    ReplayAll = All && llvm::StringRef(All) == "1";
+  }
 
   void report(llvm::raw_ostream &OS) const {
     const CacheClient::Stats &S = Client->stats();
@@ -324,6 +329,8 @@ public:
     if (DiagnosticsReplayed)
       OS << "  diagnostics printed again from copies: " << DiagnosticsReplayed
          << "\n";
+    OS << "  macro effects replayed: " << EffectsReplayed
+       << ", skipped: " << EffectsSkipped << "\n";
     if (EffectsWithoutDefinition)
       OS << "  macro effects without a definition in the module: "
          << EffectsWithoutDefinition << "\n";
@@ -604,10 +611,34 @@ private:
   /// include: the header's #undef of a macro the includer defined takes
   /// effect, and of two loaded headers that define one name, the later wins.
   /// A definition is the loaded module's own, not a copy made from text.
+  ///
+  /// Most effects need nothing: loading the copy made its macros visible,
+  /// and the visible definition is the only one. Finding the name for each,
+  /// which searches every loaded copy's table, was most of a hit's cost
+  /// (REPORT.md I8). An effect is skipped when this compile has never seen
+  /// its name and no earlier copy touched it. The first use of the name then
+  /// finds it, the copy's definition with it, in every loaded copy.
+  ///
+  /// A name the compile has seen is replayed: loading a copy marks every
+  /// name already seen as out of date, and some readers of a macro do not
+  /// bring one up to date -- the check that skips an #include whose guard
+  /// macro is defined, #pragma push_macro. Another precompiled file -- a
+  /// PCH -- may hold directives of its own, so with one loaded every effect
+  /// is replayed.
   void replayMacroEffects(llvm::ArrayRef<MacroEffect> Effects, Module &Target,
                           SourceLocation Loc) {
     Preprocessor &PP = CI.getPreprocessor();
+    IdentifierTable &Idents = PP.getIdentifierTable();
+    bool OnlyCopies =
+        !ReplayAll &&
+        CI.getASTReader()->getModuleManager().size() == CopiesLoaded;
     for (const MacroEffect &E : Effects) {
+      bool Earlier = !TouchedByCopies.insert(llvm::xxh3_64bits(E.Name)).second;
+      if (OnlyCopies && !Earlier && Idents.find(E.Name) == Idents.end()) {
+        ++EffectsSkipped;
+        continue;
+      }
+      ++EffectsReplayed;
       IdentifierInfo *II = PP.getIdentifierInfo(E.Name);
       // Loads the module's macros for this name, if the name existed before
       // the load and is now out of date.
@@ -741,6 +772,7 @@ private:
     if (!Target)
       Target = Top;
     LoadedTargets[MF->ModuleName] = {Target, Bytes, MF, /*Fresh=*/true};
+    ++CopiesLoaded;
     return Target;
   }
 
@@ -748,6 +780,8 @@ private:
   std::unique_ptr<CacheClient> Client;
   /// Only to give each loaded entry a name of its own.
   unsigned Loaded = 0;
+  /// Copies the module reader accepted.
+  unsigned CopiesLoaded = 0;
   /// Each saved copy loaded so far, by module name, for a hit on it again:
   /// the submodule served and the bytes it was read from.
   struct LoadedCopy {
@@ -768,6 +802,10 @@ private:
   WarningPragmaTracker &Pragmas;
   uint64_t WarningFlags;
   unsigned DiagnosticsReplayed = 0;
+  /// Hashes of every name a loaded copy's macro effects touched.
+  llvm::DenseSet<uint64_t> TouchedByCopies;
+  unsigned EffectsReplayed = 0, EffectsSkipped = 0;
+  bool ReplayAll = false;
   /// Each hit's header and module, for CLANG_HEADER_CACHE_STATS=2: which
   /// copy a compile used is what a failure after a hit needs traced to.
   bool LogServed;
