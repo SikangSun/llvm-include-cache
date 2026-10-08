@@ -1,7 +1,8 @@
 # Header cache: correctness, optimizations and open questions
 
 Written 2026-10-07 and updated the same evening, to work from on
-2026-10-08; updated again after your answers (Q8 to Q11, Q34, I8). The correctness problems explained and ranked (section 2), every
+2026-10-08; updated again after your answers (Q8 to Q11, Q34, I8), and on 2026-10-08
+after building Q8, Q10, Q34 and I8. The correctness problems explained and ranked (section 2), every
 optimization ranked by the time it could remove, measured (section 3),
 sorted into techniques and implementation fixes (section 4), the proposed
 switches for ablation (section 5), and every open question (section 6).
@@ -44,7 +45,8 @@ others (Q24).
 Correctness: no compile fails; every object is byte-identical to plain
 clang's except three cpython objects, which differ in one debug-line column
 each (Q7). The three fixes behind this are pushed to the fork (`3716d1a71`),
-and so are the fixes for Q35 and Q9 (section 2). Section 2 lists what the
+and so are the fixes for Q35, Q9, Q10, Q8 and Q34 (section 2) and the
+first implementation fix, I8 (section 3.1). Section 2 lists what the
 benchmarks do not reach.
 
 **The ceiling** (§2.25). If every hit cost nothing and every header were
@@ -68,14 +70,14 @@ much they change and how often they can happen.
 
 | Rank | Problem | What changes | How often | Status |
 |---|---|---|---|---|
-| 1 | Q34, Q35: a header's diagnostics are lost on a hit | Warnings disappear; under `-Werror` a compile plain clang fails succeeds | Any header with a warning | Q35 fixed 2026-10-07. Q34 designed, waiting for approval |
+| 1 | Q34, Q35: a header's diagnostics are lost on a hit | Warnings disappear; under `-Werror` a compile plain clang fails succeeds | Any header with a warning | Fixed 2026-10-07 (Q35) and 2026-10-08 (Q34) |
 | 2 | Q9: two copies of a header share a name | Wrong code, no diagnostic | One unguarded header twice in a compile, an outside declaration changed in between | Fixed 2026-10-07 |
 | 3 | Q11: `push_macro` and `pop_macro` | Wrong code, no diagnostic, in three of the four ways headers use them | No header compiled in the six projects uses them | Fix proposed |
-| 4 | Q10: the cache runs inside compiles that build a Clang module | Clang crashed | Only builds that use Clang modules | Fix proposed |
-| 5 | Q8: a name a copy refers to is looked up later than plain clang looks it up | Different but valid code; debug lines move | A declaration made again after the `#include` | Fix proposed |
+| 4 | Q10: the cache runs inside compiles that build a Clang module or a precompiled header | Clang crashed; a compile using the precompiled header failed | Only builds that use Clang modules or precompiled headers | Fixed 2026-10-08 |
+| 5 | Q8: a name a copy refers to is looked up later than plain clang looks it up | Different but valid code; debug lines move | A declaration made again after the `#include` | Fixed 2026-10-08 |
 | 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects | Design change |
 | 7 | Q12: `__COUNTER__` | Nothing: such headers are not cached | No header in the six projects uses it | -- |
-| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | Not measured | Open |
+| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | None in the six projects | Open: the fix is not cheap before I1 |
 
 Checked and fine: parallel first builds, 16 compiles at a time sharing one
 daemon (`par_check.py`), with the fixes below: no failures, and every object
@@ -104,27 +106,41 @@ it ("warnings which have been upgraded to errors do not prevent
 compilation"), and the header's declarations are what they would have been.
 Unit test: `ExportTest.ACompileWithAnErrorWritesNoPart`.
 
-**Q34, design.** Your decision (2026-10-07): store the warnings, "for only
-flags that require printing out the error".
+**Q34, fixed 2026-10-08.** Your decision: store the error strings, and
+print them where the flags require it.
 
-1. **Collect.** In the compile that reads a header as text and writes its
-   copy, each warning Clang reports while the header is open is saved with
-   the copy: which warning, where, its text and its notes.
-2. **Print again.** At a hit, each saved warning is reported again through
-   the compile's own flags: `-Werror` makes it an error and fails the
-   compile, as plain clang does; `-w` hides it.
-3. **Match only on the flags that decide what prints.** A copy fits only a
-   compile in which the same warnings are on at that `#include`: the
-   command line's `-W` flags and any `#pragma GCC diagnostic` in force
-   there. `-Werror`, `-Wno-error=...` and formatting flags are not compared,
-   because step 2 applies them. Each of the six projects compiles with one
-   set of warning flags, except postgres (6 of 1,341 compiles use another)
-   and cpython (1 of 401); 7 `.c` files set a warning pragma before a later
-   `#include` (curl 4, cpython 3).
-4. A header that leaves a warning pragma in force for its includer is not
-   written, as a header that leaves `#pragma pack` pushed is not.
+1. **Saved.** The compile that reads a header as text and writes its copy
+   saves each diagnostic Clang prints about the header: its text, its kind,
+   its place in the header, its notes, ranges and fix-its.
+2. **Printed again.** At a hit the saved diagnostics are printed again, as
+   the compile that wrote the copy printed them: warnings as warnings,
+   warnings `-Werror` made errors as errors, which fail the compile.
+3. **Only where the flags require the same.** A copy is served only where
+   the warning flags (`-W...`, `-w`, `-pedantic`) and the warning pragmas in
+   force (`#pragma GCC diagnostic ...`) are the ones it was written under.
+   Under other flags the header would print other warnings, so the copy is
+   passed over and the header read as text. Each of the six projects
+   compiles with one set of warning flags, except postgres (6 of 1,341
+   compiles) and cpython (1 of 401).
+4. **Pragmas a header leaves.** git's `git-compat-util.h` turns off
+   `-Wsign-compare` for the rest of the compile with an unpaired
+   `#pragma GCC diagnostic ignored`. Its copy records that pragma, and a hit
+   applies it at the `#include`, as the text would. A header that leaves a
+   pragma pushed, or prints a diagnostic about a place outside it, is not
+   written.
 
-Cost: a copy with no warnings stores nothing; a hit compares one number.
+| Check (2026-10-08) | Plain clang | Served |
+|---|---|---|
+| `qtests/qw`, `-Wall` | warning: unused variable `unused_local` | the same warning; stderr identical, "In file included from" line included |
+| `qtests/qw`, `-Wall -Werror` | error, exit 1 | the same error, exit 1 |
+| Six first builds, 16 compiles at a time | -- | no failures; objects identical except cpython's known Q7 columns and `getbuildinfo.c` |
+
+Unit tests: `ExportTest.AServedHeaderPrintsItsWarningAgain`,
+`UnderWerrorAServedHeaderWithAWarningFailsTheCompile`,
+`ACopyIsNotServedUnderOtherWarningFlags`,
+`NotServedWhereAWarningPragmaIsInForce`,
+`AHeaderLeavingAWarningPragmaInForceIsServedWithIt`,
+`AHeaderLeavingAWarningPragmaPushedIsNotWritten`.
 
 ### Q9: two copies of a header share a name (fixed 2026-10-07)
 
@@ -163,58 +179,240 @@ copy. A first version that allowed one copy of a header per compile read
 
 ### Q11: `push_macro` and `pop_macro`
 
-**What they do.** `#pragma push_macro("X")` saves X's current definition on
-a stack kept for X; `#pragma pop_macro("X")` puts the saved definition back.
-The usual use: a header needs a name its includer may have defined as a
-macro, so it saves it, replaces it, and restores it at its end.
+Explained again 2026-10-08, by another model, on request.
 
-```c
-// s.h
-#pragma push_macro("X")   // save the includer's X
-#undef X
-#define X 2               // the header's own X
-static inline int sx(void) { return X; }   // compiled as return 2
-#pragma pop_macro("X")    // the includer's X is back
+**Result.** In three of four tests, b.c is served the copy and returns a different number than plain clang: q11s 60 (plain clang: 21), q11p 60 (25), q11 140 (505); q11u agrees. Cause 1: the copy holds a definition of X written in a.c, and b.c reads that definition as 40; in q11s, X is `1` before `#include "s.h"` at b.c:2 and 40 after. Cause 2, in q11p and q11: the push is in one file, the pop is in another, and the copy holds neither, so even a readable definition would make X `1` (a.c's) after the `#include` in b.c, where plain clang has `5` (b.c's own).
+
+#### 1. What the two pragmas do
+
+`#pragma push_macro("X")` puts X's current definition on a stack kept for X. `#pragma pop_macro("X")` takes the top definition off that stack and makes it X's definition. Example, a file ex.c:
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| ex.c:1 | `#define X 1` | undefined → 1 | defines X |
+| ex.c:2 | `#pragma push_macro("X")` | 1 → 1 | puts `1` on X's stack; X is still 1 |
+| ex.c:3 | `#undef X` | 1 → undefined | undefines X |
+| ex.c:4 | `#define X 2` | undefined → 2 | defines X |
+| ex.c:5 | `#pragma pop_macro("X")` | 2 → 1 | takes `1` off X's stack and makes it X's definition |
+| ex.c:6 | `int v = X;` | 1 → 1 | v is 1 |
+
+The stack is kept while clang reads one .c file and every header it includes. So a push in one file can meet its pop in another (q11p, q11).
+
+#### 2. Terms
+
+- **Plain clang**: clang run on b.c with the cache off. Its answer is the correct one.
+- **a.c's compile**: clang run on a.c with the cache on, first. The cache reads each header's text and writes one copy per header.
+- **b.c's compile**: clang run on b.c with the cache on, next. At an `#include`, the cache loads the header's copy instead of reading the header's text. Then b.c is **served** the copy.
+- **Copy** of one header (s.h, begin.h, end.h or p.h): the declarations with every macro already expanded (sx() is stored as `return 2;`), plus, for each macro that the header's text defines or pops, the definition the macro has when the header's text ends.
+- **Macro list**: inside the copy, the macros that the header's text `#define`s or `#undef`s. When b.c's compile loads the copy, the cache **replays** the list: it defines each macro on the list as the copy's definition, or undefines the macro.
+- **Metadata**: inside the copy, the assumptions the copy needs, such as "X is `1` at the `#include`". The cache compares the metadata with b.c before serving b.c.
+- **Notation**: `s.h:7` is line 7 of s.h. `1 (a.c:1)` is X defined as 1 by the line a.c:1. `40 (copy)` is X defined as 40 by a loaded copy. "X before → after" is X's state before and after the line runs.
+
+#### 3. q11s: s.h pushes X, defines its own X, pops X; b.c defines X
+
+**Plain clang on b.c.**
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| b.c:1 | `#define X 1` | undefined → 1 (b.c:1) | defines X |
+| b.c:2 | `#include "s.h"` | 1 → 1 | clang enters s.h |
+| s.h:1-2 | `#ifndef S_H` `#define S_H` | 1 → 1 | include guard; X is not involved |
+| s.h:3 | `#pragma push_macro("X")` | 1 → 1 | puts `1 (b.c:1)` on X's stack |
+| s.h:4 | `#undef X` | 1 → undefined | undefines X |
+| s.h:5 | `#define X 2` | undefined → 2 (s.h:5) | defines X |
+| s.h:6 | `static inline int sx(void) { return X; }` | 2 → 2 | X expands to 2: sx() is `return 2;` |
+| s.h:7 | `#pragma pop_macro("X")` | 2 (s.h:5) → 1 (b.c:1) | takes `1 (b.c:1)` off X's stack and makes it X's definition |
+| s.h:8 | `#endif` | 1 → 1 | end of s.h |
+| b.c:3 | `int b(void) { return sx() * 10 + X; }` | 1 → 1 | sx() is 2, X is 1: 2 * 10 + 1 = **21** |
+
+**The cache: a.c's compile writes the copy.** The lines of a.c are the lines of b.c (the function is named a). So the table above applies with a.c:1 in place of b.c:1. At s.h:7, X goes from `2 (s.h:5)` to `1 (a.c:1)`. At the end of s.h, a.c's compile writes:
+
+```
+copy of s.h
+  declarations    : sx(), whose body is `return 2;`
+  macro list      : S_H, X   (both defined when s.h ends)
+  definition of X : `1`   <- written at a.c:1, outside s.h
 ```
 
-**What a served header must do.** What the text does: inside the header X is
-2; after it, X is whatever it was before.
+The copy holds s.h's text only, not a.c's. So the copy cannot store where the token `1` was written, and the token's text cannot be read back.
 
-**Tested: the four ways headers use them** (`qtests/q11*`).
+**The cache: b.c's compile loads the copy.**
 
-| Use | Test | Plain clang | Served | Same? |
+| Line | Code | X before → after | What happens |
+|---|---|---|---|
+| b.c:1 | `#define X 1` | undefined → 1 (b.c:1) | defines X |
+| b.c:2 | `#include "s.h"` | 1 (b.c:1) → 40 (copy) | loads the copy of s.h and replays the macro list: X is defined as the copy's definition, whose token reads as 40 |
+| b.c:3 | `int b(void) { return sx() * 10 + X; }` | 40 (copy) → 40 (copy) | sx() is 2 (stored in the copy), X is 40: 2 * 10 + 40 = **60** |
+
+**Result.** 60, against 21 for plain clang. Cause 1.
+
+#### 4. q11u: the same s.h; b.c has no X
+
+**Plain clang on b.c.**
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| b.c:1 | `#include "s.h"` | undefined → undefined | clang enters s.h |
+| s.h:1-2 | `#ifndef S_H` `#define S_H` | undefined → undefined | include guard |
+| s.h:3 | `#pragma push_macro("X")` | undefined → undefined | puts "undefined" on X's stack |
+| s.h:4 | `#undef X` | undefined → undefined | nothing to undefine |
+| s.h:5 | `#define X 2` | undefined → 2 (s.h:5) | defines X |
+| s.h:6 | `static inline int sx(void) { return X; }` | 2 → 2 | sx() is `return 2;` |
+| s.h:7 | `#pragma pop_macro("X")` | 2 (s.h:5) → undefined | takes "undefined" off X's stack and makes it X's state |
+| s.h:8 | `#endif` | undefined → undefined | end of s.h |
+| b.c:2-4 | `#ifdef X` `int x_after = 1;` `#endif` | undefined → undefined | `#ifdef X` is false: b.c:3 is skipped |
+| b.c:5 | `int b(void) { return sx(); }` | undefined → undefined | returns 2 |
+
+**The cache: a.c's compile writes the copy.** The lines of a.c are the lines of b.c (the function is named a). At s.h:7, X goes from `2 (s.h:5)` to undefined. At the end of s.h, a.c's compile writes:
+
+```
+copy of s.h
+  declarations    : sx(), whose body is `return 2;`
+  macro list      : S_H defined, X undefined   (when s.h ends)
+  definition of X : none   (X is undefined: no token to read back)
+```
+
+**The cache: b.c's compile loads the copy.** At b.c:1, the copy says X is undefined at the end of s.h. X is undefined before b.c:1 and after b.c:1. At b.c:2, `#ifdef X` is false, as in plain clang. At b.c:5, sx() is 2.
+
+**Result.** 2 and X undefined after the `#include`, in both. Same.
+
+#### 5. q11p: begin.h pushes, end.h pops
+
+**Plain clang on b.c.**
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| b.c:1 | `#define X 5` | undefined → 5 (b.c:1) | defines X |
+| b.c:2 | `#include "begin.h"` | 5 → 5 | clang enters begin.h |
+| begin.h:1 | `#pragma push_macro("X")` | 5 → 5 | puts `5 (b.c:1)` on X's stack |
+| begin.h:2 | `#undef X` | 5 → undefined | undefines X |
+| begin.h:3 | `#define X 2` | undefined → 2 (begin.h:3) | defines X |
+| begin.h:4 | `static inline int inside_begin(void) { return 7; }` | 2 → 2 | X is not involved |
+| b.c:3 | `static int inside = X;` | 2 → 2 | inside is 2 |
+| b.c:4 | `#include "end.h"` | 2 → 2 | clang enters end.h |
+| end.h:1 | `#pragma pop_macro("X")` | 2 (begin.h:3) → 5 (b.c:1) | takes `5 (b.c:1)` off X's stack and makes it X's definition. The push was in begin.h, another file |
+| end.h:2 | `static inline int inside_end(void) { return 8; }` | 5 → 5 | X is not involved |
+| b.c:5 | `int b(void) { return inside * 10 + X; }` | 5 → 5 | inside is 2, X is 5: 2 * 10 + 5 = **25** |
+
+**The cache: a.c's compile writes two copies.** a.c differs from b.c at a.c:1, `#define X 1`, and in the function's name. The table leaves out a.c:2-5, begin.h:4 and end.h:2: none of them defines, undefines, pushes or pops X.
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| a.c:1 | `#define X 1` | undefined → 1 (a.c:1) | defines X |
+| begin.h:1 | `#pragma push_macro("X")` | 1 → 1 | puts `1 (a.c:1)` on X's stack |
+| begin.h:2 | `#undef X` | 1 → undefined | undefines X |
+| begin.h:3 | `#define X 2` | undefined → 2 (begin.h:3) | defines X |
+| end.h:1 | `#pragma pop_macro("X")` | 2 (begin.h:3) → 1 (a.c:1) | takes `1 (a.c:1)` off X's stack and makes it X's definition |
+
+a.c's compile writes the copy of begin.h after begin.h:4, and the copy of end.h after end.h:2:
+
+```
+copy of begin.h
+  declarations    : inside_begin()
+  macro list      : X   (defined when begin.h ends)
+  definition of X : `2`   <- written at begin.h:3, inside begin.h: readable
+  not in the copy : the push at begin.h:1
+
+copy of end.h
+  declarations    : inside_end()
+  macro list      : empty   (end.h has no #define or #undef)
+  definition of X : `1`   <- written at a.c:1, outside end.h
+  not in the copy : the pop at end.h:1
+```
+
+**The cache: b.c's compile loads both copies.**
+
+| Line | Code | X before → after | What happens |
+|---|---|---|---|
+| b.c:1 | `#define X 5` | undefined → 5 (b.c:1) | defines X |
+| b.c:2 | `#include "begin.h"` | 5 (b.c:1) → 2 (copy) | loads the copy of begin.h and replays its macro list: X is defined as `2`. The push at begin.h:1 does not run: X's stack stays empty |
+| b.c:3 | `static int inside = X;` | 2 (copy) → 2 (copy) | inside is 2 |
+| b.c:4 | `#include "end.h"` | 2 (copy) → 40 (copy) | loads the copy of end.h. The copy's definition of X is the token from a.c:1, which reads as 40. The pop at end.h:1 does not run |
+| b.c:5 | `int b(void) { return inside * 10 + X; }` | 40 (copy) → 40 (copy) | inside is 2, X is 40: 2 * 10 + 40 = **60**. Clang also prints `warning: ambiguous expansion of macro 'X'` here |
+
+X is not on the macro list of end.h's copy, because `pop_macro` is neither a `#define` nor a `#undef`. Yet the load at b.c:4 still takes X from 2 to 40, and clang finds more than one definition of X at b.c:5 and prints the warning.
+
+**Result.** 60, against 25 for plain clang. Cause 1: the token from a.c:1 reads as 40, as in q11s. Cause 2: plain clang's pop at end.h:1 takes `5 (b.c:1)`, which b.c's push at begin.h:1 put on X's stack. In b.c's compile, neither begin.h:1 nor end.h:1 runs, so X's stack is empty at b.c:4. A readable token would still make X `1` (a.c's), not `5` (b.c's).
+
+#### 6. q11: b.c and a.c push; p.h pops
+
+**Plain clang on b.c.**
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| b.c:1 | `#define X 5` | undefined → 5 (b.c:1) | defines X |
+| b.c:2 | `#pragma push_macro("X")` | 5 → 5 | puts `5 (b.c:1)` on X's stack |
+| b.c:3 | `#undef X` | 5 → undefined | undefines X |
+| b.c:4 | `#define X 1` | undefined → 1 (b.c:4) | defines X |
+| b.c:5 | `#include "p.h"` | 1 → 1 | clang enters p.h |
+| p.h:1-2 | `#ifndef P_H` `#define P_H` | 1 → 1 | include guard |
+| p.h:3 | `#pragma pop_macro("X")` | 1 (b.c:4) → 5 (b.c:1) | takes `5 (b.c:1)` off X's stack and makes it X's definition. The push was in b.c, another file |
+| p.h:4 | `static inline int px(void) { return X; }` | 5 → 5 | X expands to 5: px() is `return 5;` |
+| p.h:5 | `#endif` | 5 → 5 | end of p.h |
+| b.c:6 | `int b(void) { return px() * 100 + X; }` | 5 → 5 | px() is 5, X is 5: 5 * 100 + 5 = **505** |
+
+**The cache: a.c's compile writes the copy.** a.c differs from b.c at a.c:1 (`#define X 1`) and at a.c:6 (`int a(void) { return px(); }`). The table leaves out p.h:1-2, p.h:5 and a.c:6: none of them defines, undefines, pushes or pops X.
+
+| Line | Code | X before → after | What the line does |
+|---|---|---|---|
+| a.c:1 | `#define X 1` | undefined → 1 (a.c:1) | defines X |
+| a.c:2 | `#pragma push_macro("X")` | 1 → 1 | puts `1 (a.c:1)` on X's stack |
+| a.c:3 | `#undef X` | 1 → undefined | undefines X |
+| a.c:4 | `#define X 1` | undefined → 1 (a.c:4) | defines X: a different definition from a.c:1, with the same token `1` |
+| a.c:5 | `#include "p.h"` | 1 → 1 | X is `1` here, so the copy's metadata will say "X is `1` at the `#include`" |
+| p.h:3 | `#pragma pop_macro("X")` | 1 (a.c:4) → 1 (a.c:1) | takes `1 (a.c:1)` off X's stack and makes it X's definition |
+| p.h:4 | `static inline int px(void) { return X; }` | 1 → 1 | px() is `return 1;` |
+
+a.c's compile writes the copy of p.h after p.h:5:
+
+```
+copy of p.h
+  declarations    : px(), whose body is `return 1;`
+  macro list      : P_H   (defined when p.h ends; X is not on the list)
+  definition of X : `1`   <- written at a.c:1, outside p.h
+  metadata        : X is `1` at the #include
+  not in the copy : the pop at p.h:3
+```
+
+**The cache: b.c's compile loads the copy.**
+
+| Line | Code | X before → after | What happens |
+|---|---|---|---|
+| b.c:1-4 | as in the plain table | undefined → 1 (b.c:4) | X's stack holds `5 (b.c:1)` |
+| b.c:5 | `#include "p.h"` | 1 (b.c:4) → 40 (copy) | The cache compares the metadata with b.c: X is `1` here, as the copy needs. The check passes, so b.c's compile loads the copy. The copy's definition of X is the token from a.c:1, which reads as 40. The pop at p.h:3 does not run |
+| b.c:6 | `int b(void) { return px() * 100 + X; }` | 40 (copy) → 40 (copy) | px() is 1 (stored in the copy), X is 40: 1 * 100 + 40 = **140**. Clang also prints the warning here |
+
+**Result.** 140, against 505 for plain clang. Cause 1: the token from a.c:1 reads as 40, as in q11s. Cause 2: the check compares only X's value at the `#include` (`1` at a.c:5, `1` at b.c:5). The check never compares the stacks: the top of X's stack is `1 (a.c:1)` in a.c and `5 (b.c:1)` in b.c. Plain clang's pop at p.h:3 takes `5`, so px() is 5. The copy holds px() as `return 1;`.
+
+#### 7. All four results
+
+| Test | Setup | Plain clang: b.c's return value | Served the copy: b.c's return value | Same? |
 |---|---|---|---|---|
-| A header saves, changes and restores X; the includer defines X. The usual use | `q11s`: `b.c` has `#define X 1`, includes `s.h`, returns `sx() * 10 + X` | 21 | 60 | No |
-| The same; the includer has no X | `q11u` | X undefined after | X undefined after | Yes |
-| One header saves and changes X, another restores it | `q11p`: `begin.h`, `end.h`; `b.c` has X = 5 | 25 | 60 | No |
-| A header restores what its includer saved | `q11`: `p.h` pops; `a.c` saved 1, `b.c` saved 5 | 505 | 140 | No |
+| q11s | s.h:3 pushes X, s.h:5 defines X as 2, s.h:7 pops; b.c:1 defines X as 1 | 21 | 60 | No |
+| q11u | the same s.h; b.c has no X | 2, X undefined after b.c:1 | 2, X undefined after b.c:1 | Yes |
+| q11p | begin.h:1 pushes X, end.h:1 pops; b.c:1 defines X as 5 | 25 | 60, plus a new warning | No |
+| q11 | b.c:2 pushes X (a.c:2 does too), p.h:3 pops; b.c:1 defines X as 5 | 505 | 140, plus a new warning | No |
 
-**Why.** A copy keeps, for each macro the header touched, the state the
-header left it in, as a definition the copy holds. After `pop_macro`, that
-state is the includer's own definition: `#define X 1`, written in `a.c`. The
-copy does not hold `a.c`, so the token `1` loses its place, and the served
-compile reads garbage where its text was: X expands to 40 in all three
-wrong rows (60 = 2 × 10 + 40; 140 = 1 × 100 + 40). The last two rows have a
-second problem: what `pop_macro` restores comes from a stack its includer
-filled, and a hit never compares that stack.
+Re-run on 2026-10-08 on the current build: same numbers. A test function `int v(void) { return X; }` placed right after the `#include` returns 40 when served the copy (q11s, q11p, q11) and 1, 5, 5 under plain clang.
 
-**Fix proposed.**
+**How common.** No header compiled in the six benchmark projects (redis, nginx, curl, git, postgres, cpython) uses `push_macro` or `pop_macro`. Elsewhere the pair is common: a header that needs a name such as `min` or `max` for itself pushes a.c's macro of that name, defines its own, and pops at its end, as s.h does.
 
-1. A macro that ends the header as it began (the same definition, or
-   undefined both times) is no effect of the header: nothing is replayed for
-   it, and the copy holds no definition of it. This fixes the usual use and
-   costs nothing at a hit.
-2. A copy never holds a definition written outside it.
-3. Rows 3 and 4, a push left on the stack at the header's end or a pop of
-   what was pushed before the header: either decline the header, as the
-   cache already declines one that leaves `#pragma pack` pushed, or record
-   pushes and pops as two more kinds of effect, and the definition a header
-   pops from outside as a dependency, compared at the `#include` like any
-   other macro. Either costs nothing for headers that do not use the
-   pragmas.
+#### 8. Fixes (proposed; nothing is built)
 
-**Seen.** No header compiled in the six projects uses them. `xxhash.h` does,
-in a branch not compiled on x86, and so does readline.
+| Fix | What the cache would hold or check | Copy of | Result in the tests |
+|---|---|---|---|
+| **1. Hold nothing for a macro that ends where it began** (cause 1, the usual use) | When a.c's compile reaches the end of s.h, it compares X's definition with X's definition before s.h:1. If both are the same definition, the copy holds nothing for X: no macro-list entry, no definition | s.h | q11s: X is `1 (a.c:1)` before s.h:1 and after s.h:8, so nothing is held. After b.c:2, X stays `1 (b.c:1)`, and b() returns 21, like plain clang. q11u: undefined at both ends, nothing held. Cost at a hit: none |
+| **2. Never hold a definition written outside the file** (cause 1, the split uses) | After end.h:2 and after p.h:5, X's definition is `1 (a.c:1)`, written in a.c. The copy would not hold it | end.h, p.h | X no longer reads 40, and the warning goes. b.c still does not get its own `5`: cause 2 remains |
+| **3a. Refuse** (cause 2) | The cache writes no copy of a file whose push is not popped in it, or whose pop takes a definition pushed outside it. The cache already declines a header that leaves `#pragma pack` pushed | begin.h, end.h, p.h | b.c reads their text: 25 and 505, like plain clang. Cost: these files are never served |
+| **3b. Hold the steps, check the stack** (cause 2) | The copy holds each push and pop as a step to replay. For a pop that takes a definition pushed outside its file, the copy also holds a check at the `#include`: "the definition the pop takes is `1`". Needs macro replay rebuilt as a small loop over steps, where push and pop are two more kinds of step | begin.h (steps: push X, define X as `2`); end.h and p.h (step: pop X, with the check) | In b.c the pop would take `5 (b.c:1)`, not `1`: the check fails, b.c reads the text of end.h and p.h, and returns 25 and 505. When the definitions match, b.c is served the copy and the replayed pop takes b.c's own definition off b.c's stack |
+
+**Recommendation.** Approve 1 and 2. For 3, build (a) now and (b) later, when macro replay is rebuilt as that loop. Reason: (a) follows the existing refusal for `#pragma pack`, and no header in the six benchmark projects uses these pragmas, so refusing loses no hits there.
+
+**Note on fixes 1 and 2.** `pop_macro` calls no #define or #undef callback,
+so in `q11p`'s end.h and `q11`'s p.h, X is not on the copy's macro list:
+the garbage reaches b.c through the copy's own definition of X becoming
+visible when the copy loads, not through the replay. Both fixes must remove
+X's definition from the copy itself, not only from the list.
 
 ### Q10: the cache runs inside compiles that build a Clang module
 
@@ -251,8 +449,14 @@ the header was not served the module build's copy.
 **Not seen in our runs.** The scripts pass `-fno-implicit-module-maps`, and
 none of the six projects uses Clang modules.
 
-**Fix proposed.** The hook does nothing in a module build. A module build
-runs once per library, so nothing is lost.
+**Fixed 2026-10-08.** The hook does nothing in a compile that writes a
+precompiled file: a module build, or a precompiled header. A precompiled
+header had the same problem: built through the cache, it referred to the
+copy it was served, which lives only in the daemon's memory, and every
+compile using it stopped at "module file '/__hc_memory/0.pcm' not found"
+(`qtests/q10pch`). Checked: three module builds and three precompiled
+header builds through the cache succeed, and a compile using the header
+compiles.
 
 ### Q8: a name a copy refers to is looked up later than plain clang looks it up
 
@@ -297,11 +501,12 @@ same test, `size_t` is declared again after the `#include` (lines 1 and 5),
 and a served compile's debug information names line 5 where plain clang's
 names line 1. That is how redis's `config.c` differed from plain clang.
 
-**Fix proposed.** To check that a copy fits, the cache already looks up
+**Fixed 2026-10-08.** To check that a copy fits, the cache already looks up
 every name the copy refers to, at the `#include` (here `fatal` at line 3,
-finding line 2's declaration). Keep those results and connect the copy's
-names to them instead of looking the names up again later. The later lookups
-it replaces cost about 0.5 us each, at most 0.03 s per project.
+finding line 2's declaration). The reader now resolves the copy's references
+to those declarations (`ASTReader::pinNameReference`) instead of looking the
+names up again later. Checked: `qtests/q8`'s object is identical to plain
+clang's; unit test `ExportTest.ACallInACopyFindsTheDeclarationBeforeTheInclude`.
 
 ### Q7: a column inside a macro argument
 
@@ -345,9 +550,23 @@ copy.
 **How often.** No failure in the six projects. It needs two declarations of
 one name that differ but are compatible, one of them inside a copy.
 
-**Fix (idea).** Record the names a copy declares and check at a hit that the
-compile has no declaration of them yet. Each such lookup searches every
-loaded copy now, so this is affordable only after I1 (one name index).
+**Fix (idea), and why it is not built.** Record the names a copy declares
+and check at a hit that the compile has no declaration of them yet. Each
+check is a lookup that searches every loaded copy, the search replay used
+to spend most of its time in (I8). Measured on git's first build
+(2026-10-08), with every copy dumped:
+
+| git first build | Value |
+|---|---|
+| Hits | 3,421 |
+| Declarations a served copy holds, per hit | 3,687 |
+| Of them at file scope (functions, types, variables, enumerators), the names to check | about 1,300 |
+| Cost of one lookup, measured in replay (29.18 s over 16.65 million) | 1.75 us |
+| Checks per git first build | about 7.8 s, 4.5% of plain clang's 174 s |
+
+At that rate the six first builds would pay about 43 s, more than I8 saved.
+After I1 (one index of names over the loaded copies), a check is one hash
+lookup.
 
 ## 3. Optimizations ranked by what they could remove
 
@@ -366,7 +585,7 @@ bound on what the fix saves.
 
 | Rank | Fix | What it removes | Could remove | Share of plain time |
 |---|---|---|---|---|
-| 1 | I8: skip replayed macro effects already in force | Finding each replayed macro's name, for effects that change nothing | 30.2 s | 4.3% |
+| 1 | I8: skip replayed macro effects already in force | Finding each replayed macro's name, for effects that change nothing | 30.2 s; built 2026-10-08, removed 35.1 s | 4.3% |
 | 2 | I5: write a copy from its own range | Scanning the whole compile's source locations, macros, identifiers, comments and declarations for each copy written | 19.4 s | 2.7% |
 | 3 | I9: check files once per build | Header searches and file stamps every compile redoes | 17.0 s | 2.4% |
 | 4 | I3: metadata in shared memory | Encoding, sending and decoding each saved copy's metadata at every query | 12.1 s | 1.7% |
@@ -407,6 +626,28 @@ Notes on the top three:
   a lookup of the compile's own table only. Both remove nearly all of the
   34.65 s. (b) also turns `push_macro` and `pop_macro` (Q11) into two more
   cases of the loop, and is the larger change.
+- **I8, built 2026-10-08 (option (a), your go-ahead).** At a hit an effect
+  is skipped when the compile has never seen its name and no earlier copy
+  touched it; the name's first use finds the copy's definition anyway. A name
+  the compile has seen is still replayed: loading a copy marks every name
+  already seen as out of date, and two readers of a macro do not bring one up
+  to date (the check that skips an #include whose guard macro is defined, and
+  `#pragma push_macro`). Measured: six first builds, medians of three, the
+  modes interleaved file by file, the six projects at once, each on a core
+  of its own:
+
+  | Project | Plain clang | Cache, every effect replayed | Cache with I8 | Saved by I8 |
+  |---|---|---|---|---|
+  | redis | 34.46 s | 32.67 s | 32.13 s | 0.54 s |
+  | nginx | 21.31 s | 19.44 s | 18.36 s | 1.08 s |
+  | curl | 52.22 s | 42.49 s | 40.55 s | 1.94 s |
+  | git | 167.40 s | 140.76 s | 120.24 s | 20.53 s |
+  | postgres | 266.16 s | 244.08 s | 235.87 s | 8.22 s |
+  | cpython | 183.26 s | 166.54 s | 163.78 s | 2.77 s |
+  | All six | 724.80 s | 645.98 s | 610.91 s | 35.07 s |
+
+  Predicted: nearly all of replay's 34.65 s. 75% to 93% of effects are
+  skipped. `CLANG_HEADER_CACHE_REPLAY_ALL=1` turns I8 off, for measuring.
 - **I5.** Of what the writer visits for each copy, 98% to 99.6% of the
   source-location entries and 82% to 98% of the macros belong to other
   headers. A copy's own range is known when the header ends.
@@ -557,14 +798,14 @@ Explained and ranked in section 2; each fix is approved one at a time.
 7. **Q7. A column inside a macro argument** (section 2, rank 6). Fix is a
    design change: keep dropped files as stand-ins.
 8. **Q8. A name looked up later than plain clang looks it up** (rank 5).
-   Explained again with the test. Fix proposed: keep the declarations the
-   hit's check found at the `#include`. Approve?
+   Fixed 2026-10-08: the copy's names resolve to the declarations the hit's
+   check found at the `#include`.
 9. **Q9. Two copies share a name** (rank 2). Fixed 2026-10-07: another copy
    under a name already loaded is passed over and the header read as text.
    Naming copies after their outside declarations was tried first: it
    turned the wrong code into a compile error (two `fp`'s).
-10. **Q10. Module builds** (rank 4). Explained again: what a Clang module
-    is. Fix proposed: the hook does nothing in a module build. Approve?
+10. **Q10. Module builds** (rank 4). Fixed 2026-10-08: the hook does
+    nothing in a compile that writes a module or a precompiled header.
 11. **Q11. `push_macro` and `pop_macro`** (rank 3). The usual use -- a
     header saves, changes and restores a macro -- is wrong code too (new).
     Fix proposed: a macro that ends the header as it began is no effect,
@@ -573,19 +814,20 @@ Explained and ranked in section 2; each fix is approved one at a time.
     for 3.
 12. **Q12. `__COUNTER__`.** Not a problem in the six projects: none of their
     headers uses it.
-34. **Q34. A served header's warnings are lost** (rank 1). Your decision:
-    store them. Design in section 2, matching only on which warnings are
-    on. Approve?
+34. **Q34. A served header's warnings are lost** (rank 1). Fixed
+    2026-10-08: saved with the copy, printed again at a hit, served only
+    under the same warning flags and pragmas.
 35. **Q35. A compile with errors still writes copies** (rank 1). Fixed
     2026-10-07: nothing is written after a real error.
-36. **Q36. A copy assumes the names it declares are new** (new). A lost
-    warning, or for a variable a compile error. Measure how often, or wait
-    for I1?
+36. **Q36. A copy assumes the names it declares are new** (new). Not
+    built: checking every declared name at every hit would cost about 7.8 s
+    of git's 174 s first build before I1. Build it with I1?
 
 ### C. Proposals waiting for approval
 
 13. **Q13. Macro option B** (T8), your replay design (section 3.1, I8).
-    Build (a) now as I8 and your design later as T8, or your design now?
+    (a) built as I8, 2026-10-08: 35.1 s of the six first builds' 646.0 s.
+    Your design stays T8, for later.
 14. **Q14. The eager-names experiment** (I11). Done: no gain (section 3.1).
     Close.
 15. **Q15. The check at the `#define`** (T9). Its value depends on Q26.
