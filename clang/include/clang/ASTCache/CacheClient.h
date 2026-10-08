@@ -42,6 +42,7 @@ class raw_socket_stream;
 }
 
 namespace clang {
+class NamedDecl;
 class Preprocessor;
 class Sema;
 
@@ -61,6 +62,7 @@ enum class MismatchReason {
   Include,
   Declaration,
   FileChanged,
+  WarningState,
 };
 
 llvm::StringRef describe(MismatchReason R);
@@ -73,6 +75,8 @@ struct IncludeSite {
   FileEntryRef File;
   ConstSearchDirIterator Dir;
   SourceLocation Loc;
+  /// The compile's warningState at the #include.
+  uint64_t WarningState = 0;
 };
 
 /// Whether \p Deps still holds in this compile. \p S must be non-null:
@@ -124,12 +128,15 @@ struct CheckCost {
 };
 
 /// \p Cost, when non-null, is increased by the time each step takes.
+/// \p Found, when non-null, receives the declaration each of
+/// Deps.Declarations finds here, in order.
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
                                 Preprocessor &PP, Sema *S,
                                 llvm::StringRef NotAMacroNames = {},
                                 std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
-                                CheckCost *Cost = nullptr);
+                                CheckCost *Cost = nullptr,
+                                std::vector<NamedDecl *> *Found = nullptr);
 
 class CacheClient {
 public:
@@ -188,7 +195,7 @@ public:
     unsigned Lookups = 0;
     unsigned Hits = 0;
     unsigned CandidatesRejected = 0;
-    unsigned RejectedFor[10] = {};
+    unsigned RejectedFor[11] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".
@@ -209,6 +216,13 @@ public:
   unsigned lastCandidates() const { return LastCandidates; }
   MismatchReason lastRejection() const { return LastRejection; }
 
+  /// The declaration each outside declaration of the latest lookup's match
+  /// found where the header is included, in the order of its
+  /// Deps.Declarations.
+  llvm::ArrayRef<NamedDecl *> matchedDeclarations() const {
+    return MatchedDecls;
+  }
+
   /// Keep a line per rejected candidate naming what failed. Off by default:
   /// it builds a string for every rejection.
   void logRejections(bool On) { LogRejections = On; }
@@ -223,6 +237,7 @@ private:
   bool LogRejections = false;
   unsigned LastCandidates = 0;
   MismatchReason LastRejection = MismatchReason::None;
+  std::vector<NamedDecl *> MatchedDecls;
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;
   uint64_t AskListVersion = 0;

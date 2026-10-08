@@ -28,6 +28,7 @@
 #include "clang/Serialization/ASTWriter.h"
 #include "clang/Serialization/ModuleFile.h"
 #include "clang/Serialization/ModuleManager.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
@@ -285,8 +286,10 @@ private:
 class HeaderCacheServer : public HeaderCacheHook {
 public:
   HeaderCacheServer(CompilerInstance &CI, std::unique_ptr<CacheClient> Client,
-                    bool LogServed)
-      : CI(CI), Client(std::move(Client)), LogServed(LogServed) {}
+                    bool LogServed, WarningPragmaTracker &Pragmas)
+      : CI(CI), Client(std::move(Client)), LogServed(LogServed),
+        Pragmas(Pragmas),
+        WarningFlags(warningFlagsHash(CI.getDiagnosticOpts())) {}
 
   void report(llvm::raw_ostream &OS) const {
     const CacheClient::Stats &S = Client->stats();
@@ -318,6 +321,9 @@ public:
       OS << "  fitting copies passed over, another copy of the same name "
             "loaded: "
          << OtherCopySameName << "\n";
+    if (DiagnosticsReplayed)
+      OS << "  diagnostics printed again from copies: " << DiagnosticsReplayed
+         << "\n";
     if (EffectsWithoutDefinition)
       OS << "  macro effects without a definition in the module: "
          << EffectsWithoutDefinition << "\n";
@@ -422,7 +428,8 @@ public:
     uint32_t Counter = PP.getCounterValue();
     HeaderDependencySet Deps;
     Module *Target = nullptr;
-    IncludeSite Site{File, CurDir, IncludeLoc};
+    IncludeSite Site{File, CurDir, IncludeLoc,
+                     warningState(WarningFlags, &Pragmas)};
     bool AnyFits = false;
     size_t HitBytes = 0;
     uint64_t HitLoadMicros = 0;
@@ -439,7 +446,7 @@ public:
           if (PopulateOnly)
             return false;
           auto Loading = std::chrono::steady_clock::now();
-          Target = load(Bytes, ModuleName);
+          Target = load(Bytes, ModuleName, IncludeLoc);
           HitLoadMicros = micros(Loading);
           HitBytes = Bytes.size();
           LoadMicros += HitLoadMicros;
@@ -486,6 +493,22 @@ public:
     if (Exporter)
       Exporter->served();
 
+    // The copy's references to declarations outside it resolve to the ones
+    // the check found here, as plain clang's did where it read the header;
+    // otherwise each resolves when first read, to the name's latest
+    // declaration, which may come after this #include (REPORT.md Q8).
+    const LoadedCopy &Copy = LoadedTargets.find(LastModuleName)->second;
+    if (Copy.Fresh) {
+      llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
+      IdentifierTable &Idents = PP.getIdentifierTable();
+      for (size_t I = 0, N = std::min(Found.size(), Deps.Declarations.size());
+           I != N; ++I)
+        CI.getASTReader()->pinNameReference(
+            *Copy.MF, Idents.get(Deps.Declarations[I].Name),
+            Deps.Declarations[I].In == DeclarationDependency::Space::Tag,
+            Found[I]);
+    }
+
     // What the header does to its includer's macros and pragma state, which
     // entering the file would have done. The module's macros are made visible
     // first, so the directives replayed below override them rather than the
@@ -503,6 +526,10 @@ public:
       llvm::TimeTraceScope S("HeaderCache PragmaDelta");
       applyPragmaDelta(CI.getSema(), Deps.Entry, Deps.Exit);
     }
+    printDiagnostics(Deps.Diagnostics, *Copy.MF);
+    // The warning pragmas the header left in force, as its text would have.
+    for (const WarningPragma &W : Deps.WarningPragmas)
+      Pragmas.apply(CI.getDiagnostics(), W, IncludeLoc);
     uint64_t Replay = micros(Replaying);
     ReplayMicros += Replay;
     Timings.Hits.push_back({Path, Took + Replay});
@@ -611,7 +638,45 @@ private:
   /// loadModuleFile would report that as an error, since
   /// -Wmodule-file-config-mismatch is an error by default, and fail a build
   /// that only needed to parse the header itself.
-  Module *load(llvm::StringRef Bytes, llvm::StringRef ModuleName) {
+  /// The diagnostics a copy's header printed where the copy was written,
+  /// printed again: the copy is served only under the same warning flags,
+  /// and where no warning pragma is in force, so they are the ones the
+  /// header's text would print here (REPORT.md Q34).
+  void printDiagnostics(llvm::ArrayRef<SavedDiagnostic> Saved,
+                        serialization::ModuleFile &MF) {
+    if (Saved.empty())
+      return;
+    ASTReader &Reader = *CI.getASTReader();
+    SourceManager &SM = CI.getSourceManager();
+    auto Range = [&](const SavedDiagnostic::Range &R) {
+      SourceRange Within(Reader.ReadSourceLocation(MF, R.Begin),
+                         Reader.ReadSourceLocation(MF, R.End));
+      return R.TokenRange ? CharSourceRange::getTokenRange(Within)
+                          : CharSourceRange::getCharRange(Within);
+    };
+    for (const SavedDiagnostic &D : Saved) {
+      llvm::SmallVector<CharSourceRange, 2> Ranges;
+      for (const SavedDiagnostic::Range &R : D.Ranges)
+        Ranges.push_back(Range(R));
+      llvm::SmallVector<FixItHint, 1> FixIts;
+      for (const SavedDiagnostic::FixIt &F : D.FixIts) {
+        FixItHint &H = FixIts.emplace_back();
+        H.RemoveRange = Range(F.Remove);
+        H.CodeToInsert = F.Insert;
+        H.BeforePreviousInsertions = F.BeforePreviousInsertions;
+      }
+      StoredDiagnostic Stored(
+          static_cast<DiagnosticsEngine::Level>(D.Level), D.ID, D.Message,
+          FullSourceLoc(Reader.ReadSourceLocation(MF, D.Loc), SM), Ranges,
+          FixIts);
+      CI.getDiagnostics().Report(Stored);
+      ++DiagnosticsReplayed;
+    }
+  }
+
+  Module *load(llvm::StringRef Bytes, llvm::StringRef ModuleName,
+               SourceLocation IncludeLoc) {
+    LastModuleName = ModuleName.str();
     // Loaded already in this compile: an unguarded header such as stddef.h,
     // included again in a state its copy also fits. A second module of the
     // same name is a fatal error, and the first already holds the same
@@ -631,8 +696,10 @@ private:
     auto Known = LoadedTargets.find(ModuleName);
     if (Known != LoadedTargets.end()) {
       if (Known->second.Bytes.data() == Bytes.data() ||
-          Known->second.Bytes == Bytes)
+          Known->second.Bytes == Bytes) {
+        Known->second.Fresh = false;
         return Known->second.Target;
+      }
       ++OtherCopySameName;
       return nullptr;
     }
@@ -650,7 +717,9 @@ private:
     serialization::ModuleFile *MF = nullptr;
     // ARR_ConfigurationMismatch makes the reader return ConfigurationMismatch
     // instead of diagnosing it. Any failure unloads what was read.
-    if (Reader.ReadAST(Name, serialization::MK_ExplicitModule, SourceLocation(),
+    // Imported where it is included: a diagnostic printed again from it
+    // names that #include in its "In file included from" line.
+    if (Reader.ReadAST(Name, serialization::MK_ExplicitModule, IncludeLoc,
                        ASTReader::ARR_ConfigurationMismatch,
                        &MF) != ASTReader::Success ||
         !MF) {
@@ -671,7 +740,7 @@ private:
     Module *Target = Top->findSubmodule(TargetSubmoduleName);
     if (!Target)
       Target = Top;
-    LoadedTargets[MF->ModuleName] = {Target, Bytes};
+    LoadedTargets[MF->ModuleName] = {Target, Bytes, MF, /*Fresh=*/true};
     return Target;
   }
 
@@ -684,11 +753,21 @@ private:
   struct LoadedCopy {
     Module *Target;
     llvm::StringRef Bytes;
+    serialization::ModuleFile *MF;
+    /// Loaded by the latest hit on it, not reused.
+    bool Fresh;
   };
+  /// The module name of the copy the latest load returned.
+  std::string LastModuleName;
   llvm::StringMap<LoadedCopy> LoadedTargets;
   /// Fitting copies passed over because another copy of the same name was
   /// loaded (see load).
   unsigned OtherCopySameName = 0;
+  /// Which warning pragmas are in force, and this compile's warning flags
+  /// (warningFlagsHash).
+  WarningPragmaTracker &Pragmas;
+  uint64_t WarningFlags;
+  unsigned DiagnosticsReplayed = 0;
   /// Each hit's header and module, for CLANG_HEADER_CACHE_STATS=2: which
   /// copy a compile used is what a failure after a hit needs traced to.
   bool LogServed;
@@ -765,6 +844,41 @@ private:
 /// Not from the server's destructor: cc1 runs with -disable-free, so the
 /// preprocessor that owns the server is never destroyed and a destructor
 /// would never run.
+/// Hands every diagnostic to the consumer the compile had, and to the
+/// exporter (PartExporter::diagnostic).
+class CapturingConsumer : public DiagnosticConsumer {
+public:
+  CapturingConsumer(DiagnosticConsumer &Next,
+                    std::unique_ptr<DiagnosticConsumer> Owned,
+                    PartExporter &Exporter)
+      : Next(Next), Owned(std::move(Owned)), Exporter(Exporter) {}
+
+  void BeginSourceFile(const LangOptions &LO, const Preprocessor *PP) override {
+    Next.BeginSourceFile(LO, PP);
+  }
+  void EndSourceFile() override { Next.EndSourceFile(); }
+  void finish() override { Next.finish(); }
+  void clear() override {
+    DiagnosticConsumer::clear();
+    Next.clear();
+  }
+  bool IncludeInDiagnosticCounts() const override {
+    return Next.IncludeInDiagnosticCounts();
+  }
+  void HandleDiagnostic(DiagnosticsEngine::Level Level,
+                        const Diagnostic &Info) override {
+    // Counted here too: the compile's result reads this consumer's counts.
+    DiagnosticConsumer::HandleDiagnostic(Level, Info);
+    Next.HandleDiagnostic(Level, Info);
+    Exporter.diagnostic(Level, Info);
+  }
+
+private:
+  DiagnosticConsumer &Next;
+  std::unique_ptr<DiagnosticConsumer> Owned;
+  PartExporter &Exporter;
+};
+
 class ServerCallbacks : public PPCallbacks {
 public:
   ServerCallbacks(HeaderCacheServer &Server, SourceManager &SM,
@@ -831,13 +945,23 @@ void clang::ast_cache::installHeaderCacheHook(
   if (!Client || !CI.hasPreprocessor())
     return;
   bool Detailed = Client->loggingRejections();
-  auto Server =
-      std::make_unique<HeaderCacheServer>(CI, std::move(Client), Detailed);
+  auto Tracker = std::make_unique<WarningPragmaTracker>();
+  WarningPragmaTracker &Pragmas = *Tracker;
+  CI.getPreprocessor().addPPCallbacks(std::move(Tracker));
+  auto Server = std::make_unique<HeaderCacheServer>(CI, std::move(Client),
+                                                    Detailed, Pragmas);
   if (Export != ExportMode::None) {
     HeaderCacheServer *S = Server.get();
-    S->exportMisses(
-        PartExporter::install(CI, [S](PushRequest &&R) { S->push(R); }),
-        Export == ExportMode::PopulateOnly);
+    PartExporter &E = PartExporter::install(
+        CI, [S](PushRequest &&R) { S->push(R); }, &Pragmas);
+    S->exportMisses(E, Export == ExportMode::PopulateOnly);
+    // The diagnostics printed while a header being exported is open go into
+    // its part (REPORT.md Q34).
+    DiagnosticsEngine &Diags = CI.getDiagnostics();
+    std::unique_ptr<DiagnosticConsumer> Owned = Diags.takeClient();
+    DiagnosticConsumer *Next = Owned ? Owned.get() : Diags.getClient();
+    Diags.setClient(new CapturingConsumer(*Next, std::move(Owned), E),
+                    /*ShouldOwnClient=*/true);
   }
   std::unique_ptr<JobRecorder> Recorder;
   if (!JobsDir.empty())
@@ -924,7 +1048,32 @@ private:
 
 } // namespace
 
+/// Whether \p CI writes a precompiled file: a Clang module or a precompiled
+/// header.
+static bool writesPrecompiledFile(const CompilerInstance &CI) {
+  if (CI.getLangOpts().isCompilingModule())
+    return true;
+  switch (CI.getFrontendOpts().ProgramAction) {
+  case frontend::GenerateModule:
+  case frontend::GenerateModuleInterface:
+  case frontend::GenerateReducedModuleInterface:
+  case frontend::GenerateHeaderUnit:
+  case frontend::GeneratePCH:
+    return true;
+  default:
+    return false;
+  }
+}
+
 void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
+  // A compile that writes a precompiled file does nothing with the cache.
+  // Served a copy, it writes a file that refers to the copy, which lives
+  // only in the daemon's memory: a module build served one crashed, and a
+  // compile using a precompiled header built with one stopped at "module
+  // file '/__hc_memory/0.pcm' not found" (REPORT.md Q10).
+  if (writesPrecompiledFile(CI))
+    return;
+
   // The 2.17 experiment, above.
   if (auto [Header, Out] = experimentSetting("CLANG_HEADER_CACHE_EXPORT");
       !Header.empty() && CI.hasPreprocessor()) {

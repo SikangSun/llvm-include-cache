@@ -7,7 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/ASTCache/PragmaStateCheck.h"
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/Support/xxhash.h"
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -108,4 +111,77 @@ void clang::ast_cache::applyPragmaDelta(Sema &S, const PragmaSnapshot &Entry,
     S.FpPragmaStack.Act(
         SourceLocation(), Sema::PSK_Set, llvm::StringRef(),
         FPOptionsOverride::getFromOpaqueInt(Exit.FpPragmaRaw));
+}
+
+uint64_t clang::ast_cache::warningFlagsHash(const DiagnosticOptions &Opts) {
+  std::string Key;
+  Key += Opts.IgnoreWarnings ? 'w' : '-';
+  Key += Opts.Pedantic ? 'p' : '-';
+  Key += Opts.PedanticErrors ? 'e' : '-';
+  for (const std::vector<std::string> *List :
+       {&Opts.Warnings, &Opts.Remarks, &Opts.SystemHeaderWarningsModules}) {
+    Key += '\0';
+    for (const std::string &Flag : *List) {
+      Key += Flag;
+      Key += '\1';
+    }
+  }
+  Key += '\0';
+  Key += Opts.DiagnosticSuppressionMappingsFile;
+  return llvm::xxh3_64bits(Key);
+}
+
+uint64_t WarningPragmaTracker::fingerprint() const {
+  std::string Key;
+  for (const Level &L : Levels) {
+    Key += '\2';
+    Key += std::to_string(L.Opaque);
+    for (const WarningPragma &P : L.Changes) {
+      Key += '\1';
+      Key += char('0' + P.Severity);
+      Key += P.Option;
+    }
+  }
+  return llvm::xxh3_64bits(Key);
+}
+
+WarningPragmaTracker::Mark WarningPragmaTracker::mark() const {
+  return {Levels.size(), Levels.back().Id, Levels.back().Changes.size(),
+          Levels.back().Opaque};
+}
+
+std::optional<std::vector<WarningPragma>>
+WarningPragmaTracker::since(const Mark &Begin) const {
+  const Level &Top = Levels.back();
+  if (Levels.size() != Begin.Depth || Top.Id != Begin.Level ||
+      Top.Opaque != Begin.Opaque || Top.Changes.size() < Begin.Changes)
+    return std::nullopt;
+  return std::vector<WarningPragma>(Top.Changes.begin() + Begin.Changes,
+                                    Top.Changes.end());
+}
+
+void WarningPragmaTracker::apply(DiagnosticsEngine &Diags,
+                                 const WarningPragma &P, SourceLocation Loc) {
+  // As PragmaDiagnosticHandler does.
+  StringRef Option = P.Option;
+  if (Option.size() < 3 || Option[0] != '-' ||
+      (Option[1] != 'W' && Option[1] != 'R'))
+    return;
+  diag::Flavor Flavor =
+      Option[1] == 'W' ? diag::Flavor::WarningOrError : diag::Flavor::Remark;
+  auto Severity = static_cast<diag::Severity>(P.Severity);
+  StringRef Group = Option.substr(2);
+  if (Group == "everything")
+    Diags.setSeverityForAll(Flavor, Severity, Loc);
+  else if (Diags.setSeverityForGroup(Flavor, Group, Severity, Loc))
+    return;
+  Levels.back().Changes.push_back(P);
+}
+
+uint64_t clang::ast_cache::warningState(uint64_t FlagsHash,
+                                        const WarningPragmaTracker *Pragmas) {
+  static const uint64_t NoPragmas = WarningPragmaTracker().fingerprint();
+  uint64_t Words[2] = {FlagsHash, Pragmas ? Pragmas->fingerprint() : NoPragmas};
+  return llvm::xxh3_64bits(llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Words), sizeof(Words)));
 }

@@ -224,6 +224,10 @@ private:
   /// anywhere. See setPartSizes.
   std::vector<struct PartSize> *PartSizes = nullptr;
 
+  /// See setPartLocations.
+  std::vector<SourceLocation> PartLocations;
+  std::vector<uint64_t> *PartLocationsOut = nullptr;
+
   /// Mapping from input file entries to the index into the
   /// offset table where information about that input file is stored.
   llvm::DenseMap<const FileEntry *, uint32_t> InputFileIDs;
@@ -1034,6 +1038,16 @@ public:
   /// its statements and context tables included, and each macro, its tokens
   /// included. For measuring what parts repeat; null stops it.
   void setPartSizes(std::vector<PartSize> *Out) { PartSizes = Out; }
+
+  /// Once the part is written, encodes \p Locs into \p Out, in order, as the
+  /// part's records encode locations; a place in a file the part dropped
+  /// comes out as no location. For what the part's caller keeps beside it,
+  /// such as the diagnostics the header printed. Null stops it.
+  void setPartLocations(std::vector<SourceLocation> Locs,
+                        std::vector<uint64_t> *Out) {
+    PartLocations = std::move(Locs);
+    PartLocationsOut = Out;
+  }
 
   /// Whether the part being written holds \p D itself, rather than a
   /// reference to it or nothing.

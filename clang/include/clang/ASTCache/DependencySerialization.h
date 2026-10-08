@@ -36,7 +36,7 @@ namespace ast_cache {
 /// version it does not know declines the whole block rather than guessing:
 /// a misparsed dependency set is a dependency set with the wrong contents,
 /// which is exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 7;
+constexpr uint32_t DependencyEncodingVersion = 8;
 
 /// Appends the encoding of \p Deps to \p Out.
 void encodeDependencySet(const HeaderDependencySet &Deps,

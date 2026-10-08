@@ -18,7 +18,9 @@
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/Expr.h"
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/CacheClient.h"
 #include "clang/ASTCache/CacheDaemon.h"
@@ -39,6 +41,8 @@
 #include "llvm/Testing/Support/Error.h"
 #include "gtest/gtest.h"
 #include <chrono>
+#include <functional>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -71,7 +75,14 @@ private:
 /// each import, and the tentative definitions completed at the end.
 class EmitRecorder : public ASTConsumer {
 public:
-  explicit EmitRecorder(std::set<std::string> &Out) : Out(Out) {}
+  EmitRecorder(std::set<std::string> &Out,
+               std::function<void(ASTContext &)> AtEnd)
+      : Out(Out), AtEnd(std::move(AtEnd)) {}
+
+  void HandleTranslationUnit(ASTContext &Ctx) override {
+    if (AtEnd)
+      AtEnd(Ctx);
+  }
 
   void HandleImplicitImportDecl(ImportDecl *D) override {
     for (Decl *I :
@@ -86,6 +97,7 @@ public:
 
 private:
   std::set<std::string> &Out;
+  std::function<void(ASTContext &)> AtEnd;
 };
 
 /// Installs the hit path and the file recorder on the compile.
@@ -93,14 +105,15 @@ class CachedAction : public SyntaxOnlyAction {
 public:
   CachedAction(std::unique_ptr<CacheClient> Client, std::set<std::string> &Out,
                std::string JobsDir = "", bool ExportParts = false,
-               std::set<std::string> *Emitted = nullptr)
+               std::set<std::string> *Emitted = nullptr,
+               std::function<void(ASTContext &)> AtEnd = nullptr)
       : Client(std::move(Client)), Out(Out), JobsDir(std::move(JobsDir)),
-        ExportParts(ExportParts), Emitted(Emitted) {}
+        ExportParts(ExportParts), Emitted(Emitted), AtEnd(std::move(AtEnd)) {}
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  StringRef File) override {
     if (Emitted)
-      return std::make_unique<EmitRecorder>(*Emitted);
+      return std::make_unique<EmitRecorder>(*Emitted, AtEnd);
     return SyntaxOnlyAction::CreateASTConsumer(CI, File);
   }
 
@@ -119,6 +132,7 @@ private:
   std::string JobsDir;
   bool ExportParts;
   std::set<std::string> *Emitted;
+  std::function<void(ASTContext &)> AtEnd;
 };
 
 class HitTest : public ::testing::Test {
@@ -211,6 +225,10 @@ protected:
     if (!Invocation)
       return false;
     Invocation->getFrontendOpts().DisableFree = false;
+    // Diags was made before the command line was read; its warning flags
+    // (-Wall, -Werror) are the compile's.
+    ProcessWarningOptions(*Diags, Invocation->getDiagnosticOpts(), *VFS,
+                          /*ReportDiags=*/false);
 
     CompilerInstance CI(std::move(Invocation));
     CI.setDiagnostics(Diags);
@@ -219,8 +237,11 @@ protected:
     CI.createFileManager();
 
     Emitted.clear();
-    CachedAction Action(client(), Entered, RecordJobsTo, ExportParts, &Emitted);
-    return CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
+    CachedAction Action(client(), Entered, RecordJobsTo, ExportParts, &Emitted,
+                        AtEnd);
+    bool Ok = CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
+    Warnings = Diags->getNumWarnings();
+    return Ok;
   }
 
   /// Builds \p Header after the files in \p Context, as a compile that
@@ -257,6 +278,10 @@ protected:
   /// The variables the last compile would have been told to emit, beyond
   /// what it parsed: module initializers and tentative definitions.
   std::set<std::string> Emitted;
+  /// Run on each compile's AST when its translation unit ends.
+  std::function<void(ASTContext &)> AtEnd;
+  /// How many warnings the last compile printed.
+  unsigned Warnings = 0;
   std::unique_ptr<CacheDaemon> Daemon;
   std::thread Server;
 };
@@ -1236,7 +1261,9 @@ TEST_F(ExportTest, AHeaderEndingInAFunctionIsSavedWithItsBody) {
   // emitted, to the compile's consumers -- before last_fn's body is
   // attached. last.h must not be written then, or it is saved with last_fn
   // declared but not defined, and a compile served it calls a function it
-  // never emits.
+  // never emits. Every compile has the flag that makes that an error: a copy
+  // is served only under the warning flags it was written with.
+  ExtraArgs = {"-Werror=undefined-internal"};
   std::string Next = write("next.h", "#ifndef NEXT_H\n#define NEXT_H\n"
                                      "int next_value(void) { return 4; }\n"
                                      "#endif\n");
@@ -1252,7 +1279,6 @@ TEST_F(ExportTest, AHeaderEndingInAFunctionIsSavedWithItsBody) {
   EXPECT_TRUE(reads(N, Next)) << "nothing is stored yet";
   EXPECT_FALSE(reads(X, Next)) << "next.h's part was not served";
   EXPECT_TRUE(reads(X, Last)) << "last.h is not stored yet";
-  ExtraArgs = {"-Werror=undefined-internal"};
   EXPECT_FALSE(reads(Y, Last)) << "last.h's part was not served";
 }
 
@@ -1526,4 +1552,143 @@ TEST_F(ExportTest, AHeaderIncludedUnderTwoMacroStatesIsServedBothTimes) {
   EXPECT_TRUE(reads(A, Name)) << "nothing is stored yet";
   ASSERT_EQ(Daemon->stats().Entries, 2u) << "name.h was not exported twice";
   EXPECT_FALSE(reads(A, Name)) << "a part of name.h was not served";
+}
+
+TEST_F(ExportTest, ACallInACopyFindsTheDeclarationBeforeTheInclude) {
+  // check.h calls fatal, which b.c declares before the #include and again
+  // after it, as _Noreturn. Plain clang ties the call to the declaration it
+  // found where it read check.h, the first; so must a compile served
+  // check.h's copy, though it reads check()'s body at the end.
+  std::string H = write("check.h", "#ifndef CHECK_H\n#define CHECK_H\n"
+                                   "static inline int check(int x) {\n"
+                                   "  if (x < 0)\n    fatal(\"negative\");\n"
+                                   "  return x * 2;\n}\n#endif\n");
+  std::string A = write("a.c", "void fatal(const char *msg);\n#include \"" + H +
+                                   "\"\nint a(int x) { return check(x); }\n");
+  std::string B =
+      write("b.c", "void fatal(const char *msg);\n#include \"" + H +
+                       "\"\n_Noreturn void fatal(const char *msg);\n"
+                       "int b(int x) { return check(x); }\n");
+  EXPECT_TRUE(reads(A, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, H)) << "nothing is stored yet";
+  std::optional<bool> CallsNoreturn;
+  AtEnd = [&](ASTContext &Ctx) {
+    DeclContextLookupResult Found =
+        Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("check"));
+    auto *Check =
+        Found.empty() ? nullptr : dyn_cast<FunctionDecl>(Found.front());
+    if (!Check || !Check->getBody())
+      return;
+    std::function<void(const Stmt *)> Visit = [&](const Stmt *S) {
+      if (const auto *Call = dyn_cast<CallExpr>(S))
+        if (const FunctionDecl *Callee = Call->getDirectCallee())
+          CallsNoreturn = Callee->hasAttr<C11NoReturnAttr>();
+      for (const Stmt *Child : S->children())
+        if (Child)
+          Visit(Child);
+    };
+    Visit(Check->getBody());
+  };
+  EXPECT_FALSE(reads(B, H)) << "check.h's copy was not served";
+  ASSERT_TRUE(CallsNoreturn.has_value()) << "no call to fatal in check()";
+  EXPECT_FALSE(*CallsNoreturn)
+      << "the call found the _Noreturn declaration after the #include";
+}
+
+/// w.h warns about an unused variable under -Wall.
+static const char *const WarningHeader =
+    "#ifndef W_H\n#define W_H\n"
+    "static inline int w(int x) { int unused_local; return x; }\n#endif\n";
+
+TEST_F(ExportTest, AServedHeaderPrintsItsWarningAgain) {
+  ExtraArgs = {"-Wall"};
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#include \"" + W + "\"\n");
+  EXPECT_TRUE(reads(A, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, W)) << "nothing is stored yet";
+  EXPECT_EQ(Warnings, 1u) << "a.c did not warn";
+  EXPECT_FALSE(reads(B, W)) << "w.h's copy was not served";
+  EXPECT_EQ(Warnings, 1u) << "the served header's warning was not printed";
+}
+
+TEST_F(ExportTest, UnderWerrorAServedHeaderWithAWarningFailsTheCompile) {
+  // The compile that writes the copy fails too: a warning -Werror made an
+  // error does not stop the copy, which is correct, and its warning comes
+  // back as an error.
+  ExtraArgs = {"-Wall", "-Werror"};
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#include \"" + W + "\"\n");
+  std::set<std::string> E1, E2, E3;
+  EXPECT_FALSE(compile(A, E1)) << "a.c compiled";
+  EXPECT_FALSE(compile(A, E2)) << "a.c compiled";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "w.h was not exported";
+  EXPECT_FALSE(compile(B, E3)) << "b.c compiled, served w.h's copy";
+  EXPECT_FALSE(E3.count(W)) << "w.h's copy was not served";
+}
+
+TEST_F(ExportTest, ACopyIsNotServedUnderOtherWarningFlags) {
+  // Written without -Wall, w.h's copy holds no warning; b.c, with -Wall,
+  // must print one, and reads w.h.
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#include \"" + W + "\"\n");
+  EXPECT_TRUE(reads(A, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, W)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "w.h was not exported";
+  ExtraArgs = {"-Wall"};
+  EXPECT_TRUE(reads(B, W)) << "a copy written without -Wall was served";
+  EXPECT_EQ(Warnings, 1u);
+}
+
+TEST_F(ExportTest, NotServedWhereAWarningPragmaIsInForce) {
+  // b.c silences the warning before the #include: the copy, which holds it,
+  // does not fit, and b.c reads w.h.
+  ExtraArgs = {"-Wall"};
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#pragma GCC diagnostic ignored "
+                               "\"-Wunused-variable\"\n#include \"" +
+                                   W + "\"\n");
+  EXPECT_TRUE(reads(A, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, W)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "w.h was not exported";
+  EXPECT_TRUE(reads(B, W)) << "served under a warning pragma";
+  EXPECT_EQ(Warnings, 0u) << "the pragma did not silence the warning";
+}
+
+TEST_F(ExportTest, AHeaderLeavingAWarningPragmaInForceIsServedWithIt) {
+  // quiet.h silences -Wunused-variable for the rest of the compile, as git's
+  // git-compat-util.h does -Wsign-compare. A compile served it must stay
+  // silent after it; used.h, read after it, prints with the pragma in force.
+  ExtraArgs = {"-Wall"};
+  std::string Q = write("quiet.h", "#ifndef QUIET_H\n#define QUIET_H\n"
+                                   "#pragma GCC diagnostic ignored "
+                                   "\"-Wunused-variable\"\nint quiet(void);\n"
+                                   "#endif\n");
+  std::string U = write("used.h", "#ifndef USED_H\n#define USED_H\n"
+                                  "static inline int used(void) {\n"
+                                  "  int unused_local;\n  return 1;\n}\n"
+                                  "#endif\n");
+  std::string A = write("a.c", "#include \"" + Q + "\"\n#include \"" + U +
+                                   "\"\nint f(void) { int unused; return 0; "
+                                   "}\n");
+  EXPECT_TRUE(reads(A, Q)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Q)) << "nothing is stored yet";
+  EXPECT_EQ(Warnings, 0u) << "the pragma did not silence the warnings";
+  ASSERT_EQ(Daemon->stats().Entries, 2u) << "quiet.h or used.h not exported";
+  EXPECT_FALSE(reads(A, Q)) << "quiet.h's copy was not served";
+  EXPECT_FALSE(reads(A, U)) << "used.h's copy was not served";
+  EXPECT_EQ(Warnings, 0u) << "the served pragma did not silence a warning";
+}
+
+TEST_F(ExportTest, AHeaderLeavingAWarningPragmaPushedIsNotWritten) {
+  std::string Q = write("pushed.h", "#ifndef PUSHED_H\n#define PUSHED_H\n"
+                                    "#pragma GCC diagnostic push\n"
+                                    "int pushed(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Q + "\"\n");
+  EXPECT_TRUE(reads(A, Q)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Q)) << "nothing is stored yet";
+  EXPECT_EQ(Daemon->stats().Entries, 0u) << "pushed.h was exported";
 }

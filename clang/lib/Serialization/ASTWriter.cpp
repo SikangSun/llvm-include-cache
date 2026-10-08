@@ -5536,6 +5536,15 @@ ASTWriter::WriteAST(llvm::PointerUnion<Sema *, Preprocessor *> Subject,
     PartDroppedLocations = 0;
   }
   ASTFileSignature Signature = WriteASTCore(SemaPtr, isysroot, WritingModule);
+  // While the writer still knows where each file went (setPartLocations).
+  if (PartLocationsOut) {
+    unsigned Dropped = PartDroppedLocations;
+    PartLocationsOut->clear();
+    for (SourceLocation L : PartLocations)
+      PartLocationsOut->push_back(
+          getRawSourceLocationEncoding(getAdjustedLocation(L)));
+    PartDroppedLocations = Dropped;
+  }
   PartSema = nullptr;
   PP = nullptr;
   this->WritingModule = nullptr;

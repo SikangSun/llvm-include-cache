@@ -47,6 +47,9 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
     return "an outside declaration the part refers to differs or is missing";
   case MismatchReason::FileChanged:
     return "a file the part holds changed since the part was saved";
+  case MismatchReason::WarningState:
+    return "the warning flags or pragmas differ, so the header's warnings "
+           "would too";
   }
   return "unknown";
 }
@@ -152,7 +155,7 @@ int redoLookups(
 MismatchReason clang::ast_cache::matchesLiveState(
     const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
     llvm::StringRef NotAMacroNames, std::string *Detail,
-    const IncludeSite *Site, CheckCost *Cost) {
+    const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -293,6 +296,12 @@ MismatchReason clang::ast_cache::matchesLiveState(
   if (capturePragmaState(*S) != Deps.Entry)
     return Because(MismatchReason::PragmaState, "#pragma pack or float state");
 
+  // The copy holds the warnings its header printed under its compile's
+  // flags and pragmas; under others it prints others (REPORT.md Q34).
+  if (Site && Site->WarningState != Deps.WarningState)
+    return Because(MismatchReason::WarningState,
+                   "the warning flags or pragmas differ");
+
   Lap.next(CheckCost::HeaderSearches);
 
   // The files the header's own #includes find depend on this compile's
@@ -384,6 +393,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
       return Because(MismatchReason::Declaration,
                      D.Name + " was " + D.Fingerprint + ", is " +
                          (F ? *F : std::string("not declared")));
+    if (Found)
+      Found->push_back(Live);
   }
 
   return MismatchReason::None;
@@ -464,6 +475,8 @@ llvm::StringRef CacheClient::lookup(
 
   LastCandidates = Resp->Entries.size();
   LastRejection = MismatchReason::None;
+  MatchedDecls.clear();
+  std::vector<NamedDecl *> Found;
   for (const CacheEntryRef &E : Resp->Entries) {
     // The names this entry requires not to be macros are in the region. If the
     // offset addresses nothing written, they cannot be checked, and checking
@@ -484,9 +497,10 @@ llvm::StringRef CacheClient::lookup(
     MismatchReason Why;
     {
       llvm::TimeTraceScope Scope("HeaderCache Check");
+      Found.clear();
       Why = matchesLiveState(E.Deps, PP, S, Names,
                              LogRejections ? &Detail : nullptr, Site,
-                             &Counters.Check);
+                             &Counters.Check, &Found);
     }
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
@@ -508,6 +522,9 @@ llvm::StringRef CacheClient::lookup(
                         : llvm::StringRef());
     if (!Effects || (E.EffectsLength && Effects->empty()))
       continue;
+    // Before Use loads the candidate: loading may read the part's
+    // references to outside declarations, which the caller pins to these.
+    MatchedDecls = Found;
     if (Use && !Use(Bytes, E.ModuleName))
       continue;
     ++Counters.Hits;

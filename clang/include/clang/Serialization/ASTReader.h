@@ -2617,6 +2617,11 @@ public:
   // access to a Sema object.
   SmallVector<GlobalDeclID, 16> PreloadedDeclIDs;
 
+  /// See pinNameReference.
+  llvm::DenseMap<std::tuple<ModuleFile *, IdentifierInfo *, unsigned>,
+                 NamedDecl *>
+      PinnedNameReferences;
+
   /// Retrieve the semantic analysis object used to analyze the
   /// translation unit in which the precompiled header is being
   /// imported.
@@ -2634,6 +2639,22 @@ public:
   /// and the reader resolves the part's DECL_NAME_REFERENCE records to it.
   static NamedDecl *lookupAtFileScope(Sema &S, IdentifierInfo &II, bool Tag,
                                       bool CreateBuiltin);
+
+  /// Makes the header cache part \p MF's file-scope references to \p II, in
+  /// the tag name space if \p Tag, resolve to \p D: the declaration the
+  /// loading compile found where it included the part, when it checked that
+  /// the part fits. A reference is otherwise resolved when it is first read,
+  /// to the name's latest declaration, which can come after the #include.
+  void pinNameReference(ModuleFile &MF, IdentifierInfo &II, bool Tag,
+                        NamedDecl *D) {
+    PinnedNameReferences[{&MF, &II, Tag}] = D;
+  }
+
+  /// The declaration pinNameReference fixed, or null.
+  NamedDecl *getPinnedNameReference(ModuleFile &MF, IdentifierInfo &II,
+                                    bool Tag) const {
+    return PinnedNameReferences.lookup({&MF, &II, Tag});
+  }
 
   /// Get the identifier resolver used for name lookup / updates
   /// in the translation unit scope. We have one of these even if we don't

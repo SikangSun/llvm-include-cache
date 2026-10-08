@@ -101,6 +101,34 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
     W.u64(F.Size);
     W.u64(static_cast<uint64_t>(F.ModTime));
   }
+
+  W.u64(Deps.WarningState);
+  auto Range = [&](const SavedDiagnostic::Range &R) {
+    W.u64(R.Begin);
+    W.u64(R.End);
+    W.u8(R.TokenRange ? 1 : 0);
+  };
+  W.u32(static_cast<uint32_t>(Deps.Diagnostics.size()));
+  for (const SavedDiagnostic &D : Deps.Diagnostics) {
+    W.u8(D.Level);
+    W.u32(D.ID);
+    W.u64(D.Loc);
+    W.str(D.Message);
+    W.u32(static_cast<uint32_t>(D.Ranges.size()));
+    for (const SavedDiagnostic::Range &R : D.Ranges)
+      Range(R);
+    W.u32(static_cast<uint32_t>(D.FixIts.size()));
+    for (const SavedDiagnostic::FixIt &F : D.FixIts) {
+      Range(F.Remove);
+      W.str(F.Insert);
+      W.u8(F.BeforePreviousInsertions ? 1 : 0);
+    }
+  }
+  W.u32(static_cast<uint32_t>(Deps.WarningPragmas.size()));
+  for (const WarningPragma &P : Deps.WarningPragmas) {
+    W.u8(P.Severity);
+    W.str(P.Option);
+  }
 }
 
 std::optional<HeaderDependencySet>
@@ -217,6 +245,38 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
     F.Size = R.u64();
     F.ModTime = static_cast<int64_t>(R.u64());
     Deps.Files.push_back(std::move(F));
+  }
+
+  Deps.WarningState = R.u64();
+  auto Range = [&] {
+    SavedDiagnostic::Range Out;
+    Out.Begin = R.u64();
+    Out.End = R.u64();
+    Out.TokenRange = R.u8() != 0;
+    return Out;
+  };
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    SavedDiagnostic D;
+    D.Level = R.u8();
+    D.ID = R.u32();
+    D.Loc = R.u64();
+    D.Message = R.str().str();
+    for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J)
+      D.Ranges.push_back(Range());
+    for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
+      SavedDiagnostic::FixIt F;
+      F.Remove = Range();
+      F.Insert = R.str().str();
+      F.BeforePreviousInsertions = R.u8() != 0;
+      D.FixIts.push_back(std::move(F));
+    }
+    Deps.Diagnostics.push_back(std::move(D));
+  }
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    WarningPragma P;
+    P.Severity = R.u8();
+    P.Option = R.str().str();
+    Deps.WarningPragmas.push_back(std::move(P));
   }
 
   // Trailing bytes mean the writer and reader disagree about the shape even

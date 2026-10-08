@@ -240,6 +240,42 @@ struct MacroEffect {
   bool Defined = false;
 };
 
+/// A #pragma GCC diagnostic or #pragma clang diagnostic: the severity it
+/// sets (diag::Severity) for an option such as "-Wsign-compare".
+struct WarningPragma {
+  uint8_t Severity = 0;
+  std::string Option;
+
+  friend bool operator==(const WarningPragma &A, const WarningPragma &B) {
+    return A.Severity == B.Severity && A.Option == B.Option;
+  }
+};
+
+/// A diagnostic Clang printed while the header was open, in the compile that
+/// wrote the copy. A hit prints it again: the header's text, skipped, would
+/// have printed it (REPORT.md Q34). Each location is in the copy's own
+/// encoding (ASTWriter::getRawSourceLocationEncoding), which the loading
+/// compile's reader translates as it translates any location in the copy.
+struct SavedDiagnostic {
+  /// DiagnosticsEngine::Level: a warning, an error -Werror made of one, a
+  /// remark, or a note on the diagnostic before it.
+  uint8_t Level = 0;
+  uint32_t ID = 0;
+  uint64_t Loc = 0;
+  std::string Message;
+  struct Range {
+    uint64_t Begin = 0, End = 0;
+    bool TokenRange = false;
+  };
+  std::vector<Range> Ranges;
+  struct FixIt {
+    Range Remove;
+    std::string Insert;
+    bool BeforePreviousInsertions = false;
+  };
+  std::vector<FixIt> FixIts;
+};
+
 struct HeaderDependencySet {
   std::vector<ConditionalDependency> Conditional;
   std::vector<SyntacticDependency> Syntactic;
@@ -271,6 +307,18 @@ struct HeaderDependencySet {
 
   /// Every macro the header touched, each once, in the order first touched.
   std::vector<MacroEffect> MacroEffects;
+
+  /// What decided which diagnostics the header printed where it was
+  /// included: the compile's warning flags and the warning pragmas in force
+  /// there, hashed (warningState). A hit requires the same.
+  uint64_t WarningState = 0;
+
+  /// The diagnostics the header's text printed, in order.
+  std::vector<SavedDiagnostic> Diagnostics;
+
+  /// The warning pragmas the header left in force for its includer, in
+  /// order. A hit applies them again where the header is included.
+  std::vector<WarningPragma> WarningPragmas;
 };
 
 /// One header's dependency set, as observed over the region between entering

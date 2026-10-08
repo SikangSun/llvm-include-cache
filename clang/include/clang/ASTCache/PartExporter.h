@@ -30,6 +30,7 @@
 #define LLVM_CLANG_ASTCACHE_PARTEXPORTER_H
 
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileEntry.h"
 #include <functional>
 #include <string>
@@ -39,6 +40,7 @@ namespace clang {
 class CompilerInstance;
 
 namespace ast_cache {
+class WarningPragmaTracker;
 
 class PartExporter {
 public:
@@ -59,9 +61,11 @@ public:
   };
 
   /// Installs an exporter on \p CI's preprocessor, which owns it. \p Deliver
-  /// receives each part, ready to push.
+  /// receives each part, ready to push. \p Pragmas, when given, says where a
+  /// warning pragma is in force; without it no part holds diagnostics.
   static PartExporter &install(CompilerInstance &CI,
-                               std::function<void(PushRequest &&)> Deliver);
+                               std::function<void(PushRequest &&)> Deliver,
+                               const WarningPragmaTracker *Pragmas = nullptr);
 
   virtual ~PartExporter();
 
@@ -83,6 +87,11 @@ public:
   /// Export the header whose absolute path is \p Path the first time it is
   /// entered, whatever the cache says. For CLANG_HEADER_CACHE_EXPORT.
   virtual void exportWhenEntered(std::string Path) = 0;
+
+  /// Clang printed a diagnostic. One printed while a header being exported
+  /// is open goes into its part, to be printed again at a hit.
+  virtual void diagnostic(DiagnosticsEngine::Level Level,
+                          const Diagnostic &Info) = 0;
 
   virtual const Stats &stats() const = 0;
 };

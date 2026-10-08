@@ -74,9 +74,10 @@ std::string absolutePath(FileManager &FM, llvm::StringRef Name) {
 class Exporter : public PartExporter, public PPCallbacks {
 public:
   Exporter(CompilerInstance &CI, ASTCacheDependencyTracker &Tracker,
-           std::function<void(PushRequest &&)> Deliver, bool ByName)
+           std::function<void(PushRequest &&)> Deliver, bool ByName,
+           const WarningPragmaTracker *Pragmas)
       : CI(CI), SM(CI.getSourceManager()), Tracker(Tracker),
-        Deliver(std::move(Deliver)), ByName(ByName) {
+        Deliver(std::move(Deliver)), ByName(ByName), Pragmas(Pragmas) {
     std::lock_guard<std::mutex> L(RegistryLock);
     registry()[&CI] = this;
   }
@@ -102,6 +103,27 @@ public:
 
   void exportWhenEntered(std::string Path) override {
     ExpectedPath = std::move(Path);
+  }
+
+  void diagnostic(DiagnosticsEngine::Level Level,
+                  const Diagnostic &Info) override {
+    if (Level == DiagnosticsEngine::Ignored)
+      return;
+    bool Note = Level == DiagnosticsEngine::Note;
+    for (Part &P : Open)
+      take(P, Level, Info);
+    // A header's last declaration is finished after the header is left: the
+    // parser has read a token past its closing brace. What Clang says then
+    // about a place inside the header, until the part is written, is the
+    // header's too; a note goes with the diagnostic before it.
+    for (Part &P : Ready) {
+      if (!Note)
+        P.TakingNotes = Info.getLocation().isValid() &&
+                        SM.isLocalSourceLocation(Info.getLocation()) &&
+                        inPart(P, Info.getLocation());
+      if (P.TakingNotes)
+        take(P, Level, Info);
+    }
   }
 
   const Stats &stats() const override { return Counts; }
@@ -179,6 +201,16 @@ public:
   void translationUnitFinished() { writeReady(); }
 
 private:
+  /// A diagnostic as Clang printed it.
+  struct Captured {
+    DiagnosticsEngine::Level Level;
+    unsigned ID;
+    SourceLocation Loc;
+    SmallString<128> Message;
+    std::vector<CharSourceRange> Ranges;
+    std::vector<FixItHint> FixIts;
+  };
+
   struct Part {
     FileID FID;
     /// The #include that entered the header.
@@ -199,11 +231,48 @@ private:
     std::map<std::string, FileStamp> Stamps;
     /// Non-empty: why the part is not saved.
     std::string Decline;
+    /// The diagnostics Clang printed while the header was open.
+    std::vector<Captured> Diagnostics;
+    /// Where the warning pragmas stood when the header began, and what
+    /// decided the diagnostics it printed (warningState).
+    WarningPragmaTracker::Mark PragmasAtBegin;
+    uint64_t WarningState = 0;
+    /// The warning pragmas the header left in force.
+    std::vector<WarningPragma> WarningPragmas;
+    /// After the header ended: whether the latest diagnostic was the
+    /// header's, so that its notes are too.
+    bool TakingNotes = false;
 
     bool contains(SourceLocation::UIntTy Offset) const {
       return Begin <= Offset && Offset < End;
     }
   };
+
+  /// Puts a diagnostic into \p P, to be printed again at a hit.
+  void take(Part &P, DiagnosticsEngine::Level Level, const Diagnostic &Info) {
+    if (!P.Decline.empty())
+      return;
+    // Without the tracker, nothing says the warning flags alone decided what
+    // the header printed.
+    if (!Pragmas) {
+      P.Decline = "it printed a diagnostic, and warning pragmas are not "
+                  "followed";
+      return;
+    }
+    // Another compile's IDs for a diagnostic made up at run time differ.
+    if (DiagnosticIDs::IsCustomDiag(Info.getID())) {
+      P.Decline = "it printed a diagnostic Clang made up at run time";
+      return;
+    }
+    Captured C;
+    C.Level = Level;
+    C.ID = Info.getID();
+    C.Loc = Info.getLocation();
+    Info.FormatDiagnostic(C.Message);
+    C.Ranges.assign(Info.getRanges().begin(), Info.getRanges().end());
+    C.FixIts.assign(Info.getFixItHints().begin(), Info.getFixItHints().end());
+    P.Diagnostics.push_back(std::move(C));
+  }
 
   /// \p P holds the parse of \p File's text as it is now.
   void hold(Part &P, FileEntryRef File) {
@@ -264,6 +333,12 @@ private:
         P.Decline =
             std::string("pragma state a record cannot carry: ") + Pragma;
     }
+    // The warning flags and the pragmas in force here decide what the
+    // header prints; a hit compares them (REPORT.md Q34).
+    P.WarningState =
+        warningState(warningFlagsHash(CI.getDiagnosticOpts()), Pragmas);
+    if (Pragmas)
+      P.PragmasAtBegin = Pragmas->mark();
     // A part refers to a declaration from a loaded copy by name; it cannot
     // hold a deep copy of one.
     if (P.ModulesAtBegin && !ByName && P.Decline.empty())
@@ -287,6 +362,15 @@ private:
         if (P.Decline.empty())
           P.Decline =
               std::string("pragma state a record cannot carry: ") + Pragma;
+    }
+    // A hit applies again the warning pragmas the header left in force; it
+    // cannot leave a push unpopped, or pop what the includer pushed.
+    if (Pragmas && P.Decline.empty()) {
+      if (std::optional<std::vector<WarningPragma>> Left =
+              Pragmas->since(P.PragmasAtBegin))
+        P.WarningPragmas = std::move(*Left);
+      else
+        P.Decline = "it leaves a warning pragma pushed, or pops one";
     }
     if (modulesLoaded() > P.ModulesAtBegin && P.Decline.empty())
       P.Decline = "a saved copy was loaded inside the header";
@@ -315,6 +399,8 @@ private:
   void write(Part &P) {
     if (!P.Decline.empty())
       return decline(P, P.Decline);
+    if (std::string Why = diagnosticsOutside(P); !Why.empty())
+      return decline(P, Why);
     // After an error nothing is written: Clang marks a module written then as
     // holding errors, and a compile offered it refuses it with an error of
     // its own (REPORT.md Q35). A warning that -Werror made an error is not
@@ -382,6 +468,11 @@ private:
       Counts.Copies.push_back(P.Stored + ": " + Why);
     }
     Deps.Declarations = std::move(W.Declarations);
+    if (!W.DiagnosticFailure.empty())
+      return decline(P, W.DiagnosticFailure);
+    Deps.Diagnostics = std::move(W.Diagnostics);
+    Deps.WarningState = P.WarningState;
+    Deps.WarningPragmas = P.WarningPragmas;
 
     PushRequest R;
     R.Filename = P.Stored;
@@ -392,6 +483,9 @@ private:
     std::string Line = P.Stored + ": " + std::to_string(W.Buffer.size()) +
                        " bytes in " + std::to_string(W.Micros) + " us, " +
                        std::to_string(W.ByName) + " by name";
+    if (!R.Deps.Diagnostics.empty())
+      Line += ", " + std::to_string(R.Deps.Diagnostics.size()) +
+              " diagnostics to print again";
     if (W.DroppedLocations)
       Line += ", " + std::to_string(W.DroppedLocations) +
               " locations dropped (in module files or outside the part)";
@@ -475,10 +569,93 @@ private:
     std::vector<DeclarationDependency> Declarations;
     /// Non-empty: an outside declaration that could not be named, and why.
     std::string Failure;
+    /// The part's diagnostics, located in its own encoding; or, if one
+    /// cannot be, why.
+    std::vector<SavedDiagnostic> Diagnostics;
+    std::string DiagnosticFailure;
     /// With CLANG_HEADER_CACHE_DUMP_PARTS: one line per declaration and
     /// macro written, "<bits>\t<kind>\t<name>\t<file>:<line>".
     std::vector<std::string> Sizes;
   };
+
+  /// Why \p P's diagnostics cannot be printed again as they were, or
+  /// empty. One located outside the part -- a note on the includer's
+  /// declaration, a warning about another file -- or in a macro expansion,
+  /// whose spelling may be outside, cannot.
+  std::string diagnosticsOutside(const Part &P) const {
+    auto Inside = [&](SourceLocation L) {
+      return L.isInvalid() ||
+             (L.isFileID() && !SM.isLoadedSourceLocation(L) && inPart(P, L));
+    };
+    for (const Captured &C : P.Diagnostics) {
+      bool Ok = Inside(C.Loc);
+      for (const CharSourceRange &R : C.Ranges)
+        Ok = Ok && Inside(R.getBegin()) && Inside(R.getEnd());
+      for (const FixItHint &F : C.FixIts)
+        Ok = Ok && F.InsertFromRange.isInvalid() &&
+             Inside(F.RemoveRange.getBegin()) && Inside(F.RemoveRange.getEnd());
+      if (!Ok)
+        return "it printed a diagnostic located outside it: " +
+               C.Message.str().str();
+    }
+    return "";
+  }
+
+  /// Every location of \p P's diagnostics, in the order saveDiagnostics
+  /// reads their encodings; no location first.
+  static std::vector<SourceLocation> diagnosticLocations(const Part &P) {
+    std::vector<SourceLocation> Locs{SourceLocation()};
+    for (const Captured &C : P.Diagnostics) {
+      Locs.push_back(C.Loc);
+      for (const CharSourceRange &R : C.Ranges)
+        Locs.insert(Locs.end(), {R.getBegin(), R.getEnd()});
+      for (const FixItHint &F : C.FixIts)
+        Locs.insert(Locs.end(),
+                    {F.RemoveRange.getBegin(), F.RemoveRange.getEnd()});
+    }
+    return Locs;
+  }
+
+  /// Puts \p P's diagnostics into \p W, with the encodings the writer gave
+  /// diagnosticLocations. A valid location that came out as no location is in
+  /// a file the part dropped, and the part is not saved.
+  static void saveDiagnostics(const Part &P,
+                              const std::vector<uint64_t> &Encoded,
+                              Written &W) {
+    size_t Next = 1;
+    bool Lost = false;
+    auto Take = [&](SourceLocation L) {
+      uint64_t E = Encoded[Next++];
+      Lost |= L.isValid() && E == Encoded[0];
+      return E;
+    };
+    auto TakeRange = [&](const CharSourceRange &R) {
+      SavedDiagnostic::Range Out;
+      Out.Begin = Take(R.getBegin());
+      Out.End = Take(R.getEnd());
+      Out.TokenRange = R.isTokenRange();
+      return Out;
+    };
+    for (const Captured &C : P.Diagnostics) {
+      SavedDiagnostic D;
+      D.Level = C.Level;
+      D.ID = C.ID;
+      D.Message = C.Message.str();
+      D.Loc = Take(C.Loc);
+      for (const CharSourceRange &R : C.Ranges)
+        D.Ranges.push_back(TakeRange(R));
+      for (const FixItHint &F : C.FixIts) {
+        SavedDiagnostic::FixIt &S = D.FixIts.emplace_back();
+        S.Remove = TakeRange(F.RemoveRange);
+        S.Insert = F.CodeToInsert;
+        S.BeforePreviousInsertions = F.BeforePreviousInsertions;
+      }
+      W.Diagnostics.push_back(std::move(D));
+    }
+    if (Lost)
+      W.DiagnosticFailure =
+          "it printed a diagnostic in a file it does not hold";
+  }
 
   /// Writes \p P's part as module \p M, referring to outside declarations
   /// by name if \p Named, and by deep copy otherwise.
@@ -499,12 +676,15 @@ private:
     std::vector<PartSize> Sizes;
     if (dumpDir())
       Writer.setPartSizes(&Sizes);
+    std::vector<uint64_t> Encoded;
+    Writer.setPartLocations(diagnosticLocations(P), &Encoded);
     auto Start = std::chrono::steady_clock::now();
     Writer.WriteAST(&CI.getSema(), P.Stored, M, /*isysroot=*/"");
     W.Micros = std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::steady_clock::now() - Start)
                    .count();
     W.DroppedLocations = Writer.getPartDroppedLocations();
+    saveDiagnostics(P, Encoded, W);
     llvm::TimeTraceScope OutsideScope("HeaderCache ExportOutsideDecls");
     for (const PartSize &Z : Sizes)
       W.Sizes.push_back(describeSize(P, Named, Z));
@@ -564,6 +744,8 @@ private:
   /// Whether a part refers to outside declarations by name (the default) or
   /// holds deep copies of them.
   bool ByName;
+  /// Where a warning pragma is in force; null if not followed.
+  const WarningPragmaTracker *Pragmas;
   /// Set by exportNext for the file about to be entered.
   const FileEntry *Expected = nullptr;
   std::string ExpectedPath;
@@ -626,15 +808,16 @@ static FrontendPluginRegistry::Add<ExportPlugin>
     ExportPluginEntry("header-cache-export",
                       "tells the header cache when a declaration is finished");
 
-PartExporter &
-PartExporter::install(CompilerInstance &CI,
-                      std::function<void(PushRequest &&)> Deliver) {
+PartExporter &PartExporter::install(CompilerInstance &CI,
+                                    std::function<void(PushRequest &&)> Deliver,
+                                    const WarningPragmaTracker *Pragmas) {
   Preprocessor &PP = CI.getPreprocessor();
   auto Tracker = std::make_unique<ASTCacheDependencyTracker>(PP);
   ASTCacheDependencyTracker &T = *Tracker;
   const char *Outside = std::getenv("CLANG_HEADER_CACHE_OUTSIDE");
   bool ByName = !Outside || llvm::StringRef(Outside) != "copy";
-  auto E = std::make_unique<Exporter>(CI, T, std::move(Deliver), ByName);
+  auto E =
+      std::make_unique<Exporter>(CI, T, std::move(Deliver), ByName, Pragmas);
   Exporter &Ex = *E;
   T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID); });
   PP.setExpansionCandidateObserver(T);

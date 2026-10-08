@@ -3911,9 +3911,9 @@ void ASTReader::markIncompleteDeclChain(Decl *D) {
 }
 
 /// Read the declaration at the given offset from the AST file.
-/// The declaration a DECL_NAME_REFERENCE record names in this compile, or
-/// null.
-static NamedDecl *resolveNameReference(ASTReader &Reader,
+/// The declaration a DECL_NAME_REFERENCE record of \p F names in this
+/// compile, or null.
+static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
                                        ASTRecordReader &Record) {
   auto Kind = Decl::Kind(Record.readInt());
   auto How = NameReferenceKind(Record.readInt());
@@ -3926,9 +3926,11 @@ static NamedDecl *resolveNameReference(ASTReader &Reader,
     if (!II)
       return nullptr;
     if (!Parent) {
-      if (Sema *S = Reader.getSema())
-        Found = ASTReader::lookupAtFileScope(*S, *II, Tag,
-                                             /*CreateBuiltin=*/false);
+      Found = Reader.getPinnedNameReference(F, *II, Tag);
+      if (!Found)
+        if (Sema *S = Reader.getSema())
+          Found = ASTReader::lookupAtFileScope(*S, *II, Tag,
+                                               /*CreateBuiltin=*/false);
       break;
     }
     auto *RD = dyn_cast<RecordDecl>(Parent);
@@ -4016,7 +4018,7 @@ Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
     // A declaration from outside a header cache part. The loading compile
     // checked, before it loaded the part, that the name finds a declaration
     // with the same fingerprint, so a failure here is a bug.
-    NamedDecl *Found = resolveNameReference(*this, Record);
+    NamedDecl *Found = resolveNameReference(*this, *Loc.F, Record);
     if (!Found)
       llvm::report_fatal_error(
           Twine("header cache part ") + Loc.F->ModuleName +
