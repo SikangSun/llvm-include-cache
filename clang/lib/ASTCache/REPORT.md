@@ -77,7 +77,7 @@ much they change and how often they can happen.
 | 5 | Q8: a name a copy refers to is looked up later than plain clang looks it up | Different but valid code; debug lines move | A declaration made again after the `#include` | Fixed 2026-10-08 |
 | 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects | Design change |
 | 7 | Q12: `__COUNTER__` | Nothing: such headers are not cached | No header in the six projects uses it | -- |
-| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | None in the six projects | Open: the fix is not cheap before I1 |
+| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | None in the six projects | Open: the cost estimate was wrong (2026-10-09); the fix is next, measured |
 
 Checked and fine: parallel first builds, 16 compiles at a time sharing one
 daemon (`par_check.py`), with the fixes below: no failures, and every object
@@ -550,11 +550,20 @@ copy.
 **How often.** No failure in the six projects. It needs two declarations of
 one name that differ but are compatible, one of them inside a copy.
 
-**Fix (idea), and why it is not built.** Record the names a copy declares
-and check at a hit that the compile has no declaration of them yet. Each
-check is a lookup that searches every loaded copy, the search replay used
-to spend most of its time in (I8). Measured on git's first build
-(2026-10-08), with every copy dumped:
+**Fix (idea).** Record the names a copy declares at file scope, with their
+types, and check at a hit, before loading, that the compile has no
+declaration of them, or one of the identical type.
+
+**Cost, corrected 2026-10-09.** The estimate below assumed each check is a
+new search through every loaded copy, at the rate measured in replay. The
+fit check already does that search: every name the header's text uses,
+the names it declares included, is looked up to confirm it is not a macro
+(CacheClient.cpp, the not-a-macro names). After that lookup the name's
+entry holds every declaration of the name, from the compile and from the
+loaded copies, so the fix adds one test per name on that entry. Names a
+macro builds by token pasting are not in that list and would still need a
+search. The fix is next, with its cost measured. The estimate, kept for
+the record (git's first build, 2026-10-08, every copy dumped):
 
 | git first build | Value |
 |---|---|
@@ -564,9 +573,8 @@ to spend most of its time in (I8). Measured on git's first build
 | Cost of one lookup, measured in replay (29.18 s over 16.65 million) | 1.75 us |
 | Checks per git first build | about 7.8 s, 4.5% of plain clang's 174 s |
 
-At that rate the six first builds would pay about 43 s, more than I8 saved.
-After I1 (one index of names over the loaded copies), a check is one hash
-lookup.
+At that rate the six first builds would have paid about 43 s; the
+searches the rate assumed are already made by the fit check.
 
 ## 3. Optimizations ranked by what they could remove
 
@@ -806,12 +814,15 @@ Explained and ranked in section 2; each fix is approved one at a time.
    turned the wrong code into a compile error (two `fp`'s).
 10. **Q10. Module builds** (rank 4). Fixed 2026-10-08: the hook does
     nothing in a compile that writes a module or a precompiled header.
-11. **Q11. `push_macro` and `pop_macro`** (rank 3). The usual use -- a
-    header saves, changes and restores a macro -- is wrong code too (new).
-    Fix proposed: a macro that ends the header as it began is no effect,
-    and a copy never holds a definition written outside it. For the split
-    uses: decline, or record pushes and pops? Approve 1 and 2, and choose
-    for 3.
+11. **Q11. `push_macro` and `pop_macro`** (rank 3). q11s's wrong result
+    is a bug in the recording code: s.h:4 and s.h:5 put X on s.h's macro
+    effects, with X's definition at s.h's end, which is a.c:1's. Your rule
+    (2026-10-09): (1) a macro whose definition at the header's end is the
+    one it had at the start is no effect; (2) a pop that takes a definition
+    pushed before the header is a dependency, checked at the hit; (3) a
+    push left on the stack, or such a pop, is replayed at the hit as the
+    same push or pop, so a copy holds no definition written outside it.
+    Waiting for your go to build it.
 12. **Q12. `__COUNTER__`.** Not a problem in the six projects: none of their
     headers uses it.
 34. **Q34. A served header's warnings are lost** (rank 1). Fixed
@@ -819,9 +830,10 @@ Explained and ranked in section 2; each fix is approved one at a time.
     under the same warning flags and pragmas.
 35. **Q35. A compile with errors still writes copies** (rank 1). Fixed
     2026-10-07: nothing is written after a real error.
-36. **Q36. A copy assumes the names it declares are new** (new). Not
-    built: checking every declared name at every hit would cost about 7.8 s
-    of git's 174 s first build before I1. Build it with I1?
+36. **Q36. A copy assumes the names it declares are new** (new). The
+    7.8 s estimate was wrong: the fit check already looks up every name
+    written in the header's text, the declared names included. Next, under
+    your go-ahead for a cheap fix, with its cost measured.
 
 ### C. Proposals waiting for approval
 
