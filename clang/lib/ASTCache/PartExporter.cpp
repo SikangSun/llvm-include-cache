@@ -14,6 +14,7 @@
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/DeclFingerprint.h"
 #include "clang/ASTCache/DependencySerialization.h"
+#include "clang/ASTCache/MacroTokens.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/Module.h"
@@ -31,6 +32,7 @@
 #include "clang/Serialization/ModuleManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
@@ -164,13 +166,35 @@ public:
   void MacroDefined(const Token &MacroNameTok,
                     const MacroDirective *) override {
     for (Part &P : Open)
-      P.Touched.insert(MacroNameTok.getIdentifierInfo());
+      touch(P, MacroNameTok.getIdentifierInfo());
   }
 
   void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &,
                       const MacroDirective *) override {
     for (Part &P : Open)
-      P.Touched.insert(MacroNameTok.getIdentifierInfo());
+      touch(P, MacroNameTok.getIdentifierInfo());
+  }
+
+  void PragmaPushMacro(SourceLocation, const IdentifierInfo *II,
+                       const MacroInfo *) override {
+    for (Part &P : Open) {
+      MacroStack &S = stackOf(P, II);
+      S.Pushed.push_back(S.Now);
+    }
+  }
+
+  void PragmaPopMacro(SourceLocation, const IdentifierInfo *II,
+                      const MacroInfo *Taken) override {
+    for (Part &P : Open) {
+      MacroStack &S = stackOf(P, II);
+      if (!S.Pushed.empty()) {
+        S.Now = S.Pushed.back();
+        S.Pushed.pop_back();
+        continue;
+      }
+      S.Popped.push_back(Taken);
+      S.Now = S.Popped.size();
+    }
   }
 
   void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
@@ -211,6 +235,19 @@ private:
     std::vector<FixItHint> FixIts;
   };
 
+  /// Where one name stands in a header that pushes or pops it (REPORT.md
+  /// Q11). Its definition is one of: the definition it had where the header
+  /// began (Start), the Nth one a pop took from below the header (N), or one
+  /// the header's own #define or #undef made (Own).
+  struct MacroStack {
+    static constexpr int Start = 0, Own = -1;
+    int Now = Start;
+    /// What each of the header's own pushes still on the stack saved.
+    std::vector<int> Pushed;
+    /// What the header's pops took from below it, in order.
+    std::vector<const MacroInfo *> Popped;
+  };
+
   struct Part {
     FileID FID;
     /// The #include that entered the header.
@@ -225,6 +262,9 @@ private:
     PragmaSnapshot Entry, Exit;
     llvm::SetVector<const IdentifierInfo *> Touched;
     std::vector<MacroEffect> Effects;
+    /// Each name the header's #pragma push_macro or pop_macro named.
+    llvm::MapVector<const IdentifierInfo *, MacroStack> Stacks;
+    std::vector<MacroStackEffect> MacroStacks;
     /// Every file entered while the header was open, the header included,
     /// and each one's size and modification time by real path.
     llvm::DenseSet<const FileEntry *> Files;
@@ -281,6 +321,67 @@ private:
     std::string Path = CI.getFileManager().getCanonicalName(File).str();
     P.Stamps[Path] = {Path, static_cast<uint64_t>(File.getSize()),
                       static_cast<int64_t>(File.getModificationTime())};
+  }
+
+  /// \p II was defined or undefined by \p P's header.
+  void touch(Part &P, const IdentifierInfo *II) {
+    P.Touched.insert(II);
+    if (!P.Stacks.empty())
+      if (auto It = P.Stacks.find(II); It != P.Stacks.end())
+        It->second.Now = MacroStack::Own;
+  }
+
+  MacroStack &stackOf(Part &P, const IdentifierInfo *II) {
+    auto [It, New] = P.Stacks.try_emplace(II);
+    if (New && P.Touched.contains(II))
+      It->second.Now = MacroStack::Own;
+    return It->second;
+  }
+
+  /// Your rule for push_macro and pop_macro (REPORT.md Q11): what a pop
+  /// takes from below the header is a dependency; the pops and pushes that
+  /// reach outside it are replayed; a name the header leaves as it found it
+  /// is no effect. Fills P.MacroStacks and \p Unchanged, or declines \p P.
+  void macroStacks(Part &P,
+                   llvm::DenseSet<const IdentifierInfo *> &Unchanged) {
+    Preprocessor &PP = CI.getPreprocessor();
+    for (auto &[II, S] : P.Stacks) {
+      MacroStackEffect E;
+      E.Name = II->getName().str();
+      for (const MacroInfo *MI : S.Popped) {
+        if (!MI) {
+          E.Popped.push_back(std::nullopt);
+          continue;
+        }
+        std::optional<std::string> Tokens =
+            serializeMacroTokens(*MI, SM, PP.getLangOpts());
+        if (!Tokens) {
+          P.Decline = "it pops a definition of " + E.Name +
+                      " whose text cannot be read";
+          return;
+        }
+        E.Popped.push_back(std::move(*Tokens));
+      }
+      // A hit pops as many, which leaves the last definition popped, then
+      // pushes that definition as often as the header's pushes still on the
+      // stack: each must have saved it.
+      int Left = S.Popped.size();
+      if (llvm::any_of(S.Pushed, [&](int Saved) { return Saved != Left; })) {
+        P.Decline = "it pushes a definition of " + E.Name +
+                    " a hit cannot push again";
+        return;
+      }
+      E.Pushes = S.Pushed.size();
+      if (S.Now == Left)
+        Unchanged.insert(II);
+      else if (S.Now != MacroStack::Own) {
+        P.Decline = "it leaves " + E.Name +
+                    " at a definition from outside it a hit cannot give back";
+        return;
+      }
+      if (!E.Popped.empty() || E.Pushes)
+        P.MacroStacks.push_back(std::move(E));
+    }
   }
 
   /// Whether \p L, where a macro was used if it is in one, falls in \p P.
@@ -351,10 +452,14 @@ private:
     Part P = Open.pop_back_val();
     P.End = SM.getNextLocalOffset();
     Preprocessor &PP = CI.getPreprocessor();
+    llvm::DenseSet<const IdentifierInfo *> Unchanged;
+    if (!P.Stacks.empty() && P.Decline.empty())
+      macroStacks(P, Unchanged);
     for (const IdentifierInfo *II : P.Touched)
-      P.Effects.push_back(
-          {II->getName().str(),
-           PP.isMacroDefined(const_cast<IdentifierInfo *>(II))});
+      if (!Unchanged.contains(II))
+        P.Effects.push_back(
+            {II->getName().str(),
+             PP.isMacroDefined(const_cast<IdentifierInfo *>(II))});
     if (CI.hasSema()) {
       Sema &S = CI.getSema();
       P.Exit = capturePragmaState(S);
@@ -419,6 +524,7 @@ private:
     Deps.Entry = P.Entry;
     Deps.Exit = P.Exit;
     Deps.MacroEffects = P.Effects;
+    Deps.MacroStacks = P.MacroStacks;
     Deps.HeaderName = P.Name;
     for (auto &[Path, Stamp] : P.Stamps)
       Deps.Files.push_back(Stamp);

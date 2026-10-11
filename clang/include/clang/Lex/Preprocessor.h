@@ -1482,6 +1482,20 @@ public:
   /// one.
   MacroDirective *getLocalMacroDirectiveHistory(const IdentifierInfo *II) const;
 
+  /// The definitions \#pragma push_macro has saved, per name, oldest first;
+  /// null where the name was not a macro.
+  const llvm::DenseMap<IdentifierInfo *, std::vector<MacroInfo *>> &
+  getPushedMacros() const {
+    return PragmaPushMacroInfo;
+  }
+
+  /// What \#pragma push_macro does for \p II.
+  void pushMacro(IdentifierInfo *II);
+
+  /// What \#pragma pop_macro does for \p II at \p Loc. False, and nothing
+  /// done, if nothing was pushed.
+  bool popMacro(IdentifierInfo *II, SourceLocation Loc);
+
   /// Add a directive to the macro directive history for this identifier.
   void appendMacroDirective(IdentifierInfo *II, MacroDirective *MD);
   DefMacroDirective *appendDefMacroDirective(IdentifierInfo *II, MacroInfo *MI,

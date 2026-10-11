@@ -343,6 +343,36 @@ void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
   recordSyntactic(II, PP.getMacroDefinition(II).getMacroInfo());
 }
 
+void ASTCacheDependencyTracker::PragmaPushMacro(SourceLocation,
+                                                const IdentifierInfo *II,
+                                                const MacroInfo *) {
+  for (Frame &F : Stack)
+    ++F.MacroPushes[II];
+}
+
+void ASTCacheDependencyTracker::PragmaPopMacro(SourceLocation,
+                                               const IdentifierInfo *II,
+                                               const MacroInfo *) {
+  // The frames the pop takes from below are the innermost ones: an inner
+  // frame's pushes are made inside every frame around it.
+  bool TookFromBelow = false;
+  for (Frame &F : Stack) {
+    auto It = F.MacroPushes.find(II);
+    if (It != F.MacroPushes.end() && It->second) {
+      --It->second;
+      continue;
+    }
+    TookFromBelow |= F.SeenSyntactic.insert(II).second;
+  }
+  // Every frame sees what the frames inside it see (Frame::SeenSyntactic):
+  // the frames whose own push the pop took see the name now, at the
+  // definition their push saved.
+  if (TookFromBelow) {
+    PP.refreshIdentifier(*II);
+    recordSyntactic(II, PP.getMacroDefinition(II).getMacroInfo());
+  }
+}
+
 void ASTCacheDependencyTracker::MacroExpands(const Token &MacroNameTok,
                                              const MacroDefinition &MD,
                                              SourceRange Range,

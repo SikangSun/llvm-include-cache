@@ -521,6 +521,9 @@ public:
     // first, so the directives replayed below override them rather than the
     // other way around.
     auto Replaying = std::chrono::steady_clock::now();
+    // The pushes go first: they save this compile's definitions, which the
+    // copy's own would hide once visible.
+    replayMacroStacks(Deps.MacroStacks, IncludeLoc);
     {
       llvm::TimeTraceScope S("HeaderCache MakeVisible");
       PP.makeModuleVisible(Target, IncludeLoc);
@@ -625,6 +628,24 @@ private:
   /// macro is defined, #pragma push_macro. Another precompiled file -- a
   /// PCH -- may hold directives of its own, so with one loaded every effect
   /// is replayed.
+  /// The header's #pragma pop_macro and push_macro that reach outside it,
+  /// as its text would have run them: the pops first, then the pushes, all
+  /// before the header's own definitions (REPORT.md Q11). The check made
+  /// sure each pop takes what it took where the copy was written.
+  void replayMacroStacks(llvm::ArrayRef<MacroStackEffect> Stacks,
+                         SourceLocation Loc) {
+    Preprocessor &PP = CI.getPreprocessor();
+    for (const MacroStackEffect &E : Stacks) {
+      TouchedByCopies.insert(llvm::xxh3_64bits(E.Name));
+      IdentifierInfo *II = PP.getIdentifierInfo(E.Name);
+      PP.refreshIdentifier(*II);
+      for (size_t I = 0, N = E.Popped.size(); I != N; ++I)
+        PP.popMacro(II, Loc);
+      for (uint32_t I = 0; I != E.Pushes; ++I)
+        PP.pushMacro(II);
+    }
+  }
+
   void replayMacroEffects(llvm::ArrayRef<MacroEffect> Effects, Module &Target,
                           SourceLocation Loc) {
     Preprocessor &PP = CI.getPreprocessor();

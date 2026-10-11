@@ -2,7 +2,8 @@
 
 Written 2026-10-07 and updated the same evening, to work from on
 2026-10-08; updated again after your answers (Q8 to Q11, Q34, I8), and on 2026-10-08
-after building Q8, Q10, Q34 and I8. The correctness problems explained and ranked (section 2), every
+after building Q8, Q10, Q34 and I8; on 2026-10-11 after building Q11
+and setting Q36 aside. The correctness problems explained and ranked (section 2), every
 optimization ranked by the time it could remove, measured (section 3),
 sorted into techniques and implementation fixes (section 4), the proposed
 switches for ablation (section 5), and every open question (section 6).
@@ -72,12 +73,12 @@ much they change and how often they can happen.
 |---|---|---|---|---|
 | 1 | Q34, Q35: a header's diagnostics are lost on a hit | Warnings disappear; under `-Werror` a compile plain clang fails succeeds | Any header with a warning | Fixed 2026-10-07 (Q35) and 2026-10-08 (Q34) |
 | 2 | Q9: two copies of a header share a name | Wrong code, no diagnostic | One unguarded header twice in a compile, an outside declaration changed in between | Fixed 2026-10-07 |
-| 3 | Q11: `push_macro` and `pop_macro` | Wrong code, no diagnostic, in three of the four ways headers use them | No header compiled in the six projects uses them | Fix proposed |
+| 3 | Q11: `push_macro` and `pop_macro` | Wrong code, no diagnostic, in three of the four ways headers use them | No header compiled in the six projects uses them | Fixed 2026-10-11, your rule |
 | 4 | Q10: the cache runs inside compiles that build a Clang module or a precompiled header | Clang crashed; a compile using the precompiled header failed | Only builds that use Clang modules or precompiled headers | Fixed 2026-10-08 |
 | 5 | Q8: a name a copy refers to is looked up later than plain clang looks it up | Different but valid code; debug lines move | A declaration made again after the `#include` | Fixed 2026-10-08 |
 | 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects | Design change |
 | 7 | Q12: `__COUNTER__` | Nothing: such headers are not cached | No header in the six projects uses it | -- |
-| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | None in the six projects | Open: the cost estimate was wrong (2026-10-09); the fix is next, measured |
+| -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | None in the six projects | Set aside 2026-10-11: only declarations without prototypes, removed in C23 |
 
 Checked and fine: parallel first builds, 16 compiles at a time sharing one
 daemon (`par_check.py`), with the fixes below: no failures, and every object
@@ -180,6 +181,21 @@ copy. A first version that allowed one copy of a header per compile read
 ### Q11: `push_macro` and `pop_macro`
 
 Explained again 2026-10-08, by another model, on request.
+
+**Fixed 2026-10-11, by your rule:** what a header's pop takes from below it
+is a dependency; the pushes and pops that reach outside it are replayed; a
+macro the header leaves as it found it is no effect. The exporter follows
+each push and pop (two new PPCallbacks); the copy's metadata lists, per
+name, the definitions its pops took and how many pushes it left
+(`MacroStackEffect`, metadata version 9); a hit checks the first against
+the top of the loading compile's stack and replays the pops and pushes
+before making the copy's macros visible; a copy no longer holds a
+definition a pop brought back from outside it; and a use of the name after
+such a pop is no longer checked against its definition at the `#include`,
+since the pop's own dependency covers it. q11s, q11u, q11p and q11 now
+compile to plain clang's code, served or read, and so do q11p and q11 with
+b.c pushing a.c's value, where end.h and p.h are served and their pops
+replayed. The traces below are of the build before the fix.
 
 **Result.** In three of four tests, b.c is served the copy and returns a different number than plain clang: q11s 60 (plain clang: 21), q11p 60 (25), q11 140 (505); q11u agrees. Cause 1: the copy holds a definition of X written in a.c, and b.c reads that definition as 40; in q11s, X is `1` before `#include "s.h"` at b.c:2 and 40 after. Cause 2, in q11p and q11: the push is in one file, the pop is in another, and the copy holds neither, so even a readable definition would make X `1` (a.c's) after the `#include` in b.c, where plain clang has `5` (b.c's own).
 
@@ -550,6 +566,14 @@ copy.
 **How often.** No failure in the six projects. It needs two declarations of
 one name that differ but are compatible, one of them inside a copy.
 
+**Set aside 2026-10-11, your decision.** Both failing tests need a function
+type without a prototype (`int g();`, `int (*fp)();`): deprecated in every C
+standard, and removed in C23, where `int g();` means `int g(void)` and plain
+clang rejects q9c itself (`conflicting types for 'g'`). The compatible pairs
+C still allows are served correctly: `extern int arr[];` in x.h and
+`extern int arr[10];` in y.h (`qtests/q36arr`) compile to plain clang's code,
+since Clang's loader links an array of unknown size to a sized one.
+
 **Fix (idea).** Record the names a copy declares at file scope, with their
 types, and check at a hit, before loading, that the compile has no
 declaration of them, or one of the identical type.
@@ -814,15 +838,10 @@ Explained and ranked in section 2; each fix is approved one at a time.
    turned the wrong code into a compile error (two `fp`'s).
 10. **Q10. Module builds** (rank 4). Fixed 2026-10-08: the hook does
     nothing in a compile that writes a module or a precompiled header.
-11. **Q11. `push_macro` and `pop_macro`** (rank 3). q11s's wrong result
-    is a bug in the recording code: s.h:4 and s.h:5 put X on s.h's macro
-    effects, with X's definition at s.h's end, which is a.c:1's. Your rule
-    (2026-10-09): (1) a macro whose definition at the header's end is the
-    one it had at the start is no effect; (2) a pop that takes a definition
-    pushed before the header is a dependency, checked at the hit; (3) a
-    push left on the stack, or such a pop, is replayed at the hit as the
-    same push or pop, so a copy holds no definition written outside it.
-    Waiting for your go to build it.
+11. **Q11. `push_macro` and `pop_macro`** (rank 3). Fixed 2026-10-11 by
+    your rule: what a pop takes from below the header is a dependency, the
+    pushes and pops that reach outside it are replayed, and a macro the
+    header leaves as it found it is no effect.
 12. **Q12. `__COUNTER__`.** Not a problem in the six projects: none of their
     headers uses it.
 34. **Q34. A served header's warnings are lost** (rank 1). Fixed
@@ -830,10 +849,9 @@ Explained and ranked in section 2; each fix is approved one at a time.
     under the same warning flags and pragmas.
 35. **Q35. A compile with errors still writes copies** (rank 1). Fixed
     2026-10-07: nothing is written after a real error.
-36. **Q36. A copy assumes the names it declares are new** (new). The
-    7.8 s estimate was wrong: the fit check already looks up every name
-    written in the header's text, the declared names included. Next, under
-    your go-ahead for a cheap fix, with its cost measured.
+36. **Q36. A copy assumes the names it declares are new** (new). Set
+    aside 2026-10-11: it needs declarations without prototypes, removed in
+    C23.
 
 ### C. Proposals waiting for approval
 

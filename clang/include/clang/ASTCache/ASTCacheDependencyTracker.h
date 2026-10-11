@@ -185,6 +185,16 @@ public:
   /// includer at all.
   void expansionCandidate(const Token &Identifier) override;
 
+  /// A #pragma pop_macro that takes what was pushed before a frame's header
+  /// leaves the name at the definition it took. The part's metadata checks
+  /// that definition (MacroStackEffect), so the frame records nothing more
+  /// for the name; without this, its first use after the pop would be
+  /// checked against the definition at the #include (REPORT.md Q11).
+  void PragmaPushMacro(SourceLocation Loc, const IdentifierInfo *II,
+                       const MacroInfo *Saved) override;
+  void PragmaPopMacro(SourceLocation Loc, const IdentifierInfo *II,
+                      const MacroInfo *Taken) override;
+
   /// The same record, reached from an actual expansion. Every expansion is
   /// preceded by an expansionCandidate for the same token, so this only
   /// matters if some path reaches HandleIdentifier without one -- in which
@@ -269,6 +279,8 @@ private:
     /// enclosing it has seen too, since both were open at the time.
     llvm::DenseSet<const IdentifierInfo *> SeenSyntactic;
     llvm::DenseSet<const IdentifierInfo *> SeenSymbol;
+    /// Per name, the #pragma push_macro made in this frame and not popped.
+    llvm::DenseMap<const IdentifierInfo *, unsigned> MacroPushes;
     llvm::DenseSet<const FileEntry *> SeenSkipped;
     llvm::StringSet<> SeenFileNames;
     /// For each file entered under this frame, the index of the

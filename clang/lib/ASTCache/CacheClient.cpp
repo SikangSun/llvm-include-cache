@@ -50,6 +50,8 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
   case MismatchReason::WarningState:
     return "the warning flags or pragmas differ, so the header's warnings "
            "would too";
+  case MismatchReason::MacroStack:
+    return "a definition the header's #pragma pop_macro takes differs";
   }
   return "unknown";
 }
@@ -242,6 +244,29 @@ MismatchReason clang::ast_cache::matchesLiveState(
     if (!Live || *Live != D.TokenSequence)
       return Because(MismatchReason::Syntactic,
                      D.Name + " expands differently");
+  }
+
+  // What the header's pops take from below it: the top of each name's
+  // push_macro stack, as where the copy was written (REPORT.md Q11).
+  for (const MacroStackEffect &E : Deps.MacroStacks) {
+    if (E.Popped.empty())
+      continue;
+    const auto &Pushed = PP.getPushedMacros();
+    auto It = Pushed.find(Fresh(E.Name));
+    size_t Have = It == Pushed.end() ? 0 : It->second.size();
+    if (Have < E.Popped.size())
+      return Because(MismatchReason::MacroStack,
+                     E.Name + " has fewer definitions pushed");
+    for (size_t I = 0, N = E.Popped.size(); I != N; ++I) {
+      const MacroInfo *MI = It->second[Have - 1 - I];
+      std::optional<std::string> Live =
+          MI ? serializeMacroTokens(*MI, PP.getSourceManager(),
+                                    PP.getLangOpts())
+             : std::nullopt;
+      if (bool(MI) != E.Popped[I].has_value() || (MI && Live != E.Popped[I]))
+        return Because(MismatchReason::MacroStack,
+                       E.Name + "'s pushed definitions differ");
+    }
   }
 
   // An #include the recorded compile skipped must also be skippable here,

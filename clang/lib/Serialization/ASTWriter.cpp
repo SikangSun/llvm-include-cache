@@ -2700,6 +2700,17 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
       if (PartMacros)
         while (MD && !PartMacros(MD))
           MD = MD->getPrevious();
+      // That directive can give back a definition from outside the part:
+      // #pragma pop_macro taking back what was pushed before the header. The
+      // part holds no such definition; a hit gets it from the loading
+      // compile's own stack (REPORT.md Q11).
+      if (PartMacros && PartKeepsExpansion)
+        if (auto *DefMD = dyn_cast_or_null<DefMacroDirective>(MD))
+          if (!PartKeepsExpansion(PP.getSourceManager()
+                                      .getExpansionLoc(
+                                          DefMD->getInfo()->getDefinitionLoc())
+                                      .getRawEncoding()))
+            continue;
       if (!MD || shouldIgnoreMacro(MD, IsModule, PP) ||
           MD->getKind() == MacroDirective::MD_Undefine)
         continue;

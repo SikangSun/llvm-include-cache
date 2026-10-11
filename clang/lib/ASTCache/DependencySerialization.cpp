@@ -129,6 +129,17 @@ void clang::ast_cache::encodeDependencySet(const HeaderDependencySet &Deps,
     W.u8(P.Severity);
     W.str(P.Option);
   }
+  W.u32(static_cast<uint32_t>(Deps.MacroStacks.size()));
+  for (const MacroStackEffect &E : Deps.MacroStacks) {
+    W.str(E.Name);
+    W.u32(static_cast<uint32_t>(E.Popped.size()));
+    for (const std::optional<std::string> &D : E.Popped) {
+      W.u8(D ? 1 : 0);
+      if (D)
+        W.str(*D);
+    }
+    W.u32(E.Pushes);
+  }
 }
 
 std::optional<HeaderDependencySet>
@@ -277,6 +288,18 @@ clang::ast_cache::decodeDependencySet(llvm::StringRef Data) {
     P.Severity = R.u8();
     P.Option = R.str().str();
     Deps.WarningPragmas.push_back(std::move(P));
+  }
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    MacroStackEffect E;
+    E.Name = R.str().str();
+    for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
+      if (R.u8())
+        E.Popped.push_back(R.str().str());
+      else
+        E.Popped.push_back(std::nullopt);
+    }
+    E.Pushes = R.u32();
+    Deps.MacroStacks.push_back(std::move(E));
   }
 
   // Trailing bytes mean the writer and reader disagree about the shape even

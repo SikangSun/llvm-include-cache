@@ -63,6 +63,7 @@ enum class MismatchReason {
   Declaration,
   FileChanged,
   WarningState,
+  MacroStack,
 };
 
 llvm::StringRef describe(MismatchReason R);
@@ -195,7 +196,7 @@ public:
     unsigned Lookups = 0;
     unsigned Hits = 0;
     unsigned CandidatesRejected = 0;
-    unsigned RejectedFor[11] = {};
+    unsigned RejectedFor[12] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".

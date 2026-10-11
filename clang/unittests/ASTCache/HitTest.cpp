@@ -1692,3 +1692,83 @@ TEST_F(ExportTest, AHeaderLeavingAWarningPragmaPushedIsNotWritten) {
   EXPECT_TRUE(reads(A, Q)) << "nothing is stored yet";
   EXPECT_EQ(Daemon->stats().Entries, 0u) << "pushed.h was exported";
 }
+
+/// s.h saves X, defines its own X for sx(), and puts X back.
+static const char *const SaveRestoreHeader =
+    "#ifndef S_H\n#define S_H\n#pragma push_macro(\"X\")\n#undef X\n"
+    "#define X 2\nstatic inline int sx(void) { return X; }\n"
+    "#pragma pop_macro(\"X\")\n#endif\n";
+
+TEST_F(ExportTest, AHeaderThatPutsAMacroBackLeavesItAsItWas) {
+  // a.c has no X. s.h's copy fits b.c, which defines X, and must leave X as
+  // b.c defined it, as the text would (REPORT.md Q11).
+  std::string S = write("s.h", SaveRestoreHeader);
+  std::string A =
+      write("a.c", "#include \"" + S + "\"\nint a(void) { return sx(); }\n");
+  std::string B = write("b.c", "#define X 7\n#include \"" + S +
+                                   "\"\n_Static_assert(X == 7, \"b.c's X\");\n");
+  std::string C = write("c.c", "#include \"" + S +
+                                   "\"\n#ifdef X\n#error X is defined\n#endif\n");
+  EXPECT_TRUE(reads(A, S)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, S)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(B, S)) << "s.h's copy was not served";
+  EXPECT_EQ(Warnings, 0u);
+  EXPECT_FALSE(reads(C, S)) << "s.h's copy was not served";
+}
+
+TEST_F(ExportTest, AHeaderThatPopsWhatItsIncluderPushedNeedsTheSameThere) {
+  // p.h's pop takes the X a.c pushed. b.c pushed the same, c.c another.
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n"
+                               "#pragma pop_macro(\"X\")\n"
+                               "static inline int px(void) { return X; }\n"
+                               "#endif\n");
+  auto Main = [&](const char *Name, int Pushed, const std::string &After) {
+    return write(Name, "#define X " + std::to_string(Pushed) +
+                           "\n#pragma push_macro(\"X\")\n#undef X\n"
+                           "#define X 3\n#include \"" +
+                           P + "\"\n" + After);
+  };
+  std::string A = Main("a.c", 1, "");
+  std::string B = Main("b.c", 1, "_Static_assert(X == 1, \"popped\");\n");
+  std::string C = Main("c.c", 5, "_Static_assert(X == 5, \"popped\");\n");
+  EXPECT_TRUE(reads(A, P)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, P)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(B, P)) << "p.h's copy was not served";
+  EXPECT_EQ(Warnings, 0u);
+  EXPECT_TRUE(reads(C, P)) << "p.h's copy was served, popping 5";
+}
+
+TEST_F(ExportTest, APushLeftForAnotherHeaderIsReplayed) {
+  // begin.h saves X and defines its own; end.h puts X back.
+  std::string Begin = write("begin.h", "#pragma push_macro(\"X\")\n#undef X\n"
+                                       "#define X 2\n"
+                                       "static inline int in_begin(void) "
+                                       "{ return 7; }\n");
+  std::string End = write("end.h", "#pragma pop_macro(\"X\")\n"
+                                   "static inline int in_end(void) "
+                                   "{ return 8; }\n");
+  auto Main = [&](const char *Name, int Outer) {
+    std::string X = std::to_string(Outer);
+    return write(Name, "#define X " + X + "\n#include \"" + Begin +
+                           "\"\n_Static_assert(X == 2, \"begin.h's X\");\n"
+                           "#include \"" +
+                           End + "\"\n_Static_assert(X == " + X +
+                           ", \"put back\");\n");
+  };
+  std::string A = Main("a.c", 1);
+  std::string B = Main("b.c", 1);
+  std::string C = Main("c.c", 5);
+  EXPECT_TRUE(reads(A, Begin)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Begin)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 2u) << "begin.h or end.h not exported";
+  // One compile each: a compile that reads end.h writes a copy of its own.
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered)) << "b.c did not compile";
+  EXPECT_FALSE(Entered.count(Begin)) << "begin.h's copy was not served";
+  EXPECT_FALSE(Entered.count(End)) << "end.h's copy was not served";
+  EXPECT_EQ(Warnings, 0u);
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Begin)) << "begin.h's copy was not served";
+  EXPECT_TRUE(Entered.count(End)) << "end.h's copy was served, popping 5";
+}

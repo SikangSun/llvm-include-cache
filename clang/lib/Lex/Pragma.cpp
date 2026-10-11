@@ -635,6 +635,13 @@ void Preprocessor::HandlePragmaPushMacro(Token &PushMacroTok) {
   IdentifierInfo *IdentInfo = ParsePragmaPushOrPopMacro(PushMacroTok);
   if (!IdentInfo) return;
 
+  pushMacro(IdentInfo);
+  if (Callbacks)
+    Callbacks->PragmaPushMacro(PushMacroTok.getLocation(), IdentInfo,
+                               PragmaPushMacroInfo[IdentInfo].back());
+}
+
+void Preprocessor::pushMacro(IdentifierInfo *IdentInfo) {
   // Get the MacroInfo associated with IdentInfo.
   MacroInfo *MI = getMacroInfo(IdentInfo);
 
@@ -660,6 +667,18 @@ void Preprocessor::HandlePragmaPopMacro(Token &PopMacroTok) {
   IdentifierInfo *IdentInfo = ParsePragmaPushOrPopMacro(PopMacroTok);
   if (!IdentInfo) return;
 
+  auto Pushed = PragmaPushMacroInfo.find(IdentInfo);
+  MacroInfo *Taken =
+      Pushed == PragmaPushMacroInfo.end() ? nullptr : Pushed->second.back();
+  if (!popMacro(IdentInfo, MessageLoc))
+    Diag(MessageLoc, diag::warn_pragma_pop_macro_no_push)
+      << IdentInfo->getName();
+  else if (Callbacks)
+    Callbacks->PragmaPopMacro(MessageLoc, IdentInfo, Taken);
+}
+
+bool Preprocessor::popMacro(IdentifierInfo *IdentInfo,
+                            SourceLocation MessageLoc) {
   // Find the vector<MacroInfo*> associated with the macro.
   llvm::DenseMap<IdentifierInfo *, std::vector<MacroInfo *>>::iterator iter =
     PragmaPushMacroInfo.find(IdentInfo);
@@ -682,10 +701,9 @@ void Preprocessor::HandlePragmaPopMacro(Token &PopMacroTok) {
     iter->second.pop_back();
     if (iter->second.empty())
       PragmaPushMacroInfo.erase(iter);
-  } else {
-    Diag(MessageLoc, diag::warn_pragma_pop_macro_no_push)
-      << IdentInfo->getName();
+    return true;
   }
+  return false;
 }
 
 void Preprocessor::HandlePragmaIncludeAlias(Token &Tok) {

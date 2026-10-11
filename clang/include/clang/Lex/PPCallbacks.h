@@ -27,6 +27,7 @@ class Token;
 class IdentifierInfo;
 class MacroDefinition;
 class MacroDirective;
+class MacroInfo;
 class MacroArgs;
 struct LexEmbedParametersResult;
 
@@ -318,6 +319,17 @@ public:
   /// Callback invoked when a \#pragma warning(pop) directive is read.
   virtual void PragmaWarningPop(SourceLocation Loc) {
   }
+
+  /// Callback invoked when a \#pragma push_macro saves \p Saved, null where
+  /// \p II is not a macro.
+  virtual void PragmaPushMacro(SourceLocation Loc, const IdentifierInfo *II,
+                               const MacroInfo *Saved) {}
+
+  /// Callback invoked when a \#pragma pop_macro takes back \p Taken, null
+  /// where \p II was not a macro when pushed. Not invoked for a pop with
+  /// nothing pushed.
+  virtual void PragmaPopMacro(SourceLocation Loc, const IdentifierInfo *II,
+                              const MacroInfo *Taken) {}
 
   /// Callback invoked when a \#pragma execution_character_set(push) directive
   /// is read.
@@ -687,6 +699,18 @@ public:
   void PragmaWarningPop(SourceLocation Loc) override {
     First->PragmaWarningPop(Loc);
     Second->PragmaWarningPop(Loc);
+  }
+
+  void PragmaPushMacro(SourceLocation Loc, const IdentifierInfo *II,
+                       const MacroInfo *Saved) override {
+    First->PragmaPushMacro(Loc, II, Saved);
+    Second->PragmaPushMacro(Loc, II, Saved);
+  }
+
+  void PragmaPopMacro(SourceLocation Loc, const IdentifierInfo *II,
+                      const MacroInfo *Taken) override {
+    First->PragmaPopMacro(Loc, II, Taken);
+    Second->PragmaPopMacro(Loc, II, Taken);
   }
 
   void PragmaExecCharsetPush(SourceLocation Loc, StringRef Str) override {

@@ -28,6 +28,7 @@
 #define LLVM_CLANG_ASTCACHE_DEPENDENCYRECORD_H
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -240,6 +241,21 @@ struct MacroEffect {
   bool Defined = false;
 };
 
+/// What the header's #pragma push_macro and pop_macro did to one name's
+/// stack of saved definitions, seen from outside the header (REPORT.md Q11).
+/// A push and its pop inside the header leave nothing.
+///
+/// Popped is a dependency: the definitions the header's pops took from below
+/// it, the top of the stack first, each as macro tokens, or none where the
+/// name was not a macro. A hit requires the same at the top of the loading
+/// compile's stack. Pops and Pushes are the effect: a hit pops as many, then
+/// pushes as many of the definition that leaves, as the header's text would.
+struct MacroStackEffect {
+  std::string Name;
+  std::vector<std::optional<std::string>> Popped;
+  uint32_t Pushes = 0;
+};
+
 /// A #pragma GCC diagnostic or #pragma clang diagnostic: the severity it
 /// sets (diag::Severity) for an option such as "-Wsign-compare".
 struct WarningPragma {
@@ -305,7 +321,9 @@ struct HeaderDependencySet {
   /// applies the difference from Entry after loading.
   PragmaSnapshot Exit;
 
-  /// Every macro the header touched, each once, in the order first touched.
+  /// Every macro the header defined or undefined, each once, in the order
+  /// first defined or undefined; less those its push_macro and pop_macro
+  /// leave as they were (MacroStacks).
   std::vector<MacroEffect> MacroEffects;
 
   /// What decided which diagnostics the header printed where it was
@@ -319,6 +337,10 @@ struct HeaderDependencySet {
   /// The warning pragmas the header left in force for its includer, in
   /// order. A hit applies them again where the header is included.
   std::vector<WarningPragma> WarningPragmas;
+
+  /// The header's pushes and pops that reach outside it, one per name. A hit
+  /// checks Popped and replays the rest before MacroEffects.
+  std::vector<MacroStackEffect> MacroStacks;
 };
 
 /// One header's dependency set, as observed over the region between entering
