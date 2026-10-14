@@ -6851,18 +6851,17 @@ SourceLocation ASTWriter::getAdjustedLocation(SourceLocation Loc) const {
   if (Loc.isInvalid())
     return Loc;
   // A part drops the macro expansions outside it, and those spelled in a
-  // file it drops. A location in one becomes the place the macro was used,
-  // which is what a presumed location reports for it -- but not always what
-  // debug information reports: inside a macro's argument, that is where the
-  // argument was written (SourceManager::getFileLoc), and that place is lost
-  // when the macro taking the argument is dropped (cpython's
-  // Py_SET_REFCNT(op, Py_REFCNT(op) - 1), DECISIONS.md section 3). A place
-  // in a file the part drops is written as no location.
+  // file it drops. A location in one becomes the place debug information and
+  // diagnostics report for it (SourceManager::getFileLoc): where the macro
+  // was used, or, inside a macro's argument, where the argument was written.
+  // The macro's use, for all of them, lost the argument's column (cpython's
+  // Py_SET_REFCNT(op, Py_REFCNT(op) - 1), REPORT.md Q7). A place in a file
+  // the part drops is written as no location.
   if (PartKeepsExpansion) {
     const SourceManager &SM = PP->getSourceManager();
     if (Loc.isMacroID() && !SM.isLoadedSourceLocation(Loc) &&
         !IsSLocAffecting[SM.getFileID(Loc).ID])
-      Loc = SM.getExpansionLoc(Loc);
+      Loc = SM.getFileLoc(Loc);
     // A location in a file the part dropped has no place in it.
     if (Loc.isFileID() && !SM.isLoadedSourceLocation(Loc) &&
         !IsSLocAffecting[SM.getFileID(Loc).ID]) {

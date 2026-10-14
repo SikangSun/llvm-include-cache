@@ -76,7 +76,7 @@ much they change and how often they can happen.
 | 3 | Q11: `push_macro` and `pop_macro` | Wrong code, no diagnostic, in three of the four ways headers use them | No header compiled in the six projects uses them | Fixed 2026-10-11, your rule |
 | 4 | Q10: the cache runs inside compiles that build a Clang module or a precompiled header | Clang crashed; a compile using the precompiled header failed | Only builds that use Clang modules or precompiled headers | Fixed 2026-10-08 |
 | 5 | Q8: a name a copy refers to is looked up later than plain clang looks it up | Different but valid code; debug lines move | A declaration made again after the `#include` | Fixed 2026-10-08 |
-| 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects | Design change |
+| 6 | Q7: a macro argument's column | One debug-line column | 3 of 401 cpython objects | Fixed 2026-10-14, no cost |
 | 7 | Q12: `__COUNTER__` | Nothing: such headers are not cached | No header in the six projects uses it | -- |
 | -- | Q36 (new): a copy assumes the names it declares are new | A lost warning; for a variable, a compile error | None in the six projects | Set aside 2026-10-11: only declarations without prototypes, removed in C23 |
 
@@ -538,6 +538,19 @@ of 401 objects; code identical.
 **Fix.** Keep a dropped file as a stand-in with no contents, so expansions
 keep their spelling. A design change.
 
+**Fixed 2026-10-14, more simply.** The writer turned a location inside a
+dropped expansion into the macro's use (`getExpansionLoc`). It now turns it
+into the place debug information and diagnostics report for it
+(`getFileLoc`): the macro's use, or, inside a macro argument, where the
+argument was written. `qtests/q7` (`SET(o, GET(o) - 1)`, with SET and GET
+defined in a header outside the copy) now compiles to plain clang's code
+with `-g`; so do all six projects' objects, but cpython's
+`getbuildinfo.c`, which embeds its build time. A note pointing into such an
+argument moves to plain clang's column too (`qtests/q7d`: h.h:4:9, was
+h.h:4:4). Writing costs the same: 260.6 against 259.5 ms for the 26 copies
+`Objects/object.c` writes, 232.5 against 232.2 ms for `typeobject.c`'s 22,
+medians of 7 interleaved.
+
 ### Q12: `__COUNTER__`
 
 Not a correctness problem now: a header that uses `__COUNTER__` is never
@@ -827,8 +840,8 @@ Explained and ranked in section 2; each fix is approved one at a time.
 6. **Q6. Commit and push the three bug fixes.** Done: `3716d1a71`, pushed
    to the fork, after checking what they assume (the commit message lists
    it).
-7. **Q7. A column inside a macro argument** (section 2, rank 6). Fix is a
-   design change: keep dropped files as stand-ins.
+7. **Q7. A column inside a macro argument** (section 2, rank 6). Fixed
+   2026-10-14, at no measured cost.
 8. **Q8. A name looked up later than plain clang looks it up** (rank 5).
    Fixed 2026-10-08: the copy's names resolve to the declarations the hit's
    check found at the `#include`.
