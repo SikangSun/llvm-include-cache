@@ -201,6 +201,17 @@ private:
   std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
   std::function<bool(FileEntryRef)> PartKeepsHeaderInfo;
 
+  /// See setPartScope.
+  bool PartScoped = false;
+  unsigned PartSLocBegin = 0, PartSLocEnd = 0;
+  ArrayRef<unsigned> PartBuffers;
+  ArrayRef<const IdentifierInfo *> PartMacroNames;
+  const Decl *PartDeclsAfter = nullptr;
+
+  /// The local source-location entries the writer visits, in order: every
+  /// one, or, for a scoped part, its own run and the memory buffers.
+  SmallVector<unsigned, 0> visitedSLocEntries() const;
+
   /// When writing a part: whether a declaration from outside it is written
   /// as a reference by name rather than as a deep copy, and which
   /// declarations the compile made after the part's header ended. See
@@ -996,6 +1007,29 @@ public:
     PartKeepsHeaderInfo = std::move(KeepsHeaderInfo);
   }
   bool isWritingPart() const { return bool(PartDecls); }
+
+  /// Where a part's own state lies, so that the writer visits only that
+  /// instead of the whole compile (REPORT.md I5); the filters above still
+  /// decide what is kept, and the result is the same.
+  ///
+  /// \p SLocBegin and \p SLocEnd: the part's run of local source-location
+  /// entries, which the compile made while the header was open. Entries
+  /// outside it are dropped, but for \p Buffers, every local entry of a
+  /// memory buffer (the predefines, scratch space), sorted, which a part
+  /// keeps wherever it lies. \p MacroNames: every name a directive inside
+  /// the part named. \p DeclsAfter: a top-level declaration made before the
+  /// header began, null for none; the part's declarations come after it.
+  void setPartScope(unsigned SLocBegin, unsigned SLocEnd,
+                    ArrayRef<unsigned> Buffers,
+                    ArrayRef<const IdentifierInfo *> MacroNames,
+                    const Decl *DeclsAfter) {
+    PartSLocBegin = SLocBegin;
+    PartSLocEnd = SLocEnd;
+    PartBuffers = Buffers;
+    PartMacroNames = MacroNames;
+    PartDeclsAfter = DeclsAfter;
+    PartScoped = true;
+  }
 
   /// How a part refers to a declaration from outside it.
   ///

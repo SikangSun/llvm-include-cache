@@ -1864,7 +1864,7 @@ void ASTWriter::WriteInputFiles(SourceManager &SourceMgr) {
   // Get all ContentCache objects for files.
   std::vector<InputFileEntry> UserFiles;
   std::vector<InputFileEntry> SystemFiles;
-  for (unsigned I = 1, N = SourceMgr.local_sloc_entry_size(); I != N; ++I) {
+  for (unsigned I : visitedSLocEntries()) {
     // Get this source location entry.
     const SrcMgr::SLocEntry *SLoc = &SourceMgr.getLocalSLocEntry(I);
     assert(&SourceMgr.getSLocEntry(FileID::get(I)) == SLoc);
@@ -2386,8 +2386,8 @@ void ASTWriter::WriteSourceManagerBlock(SourceManager &SourceMgr) {
   std::vector<uint32_t> SLocEntryOffsets;
   uint64_t SLocEntryOffsetsBase = Stream.GetCurrentBitNo();
   SLocEntryOffsets.reserve(SourceMgr.local_sloc_entry_size() - 1);
-  for (unsigned I = 1, N = SourceMgr.local_sloc_entry_size();
-       I != N; ++I) {
+  unsigned N = SourceMgr.local_sloc_entry_size();
+  for (unsigned I : visitedSLocEntries()) {
     // Get this source location entry.
     const SrcMgr::SLocEntry *SLoc = &SourceMgr.getLocalSLocEntry(I);
     FileID FID = FileID::get(I);
@@ -2662,12 +2662,20 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
   SmallVector<const IdentifierInfo *, 128> MacroIdentifiers;
   // It is meaningless to emit macros for named modules. It only wastes times
   // and spaces.
-  if (!isWritingStdCXXNamedModules())
+  // A scoped part looks only at the names its directives named.
+  auto Consider = [&](const IdentifierInfo *II) {
+    if (II->hadMacroDefinition() &&
+        (!II->isFromAST() || II->hasChangedSinceDeserialization()))
+      MacroIdentifiers.push_back(II);
+  };
+  if (isWritingStdCXXNamedModules()) {
+  } else if (PartScoped) {
+    for (const IdentifierInfo *II : PartMacroNames)
+      Consider(II);
+  } else {
     for (auto &Id : PP.getIdentifierTable())
-      if (Id.second->hadMacroDefinition() &&
-          (!Id.second->isFromAST() ||
-          Id.second->hasChangedSinceDeserialization()))
-        MacroIdentifiers.push_back(Id.second);
+      Consider(Id.second);
+  }
   // Sort the set of macro definitions that need to be serialized by the
   // name of the macro, to provide a stable ordering.
   llvm::sort(MacroIdentifiers, llvm::deref<std::less<>>());
@@ -5589,6 +5597,23 @@ static void AddLazyVectorEmiitedDecls(ASTWriter &Writer, Vector &Vec,
   }
 }
 
+SmallVector<unsigned, 0> ASTWriter::visitedSLocEntries() const {
+  unsigned N = PP->getSourceManager().local_sloc_entry_size();
+  SmallVector<unsigned, 0> Visit;
+  if (!PartScoped) {
+    Visit.reserve(N);
+    for (unsigned I = 1; I != N; ++I)
+      Visit.push_back(I);
+    return Visit;
+  }
+  const unsigned *Inside = llvm::lower_bound(PartBuffers, PartSLocBegin);
+  Visit.append(PartBuffers.begin(), Inside);
+  for (unsigned I = PartSLocBegin; I != PartSLocEnd; ++I)
+    Visit.push_back(I);
+  Visit.append(llvm::lower_bound(PartBuffers, PartSLocEnd), PartBuffers.end());
+  return Visit;
+}
+
 void ASTWriter::computeNonAffectingInputFiles() {
   SourceManager &SrcMgr = PP->getSourceManager();
   unsigned N = SrcMgr.local_sloc_entry_size();
@@ -5610,7 +5635,8 @@ void ASTWriter::computeNonAffectingInputFiles() {
   NonAffectingFileIDAdjustments.push_back(FileIDAdjustment);
   NonAffectingOffsetAdjustments.push_back(OffsetAdjustment);
 
-  for (unsigned I = 1; I != N; ++I) {
+  // Whether entry I is kept; for one that is not, the code below drops it.
+  auto Keeps = [&](unsigned I) -> bool {
     const SrcMgr::SLocEntry *SLoc = &SrcMgr.getLocalSLocEntry(I);
     FileID FID = FileID::get(I);
     assert(&SrcMgr.getSLocEntry(FID) == SLoc);
@@ -5628,12 +5654,12 @@ void ASTWriter::computeNonAffectingInputFiles() {
           (PartKeepsExpansion(SLoc->getOffset()) &&
            !SrcMgr.isLoadedSourceLocation(Spelling) &&
            IsSLocAffecting[SrcMgr.getFileID(Spelling).ID]))
-        continue;
+        return true;
     } else {
       const SrcMgr::FileInfo &File = SLoc->getFile();
       const SrcMgr::ContentCache *Cache = &File.getContentCache();
       if (!Cache->OrigEntry)
-        continue;
+        return true;
 
       if (PartKeepsExpansion && !PartKeepsExpansion(SLoc->getOffset())) {
         // A part keeps only the files entered inside it. Any other -- the
@@ -5647,47 +5673,86 @@ void ASTWriter::computeNonAffectingInputFiles() {
       } else {
         // Don't prune anything other than module maps.
         if (!isModuleMap(File.getFileCharacteristic()))
-          continue;
+          return true;
 
         // Don't prune module maps if all are guaranteed to be affecting.
         if (!AffectingModuleMaps)
-          continue;
+          return true;
 
         // Don't prune module maps that are affecting.
         if (AffectingModuleMaps->DefinitionFileIDs.contains(FID))
-          continue;
+          return true;
 
         IsSLocFileEntryAffecting[I] =
             AffectingModuleMaps->DefinitionFiles.contains(*Cache->OrigEntry);
       }
     }
+    return false;
+  };
 
-    IsSLocAffecting[I] = false;
+  // Drops the consecutive entries [A, B).
+  auto Drop = [&](unsigned A, unsigned B) {
+    IsSLocAffecting.reset(A, B);
 
-    FileIDAdjustment += 1;
+    FileIDAdjustment += B - A;
     // Even empty files take up one element in the offset table.
-    OffsetAdjustment += SrcMgr.getFileIDSize(FID) + 1;
+    SourceLocation::UIntTy BeginOffset =
+        SrcMgr.getLocalSLocEntry(A).getOffset();
+    SourceLocation::UIntTy EndOffset =
+        B == N ? SrcMgr.getNextLocalOffset()
+               : SrcMgr.getLocalSLocEntry(B).getOffset();
+    OffsetAdjustment += EndOffset - BeginOffset;
 
-    // The first and last offset the entry covers.
-    SourceLocation RangeBegin = SourceLocation::getFileLoc(SLoc->getOffset());
-    SourceLocation RangeEnd = RangeBegin.getLocWithOffset(
-        static_cast<SourceLocation::IntTy>(SrcMgr.getFileIDSize(FID)));
+    // The first and last offset the entries cover.
+    SourceLocation RangeBegin = SourceLocation::getFileLoc(BeginOffset);
+    SourceLocation RangeEnd = SourceLocation::getFileLoc(EndOffset - 1);
+    FileID Last = FileID::get(B - 1);
 
     // If the previous entry was non-affecting as well, just extend its range
     // with our information.
     if (!NonAffectingFileIDs.empty() &&
-        NonAffectingFileIDs.back().ID == FID.ID - 1) {
-      NonAffectingFileIDs.back() = FID;
+        NonAffectingFileIDs.back().ID == static_cast<int>(A) - 1) {
+      NonAffectingFileIDs.back() = Last;
       NonAffectingRanges.back().setEnd(RangeEnd);
       NonAffectingFileIDAdjustments.back() = FileIDAdjustment;
       NonAffectingOffsetAdjustments.back() = OffsetAdjustment;
-      continue;
+      return;
     }
 
-    NonAffectingFileIDs.push_back(FID);
+    NonAffectingFileIDs.push_back(Last);
     NonAffectingRanges.emplace_back(RangeBegin, RangeEnd);
     NonAffectingFileIDAdjustments.push_back(FileIDAdjustment);
     NonAffectingOffsetAdjustments.push_back(OffsetAdjustment);
+  };
+
+  if (!PartScoped) {
+    for (unsigned I = 1; I != N; ++I)
+      if (!Keeps(I))
+        Drop(I, I + 1);
+  } else {
+    // Outside the part's own run every entry is dropped, as Keeps would, but
+    // a memory buffer's: in runs, without visiting each (REPORT.md I5).
+    unsigned I = 1;
+    auto DropTo = [&](unsigned Stop) {
+      const unsigned *B = llvm::lower_bound(PartBuffers, I);
+      while (I < Stop) {
+        unsigned Next = B != PartBuffers.end() && *B < Stop ? *B : Stop;
+        if (I < Next) {
+          Drop(I, Next);
+          IsSLocFileEntryAffecting.reset(I, Next);
+        }
+        I = Next;
+        if (I < Stop) {
+          ++I;
+          ++B;
+        }
+      }
+    };
+    DropTo(PartSLocBegin);
+    for (; I != PartSLocEnd; ++I)
+      if (!Keeps(I))
+        Drop(I, I + 1);
+    DropTo(N);
   }
 
   if (!PP->getHeaderSearchInfo().getHeaderSearchOpts().ModulesIncludeVFSUsage)
@@ -5762,7 +5827,13 @@ void ASTWriter::PrepareWritingSpecialDecls(Sema &SemaRef) {
   //
   // We start emitting top level declarations from the module purview to
   // implement the eliding unreachable declaration feature.
-  for (const auto *D : TU->noload_decls()) {
+  // A scoped part's declarations come after the one made before it began.
+  DeclContext::decl_iterator FirstDecl = TU->noload_decls_begin();
+  if (PartScoped && PartDeclsAfter)
+    FirstDecl = DeclContext::decl_iterator(
+        const_cast<Decl *>(PartDeclsAfter)->getNextDeclInContext());
+  for (const auto *D :
+       llvm::make_range(FirstDecl, DeclContext::decl_iterator())) {
     if (D->isFromASTFile())
       continue;
 
@@ -6134,8 +6205,8 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
   // their IDs as those are written.
   SmallVector<const IdentifierInfo *, 128> IIs;
   for (const auto &ID : PP->getIdentifierTable())
-    if (IsInterestingNonMacroIdentifier(ID.second, *this) &&
-        (!PartDecls || ID.second->isPoisoned()))
+    if ((!PartDecls || ID.second->isPoisoned()) &&
+        IsInterestingNonMacroIdentifier(ID.second, *this))
       IIs.push_back(ID.second);
   // Sort the identifiers lexicographically before getting the references so
   // that their order is stable.

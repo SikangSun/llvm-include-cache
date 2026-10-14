@@ -217,7 +217,12 @@ public:
 
   /// A top-level declaration is finished: every header that ended before it
   /// has its last declaration finished too.
-  void declarationFinished() {
+  void declarationFinished(DeclGroupRef Group) {
+    if (!Group.isNull()) {
+      Decl *Last = *(Group.end() - 1);
+      if (Last->getLexicalDeclContext()->isTranslationUnit())
+        LastTopLevel = Last;
+    }
     if (!Ready.empty())
       writeReady();
   }
@@ -255,8 +260,13 @@ private:
     /// The name the compile opened the header by, and the absolute path the
     /// daemon stores it under.
     std::string Name, Stored;
-    /// The offsets of every location made while the header was open.
+    /// The offsets of every location made while the header was open, and
+    /// the local source-location entries that hold them, from FID's on.
     SourceLocation::UIntTy Begin = 0, End = 0;
+    unsigned SLocEnd = 0;
+    /// A top-level declaration made before the header began; the header's
+    /// own come after it. Null for none.
+    const Decl *DeclsAfter = nullptr;
     /// How many module files the compile had loaded when the header began.
     size_t ModulesAtBegin = 0;
     PragmaSnapshot Entry, Exit;
@@ -321,6 +331,19 @@ private:
     std::string Path = CI.getFileManager().getCanonicalName(File).str();
     P.Stamps[Path] = {Path, static_cast<uint64_t>(File.getSize()),
                       static_cast<int64_t>(File.getModificationTime())};
+  }
+
+  /// Every local source-location entry of a memory buffer -- the
+  /// predefines, scratch space for pasted tokens -- in order: a part keeps
+  /// these wherever they lie. Extended as the compile makes entries.
+  llvm::ArrayRef<unsigned> memoryBuffers() {
+    for (unsigned N = SM.local_sloc_entry_size(); BuffersSeen < N;
+         ++BuffersSeen) {
+      const SrcMgr::SLocEntry &E = SM.getLocalSLocEntry(BuffersSeen);
+      if (E.isFile() && !E.getFile().getContentCache().OrigEntry)
+        Buffers.push_back(BuffersSeen);
+    }
+    return Buffers;
   }
 
   /// \p II was defined or undefined by \p P's header.
@@ -419,6 +442,7 @@ private:
     P.Stored = absolutePath(CI.getFileManager(), P.Name);
     P.IncludeLoc = SM.getIncludeLoc(FID);
     P.Begin = SM.getSLocEntry(FID).getOffset();
+    P.DeclsAfter = LastTopLevel;
     P.ModulesAtBegin = modulesLoaded();
     hold(P, FE);
     if (!CI.hasSema()) {
@@ -451,6 +475,7 @@ private:
   void end() {
     Part P = Open.pop_back_val();
     P.End = SM.getNextLocalOffset();
+    P.SLocEnd = SM.local_sloc_entry_size();
     Preprocessor &PP = CI.getPreprocessor();
     llvm::DenseSet<const IdentifierInfo *> Unchanged;
     if (!P.Stacks.empty() && P.Decline.empty())
@@ -556,7 +581,11 @@ private:
     // initializer of the module, emitted where it is imported. Clang lists a
     // module's initializers only for a module it builds, which a part is not.
     ASTContext &Ctx = CI.getASTContext();
-    for (Decl *D : Ctx.getTranslationUnitDecl()->noload_decls())
+    Decl *First =
+        P.DeclsAfter
+            ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+            : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+    for (Decl *D = First; D; D = D->getNextDeclInContext())
       if (auto *VD = dyn_cast<VarDecl>(D))
         if (VD->isFileVarDecl() &&
             VD->isThisDeclarationADefinition() == VarDecl::Definition &&
@@ -779,6 +808,15 @@ private:
         [&](FileEntryRef F) { return P.Files.contains(&F.getFileEntry()); });
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
+    // What the writer needs to look at: the part's own entries, macros and
+    // declarations, not the whole compile's (REPORT.md I5).
+    std::vector<const IdentifierInfo *> MacroNames(P.Touched.begin(),
+                                                   P.Touched.end());
+    for (const auto &[II, Stack] : P.Stacks)
+      if (!P.Touched.contains(II))
+        MacroNames.push_back(II);
+    Writer.setPartScope(P.FID.getHashValue(), P.SLocEnd, memoryBuffers(),
+                        MacroNames, P.DeclsAfter);
     std::vector<PartSize> Sizes;
     if (dumpDir())
       Writer.setPartSizes(&Sizes);
@@ -861,6 +899,11 @@ private:
   std::vector<Part> Ready;
   llvm::DenseSet<FileID> Tracked;
   bool ObserverSet = false;
+  /// See memoryBuffers.
+  std::vector<unsigned> Buffers;
+  unsigned BuffersSeen = 1;
+  /// The latest top-level declaration the parser finished.
+  const Decl *LastTopLevel = nullptr;
   Stats Counts;
 };
 
@@ -871,9 +914,9 @@ class ExportConsumer : public ASTConsumer {
 public:
   explicit ExportConsumer(const CompilerInstance &CI) : CI(CI) {}
 
-  bool HandleTopLevelDecl(DeclGroupRef) override {
+  bool HandleTopLevelDecl(DeclGroupRef Group) override {
     if (Exporter *E = exporterFor(CI))
-      E->declarationFinished();
+      E->declarationFinished(Group);
     return true;
   }
 
