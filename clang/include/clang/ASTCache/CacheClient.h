@@ -28,6 +28,7 @@
 #include "clang/ASTCache/SharedRegion.h"
 #include "clang/Basic/FileEntry.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -78,6 +79,19 @@ struct IncludeSite {
   SourceLocation Loc;
   /// The compile's warningState at the #include.
   uint64_t WarningState = 0;
+  /// What the header's own #include searches depend on besides the files
+  /// present: the compile's include path and where this one found the
+  /// header (REPORT.md I9). See searchContext in HeaderCacheServer.cpp.
+  uint64_t SearchContext = 0;
+};
+
+/// The outcome of a candidate's #include searches as earlier compiles of the
+/// build found it, and as this check finds it (REPORT.md I9).
+struct SearchMemo {
+  /// The outcome known under a search key, if any.
+  llvm::function_ref<std::optional<uint8_t>(uint64_t Key)> Recall;
+  /// Set when the check made the searches.
+  std::optional<SearchOutcome> Found;
 };
 
 /// Whether \p Deps still holds in this compile. \p S must be non-null:
@@ -125,19 +139,23 @@ struct CheckCost {
   };
   uint64_t Nanos[NumSteps] = {};
   unsigned SearchesRedone = 0;
+  /// Candidates whose searches an earlier compile of the build made.
+  unsigned SearchesReused = 0;
   unsigned FilesCompared = 0;
 };
 
 /// \p Cost, when non-null, is increased by the time each step takes.
 /// \p Found, when non-null, receives the declaration each of
-/// Deps.Declarations finds here, in order.
+/// Deps.Declarations finds here, in order. \p Memo, when non-null, offers
+/// the searches' outcome from earlier compiles and receives this one's.
 MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
                                 Preprocessor &PP, Sema *S,
                                 llvm::StringRef NotAMacroNames = {},
                                 std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
                                 CheckCost *Cost = nullptr,
-                                std::vector<NamedDecl *> *Found = nullptr);
+                                std::vector<NamedDecl *> *Found = nullptr,
+                                SearchMemo *Memo = nullptr);
 
 class CacheClient {
 public:
@@ -224,6 +242,11 @@ public:
     return MatchedDecls;
   }
 
+  /// The build this compile belongs to (CLANG_HEADER_CACHE_BUILD), 0 for
+  /// none. Within one build the outcome of a copy's #include searches is
+  /// shared through the daemon (REPORT.md I9).
+  void setBuild(uint64_t B) { Build = B; }
+
   /// Keep a line per rejected candidate naming what failed. Off by default:
   /// it builds a string for every rejection.
   void logRejections(bool On) { LogRejections = On; }
@@ -242,6 +265,11 @@ private:
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;
   uint64_t AskListVersion = 0;
+  /// See setBuild. The searches' outcomes this compile found, by the copy's
+  /// module name and the search key, and those not yet sent to the daemon.
+  uint64_t Build = 0;
+  llvm::DenseMap<std::pair<uint64_t, uint64_t>, uint8_t> Outcomes;
+  std::vector<LearnedSearch> Learned;
 };
 
 } // namespace ast_cache

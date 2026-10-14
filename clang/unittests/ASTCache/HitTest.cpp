@@ -237,8 +237,11 @@ protected:
     CI.createFileManager();
 
     Emitted.clear();
-    CachedAction Action(client(), Entered, RecordJobsTo, ExportParts, &Emitted,
-                        AtEnd);
+    std::unique_ptr<CacheClient> C = client();
+    if (C)
+      C->setBuild(Build);
+    CachedAction Action(std::move(C), Entered, RecordJobsTo, ExportParts,
+                        &Emitted, AtEnd);
     bool Ok = CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
     Warnings = Diags->getNumWarnings();
     return Ok;
@@ -282,6 +285,8 @@ protected:
   std::function<void(ASTContext &)> AtEnd;
   /// How many warnings the last compile printed.
   unsigned Warnings = 0;
+  /// The build compiles belong to (CacheClient::setBuild); 0 for none.
+  uint64_t Build = 0;
   std::unique_ptr<CacheDaemon> Daemon;
   std::thread Server;
 };
@@ -1771,4 +1776,45 @@ TEST_F(ExportTest, APushLeftForAnotherHeaderIsReplayed) {
   ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
   EXPECT_FALSE(Entered.count(Begin)) << "begin.h's copy was not served";
   EXPECT_TRUE(Entered.count(End)) << "end.h's copy was served, popping 5";
+}
+
+TEST_F(ExportTest, SearchesFoundInABuildAreNotTakenUnderAnotherIncludePath) {
+  // h.h's <inner.h> finds a/inner.h under -Ia, b/inner.h under -Ib. Within
+  // one build, what a compile under -Ia found must not stand in for a
+  // compile under -Ib (REPORT.md I9).
+  Build = 7;
+  for (const char *D : {"a", "b"}) {
+    llvm::SmallString<256> Sub(Dir);
+    llvm::sys::path::append(Sub, D);
+    ASSERT_FALSE(llvm::sys::fs::create_directory(Sub));
+  }
+  write("a/inner.h", "#define INNER 1\n");
+  write("b/inner.h", "#define INNER 2\n");
+  std::string H = write("h.h", "#ifndef H_H\n#define H_H\n#include <inner.h>\n"
+                               "int h(void);\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + H +
+                                         "\"\n_Static_assert(INNER == "
+                                         "INNER_WANTED, \"inner.h\");\n");
+  ExtraArgs = {"-I" + Dir + "/a", "-DINNER_WANTED=1"};
+  EXPECT_TRUE(reads(Main, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, H)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Main, H)) << "h.h's copy was not served under -Ia";
+  EXPECT_FALSE(reads(Main, H)) << "nor again in the same build";
+  ExtraArgs = {"-I" + Dir + "/b", "-DINNER_WANTED=2"};
+  EXPECT_TRUE(reads(Main, H)) << "a/inner.h's copy was served under -Ib";
+}
+
+TEST_F(ExportTest, AFileChangedInABuildIsStillCaught) {
+  // The searches' outcome is shared within a build; the files' sizes and
+  // times are checked by every compile.
+  Build = 7;
+  std::string H = write("h.h", "#ifndef H_H\n#define H_H\nint h(void);\n"
+                               "#endif\n");
+  std::string Main = write("main.c", "#include \"" + H + "\"\n");
+  EXPECT_TRUE(reads(Main, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, H)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Main, H)) << "h.h's copy was not served";
+  write("h.h", "#ifndef H_H\n#define H_H\nint h(void); int h2(void);\n"
+               "#endif\n");
+  EXPECT_TRUE(reads(Main, H)) << "a copy of the old h.h was served";
 }

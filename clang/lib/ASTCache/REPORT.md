@@ -3,7 +3,8 @@
 Written 2026-10-07 and updated the same evening, to work from on
 2026-10-08; updated again after your answers (Q8 to Q11, Q34, I8), and on 2026-10-08
 after building Q8, Q10, Q34 and I8; on 2026-10-11 after building Q11
-and setting Q36 aside. The correctness problems explained and ranked (section 2), every
+and setting Q36 aside; on 2026-10-14 after building Q7, I5 and I9. The
+correctness problems explained and ranked (section 2), every
 optimization ranked by the time it could remove, measured (section 3),
 sorted into techniques and implementation fixes (section 4), the proposed
 switches for ablation (section 5), and every open question (section 6).
@@ -631,8 +632,8 @@ bound on what the fix saves.
 | Rank | Fix | What it removes | Could remove | Share of plain time |
 |---|---|---|---|---|
 | 1 | I8: skip replayed macro effects already in force | Finding each replayed macro's name, for effects that change nothing | 30.2 s; built 2026-10-08, removed 35.1 s | 4.3% |
-| 2 | I5: write a copy from its own range | Scanning the whole compile's source locations, macros, identifiers, comments and declarations for each copy written | 19.4 s | 2.7% |
-| 3 | I9: check files once per build | Header searches and file stamps every compile redoes | 17.0 s | 2.4% |
+| 2 | I5: write a copy from its own range | Scanning the whole compile's source locations, macros, identifiers, comments and declarations for each copy written | 19.4 s; built 2026-10-14, removed 5.2 s | 2.7% |
+| 3 | I9: check files once per build | Header searches and file stamps every compile redoes | 17.0 s; built 2026-10-14 (searches only), removed 6.3 s | 2.4% |
 | 4 | I3: metadata in shared memory | Encoding, sending and decoding each saved copy's metadata at every query | 12.1 s | 1.7% |
 | 5 | I1: one index of names over the loaded copies | Searching every loaded copy's name table for a name | 11.5 s | 1.6% |
 | 6 | I7: send a copy without waiting | Waiting for the daemon to acknowledge each copy | 8.4 s | 1.2% |
@@ -697,6 +698,46 @@ Notes on the top three:
   source-location entries and 82% to 98% of the macros belong to other
   headers. A copy's own range is known when the header ends.
 - **I9** includes I4.
+- **I5 and I9, built 2026-10-14, measured.** Six first builds, the six
+  projects at once, each on cores of its own, four modes interleaved file by
+  file: plain clang; the cache before I5 and I9; with I5; with I5 and I9 (a
+  build ID per build). Three builds each; savings are means of the per-build
+  differences, since the modes ran side by side:
+
+  | | Plain clang | Before | I5 | I5 and I9 |
+  |---|---|---|---|---|
+  | Six first builds, mean of 3 | 728.53 s | 605.59 s | 600.37 s | 594.06 s |
+  | Speedup over plain clang | -- | 1.20x | 1.21x | 1.23x |
+  | Writing copies (the cache's own timer) | -- | 38.04 s | 33.48 s | 33.93 s |
+  | Redoing a copy's header searches | -- | 9.64 s | 9.68 s | 1.48 s |
+  | Checking candidates, all steps | -- | 20.81 s | 20.88 s | 12.69 s |
+
+  I5 removed 5.22 s (3.16 to 7.42 s per build), I9 6.31 s (5.14 to 8.62
+  s). Every compile succeeded; every object matched plain clang's.
+
+  Both are well below the estimates above. The profile's own timers
+  inflated short, frequent steps: curl's header searches took 2.47 s under
+  them and 1.19 to 1.44 s without. Treat the other rows of this table as
+  upper bounds too, and measure each fix.
+
+  *I5* gives the writer the copy's own run of source-location entries (one
+  unbroken run, since Clang numbers entries as it makes them), the compile's
+  memory buffers (kept wherever they lie, found once per compile), the macro
+  names the header's directives named, and the last top-level declaration
+  before the header. Every copy written in both ways, 799 copies over 40
+  compiles of each project, was byte-identical.
+
+  *I9* keeps, with each stored copy in the daemon, what its #include
+  searches found in the current build, under a key: the include path, the
+  name the header was found by and the directory it was found in, and the
+  names the compile already holds any of the copy's files by (a search
+  starts from those). A compile that finds a known outcome skips the
+  searches; one that does not makes them and sends the outcome with its next
+  message, so nothing waits. The assumption: during a build no header
+  appears in or disappears from the include path. Every compile still checks
+  the size and modification time of each file a copy holds. The build ID is
+  `CLANG_HEADER_CACHE_BUILD`; without one, outcomes are kept only within a
+  compile.
 
 Together, without double counting, the fixes could remove about 103 s.
 The cache's six first builds take 624.1 s now (1.14x over plain clang's
@@ -773,11 +814,11 @@ that stood here (§2.21, §2.24) are superseded.
 | I2 | Check options once per compile; drop the record-name table | The same option comparisons for every PCM; 12 KB in every PCM, 13% of the stored bytes | 0.8 s, and 13% of the bytes | Proposed (§2.24 C) |
 | I3 | Metadata in shared memory, replies carrying offsets; or no socket at all | Encoding, copying and decoding a copy's metadata on every query | 12.1 s | Proposed; the no-socket form not approved (NEXT.md 3) |
 | I4 | Remember header searches and declaration checks within a compile | The 48% of header searches and 49% of declaration checks that repeat | 1.1 s | Proposed (§2.21) |
-| I5 | Write a copy from its own source range | Four scans of the compile's whole state per copy written: 2.4 of its 4.0 ms | 19.4 s | Proposed (§2.21) |
+| I5 | Write a copy from its own source range | Four scans of the compile's whole state per copy written: 2.4 of its 4.0 ms | 19.4 s | Built 2026-10-14: 5.2 s |
 | I6 | Track dependencies only around headers that will be written | Most of the tracking | under 0.6 s | Proposed (§2.21) |
 | I7 | Send a copy to the daemon without waiting for the acknowledgement | The wait | 8.4 s | Proposed (§2.21) |
 | I8 | Replay: find each effect's name in its own PCM; skip effects already in force | Searching every loaded PCM per effect | 30.2 s | Proposed; T8's option B would replace it |
-| I9 | Check files once per build, in the daemon | Every compile checking the same files and redoing the same header searches | 17.0 s | Deferred by you (§2.19) |
+| I9 | Check files once per build, in the daemon | Every compile checking the same files and redoing the same header searches | 17.0 s | Built 2026-10-14, the searches; each compile still checks the files: 6.3 s |
 | I10 | Overlap the lookup's round trip with resolving the `#include`; batch lookups | Tens of microseconds per `#include` | Small | Idea (§4) |
 | I11 | Enter all of a loaded copy's names at load, as Clang does for C++ | Lazy searches at later lookups | None: measured -1.2% to +1.6% | Measured 2026-10-07; drop |
 | I12 | Cross-reference IDs for outside declarations | Resolving names at load | 1.9 s | Not started (NEXT.md 1) |

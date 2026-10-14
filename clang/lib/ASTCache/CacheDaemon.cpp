@@ -75,10 +75,34 @@ void CacheDaemon::publishLocked() {
   Region.publishAskList(List);
 }
 
+void CacheDaemon::learnLocked(uint64_t Build,
+                              const std::vector<LearnedSearch> &Learned) {
+  if (!Build)
+    return;
+  for (const LearnedSearch &L : Learned) {
+    auto It = Table.find(L.Filename);
+    if (It == Table.end())
+      continue;
+    for (StoredEntry &E : It->second) {
+      if (E.ModuleName != L.ModuleName)
+        continue;
+      if (E.SearchBuild != Build) {
+        E.SearchBuild = Build;
+        E.Searches.clear();
+      }
+      if (llvm::none_of(E.Searches, [&](const SearchOutcome &O) {
+            return O.Key == L.Found.Key;
+          }))
+        E.Searches.push_back(L.Found);
+    }
+  }
+}
+
 llvm::SmallVector<char, 0>
 CacheDaemon::handleTiming(const TimingReport &Report) {
   {
     std::lock_guard<std::mutex> Lock(Mutex);
+    learnLocked(Report.Build, Report.Learned);
     ++Counters.TimingReports;
     bool Changed = false;
     for (const HeaderTiming &H : Report.Headers) {
@@ -122,6 +146,7 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
   LookupResponse Resp;
   {
     std::lock_guard<std::mutex> Lock(Mutex);
+    learnLocked(Req.Build, Req.Learned);
     ++Counters.Lookups;
     auto It = Table.find(Req.Filename);
     if (It != Table.end()) {
@@ -133,9 +158,12 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
       // handful of names a header actually depends on.
       Resp.Entries.reserve(It->second.size());
       for (const StoredEntry &E : It->second)
-        Resp.Entries.push_back({E.Deps, E.Offset, E.Length, E.NamesOffset,
-                                E.NamesLength, E.EffectsOffset, E.EffectsLength,
-                                E.ModuleName});
+        Resp.Entries.push_back(
+            {E.Deps, E.Offset, E.Length, E.NamesOffset, E.NamesLength,
+             E.EffectsOffset, E.EffectsLength, E.ModuleName,
+             Req.Build && E.SearchBuild == Req.Build
+                 ? E.Searches
+                 : std::vector<SearchOutcome>()});
     }
   }
 

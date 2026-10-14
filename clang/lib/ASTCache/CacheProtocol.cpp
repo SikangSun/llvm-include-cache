@@ -66,10 +66,38 @@ bool expectKind(ByteReader &R, MessageKind Want) {
 // Encoding
 //===----------------------------------------------------------------------===//
 
+static void writeLearned(ByteWriter &W, uint64_t Build,
+                         const std::vector<LearnedSearch> &Learned) {
+  W.u64(Build);
+  W.u32(static_cast<uint32_t>(Learned.size()));
+  for (const LearnedSearch &L : Learned) {
+    W.str(L.Filename);
+    W.str(L.ModuleName);
+    W.u64(L.Found.Key);
+    W.u8(L.Found.Outcome);
+  }
+}
+
+static bool readLearned(ByteReader &R, uint64_t &Build,
+                        std::vector<LearnedSearch> &Learned) {
+  Build = R.u64();
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    LearnedSearch L;
+    L.Filename = R.str().str();
+    L.ModuleName = R.str().str();
+    L.Found.Key = R.u64();
+    L.Found.Outcome = R.u8();
+    Learned.push_back(std::move(L));
+  }
+  return R.ok();
+}
+
 void clang::ast_cache::encodeLookupRequest(const LookupRequest &Req,
                                            llvm::SmallVectorImpl<char> &Out) {
-  frame(Out, MessageKind::LookupRequest,
-        [&](ByteWriter &W) { W.str(Req.Filename); });
+  frame(Out, MessageKind::LookupRequest, [&](ByteWriter &W) {
+    W.str(Req.Filename);
+    writeLearned(W, Req.Build, Req.Learned);
+  });
 }
 
 void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
@@ -85,6 +113,11 @@ void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
       W.u64(E.EffectsOffset);
       W.u64(E.EffectsLength);
       W.str(E.ModuleName);
+      W.u32(static_cast<uint32_t>(E.Searches.size()));
+      for (const SearchOutcome &O : E.Searches) {
+        W.u64(O.Key);
+        W.u8(O.Outcome);
+      }
     }
   });
 }
@@ -113,6 +146,7 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
         W.u64(H.Micros);
       }
     }
+    writeLearned(W, Report.Build, Report.Learned);
   });
 }
 
@@ -169,7 +203,7 @@ clang::ast_cache::decodeLookupRequest(llvm::StringRef Body) {
     return std::nullopt;
   LookupRequest Req;
   Req.Filename = R.str().str();
-  if (!R.atEnd())
+  if (!readLearned(R, Req.Build, Req.Learned) || !R.atEnd())
     return std::nullopt;
   return Req;
 }
@@ -193,6 +227,12 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
     E.EffectsOffset = R.u64();
     E.EffectsLength = R.u64();
     E.ModuleName = R.str().str();
+    for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
+      SearchOutcome O;
+      O.Key = R.u64();
+      O.Outcome = R.u8();
+      E.Searches.push_back(O);
+    }
     Resp.Entries.push_back(std::move(E));
   }
   if (!R.atEnd())
@@ -231,7 +271,7 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
       L->push_back(std::move(H));
     }
   }
-  if (!R.ok() || !R.atEnd())
+  if (!readLearned(R, Report.Build, Report.Learned) || !R.ok() || !R.atEnd())
     return std::nullopt;
   return Report;
 }

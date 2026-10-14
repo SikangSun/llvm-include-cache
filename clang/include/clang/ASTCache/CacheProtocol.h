@@ -66,6 +66,26 @@ enum class MessageKind : uint8_t {
   HelloReply = 8,
 };
 
+/// What a copy's #include searches found in one build, under one search key
+/// (REPORT.md I9): the check's MismatchReason, None if every search found
+/// the file, and the name, the copy was made from. Within a build the files
+/// in the include path's directories do not appear or go away, so the same
+/// searches under the same key find the same: the include path, the place
+/// the header was found, and the names the compile already reads the copy's
+/// files by (CacheClient's matchesLiveState).
+struct SearchOutcome {
+  uint64_t Key = 0;
+  uint8_t Outcome = 0;
+};
+
+/// A SearchOutcome a compile found, for the daemon to keep for the rest of
+/// the build. The copy is the one stored for Filename under ModuleName.
+struct LearnedSearch {
+  std::string Filename;
+  std::string ModuleName;
+  SearchOutcome Found;
+};
+
 /// A stored result the daemon knows about: what it was built against, and
 /// where to find it. Offset and Length address the shared region, not a file.
 struct CacheEntryRef {
@@ -86,10 +106,16 @@ struct CacheEntryRef {
   /// another header in the same state -- reuses it: loading a second module
   /// of the same name is a fatal error.
   std::string ModuleName;
+  /// What the copy's searches found in the asking compile's build.
+  std::vector<SearchOutcome> Searches;
 };
 
 struct LookupRequest {
   std::string Filename;
+  /// The build the compile belongs to, 0 for none (CLANG_HEADER_CACHE_BUILD),
+  /// and what its searches found since its last message.
+  uint64_t Build = 0;
+  std::vector<LearnedSearch> Learned;
 };
 
 struct LookupResponse {
@@ -127,6 +153,9 @@ struct HeaderTiming {
 struct TimingReport {
   std::vector<HeaderTiming> Headers;
   std::vector<HeaderTiming> Hits;
+  /// As in LookupRequest: the compile's last searches.
+  uint64_t Build = 0;
+  std::vector<LearnedSearch> Learned;
 };
 
 /// The daemon's answer to a client that has just connected: the region file

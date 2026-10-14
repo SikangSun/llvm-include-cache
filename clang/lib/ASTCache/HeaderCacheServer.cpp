@@ -318,7 +318,8 @@ public:
        << " conditions, " << Step(CheckCost::Macros) << " macros, "
        << Step(CheckCost::TypeNamesAndPragmas) << " type names and pragmas, "
        << Step(CheckCost::HeaderSearches) << " header searches ("
-       << C.SearchesRedone << " redone), " << Step(CheckCost::FileNames)
+       << C.SearchesRedone << " redone, " << C.SearchesReused
+       << " copies' reused from the build), " << Step(CheckCost::FileNames)
        << " __FILE__, " << Step(CheckCost::FileStamps) << " file stamps ("
        << C.FilesCompared << " compared), " << Step(CheckCost::Declarations)
        << " declarations\n";
@@ -436,7 +437,8 @@ public:
     HeaderDependencySet Deps;
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc,
-                     warningState(WarningFlags, &Pragmas)};
+                     warningState(WarningFlags, &Pragmas),
+                     searchContext(File, CurDir)};
     bool AnyFits = false;
     size_t HitBytes = 0;
     uint64_t HitLoadMicros = 0;
@@ -600,6 +602,62 @@ public:
   }
 
 private:
+  /// What a header's own #include searches depend on besides the files
+  /// present (REPORT.md I9): the include path -- each directory as written,
+  /// its kind and whether it is a system one, where the angled and system
+  /// ones begin -- the working directory, the options that change how a
+  /// search goes, the name this compile found the header by, and the
+  /// directory it found it in.
+  uint64_t searchContext(FileEntryRef File, ConstSearchDirIterator Dir) {
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    if (!SearchPathHash) {
+      std::string K;
+      auto Num = [&](uint64_t V) {
+        K.append(reinterpret_cast<const char *>(&V), sizeof(V));
+      };
+      auto Str = [&](llvm::StringRef V) {
+        K += V;
+        K += '\0';
+      };
+      Str(CI.getFileManager().getFileSystemOpts().WorkingDir);
+      if (llvm::ErrorOr<std::string> CWD =
+              CI.getFileManager().getVirtualFileSystem()
+                  .getCurrentWorkingDirectory())
+        Str(*CWD);
+      const HeaderSearchOptions &O = HS.getHeaderSearchOpts();
+      Str(O.Sysroot);
+      for (const std::string &F : O.VFSOverlayFiles)
+        Str(F);
+      Num(CI.getLangOpts().MSVCCompat);
+      unsigned Index = 0, Angled = 0, System = 0;
+      for (const DirectoryLookup &D : HS.search_dir_range()) {
+        if (HS.angled_dir_begin() != HS.search_dir_end() &&
+            &D == &*HS.angled_dir_begin())
+          Angled = Index;
+        if (HS.system_dir_begin() != HS.search_dir_end() &&
+            &D == &*HS.system_dir_begin())
+          System = Index;
+        Num(D.getLookupType());
+        Num(D.getDirCharacteristic());
+        Str(D.getName());
+        ++Index;
+      }
+      Num(Angled);
+      Num(System);
+      Num(Index);
+      SearchPathHash = llvm::xxh3_64bits(K) | 1;
+    }
+    std::string K;
+    K.append(reinterpret_cast<const char *>(&SearchPathHash),
+             sizeof(SearchPathHash));
+    K += File.getName();
+    K += '\0';
+    int64_t At = Dir ? static_cast<int64_t>(HS.searchDirIdx(*Dir)) : -1;
+    K.append(reinterpret_cast<const char *>(&At), sizeof(At));
+    return llvm::xxh3_64bits(K);
+  }
+  uint64_t SearchPathHash = 0;
+
   /// The name entries are stored under; see absolutePath.
   std::string storedName(llvm::StringRef Name) {
     return absolutePath(CI.getFileManager(), Name);
@@ -1170,6 +1228,12 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
     llvm::consumeError(Client.takeError());
     return;
   }
+
+  // The build this compile belongs to: within one, the daemon shares what
+  // each copy's #include searches found (REPORT.md I9).
+  if (const char *Build = std::getenv("CLANG_HEADER_CACHE_BUILD"))
+    if (*Build)
+      (*Client)->setBuild(llvm::xxh3_64bits(llvm::StringRef(Build)) | 1);
 
   // 1 prints the counts when the main file ends; 2 also names what failed
   // for each rejected candidate.

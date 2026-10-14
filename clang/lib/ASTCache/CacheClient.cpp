@@ -19,6 +19,7 @@
 #include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTReader.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/Support/raw_socket_stream.h"
 #include <chrono>
 
@@ -157,7 +158,8 @@ int redoLookups(
 MismatchReason clang::ast_cache::matchesLiveState(
     const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
     llvm::StringRef NotAMacroNames, std::string *Detail,
-    const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found) {
+    const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found,
+    SearchMemo *Memo) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -327,6 +329,39 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return Because(MismatchReason::WarningState,
                    "the warning flags or pragmas differ");
 
+  // The part holds the parse of each file's text when it was saved. A plain
+  // compile reads the file again; a hit requires it unchanged, by size and
+  // modification time, as Clang's own modules check their input files. Every
+  // compile checks this itself.
+  Lap.next(CheckCost::FileStamps);
+  FileManager &FM = PP.getFileManager();
+  SourceManager &SM = PP.getSourceManager();
+  // The searches below start from the name this compile holds a file by when
+  // it read the file before (refOnEntry). With the include path and the site,
+  // those names make the searches' key (REPORT.md I9).
+  std::string Key;
+  if (Site)
+    Key.append(reinterpret_cast<const char *>(&Site->SearchContext),
+               sizeof(Site->SearchContext));
+  for (const FileStamp &F : Deps.Files) {
+    if (Cost)
+      ++Cost->FilesCompared;
+    OptionalFileEntryRef Live =
+        FM.getOptionalFileRef(F.Path, /*OpenFile=*/false);
+    if (!Live)
+      return Because(MismatchReason::FileChanged, F.Path + " is gone");
+    if (static_cast<uint64_t>(Live->getSize()) != F.Size ||
+        static_cast<int64_t>(Live->getModificationTime()) != F.ModTime)
+      return Because(MismatchReason::FileChanged,
+                     F.Path + " changed since the part was saved");
+    if (SM.hasFileInfo(&Live->getFileEntry())) {
+      Key += F.Path;
+      Key += '\0';
+      Key += refOnEntry(SM, *Live).getName();
+      Key += '\0';
+    }
+  }
+
   Lap.next(CheckCost::HeaderSearches);
 
   // The files the header's own #includes find depend on this compile's
@@ -347,58 +382,65 @@ MismatchReason clang::ast_cache::matchesLiveState(
       return Because(MismatchReason::Include, "the header was opened as " +
                                                   Deps.HeaderName + ", is " +
                                                   Site->File.getName());
-    std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>> Found;
-    int Bad = redoLookups(Deps, PP, *Site, CheckNames, Found);
-    if (Cost)
-      Cost->SearchesRedone += Bad < 0 ? Found.size() : Bad + 1;
-    if (Bad >= 0) {
-      const IncludeDependency &D = Deps.Includes[Bad];
-      std::string Written =
-          D.Angled ? "<" + D.Spelled + ">" : "\"" + D.Spelled + "\"";
-      std::string Was = D.Found.empty() ? std::string("nothing")
-                        : CheckNames    ? D.Name
-                                        : D.Found;
-      return Because(MismatchReason::Include,
-                     Written + " found " + Was + ", finds something else");
-    }
 
-    Lap.next(CheckCost::FileNames);
-    SourceManager &SM = PP.getSourceManager();
-    for (const FileNameDependency &D : Deps.FileNames) {
-      OptionalFileEntryRef File =
-          D.File < 0 ? OptionalFileEntryRef(Site->File) : Found[D.File].first;
-      if (!File)
-        return Because(MismatchReason::FileName,
-                       "__FILE__ is in a file this compile does not find");
-      std::string Live =
-          fileMacroText(refOnEntry(SM, *File).getName(),
-                        D.Which == FileNameDependency::Macro::FileName,
-                        PP.getLangOpts(), PP.getTargetInfo());
-      if (Live != D.Text)
-        return Because(MismatchReason::FileName,
-                       "__FILE__ was \"" + D.Text + "\", is \"" + Live + "\"");
+    // Within a build the files in the include path do not appear or go away,
+    // so searches under the same key find what an earlier compile's found.
+    uint64_t SearchKey = llvm::xxh3_64bits(Key);
+    std::optional<uint8_t> Known;
+    if (Memo && Memo->Recall)
+      Known = Memo->Recall(SearchKey);
+    if (Known) {
+      if (Cost)
+        ++Cost->SearchesReused;
+      if (*Known != static_cast<uint8_t>(MismatchReason::None))
+        return Because(static_cast<MismatchReason>(*Known),
+                       "an earlier compile of the build found the header's "
+                       "searches to find other files");
+    } else {
+      auto Search = [&]() -> MismatchReason {
+        std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
+            Found;
+        int Bad = redoLookups(Deps, PP, *Site, CheckNames, Found);
+        if (Cost)
+          Cost->SearchesRedone += Bad < 0 ? Found.size() : Bad + 1;
+        if (Bad >= 0) {
+          const IncludeDependency &D = Deps.Includes[Bad];
+          std::string Written =
+              D.Angled ? "<" + D.Spelled + ">" : "\"" + D.Spelled + "\"";
+          std::string Was = D.Found.empty() ? std::string("nothing")
+                            : CheckNames    ? D.Name
+                                            : D.Found;
+          return Because(MismatchReason::Include,
+                         Written + " found " + Was + ", finds something else");
+        }
+
+        Lap.next(CheckCost::FileNames);
+        for (const FileNameDependency &D : Deps.FileNames) {
+          OptionalFileEntryRef File = D.File < 0
+                                          ? OptionalFileEntryRef(Site->File)
+                                          : Found[D.File].first;
+          if (!File)
+            return Because(MismatchReason::FileName,
+                           "__FILE__ is in a file this compile does not find");
+          std::string Live =
+              fileMacroText(refOnEntry(SM, *File).getName(),
+                            D.Which == FileNameDependency::Macro::FileName,
+                            PP.getLangOpts(), PP.getTargetInfo());
+          if (Live != D.Text)
+            return Because(MismatchReason::FileName, "__FILE__ was \"" +
+                                                         D.Text + "\", is \"" +
+                                                         Live + "\"");
+        }
+        return MismatchReason::None;
+      };
+      MismatchReason Searched = Search();
+      if (Memo)
+        Memo->Found = SearchOutcome{SearchKey, static_cast<uint8_t>(Searched)};
+      if (Searched != MismatchReason::None)
+        return Searched;
     }
   }
 
-  // The part holds the parse of each file's text when it was saved. A plain
-  // compile reads the file again; a hit requires it unchanged, by size and
-  // modification time, as Clang's own modules check their input files. The
-  // file manager stats a file once per compile, the header searches above
-  // included.
-  Lap.next(CheckCost::FileStamps);
-  FileManager &FM = PP.getFileManager();
-  for (const FileStamp &F : Deps.Files) {
-    if (Cost)
-      ++Cost->FilesCompared;
-    OptionalFileEntryRef Live =
-        FM.getOptionalFileRef(F.Path, /*OpenFile=*/false);
-    if (!Live)
-      return Because(MismatchReason::FileChanged, F.Path + " is gone");
-    if (static_cast<uint64_t>(Live->getSize()) != F.Size ||
-        static_cast<int64_t>(Live->getModificationTime()) != F.ModTime)
-      return Because(MismatchReason::FileChanged,
-                     F.Path + " changed since the part was saved");
-  }
   Lap.next(CheckCost::Declarations);
 
   // The part's own declarations were compiled against the outside
@@ -482,7 +524,8 @@ llvm::StringRef CacheClient::lookup(
   ++Counters.Lookups;
 
   llvm::SmallVector<char, 0> Msg;
-  encodeLookupRequest({Filename.str()}, Msg);
+  encodeLookupRequest({Filename.str(), Build, std::move(Learned)}, Msg);
+  Learned.clear();
   auto Asked = std::chrono::steady_clock::now();
   std::optional<std::string> Reply;
   {
@@ -520,12 +563,30 @@ llvm::StringRef CacheClient::lookup(
     ++Counters.CandidatesChecked;
     auto Checking = std::chrono::steady_clock::now();
     MismatchReason Why;
+    // What this compile, or an earlier one of its build, found the
+    // candidate's searches to find under a key (REPORT.md I9).
+    uint64_t Copy = llvm::xxh3_64bits(E.ModuleName);
+    auto Recall = [&](uint64_t Key) -> std::optional<uint8_t> {
+      auto Own = Outcomes.find({Copy, Key});
+      if (Own != Outcomes.end())
+        return Own->second;
+      for (const SearchOutcome &O : E.Searches)
+        if (O.Key == Key)
+          return O.Outcome;
+      return std::nullopt;
+    };
+    SearchMemo Memo{Recall, std::nullopt};
     {
       llvm::TimeTraceScope Scope("HeaderCache Check");
       Found.clear();
       Why = matchesLiveState(E.Deps, PP, S, Names,
                              LogRejections ? &Detail : nullptr, Site,
-                             &Counters.Check, &Found);
+                             &Counters.Check, &Found, &Memo);
+    }
+    if (Memo.Found) {
+      Outcomes[{Copy, Memo.Found->Key}] = Memo.Found->Outcome;
+      if (Build)
+        Learned.push_back({Filename.str(), E.ModuleName, *Memo.Found});
     }
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
@@ -581,7 +642,11 @@ bool CacheClient::isListed(llvm::StringRef Path) {
 bool CacheClient::reportTimings(const TimingReport &Report) {
   auto Start = std::chrono::steady_clock::now();
   llvm::SmallVector<char, 0> Msg;
-  encodeTimingReport(Report, Msg);
+  TimingReport WithSearches = Report;
+  WithSearches.Build = Build;
+  WithSearches.Learned = std::move(Learned);
+  Learned.clear();
+  encodeTimingReport(WithSearches, Msg);
   bool Sent = sendMessage(*Conn, Msg) && receiveMessage(*Conn).has_value();
   Counters.ReportMicros += microsSince(Start);
   return Sent;

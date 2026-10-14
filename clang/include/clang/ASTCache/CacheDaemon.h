@@ -138,12 +138,19 @@ private:
     /// The record's macro effects, moved out of Deps into the region.
     uint64_t EffectsOffset = 0;
     uint64_t EffectsLength = 0;
+    /// What compiles of build SearchBuild found the copy's searches to find,
+    /// one per search key (REPORT.md I9). Another build starts afresh.
+    uint64_t SearchBuild = 0;
+    std::vector<SearchOutcome> Searches;
   };
 
   llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req);
   llvm::SmallVector<char, 0> handlePush(const PushRequest &Req);
   llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
   llvm::SmallVector<char, 0> handleHello();
+
+  /// Keeps what a compile of \p Build found its searches to find. Mutex held.
+  void learnLocked(uint64_t Build, const std::vector<LearnedSearch> &Learned);
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
   bool listLocked(llvm::StringRef Path);
