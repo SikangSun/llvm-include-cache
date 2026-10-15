@@ -56,6 +56,10 @@ public:
     /// "<header>: <bytes> bytes in <us> us, <n> by name", one per exported
     /// part.
     std::vector<std::string> Exports;
+    /// With CLANG_HEADER_CACHE_INDEP=1: per part written, a line for each
+    /// guarded header inside it saying whether it is independent of the
+    /// part's lines before it (REPORT.md T15).
+    std::vector<std::string> Independence;
     /// Wall time writing parts and pushing them to the daemon.
     uint64_t Micros = 0;
   };

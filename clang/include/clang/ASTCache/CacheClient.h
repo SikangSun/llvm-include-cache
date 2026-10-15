@@ -138,18 +138,23 @@ struct CheckCost {
   /// Candidates whose searches an earlier compile of the build made.
   unsigned SearchesReused = 0;
   unsigned FilesCompared = 0;
+  /// Elements read, section by section.
+  uint64_t Read[MetadataView::NumSections] = {};
 };
 
 /// \p Cost, when non-null, is increased by the time each step takes.
 /// \p Found, when non-null, receives the declaration each of
 /// Deps.declarations() finds here, in order. \p Memo, when non-null, offers
 /// the searches' outcome from earlier compiles and receives this one's.
+/// \p SkipConditionals, for measurement only, leaves out the definedness
+/// tests (REPORT.md T15).
 MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                 Sema *S, std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
                                 CheckCost *Cost = nullptr,
                                 std::vector<NamedDecl *> *Found = nullptr,
-                                SearchMemo *Memo = nullptr);
+                                SearchMemo *Memo = nullptr,
+                                bool SkipConditionals = false);
 
 class CacheClient {
 public:
@@ -214,6 +219,9 @@ public:
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".
     std::vector<std::string> Rejections;
+    /// With logChecks on: one line per candidate checked, with where the
+    /// check stopped and the time each step took.
+    std::vector<std::string> Checks;
     /// Wall time, in microseconds: waiting for the daemon to answer lookups,
     /// checking candidates against the live state, sending this compile's
     /// header timings, and connecting.
@@ -246,6 +254,7 @@ public:
   /// it builds a string for every rejection.
   void logRejections(bool On) { LogRejections = On; }
   bool loggingRejections() const { return LogRejections; }
+  void logChecks(bool On) { LogChecks = On; }
 
 private:
   CacheClient() = default;
@@ -254,6 +263,7 @@ private:
   SharedRegion Region;
   Stats Counters;
   bool LogRejections = false;
+  bool LogChecks = false;
   unsigned LastCandidates = 0;
   MismatchReason LastRejection = MismatchReason::None;
   std::vector<NamedDecl *> MatchedDecls;

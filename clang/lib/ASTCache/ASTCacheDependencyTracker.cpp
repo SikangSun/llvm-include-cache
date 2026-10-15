@@ -41,6 +41,8 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
     PendingEntries.clear();
     if (!FE)
       return;
+    if (Measuring)
+      FirstEntered.try_emplace(&FE->getFileEntry(), FID);
 
     // Every open frame's closure covers everything entered beneath it.
     for (Frame &F : Stack) {
@@ -73,6 +75,16 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
 }
 
 void ASTCacheDependencyTracker::closeFrame(Frame &F) {
+  if (Measuring) {
+    Independence I;
+    I.FID = F.FID;
+    I.Path = F.Path;
+    I.Closure.assign(F.Closure.begin(), F.Closure.end());
+    I.ReadFrom = std::move(F.ReadFrom);
+    I.AltersFrom = std::move(F.AltersFrom);
+    I.Poisoned = F.Poisoned;
+    Measured.push_back(std::move(I));
+  }
   // A poisoned frame emits nothing. Emitting a partial record would produce
   // an entry with fewer constraints than the compile it was recorded from,
   // which is precisely the shape that validates where it must not.
@@ -198,6 +210,7 @@ void ASTCacheDependencyTracker::FileSkipped(
       // guard itself: stdio.h reaching <features.h> a second time.
       if (GuardOrigin.isValid() && F.Closure.contains(GuardOrigin))
         continue;
+      noteRead(F, GuardOrigin, "skips " + SkippedFile.getName());
       ConditionalDependency Dep;
       Dep.MacroName = Guard->getName().str();
       Dep.WasDefined = true;
@@ -208,6 +221,9 @@ void ASTCacheDependencyTracker::FileSkipped(
     // Likewise for a #pragma once file this header itself read earlier.
     if (F.ClosureFiles.contains(&SkippedFile.getFileEntry()))
       continue;
+    if (Measuring)
+      noteRead(F, FirstEntered.lookup(&SkippedFile.getFileEntry()),
+               "skips " + SkippedFile.getName());
 
     InclusionDependency Dep;
     Dep.HeaderPath = SkippedFile.getName().str();
@@ -237,6 +253,7 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
       continue;
     if (Origin.isValid() && F.Closure.contains(Origin))
       continue;
+    noteRead(F, Origin, "tests " + II->getName());
     ConditionalDependency Dep;
     Dep.MacroName = II->getName().str();
     Dep.WasDefined = WasDefined;
@@ -437,6 +454,11 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
                                                 const MacroInfo *MI) {
   FileID DefFID =
       MI ? PP.getSourceManager().getFileID(MI->getDefinitionLoc()) : FileID();
+  // For measureIndependence: a name read as plain text depends on the #undef
+  // that made it so, if a file made one.
+  FileID ReadOrigin = DefFID;
+  if (Measuring && !MI)
+    ReadOrigin = stateOrigin(II, MacroDefinition());
 
   // The same sighting answers differently per frame: a macro is internal to
   // a frame whose closure contains its definition, and external -- so a
@@ -449,6 +471,8 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
       continue;
     if (MI && F.Closure.contains(DefFID))
       continue;
+    noteRead(F, ReadOrigin,
+             (MI ? "expands " : "reads as plain text ") + II->getName());
 
     SyntacticDependency Dep;
     Dep.Name = II->getName().str();
@@ -504,6 +528,7 @@ void ASTCacheDependencyTracker::recordSymbol(
       continue;
     if (!F.SeenSymbol.insert(Name).second)
       continue;
+    noteRead(F, ResolvedFID, "names " + Name->getName());
 
     SymbolDependency Dep;
     Dep.Name = Name->getName().str();
@@ -555,6 +580,65 @@ void ASTCacheDependencyTracker::recordTemplateNameQuery(
 void ASTCacheDependencyTracker::recordDeductionGuideNameQuery(
     const IdentifierInfo *Name, bool IsDeductionGuide) {
   poisonOpenFrames();
+}
+
+void ASTCacheDependencyTracker::noteRead(Frame &F, FileID Origin,
+                                         const llvm::Twine &What) {
+  if (!Measuring || Origin.isInvalid() || F.Closure.contains(Origin))
+    return;
+  if (!F.ReadFrom.count(Origin))
+    F.ReadFrom[Origin] = What.str();
+}
+
+void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
+                                             const MacroDirective *MD) {
+  if (!Measuring || Stack.empty() || !MD)
+    return;
+  const MacroDirective *Prev = MD->getPrevious();
+  if (!Prev)
+    return;
+  SourceLocation Loc = Prev->getLocation();
+  if (const auto *Def = dyn_cast<DefMacroDirective>(Prev)) {
+    const MacroInfo *Old = Def->getInfo();
+    const MacroInfo *New = MD->getMacroInfo();
+    if (Old && New && Old->isIdenticalTo(*New, PP, /*Syntactically=*/true))
+      return;
+    if (Old)
+      Loc = Old->getDefinitionLoc();
+  }
+  FileID Origin =
+      Loc.isValid() ? PP.getSourceManager().getFileID(Loc) : FileID();
+  if (Origin.isInvalid())
+    return;
+  for (Frame &F : Stack)
+    if (!F.Closure.contains(Origin) && !F.AltersFrom.count(Origin))
+      F.AltersFrom[Origin] =
+          "redefines " + MacroNameTok.getIdentifierInfo()->getName().str();
+}
+
+void ASTCacheDependencyTracker::MacroUndefined(const Token &MacroNameTok,
+                                               const MacroDefinition &MD,
+                                               const MacroDirective *Undef) {
+  if (!Measuring || Stack.empty())
+    return;
+  const MacroInfo *MI = MD.getMacroInfo();
+  if (!MI)
+    return;
+  FileID Origin = PP.getSourceManager().getFileID(MI->getDefinitionLoc());
+  if (Origin.isInvalid())
+    return;
+  for (Frame &F : Stack)
+    if (!F.Closure.contains(Origin) && !F.AltersFrom.count(Origin))
+      F.AltersFrom[Origin] =
+          "undefines " + MacroNameTok.getIdentifierInfo()->getName().str();
+}
+
+const ASTCacheDependencyTracker::Independence *
+ASTCacheDependencyTracker::independenceFor(FileID FID) const {
+  for (const Independence &I : Measured)
+    if (I.FID == FID)
+      return &I;
+  return nullptr;
 }
 
 void ASTCacheDependencyTracker::poisonOpenFrames() {

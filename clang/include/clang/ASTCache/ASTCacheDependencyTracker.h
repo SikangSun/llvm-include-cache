@@ -41,6 +41,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
 #include <functional>
 #include <optional>
 #include <string>
@@ -263,6 +264,36 @@ public:
     TrackOnly = std::move(Track);
   }
 
+  /// For measuring which headers inside a written one are independent of it
+  /// (REPORT.md T15): per header, the files outside it whose state it read
+  /// and whose state it changed. Kept only after measureIndependence().
+  struct Independence {
+    FileID FID;
+    std::string Path;
+    /// This file plus every real file entered beneath it.
+    std::vector<FileID> Closure;
+    /// The files outside the header whose #define or #undef gave a state the
+    /// header read: a definedness test, a macro expanded, a name read as
+    /// plain text after an #undef, a type name, a guarded #include skipped.
+    /// Each with the first such read, for the log: "tests FOO".
+    llvm::DenseMap<FileID, std::string> ReadFrom;
+    /// The files outside the header whose #define or #undef the header
+    /// replaced with another state, with the first: "undefines FOO". A
+    /// redefinition with the same tokens changes nothing and is not counted.
+    llvm::DenseMap<FileID, std::string> AltersFrom;
+    bool Poisoned = false;
+  };
+  void measureIndependence() { Measuring = true; }
+  bool measuringIndependence() const { return Measuring; }
+  /// What was measured for the header entered as \p FID, once left.
+  const Independence *independenceFor(FileID FID) const;
+
+  /// Notes changes to macros, for measureIndependence.
+  void MacroDefined(const Token &MacroNameTok,
+                    const MacroDirective *MD) override;
+  void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &MD,
+                      const MacroDirective *Undef) override;
+
 private:
   /// One header's in-flight state, live between its EnterFile and ExitFile.
   struct Frame {
@@ -287,6 +318,8 @@ private:
     /// IncludeDependency that found it.
     llvm::DenseMap<FileID, int32_t> EntryOf;
     HeaderDependencySet Deps;
+    /// For measureIndependence.
+    llvm::DenseMap<FileID, std::string> ReadFrom, AltersFrom;
     /// Something happened in this header that this tracker cannot record
     /// soundly, so it must not be cached at all. Checked at frame close.
     bool Poisoned = false;
@@ -325,6 +358,10 @@ private:
   /// Marks every open frame uncacheable.
   void poisonOpenFrames();
 
+  /// For measureIndependence: \p F read a state that \p Origin set, \p What
+  /// naming the read.
+  void noteRead(Frame &F, FileID Origin, const llvm::Twine &What);
+
   /// Records the text of a __FILE__ (or, with \p LastComponentOnly,
   /// __FILE_NAME__) whose name token is at \p Loc.
   void recordFileName(SourceLocation Loc, bool LastComponentOnly);
@@ -340,6 +377,10 @@ private:
   /// The file each Completed record is for, by the same index.
   std::vector<FileID> CompletedFIDs;
   std::function<bool(FileID)> TrackOnly;
+  bool Measuring = false;
+  std::vector<Independence> Measured;
+  /// Where each file was first entered, for a #pragma once skip.
+  llvm::DenseMap<const FileEntry *, FileID> FirstEntered;
   /// The entries InclusionDirective just made, as (frame, index), waiting
   /// for the file they found to be entered.
   const FileEntry *PendingFile = nullptr;

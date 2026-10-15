@@ -343,6 +343,8 @@ public:
            << describe(static_cast<MismatchReason>(R)) << "\n";
     for (const std::string &Line : S.Rejections)
       OS << "    " << Line << "\n";
+    for (const std::string &Line : S.Checks)
+      OS << "  check " << Line << "\n";
     for (const std::string &Line : Served)
       OS << "  served " << Line << "\n";
     OS << "header cache text time: " << ms(TextMicros) << " ms reading "
@@ -358,6 +360,8 @@ public:
       OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
          << " with deep copies), declined " << E.Declined << ", "
          << ms(E.Micros) << " ms writing and pushing\n";
+      for (const std::string &Line : E.Independence)
+        OS << "  indep " << Line << "\n";
       if (LogServed) {
         for (const std::string &Line : E.Exports)
           OS << "  exported " << Line << "\n";
@@ -1243,7 +1247,8 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
   // for each rejected candidate.
   const char *Stats = std::getenv("CLANG_HEADER_CACHE_STATS");
   llvm::StringRef Level = Stats ? Stats : "";
-  (*Client)->logRejections(Level == "2");
+  (*Client)->logRejections(Level == "2" || Level == "3");
+  (*Client)->logChecks(Level == "3");
   // A directory to record, for every header this compile reads, the job that
   // would build its saved copy.
   const char *Jobs = std::getenv("CLANG_HEADER_CACHE_JOBS");

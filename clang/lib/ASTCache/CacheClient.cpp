@@ -20,7 +20,9 @@
 #include "clang/Serialization/ASTReader.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/raw_socket_stream.h"
+#include <algorithm>
 #include <chrono>
 
 using namespace clang;
@@ -157,7 +159,7 @@ std::optional<IncludeView> redoLookups(
 MismatchReason clang::ast_cache::matchesLiveState(
     const MetadataView &Deps, Preprocessor &PP, Sema *S, std::string *Detail,
     const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found,
-    SearchMemo *Memo) {
+    SearchMemo *Memo, bool SkipConditionals) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -211,6 +213,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // Cheapest first: a definedness test is a hash lookup, and a header with
   // dozens of them usually fails on one.
   for (const ConditionalView &D : Deps.conditional()) {
+    if (SkipConditionals)
+      break;
+    if (Cost)
+      ++Cost->Read[MetadataView::Conditional];
     bool Defined = PP.isMacroDefined(Fresh(D.MacroName));
     if (Defined != D.WasDefined)
       return Because(MismatchReason::Conditional,
@@ -229,6 +235,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   };
 
   for (const ExpandsToView &D : Deps.expandsTo()) {
+    if (Cost)
+      ++Cost->Read[MetadataView::ExpandsTo];
     const MacroInfo *MI = PP.getMacroDefinition(Fresh(D.Name)).getMacroInfo();
     std::optional<std::string> Live =
         MI ? serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts())
@@ -241,6 +249,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // What the header's pops take from below it: the top of each name's
   // push_macro stack, as where the copy was written (REPORT.md Q11).
   for (const MacroStackView &Stack : Deps.macroStacks()) {
+    if (Cost)
+      ++Cost->Read[MetadataView::MacroStacks];
     const MacroStackEffect &E = Stack.Effect;
     if (E.Popped.empty())
       continue;
@@ -266,6 +276,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // which means the same file must already have been read.
   HeaderSearch &HS = PP.getHeaderSearchInfo();
   for (const InclusionView &D : Deps.inclusion()) {
+    if (Cost)
+      ++Cost->Read[MetadataView::Inclusion];
     OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(D.HeaderPath);
     if (!FE || (!HS.hasFileBeenImported(*FE) && !HS.getFileInfo(*FE).isImport))
       return Because(MismatchReason::Inclusion,
@@ -275,10 +287,13 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // Several hundred names for a system header, so after the short lists.
   std::optional<llvm::TimeTraceScope> NamesScope;
   NamesScope.emplace("HeaderCache Check NotAMacro");
-  for (const NameView &N : Deps.notAMacro())
+  for (const NameView &N : Deps.notAMacro()) {
+    if (Cost)
+      ++Cost->Read[MetadataView::NotAMacro];
     if (IsMacro(N.Name))
       return Because(MismatchReason::Syntactic,
                      N.Name + " was not a macro, is");
+  }
 
   NamesScope.reset();
   Lap.next(CheckCost::TypeNamesAndPragmas);
@@ -286,6 +301,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // Symbol dependencies last: the only ones that cost a name lookup.
   {
     for (const SymbolView &D : Deps.symbol()) {
+      if (Cost)
+        ++Cost->Read[MetadataView::Symbol];
       IdentifierInfo &II = Idents.get(D.Name);
       std::string LiveType;
       bool IsType = resolvesToType(*S, II, LiveType);
@@ -328,8 +345,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
     Key.append(reinterpret_cast<const char *>(&Site->SearchContext),
                sizeof(Site->SearchContext));
   for (const FileStampView &F : Deps.files()) {
-    if (Cost)
+    if (Cost) {
       ++Cost->FilesCompared;
+      ++Cost->Read[MetadataView::Files];
+    }
     OptionalFileEntryRef Live =
         FM.getOptionalFileRef(F.Path, /*OpenFile=*/false);
     if (!Live)
@@ -435,6 +454,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // members, or an fscanf with another asm label, would compile differently.
   // The lookup is the one the reader resolves the names with.
   for (const DeclarationView &D : Deps.declarations()) {
+    if (Cost)
+      ++Cost->Read[MetadataView::Declarations];
     NamedDecl *Live = ASTReader::lookupAtFileScope(
         *S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
         /*CreateBuiltin=*/true);
@@ -553,11 +574,61 @@ llvm::StringRef CacheClient::lookup(
       return std::nullopt;
     };
     SearchMemo Memo{Recall, std::nullopt};
+    CheckCost Prev = Counters.Check;
     {
       llvm::TimeTraceScope Scope("HeaderCache Check");
       Found.clear();
-      Why = matchesLiveState(*Deps, PP, S, LogRejections ? &Detail : nullptr,
+      Why = matchesLiveState(*Deps, PP, S,
+                             LogRejections || LogChecks ? &Detail : nullptr,
                              Site, &Counters.Check, &Found, &Memo);
+    }
+    if (LogChecks) {
+      // Where the check stopped: each step's time, and each section's
+      // elements read out of its size.
+      std::string Line;
+      llvm::raw_string_ostream OS(Line);
+      const CheckCost &Now = Counters.Check;
+      OS << Filename << " lookup=" << Counters.Lookups
+         << " cand=" << (&E - Resp->Entries.data()) << "/"
+         << Resp->Entries.size() << " entry=" << E.MetadataOffset
+         << " why=" << static_cast<unsigned>(Why) << " ns=";
+      for (unsigned I = 0; I != CheckCost::NumSteps; ++I)
+        OS << (I ? "," : "") << Now.Nanos[I] - Prev.Nanos[I];
+      OS << " reused=" << Now.SearchesReused - Prev.SearchesReused
+         << " redone=" << Now.SearchesRedone - Prev.SearchesRedone
+         << " read=";
+      size_t Sizes[] = {Deps->conditional().size(), Deps->expandsTo().size(),
+                        Deps->macroStacks().size(), Deps->inclusion().size(),
+                        Deps->notAMacro().size(),   Deps->symbol().size(),
+                        Deps->files().size(),       Deps->includes().size(),
+                        Deps->fileNames().size(),   Deps->declarations().size()};
+      for (unsigned I = 0; I != std::size(Sizes); ++I)
+        OS << (I ? "," : "") << Now.Read[I] - Prev.Read[I] << "/" << Sizes[I];
+      OS << " bytes=" << E.MetadataLength << " module=" << Deps->moduleName();
+      // Every definedness test that differs, + for "was not defined, is"
+      // and - for "was defined, is not", and what the rest of the check says
+      // without them (REPORT.md T15).
+      if (Why == MismatchReason::Conditional) {
+        OS << " fails=";
+        bool Any = false;
+        for (const ConditionalView &D : Deps->conditional()) {
+          IdentifierInfo *II = PP.getIdentifierInfo(D.MacroName);
+          PP.refreshIdentifier(*II);
+          if (PP.isMacroDefined(II) == D.WasDefined)
+            continue;
+          OS << (Any ? "," : "") << D.MacroName << (D.WasDefined ? "-" : "+");
+          Any = true;
+        }
+        std::string Rest;
+        SearchMemo Peek{Recall, std::nullopt};
+        MismatchReason R = matchesLiveState(*Deps, PP, S, &Rest, Site,
+                                            /*Cost=*/nullptr, /*Found=*/nullptr,
+                                            &Peek, /*SkipConditionals=*/true);
+        std::replace(Rest.begin(), Rest.end(), ' ', '_');
+        OS << " rest=" << static_cast<unsigned>(R) << " restwhy=" << Rest;
+      }
+      OS << " detail=" << Detail;
+      Counters.Checks.push_back(std::move(Line));
     }
     if (Memo.Found) {
       Outcomes[{E.MetadataOffset, Memo.Found->Key}] = Memo.Found->Outcome;
@@ -583,6 +654,8 @@ llvm::StringRef CacheClient::lookup(
     if (Use && !Use(Bytes, Deps->moduleName()))
       continue;
     ++Counters.Hits;
+    if (LogChecks)
+      Counters.Checks.back() += " used";
     if (Matched)
       *Matched = *Deps;
     return Bytes;

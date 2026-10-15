@@ -10,6 +10,7 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/ASTCache/ASTCacheDependencyTracker.h"
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/DeclFingerprint.h"
@@ -133,6 +134,8 @@ public:
   /// Whether the tracker should keep a record for \p FID: only for the
   /// headers being exported.
   bool tracks(FileID FID) const { return Tracked.contains(FID); }
+  /// Whether a header being exported is open.
+  bool inside() const { return !Open.empty(); }
 
   //===--------------------------------------------------------------------===//
   // The header's region, from the preprocessor.
@@ -625,9 +628,168 @@ private:
       Line += ", " + std::to_string(W.DroppedLocations) +
               " locations dropped (in module files or outside the part)";
     Counts.Exports.push_back(std::move(Line));
+    if (Tracker.measuringIndependence())
+      measureIndependence(P, Name, W.Buffer.size());
     dump(P, R, W.Sizes);
     llvm::TimeTraceScope PushScope("HeaderCache Push");
     Deliver(std::move(R));
+  }
+
+  /// The declarations each file inside \p P refers to in another file inside
+  /// it, as (referring file, referred-to file).
+  void declarationReads(const Part &P,
+                        llvm::DenseSet<std::pair<FileID, FileID>> &Pairs) {
+    struct Refs : RecursiveASTVisitor<Refs> {
+      llvm::function_ref<void(const Decl *)> On;
+      bool VisitDeclRefExpr(DeclRefExpr *E) {
+        On(E->getDecl());
+        return true;
+      }
+      bool VisitMemberExpr(MemberExpr *E) {
+        On(E->getMemberDecl());
+        return true;
+      }
+      bool VisitTagTypeLoc(TagTypeLoc TL) {
+        On(TL.getDecl());
+        return true;
+      }
+      bool VisitTypedefTypeLoc(TypedefTypeLoc TL) {
+        On(TL.getDecl());
+        return true;
+      }
+    };
+    ASTContext &Ctx = CI.getASTContext();
+    Decl *First =
+        P.DeclsAfter
+            ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+            : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+    for (Decl *D = First; D; D = D->getNextDeclInContext()) {
+      if (!inPart(P, D->getLocation()))
+        continue;
+      FileID From = SM.getFileID(SM.getExpansionLoc(D->getLocation()));
+      auto Note = [&](const Decl *R) {
+        if (!R)
+          return;
+        SourceLocation L = R->getLocation();
+        if (L.isInvalid() || !SM.isLocalSourceLocation(L) || !inPart(P, L))
+          return;
+        FileID To = SM.getFileID(SM.getExpansionLoc(L));
+        if (To != From)
+          Pairs.insert({From, To});
+      };
+      Refs V;
+      V.On = Note;
+      V.TraverseDecl(D);
+    }
+  }
+
+  /// CLANG_HEADER_CACHE_INDEP=1: for each guarded header inside \p P,
+  /// whether it reads or changes a state that \p P's lines before it set,
+  /// one line each, then one for \p P itself.
+  void measureIndependence(const Part &P, llvm::StringRef Module,
+                           size_t Bytes) {
+    using Independence = ASTCacheDependencyTracker::Independence;
+    const Independence *H = Tracker.independenceFor(P.FID);
+    if (!H)
+      return;
+    llvm::DenseSet<FileID> InH(H->Closure.begin(), H->Closure.end());
+    llvm::DenseSet<std::pair<FileID, FileID>> DeclPairs;
+    declarationReads(P, DeclPairs);
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+
+    struct Nested {
+      const Independence *X;
+      llvm::DenseSet<FileID> Closure;
+      std::string Guard;
+      /// The files of P outside X that X reads from, by macro or by
+      /// declaration.
+      llvm::DenseSet<FileID> Reads;
+      bool Alters = false, DeclRead = false, Strict = false;
+      std::string First;
+    };
+    std::vector<Nested> All;
+    for (FileID FID : H->Closure) {
+      if (FID == P.FID)
+        continue;
+      const Independence *X = Tracker.independenceFor(FID);
+      OptionalFileEntryRef FE = SM.getFileEntryRefForID(FID);
+      if (!X || !FE)
+        continue;
+      HeaderFileInfo &Info = HS.getFileInfo(*FE);
+      std::string Guard;
+      if (const IdentifierInfo *G =
+              Info.getControllingMacro(HS.getExternalLookup()))
+        Guard = G->getName().str();
+      else if (Info.isPragmaOnce)
+        Guard = "#pragma-once";
+      else
+        continue;
+      Nested N{X, llvm::DenseSet<FileID>(X->Closure.begin(), X->Closure.end()),
+               Guard};
+      for (auto &[O, What] : X->ReadFrom)
+        if (InH.contains(O)) {
+          N.Reads.insert(O);
+          if (N.First.empty())
+            N.First = What;
+        }
+      for (auto [From, To] : DeclPairs)
+        if (N.Closure.contains(From) && !N.Closure.contains(To) &&
+            InH.contains(To)) {
+          if (N.Reads.insert(To).second && N.First.empty())
+            N.First = "refers to a declaration in " +
+                      SM.getFileEntryRefForID(To)->getName().str();
+          N.DeclRead = true;
+        }
+      for (auto &[O, What] : X->AltersFrom)
+        if (InH.contains(O)) {
+          N.Alters = true;
+          N.First = What;
+        }
+      N.Strict = N.Reads.empty() && !N.Alters && !X->Poisoned;
+      All.push_back(std::move(N));
+    }
+    // Relaxed: reads only from headers before it that are independent
+    // themselves, which a hit would load first.
+    for (Nested &N : All) {
+      bool Relaxed = !N.Alters && !N.X->Poisoned;
+      for (FileID O : N.Reads) {
+        bool Covered = false;
+        for (const Nested &Y : All)
+          if (&Y != &N && Y.Strict && Y.Closure.contains(O) &&
+              !Y.Closure.contains(N.X->FID)) {
+            Covered = true;
+            break;
+          }
+        if (!Covered) {
+          Relaxed = false;
+          break;
+        }
+      }
+      std::string Line;
+      llvm::raw_string_ostream OS(Line);
+      OS << Module << " " << P.Stored << " "
+         << absolutePath(CI.getFileManager(), N.X->Path) << " guard="
+         << N.Guard << " strict=" << N.Strict << " relaxed=" << Relaxed
+         << " readfiles=" << N.Reads.size() << " declread=" << N.DeclRead
+         << " alters=" << N.Alters << " poisoned=" << N.X->Poisoned
+         << " first=" << N.First;
+      Counts.Independence.push_back(std::move(Line));
+    }
+    std::string Line;
+    llvm::raw_string_ostream OS(Line);
+    // The files before the header that it reads from; a header reading
+    // from none depends only on the command line.
+    size_t Files = 0;
+    std::string First;
+    for (auto &[O, What] : H->ReadFrom)
+      if (SM.getFileEntryRefForID(O)) {
+        ++Files;
+        if (First.empty())
+          First = What;
+      }
+    OS << Module << " " << P.Stored << " self readfiles=" << Files
+       << " bytes=" << Bytes << " nested=" << All.size() << " first=" << First;
+    Counts.Independence.push_back(std::move(Line));
   }
 
   /// CLANG_HEADER_CACHE_DUMP_PARTS=<dir>, for debugging: each part goes to
@@ -968,7 +1130,15 @@ PartExporter &PartExporter::install(CompilerInstance &CI,
   auto E =
       std::make_unique<Exporter>(CI, T, std::move(Deliver), ByName, Pragmas);
   Exporter &Ex = *E;
-  T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID); });
+  // Measuring independence (REPORT.md T15) needs a record of every header
+  // inside one being written as well.
+  const char *Indep = std::getenv("CLANG_HEADER_CACHE_INDEP");
+  if (Indep && llvm::StringRef(Indep) == "1") {
+    T.measureIndependence();
+    T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID) || Ex.inside(); });
+  } else {
+    T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID); });
+  }
   PP.setExpansionCandidateObserver(T);
   // Callbacks added later run first: the exporter marks a header as tracked
   // before the tracker decides whether to open a frame for it.
