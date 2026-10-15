@@ -11,6 +11,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_socket_stream.h"
+#include "llvm/Support/xxhash.h"
 #include <thread>
 
 using namespace clang;
@@ -84,7 +85,7 @@ void CacheDaemon::learnLocked(uint64_t Build,
     if (It == Table.end())
       continue;
     for (StoredEntry &E : It->second) {
-      if (E.ModuleName != L.ModuleName)
+      if (E.MetadataOffset != L.Entry)
         continue;
       if (E.SearchBuild != Build) {
         E.SearchBuild = Build;
@@ -151,19 +152,18 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
     auto It = Table.find(Req.Filename);
     if (It != Table.end()) {
       ++Counters.Hits;
-      // Every stored entry for the name is returned, with no comparison of
-      // its record here. The daemon has no way to evaluate a dependency --
+      // Where every stored entry for the name is, with no comparison of its
+      // metadata here. The daemon has no way to evaluate a dependency --
       // that needs the client's live macro table and its Sema -- and sending
       // the client's whole state here instead would be far larger than the
       // handful of names a header actually depends on.
       Resp.Entries.reserve(It->second.size());
       for (const StoredEntry &E : It->second)
-        Resp.Entries.push_back(
-            {E.Deps, E.Offset, E.Length, E.NamesOffset, E.NamesLength,
-             E.EffectsOffset, E.EffectsLength, E.ModuleName,
-             Req.Build && E.SearchBuild == Req.Build
-                 ? E.Searches
-                 : std::vector<SearchOutcome>()});
+        Resp.Entries.push_back({E.MetadataOffset, E.MetadataLength, E.Offset,
+                                E.Length,
+                                Req.Build && E.SearchBuild == Req.Build
+                                    ? E.Searches
+                                    : std::vector<SearchOutcome>()});
     }
   }
 
@@ -172,27 +172,16 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
   return Out;
 }
 
-llvm::SmallVector<char, 0> CacheDaemon::handlePush(const PushRequest &Req) {
-  llvm::SmallVector<char, 256> Encoded;
-  encodeDependencySet(Req.Deps, Encoded);
-  llvm::StringRef EncodedRef(Encoded.data(), Encoded.size());
-
-  // The names the record requires not to be macros are several hundred for a
-  // system header. They go into the region beside the stored result, so a
-  // lookup reply carries where they are instead of the names themselves.
-  HeaderDependencySet Kept = Req.Deps;
-  std::string Names = extractNotAMacroNames(Kept);
-  // The macros the header leaves defined or undefined: thousands for a header
-  // that pulls in a system header, and needed only on a hit.
-  std::string Effects = extractMacroEffects(Kept);
-
+llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
+  uint64_t Hash = llvm::xxh3_64bits(Req.Metadata);
   {
     std::lock_guard<std::mutex> Lock(Mutex);
     ++Counters.Pushes;
     std::vector<StoredEntry> &Entries = Table[Req.Filename];
 
     for (const StoredEntry &E : Entries) {
-      if (E.EncodedDeps == EncodedRef && E.ModuleName == Req.ModuleName) {
+      if (E.Hash == Hash &&
+          Region.read(E.MetadataOffset, E.MetadataLength) == Req.Metadata) {
         // Another client stored this exact result while this one was still
         // compiling. Discard it and acknowledge: the client that lost the
         // race already holds its own result and has no use for the winner.
@@ -203,35 +192,22 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const PushRequest &Req) {
       }
     }
 
-    // An entry is recorded only with its names and its effects. Kept without
-    // the names, it would match compiles that define those names as macros;
-    // without the effects, a hit would leave the macro table as if the header
-    // had not been included.
-    auto AppendList = [&](const std::string &L) {
-      return L.empty() ? std::optional<uint64_t>(0) : Region.append(L);
-    };
-    std::optional<uint64_t> NamesAt = AppendList(Names);
-    std::optional<uint64_t> EffectsAt =
-        NamesAt ? AppendList(Effects) : std::nullopt;
+    // An entry is recorded only with its metadata, which every compile reads
+    // in place in the region, as it reads the copy.
+    std::optional<uint64_t> MetadataAt = Region.append(Req.Metadata);
     std::optional<uint64_t> Offset =
-        EffectsAt ? Region.append(Req.Data) : std::nullopt;
+        MetadataAt ? Region.append(Req.Data) : std::nullopt;
     if (Offset) {
       StoredEntry E;
-      E.Deps = std::move(Kept);
-      E.EncodedDeps = EncodedRef.str();
-      E.ModuleName = Req.ModuleName;
+      E.Hash = Hash;
+      E.MetadataOffset = *MetadataAt;
+      E.MetadataLength = Req.Metadata.size();
       E.Offset = *Offset;
       E.Length = Req.Data.size();
-      E.NamesOffset = *NamesAt;
-      E.NamesLength = Names.size();
-      E.EffectsOffset = *EffectsAt;
-      E.EffectsLength = Effects.size();
       Entries.push_back(std::move(E));
-      Counters.BytesStored += Req.Data.size() + Names.size() + Effects.size();
+      Counters.BytesStored += Req.Data.size() + Req.Metadata.size();
       Counters.PartBytes += Req.Data.size();
-      Counters.NameBytes += Names.size();
-      Counters.EffectBytes += Effects.size();
-      Counters.MetadataBytes += EncodedRef.size();
+      Counters.MetadataBytes += Req.Metadata.size();
       ++Counters.Entries;
       Counters.Headers = Table.size();
       if (Opts.ListStored && listLocked(Req.Filename))
@@ -259,8 +235,14 @@ CacheDaemon::handleMessage(llvm::StringRef Body) {
       return handleLookup(*Req);
     return std::nullopt;
   case MessageKind::PushRequest:
-    if (std::optional<PushRequest> Req = decodePushRequest(Body))
-      return handlePush(*Req);
+    // The metadata is checked whole once, here, outside the lock; every
+    // compile after reads it as stored. Metadata that is not well formed
+    // must not be offered: a candidate missing constraints matches compiles
+    // it must not.
+    if (std::optional<ReceivedPush> Req = decodePushRequest(Body))
+      if (std::optional<MetadataView> V = MetadataView::open(Req->Metadata))
+        if (V->validate())
+          return handlePush(*Req);
     return std::nullopt;
   case MessageKind::TimingReport:
     if (std::optional<TimingReport> Report = decodeTimingReport(Body))

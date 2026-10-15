@@ -7,7 +7,9 @@
 //===----------------------------------------------------------------------===//
 //
 // The caching daemon: a lookup table from header filename to the entries
-// stored for it, over an append-only shared region (SharedRegion.h).
+// stored for it, over an append-only shared region (SharedRegion.h). Each
+// entry's metadata and saved copy are in the region; the table holds only
+// where they are.
 //
 // The daemon holds no state across restarts -- it starts with an empty table
 // and a fresh region, and loads nothing from disk. Its only cleanup duty is
@@ -101,10 +103,8 @@ public:
     uint64_t Pushes = 0;
     uint64_t Duplicates = 0; // pushes discarded as already stored
     uint64_t BytesStored = 0;
-    /// BytesStored by kind: the parts' module files, the not-a-macro name
-    /// lists, the macro effects. MetadataBytes is the encoded metadata kept
-    /// in the daemon's own memory, not in the region.
-    uint64_t PartBytes = 0, NameBytes = 0, EffectBytes = 0, MetadataBytes = 0;
+    /// BytesStored by kind: the parts' module files and their metadata.
+    uint64_t PartBytes = 0, MetadataBytes = 0;
     uint64_t Entries = 0;
     uint64_t Headers = 0;
     uint64_t TimingReports = 0;
@@ -121,23 +121,17 @@ private:
   CacheDaemon() = default;
 
   struct StoredEntry {
-    HeaderDependencySet Deps;
-    /// The encoded record, kept so a push can be tested for duplication by
-    /// byte comparison. Two runs that produce the same dependencies in a
-    /// different order would fail this test and store a second, redundant
-    /// entry -- which costs space, never correctness, since matching is
-    /// semantic and happens on the client.
-    std::string EncodedDeps;
-    /// The pushed module name; see PushRequest::ModuleName.
-    std::string ModuleName;
+    /// The metadata's hash, so a push can be tested for duplication without
+    /// comparing bytes against every entry. Two runs that produce the same
+    /// metadata in a different order would fail the test and store a
+    /// second, redundant entry -- which costs space, never correctness,
+    /// since matching is semantic and happens on the client.
+    uint64_t Hash = 0;
+    /// Where the metadata and the copy's PCM bytes sit in the region.
+    uint64_t MetadataOffset = 0;
+    uint64_t MetadataLength = 0;
     uint64_t Offset = 0;
     uint64_t Length = 0;
-    /// The record's NotAMacro names, moved out of Deps into the region.
-    uint64_t NamesOffset = 0;
-    uint64_t NamesLength = 0;
-    /// The record's macro effects, moved out of Deps into the region.
-    uint64_t EffectsOffset = 0;
-    uint64_t EffectsLength = 0;
     /// What compiles of build SearchBuild found the copy's searches to find,
     /// one per search key (REPORT.md I9). Another build starts afresh.
     uint64_t SearchBuild = 0;
@@ -145,7 +139,7 @@ private:
   };
 
   llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req);
-  llvm::SmallVector<char, 0> handlePush(const PushRequest &Req);
+  llvm::SmallVector<char, 0> handlePush(const ReceivedPush &Req);
   llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
   llvm::SmallVector<char, 0> handleHello();
 

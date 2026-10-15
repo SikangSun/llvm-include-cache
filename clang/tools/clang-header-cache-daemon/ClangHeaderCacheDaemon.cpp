@@ -121,10 +121,7 @@ int main(int argc, char **argv) {
            << "stored  " << S.Entries << " entries for " << S.Headers
            << " headers, " << (S.BytesStored / 1024)
            << " KiB: " << (S.PartBytes / 1024) << " KiB of parts, "
-           << (S.NameBytes / 1024) << " KiB of not-a-macro names, "
-           << (S.EffectBytes / 1024) << " KiB of macro effects; "
-           << (S.MetadataBytes / 1024)
-           << " KiB of metadata in the daemon's memory\n"
+           << (S.MetadataBytes / 1024) << " KiB of metadata\n"
            << "timed   " << S.HeadersTimed << " headers from "
            << S.TimingReports << " compiles; " << S.HeadersListed
            << " on the ask-list; " << S.HitsTimed << " hits timed, "

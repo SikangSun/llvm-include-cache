@@ -25,6 +25,7 @@
 #define LLVM_CLANG_ASTCACHE_CACHECLIENT_H
 
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/SharedRegion.h"
 #include "clang/Basic/FileEntry.h"
 #include "clang/Lex/HeaderSearch.h"
@@ -94,21 +95,16 @@ struct SearchMemo {
   std::optional<SearchOutcome> Found;
 };
 
-/// Whether \p Deps still holds in this compile. \p S must be non-null:
-/// every record carries pragma state and only Sema holds the live value, so
-/// a null Sema rejects every candidate rather than passing checks it cannot
-/// run.
-///
-/// \p NotAMacroNames is the list extractNotAMacroNames took out of a record
-/// the daemon stored (see DependencySerialization.h). A record that never went
-/// through the daemon still carries those names in Deps.Syntactic, and both
-/// are checked.
+/// Whether the metadata \p Deps still holds in this compile, read in place.
+/// \p S must be non-null: all metadata carries pragma state and only Sema
+/// holds the live value, so a null Sema rejects every candidate rather than
+/// passing checks it cannot run.
 ///
 /// \p Detail, when non-null, receives what failed, e.g. "LIMIT was not
 /// defined, is".
 ///
-/// \p Site is where the header is being included. Deps.Includes and
-/// Deps.FileNames are checked from there, and metadata with either is
+/// \p Site is where the header is being included. The metadata's #includes
+/// and __FILE__s are checked from there, and metadata with either is
 /// rejected without one.
 ///
 /// Where checking candidates spends its time, one entry per step, in the
@@ -146,12 +142,10 @@ struct CheckCost {
 
 /// \p Cost, when non-null, is increased by the time each step takes.
 /// \p Found, when non-null, receives the declaration each of
-/// Deps.Declarations finds here, in order. \p Memo, when non-null, offers
+/// Deps.declarations() finds here, in order. \p Memo, when non-null, offers
 /// the searches' outcome from earlier compiles and receives this one's.
-MismatchReason matchesLiveState(const HeaderDependencySet &Deps,
-                                Preprocessor &PP, Sema *S,
-                                llvm::StringRef NotAMacroNames = {},
-                                std::string *Detail = nullptr,
+MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
+                                Sema *S, std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
                                 CheckCost *Cost = nullptr,
                                 std::vector<NamedDecl *> *Found = nullptr,
@@ -177,9 +171,10 @@ public:
   /// region and stay valid for this process's lifetime -- the region is
   /// append-only, so nothing rewrites them.
   ///
-  /// \p MatchedDeps, when non-null, receives the matched entry's record, whose
-  /// Entry/Exit snapshots and macro effects the caller needs to replay the
-  /// header's effect on the compile after loading.
+  /// \p Matched, when non-null, receives the matched entry's metadata, in
+  /// the region, whose pragma state, macro effects and diagnostics the
+  /// caller needs to replay the header's effect on the compile after
+  /// loading.
   ///
   /// \p Use, when given, is offered each candidate that passes the check, in
   /// order, with its module name, and the first it accepts is the result. A
@@ -189,7 +184,7 @@ public:
   /// \p Site is where the header is being included, as matchesLiveState
   /// takes it.
   llvm::StringRef lookup(llvm::StringRef Filename, Preprocessor &PP, Sema *S,
-                         HeaderDependencySet *MatchedDeps = nullptr,
+                         MetadataView *Matched = nullptr,
                          llvm::function_ref<bool(llvm::StringRef Bytes,
                                                  llvm::StringRef ModuleName)>
                              Use = nullptr,
@@ -237,7 +232,7 @@ public:
 
   /// The declaration each outside declaration of the latest lookup's match
   /// found where the header is included, in the order of its
-  /// Deps.Declarations.
+  /// declarations().
   llvm::ArrayRef<NamedDecl *> matchedDeclarations() const {
     return MatchedDecls;
   }
@@ -265,8 +260,9 @@ private:
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;
   uint64_t AskListVersion = 0;
-  /// See setBuild. The searches' outcomes this compile found, by the copy's
-  /// module name and the search key, and those not yet sent to the daemon.
+  /// See setBuild. The searches' outcomes this compile found, by where the
+  /// copy's metadata is and the search key, and those not yet sent to the
+  /// daemon.
   uint64_t Build = 0;
   llvm::DenseMap<std::pair<uint64_t, uint64_t>, uint8_t> Outcomes;
   std::vector<LearnedSearch> Learned;

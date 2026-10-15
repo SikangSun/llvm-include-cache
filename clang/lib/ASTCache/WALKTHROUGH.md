@@ -821,12 +821,14 @@ header also holds an instance id, which a compile checks when it connects
 The messages between a compile and the daemon, each length-prefixed:
 
 - `HELLO`: answered with the region's path and instance id.
-- `LOOKUP(filename)`: the cache query. Answered with every candidate stored
-  under that name: its metadata, its module name, and where in the region its
-  bytes, its NotAMacro names and its macro effects sit. The names (several
-  hundred for a system header) and effects stay in the region, out of the
-  reply.
-- `PUSH(filename, metadata, bytes)`: store a saved copy; acknowledged.
+- `LOOKUP(filename)`: the cache query. Answered with where in the region
+  each candidate stored under that name sits: its metadata and its bytes.
+  **NEW (2026-10-15): the reply carries no metadata.** The compile reads it
+  in place in the region (`MetadataView`, DependencySerialization.h), with
+  nothing decoded or copied.
+- `PUSH(filename, metadata, bytes)`: store a saved copy; acknowledged. The
+  metadata is sent in the form it is stored and read in, the module name
+  inside it.
 - `TIMING`: the times this compile took to read each header; acknowledged.
 
 The daemon never interprets metadata. Deciding which candidate fits needs the
@@ -840,11 +842,12 @@ thread per connection, blocking reads, no timeout: after a compile's last
 cache query it spends a long time generating code without touching the
 socket, and a parked thread costs nothing.
 
-- **On a push**, the daemon moves the NotAMacro names and the effects into
-  the region, and keeps the entry only if they and the bytes were written. A
-  push is a duplicate only if both its metadata and its module name match a
-  stored one: the compiler flags are not in the metadata, so a copy built with
-  `-fshort-enums` must not shut out one built without it.
+- **On a push**, the daemon checks the metadata whole once
+  (`MetadataView::validate`), appends it and the bytes to the region, and
+  keeps only where they are. A push is a duplicate only if its metadata,
+  module name included, matches a stored one byte for byte: the compiler
+  flags are not in the metadata, so a copy built with `-fshort-enums` must
+  not shut out one built without it.
 - **The ask-list.** The daemon keeps each header's first reported time and
   lists the headers at or above `-ask-cutoff-us` (226 µs by default, the cost
   of one PCM load measured on release clang 18). `-list-stored` also lists
@@ -879,7 +882,7 @@ and a check that cannot run must reject. In order:
 2. Syntactic dependencies that require a macro: same replacement text?
 3. Inclusion dependencies: a `#pragma once` file skipped then must be
    skippable now.
-4. The NotAMacro names, read from the region: none may be a macro now.
+4. The NotAMacro names: none may be a macro now.
 5. Symbol dependencies: does each name still resolve to the same type?
 6. Pragma state at entry.
 7. **NEW (`9b86dcc4e`, names `9f46203f6`): the header's own header searches**

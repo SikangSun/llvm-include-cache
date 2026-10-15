@@ -9,20 +9,19 @@
 // The compiler/daemon wire protocol. Two request types:
 //
 //   LOOKUP(filename)
-//     -> every entry stored under that filename, each carrying the dependency
-//        record it was built against and where its stored result sits in the
-//        shared region. The names the record requires not to be macros --
-//        most of it, by size -- are in the region too, and the reply says
-//        where rather than carrying them.
+//     -> where each entry stored under that filename sits in the shared
+//        region: its metadata and its saved copy. The reply carries no
+//        metadata; the compile reads it in place there (MetadataView).
 //
-//   PUSH(filename, record, data)
-//     -> a bare acknowledgment.
+//   PUSH(filename, metadata, data)
+//     -> a bare acknowledgment. The metadata crosses the socket once, in the
+//        form it is stored and read in.
 //
-// The daemon never interprets a record. It matches on filename only, hands
-// back every candidate, and the client decides which -- if any -- of them its
-// own compile matches. That keeps the daemon simple, and it avoids sending
-// the client's entire macro table across the socket when a header depends on
-// a handful of names.
+// The daemon never interprets metadata beyond checking it is well formed. It
+// matches on filename only, hands back every candidate, and the client
+// decides which -- if any -- of them its own compile matches. That keeps the
+// daemon simple, and it avoids sending the client's entire macro table
+// across the socket when a header depends on a handful of names.
 //
 // Every entry's shared-memory location is returned, not just the one that
 // turns out to match: mapping is cheap, and it saves a second round trip once
@@ -79,33 +78,22 @@ struct SearchOutcome {
 };
 
 /// A SearchOutcome a compile found, for the daemon to keep for the rest of
-/// the build. The copy is the one stored for Filename under ModuleName.
+/// the build. The copy is the one stored for Filename whose metadata starts
+/// at Entry (CacheEntryRef::MetadataOffset).
 struct LearnedSearch {
   std::string Filename;
-  std::string ModuleName;
+  uint64_t Entry = 0;
   SearchOutcome Found;
 };
 
-/// A stored result the daemon knows about: what it was built against, and
-/// where to find it. Offset and Length address the shared region, not a file.
+/// A stored copy the daemon knows about. Both ranges address the shared
+/// region, not a file: the metadata, in encodeMetadata's form, and the saved
+/// copy's PCM bytes.
 struct CacheEntryRef {
-  /// The record, less its NotAMacro syntactic dependencies.
-  HeaderDependencySet Deps;
+  uint64_t MetadataOffset = 0;
+  uint64_t MetadataLength = 0;
   uint64_t Offset = 0;
   uint64_t Length = 0;
-  /// Where those NotAMacro names sit in the shared region, as a list built by
-  /// extractNotAMacroNames. A zero length means the record has none.
-  uint64_t NamesOffset = 0;
-  uint64_t NamesLength = 0;
-  /// Where the record's macro effects sit in the shared region, as a list
-  /// built by extractMacroEffects. Read only on a hit.
-  uint64_t EffectsOffset = 0;
-  uint64_t EffectsLength = 0;
-  /// The saved copy's top-level module name (PushRequest::ModuleName). A
-  /// compile that already loaded this copy -- stddef.h, included again from
-  /// another header in the same state -- reuses it: loading a second module
-  /// of the same name is a fatal error.
-  std::string ModuleName;
   /// What the copy's searches found in the asking compile's build.
   std::vector<SearchOutcome> Searches;
 };
@@ -127,16 +115,25 @@ struct LookupResponse {
 struct PushRequest {
   std::string Filename;
   /// Names the build: the producer hashes the header, the compiler options
-  /// and the context into it. Two pushes with the same record but different
-  /// options are different entries -- the options are not part of the record
-  /// -- so the daemon compares this too before discarding a push as a
-  /// duplicate.
+  /// and the context into it. Two pushes with the same metadata but
+  /// different options are different entries -- the options are not part of
+  /// the metadata -- so the name is stored inside the metadata, and the
+  /// daemon's byte comparison for a duplicate compares it too.
   std::string ModuleName;
-  /// The whole record. The daemon moves its NotAMacro names into the region.
+  /// The copy's metadata, encoded with ModuleName into the stored form as
+  /// the push is sent.
   HeaderDependencySet Deps;
   /// The serialized parsed header. Copied into the shared region by the
   /// daemon, so it crosses the socket once.
   std::string Data;
+};
+
+/// A push as the daemon reads it: the metadata already in its stored form,
+/// the module name inside it. Each field points into the message.
+struct ReceivedPush {
+  llvm::StringRef Filename;
+  llvm::StringRef Metadata;
+  llvm::StringRef Data;
 };
 
 /// How long a compile took to read one header, from entering it to leaving
@@ -205,7 +202,7 @@ std::optional<MessageKind> peekMessageKind(llvm::StringRef Body);
 
 std::optional<LookupRequest> decodeLookupRequest(llvm::StringRef Body);
 std::optional<LookupResponse> decodeLookupResponse(llvm::StringRef Body);
-std::optional<PushRequest> decodePushRequest(llvm::StringRef Body);
+std::optional<ReceivedPush> decodePushRequest(llvm::StringRef Body);
 std::optional<TimingReport> decodeTimingReport(llvm::StringRef Body);
 std::optional<HelloReply> decodeHelloReply(llvm::StringRef Body);
 

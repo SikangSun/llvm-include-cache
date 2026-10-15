@@ -434,7 +434,7 @@ public:
     // The saved header itself used none -- the producer declines one that
     // does -- so the counter after it is the counter before it.
     uint32_t Counter = PP.getCounterValue();
-    HeaderDependencySet Deps;
+    MetadataView Deps;
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc,
                      warningState(WarningFlags, &Pragmas),
@@ -510,12 +510,14 @@ public:
     if (Copy.Fresh) {
       llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
       IdentifierTable &Idents = PP.getIdentifierTable();
-      for (size_t I = 0, N = std::min(Found.size(), Deps.Declarations.size());
-           I != N; ++I)
+      size_t I = 0;
+      for (const DeclarationView &D : Deps.declarations()) {
+        if (I == Found.size())
+          break;
         CI.getASTReader()->pinNameReference(
-            *Copy.MF, Idents.get(Deps.Declarations[I].Name),
-            Deps.Declarations[I].In == DeclarationDependency::Space::Tag,
-            Found[I]);
+            *Copy.MF, Idents.get(D.Name),
+            D.In == DeclarationDependency::Space::Tag, Found[I++]);
+      }
     }
 
     // What the header does to its includer's macros and pragma state, which
@@ -525,23 +527,23 @@ public:
     auto Replaying = std::chrono::steady_clock::now();
     // The pushes go first: they save this compile's definitions, which the
     // copy's own would hide once visible.
-    replayMacroStacks(Deps.MacroStacks, IncludeLoc);
+    replayMacroStacks(Deps.macroStacks(), IncludeLoc);
     {
       llvm::TimeTraceScope S("HeaderCache MakeVisible");
       PP.makeModuleVisible(Target, IncludeLoc);
     }
     {
       llvm::TimeTraceScope S("HeaderCache ReplayEffects");
-      replayMacroEffects(Deps.MacroEffects, *Target, IncludeLoc);
+      replayMacroEffects(Deps.macroEffects(), *Target, IncludeLoc);
     }
     {
       llvm::TimeTraceScope S("HeaderCache PragmaDelta");
-      applyPragmaDelta(CI.getSema(), Deps.Entry, Deps.Exit);
+      applyPragmaDelta(CI.getSema(), Deps.entry(), Deps.exit());
     }
-    printDiagnostics(Deps.Diagnostics, *Copy.MF);
+    printDiagnostics(Deps.diagnostics(), *Copy.MF);
     // The warning pragmas the header left in force, as its text would have.
-    for (const WarningPragma &W : Deps.WarningPragmas)
-      Pragmas.apply(CI.getDiagnostics(), W, IncludeLoc);
+    for (const WarningPragmaView &W : Deps.warningPragmas())
+      Pragmas.apply(CI.getDiagnostics(), W.Pragma, IncludeLoc);
     uint64_t Replay = micros(Replaying);
     ReplayMicros += Replay;
     Timings.Hits.push_back({Path, Took + Replay});
@@ -690,10 +692,11 @@ private:
   /// as its text would have run them: the pops first, then the pushes, all
   /// before the header's own definitions (REPORT.md Q11). The check made
   /// sure each pop takes what it took where the copy was written.
-  void replayMacroStacks(llvm::ArrayRef<MacroStackEffect> Stacks,
+  void replayMacroStacks(MetadataSection<MacroStackView> Stacks,
                          SourceLocation Loc) {
     Preprocessor &PP = CI.getPreprocessor();
-    for (const MacroStackEffect &E : Stacks) {
+    for (const MacroStackView &Stack : Stacks) {
+      const MacroStackEffect &E = Stack.Effect;
       TouchedByCopies.insert(llvm::xxh3_64bits(E.Name));
       IdentifierInfo *II = PP.getIdentifierInfo(E.Name);
       PP.refreshIdentifier(*II);
@@ -704,14 +707,14 @@ private:
     }
   }
 
-  void replayMacroEffects(llvm::ArrayRef<MacroEffect> Effects, Module &Target,
-                          SourceLocation Loc) {
+  void replayMacroEffects(MetadataSection<MacroEffectView> Effects,
+                          Module &Target, SourceLocation Loc) {
     Preprocessor &PP = CI.getPreprocessor();
     IdentifierTable &Idents = PP.getIdentifierTable();
     bool OnlyCopies =
         !ReplayAll &&
         CI.getASTReader()->getModuleManager().size() == CopiesLoaded;
-    for (const MacroEffect &E : Effects) {
+    for (const MacroEffectView &E : Effects) {
       bool Earlier = !TouchedByCopies.insert(llvm::xxh3_64bits(E.Name)).second;
       if (OnlyCopies && !Earlier && Idents.find(E.Name) == Idents.end()) {
         ++EffectsSkipped;
@@ -752,7 +755,7 @@ private:
   /// printed again: the copy is served only under the same warning flags,
   /// and where no warning pragma is in force, so they are the ones the
   /// header's text would print here (REPORT.md Q34).
-  void printDiagnostics(llvm::ArrayRef<SavedDiagnostic> Saved,
+  void printDiagnostics(MetadataSection<DiagnosticView> Saved,
                         serialization::ModuleFile &MF) {
     if (Saved.empty())
       return;
@@ -764,7 +767,8 @@ private:
       return R.TokenRange ? CharSourceRange::getTokenRange(Within)
                           : CharSourceRange::getCharRange(Within);
     };
-    for (const SavedDiagnostic &D : Saved) {
+    for (const DiagnosticView &Ref : Saved) {
+      const SavedDiagnostic &D = Ref.Diagnostic;
       llvm::SmallVector<CharSourceRange, 2> Ranges;
       for (const SavedDiagnostic::Range &R : D.Ranges)
         Ranges.push_back(Range(R));

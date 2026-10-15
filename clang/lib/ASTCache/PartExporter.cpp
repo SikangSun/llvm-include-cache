@@ -557,7 +557,7 @@ private:
     // The same header, metadata and compiler options give the same name in
     // any compile, which lets the daemon recognise a part it already holds.
     llvm::SmallVector<char, 256> Encoded;
-    encodeDependencySet(Deps, Encoded);
+    encodeMetadata(Deps, /*ModuleName=*/{}, Encoded);
     std::string Key = P.Stored;
     Key += '\0';
     Key += CI.getInvocation().getModuleHash();

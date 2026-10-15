@@ -35,26 +35,6 @@ void frame(llvm::SmallVectorImpl<char> &Out, MessageKind Kind, Fn Body) {
                                                           sizeof(uint32_t)));
 }
 
-void writeRecord(ByteWriter &W, const HeaderDependencySet &Deps) {
-  llvm::SmallVector<char, 256> Encoded;
-  encodeDependencySet(Deps, Encoded);
-  W.str(llvm::StringRef(Encoded.data(), Encoded.size()));
-}
-
-/// Returns false if the nested record could not be decoded, which fails the
-/// whole message: an entry whose record is unreadable must not be offered as
-/// a candidate, since a candidate with no constraints matches everything.
-bool readRecord(ByteReader &R, HeaderDependencySet &Out) {
-  llvm::StringRef Encoded = R.str();
-  if (!R.ok())
-    return false;
-  std::optional<HeaderDependencySet> Deps = decodeDependencySet(Encoded);
-  if (!Deps)
-    return false;
-  Out = std::move(*Deps);
-  return true;
-}
-
 /// Strips and validates the kind byte, leaving \p R positioned at the body.
 bool expectKind(ByteReader &R, MessageKind Want) {
   return R.u8() == static_cast<uint8_t>(Want) && R.ok();
@@ -72,7 +52,7 @@ static void writeLearned(ByteWriter &W, uint64_t Build,
   W.u32(static_cast<uint32_t>(Learned.size()));
   for (const LearnedSearch &L : Learned) {
     W.str(L.Filename);
-    W.str(L.ModuleName);
+    W.u64(L.Entry);
     W.u64(L.Found.Key);
     W.u8(L.Found.Outcome);
   }
@@ -84,7 +64,7 @@ static bool readLearned(ByteReader &R, uint64_t &Build,
   for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
     LearnedSearch L;
     L.Filename = R.str().str();
-    L.ModuleName = R.str().str();
+    L.Entry = R.u64();
     L.Found.Key = R.u64();
     L.Found.Outcome = R.u8();
     Learned.push_back(std::move(L));
@@ -105,14 +85,10 @@ void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
   frame(Out, MessageKind::LookupResponse, [&](ByteWriter &W) {
     W.u32(static_cast<uint32_t>(Resp.Entries.size()));
     for (const CacheEntryRef &E : Resp.Entries) {
-      writeRecord(W, E.Deps);
+      W.u64(E.MetadataOffset);
+      W.u64(E.MetadataLength);
       W.u64(E.Offset);
       W.u64(E.Length);
-      W.u64(E.NamesOffset);
-      W.u64(E.NamesLength);
-      W.u64(E.EffectsOffset);
-      W.u64(E.EffectsLength);
-      W.str(E.ModuleName);
       W.u32(static_cast<uint32_t>(E.Searches.size()));
       for (const SearchOutcome &O : E.Searches) {
         W.u64(O.Key);
@@ -126,8 +102,9 @@ void clang::ast_cache::encodePushRequest(const PushRequest &Req,
                                          llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::PushRequest, [&](ByteWriter &W) {
     W.str(Req.Filename);
-    W.str(Req.ModuleName);
-    writeRecord(W, Req.Deps);
+    llvm::SmallVector<char, 0> Metadata;
+    encodeMetadata(Req.Deps, Req.ModuleName, Metadata);
+    W.str(llvm::StringRef(Metadata.data(), Metadata.size()));
     W.str(Req.Data);
   });
 }
@@ -218,15 +195,10 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
   uint32_t N = R.count();
   for (uint32_t I = 0; I < N && R.ok(); ++I) {
     CacheEntryRef E;
-    if (!readRecord(R, E.Deps))
-      return std::nullopt;
+    E.MetadataOffset = R.u64();
+    E.MetadataLength = R.u64();
     E.Offset = R.u64();
     E.Length = R.u64();
-    E.NamesOffset = R.u64();
-    E.NamesLength = R.u64();
-    E.EffectsOffset = R.u64();
-    E.EffectsLength = R.u64();
-    E.ModuleName = R.str().str();
     for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
       SearchOutcome O;
       O.Key = R.u64();
@@ -240,18 +212,16 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
   return Resp;
 }
 
-std::optional<PushRequest>
+std::optional<ReceivedPush>
 clang::ast_cache::decodePushRequest(llvm::StringRef Body) {
   ByteReader R(Body);
   if (!expectKind(R, MessageKind::PushRequest))
     return std::nullopt;
 
-  PushRequest Req;
-  Req.Filename = R.str().str();
-  Req.ModuleName = R.str().str();
-  if (!readRecord(R, Req.Deps))
-    return std::nullopt;
-  Req.Data = R.str().str();
+  ReceivedPush Req;
+  Req.Filename = R.str();
+  Req.Metadata = R.str();
+  Req.Data = R.str();
   if (!R.atEnd())
     return std::nullopt;
   return Req;

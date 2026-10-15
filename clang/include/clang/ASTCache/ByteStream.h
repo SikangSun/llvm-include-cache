@@ -68,6 +68,8 @@ public:
 
   bool ok() const { return !Failed; }
   bool atEnd() const { return !Failed && Pos == Data.size(); }
+  /// Marks a value read as out of range, so the whole read fails.
+  void fail() { Failed = true; }
 
   uint8_t u8() {
     if (Failed || Data.size() - Pos < 1) {

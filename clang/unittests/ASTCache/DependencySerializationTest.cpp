@@ -6,11 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The dependency set is what decides whether a cached AST may be spliced into
-// a live compile, so a decode that quietly drops or mangles part of it turns
-// into a wrong hit rather than a diagnostic. These tests pin the round trip
-// and, just as importantly, that a damaged buffer decodes to nothing at all
-// rather than to a smaller set.
+// A copy's metadata is what decides whether the copy may be spliced into a
+// live compile, so a read that quietly drops or mangles part of it turns into
+// a wrong hit rather than a diagnostic. These tests pin the round trip, that
+// the view reads the stored bytes in place, and, just as importantly, that
+// damaged bytes are refused whole rather than read as smaller metadata.
 //
 //===----------------------------------------------------------------------===//
 
@@ -24,10 +24,15 @@ using namespace clang::ast_cache;
 
 namespace {
 
-std::string encode(const HeaderDependencySet &D) {
+std::string encode(const HeaderDependencySet &D,
+                   llvm::StringRef ModuleName = "__hcp_0123") {
   llvm::SmallVector<char, 128> Out;
-  encodeDependencySet(D, Out);
+  encodeMetadata(D, ModuleName, Out);
   return std::string(Out.data(), Out.size());
+}
+
+std::optional<HeaderDependencySet> decodeDependencySet(llvm::StringRef Data) {
+  return decodeMetadata(Data);
 }
 
 HeaderDependencySet makeFullSet() {
@@ -58,6 +63,19 @@ HeaderDependencySet makeFullSet() {
   D.HeaderName = "./anet.h";
   D.Files.push_back({"/src/redis/src/anet.h", 2491, 1759600000});
   D.Files.push_back({"/usr/include/stdio.h", 0, -1});
+  D.Entry = {7, 0x1234};
+  D.Exit = {8, 0x5678};
+  D.WarningState = 0xabcdef;
+  D.MacroStacks.push_back({"X", {std::string("1"), std::nullopt}, 2});
+  SavedDiagnostic Diag;
+  Diag.Level = 3;
+  Diag.ID = 1234;
+  Diag.Loc = 99;
+  Diag.Message = "unused variable 'x'";
+  Diag.Ranges.push_back({10, 20, true});
+  Diag.FixIts.push_back({{30, 40, false}, "y", true});
+  D.Diagnostics.push_back(Diag);
+  D.WarningPragmas.push_back({2, "-Wsign-compare"});
   return D;
 }
 
@@ -94,6 +112,37 @@ void expectEqual(const HeaderDependencySet &A, const HeaderDependencySet &B) {
   EXPECT_EQ(A.Declarations, B.Declarations);
   EXPECT_EQ(A.HeaderName, B.HeaderName);
   EXPECT_EQ(A.Files, B.Files);
+  EXPECT_EQ(A.Entry, B.Entry);
+  EXPECT_EQ(A.Exit, B.Exit);
+  EXPECT_EQ(A.WarningState, B.WarningState);
+  ASSERT_EQ(A.MacroStacks.size(), B.MacroStacks.size());
+  for (size_t I = 0; I != A.MacroStacks.size(); ++I) {
+    EXPECT_EQ(A.MacroStacks[I].Name, B.MacroStacks[I].Name);
+    EXPECT_EQ(A.MacroStacks[I].Popped, B.MacroStacks[I].Popped);
+    EXPECT_EQ(A.MacroStacks[I].Pushes, B.MacroStacks[I].Pushes);
+  }
+  ASSERT_EQ(A.Diagnostics.size(), B.Diagnostics.size());
+  for (size_t I = 0; I != A.Diagnostics.size(); ++I) {
+    const SavedDiagnostic &X = A.Diagnostics[I], &Y = B.Diagnostics[I];
+    EXPECT_EQ(X.Level, Y.Level);
+    EXPECT_EQ(X.ID, Y.ID);
+    EXPECT_EQ(X.Loc, Y.Loc);
+    EXPECT_EQ(X.Message, Y.Message);
+    ASSERT_EQ(X.Ranges.size(), Y.Ranges.size());
+    for (size_t J = 0; J != X.Ranges.size(); ++J) {
+      EXPECT_EQ(X.Ranges[J].Begin, Y.Ranges[J].Begin);
+      EXPECT_EQ(X.Ranges[J].End, Y.Ranges[J].End);
+      EXPECT_EQ(X.Ranges[J].TokenRange, Y.Ranges[J].TokenRange);
+    }
+    ASSERT_EQ(X.FixIts.size(), Y.FixIts.size());
+    for (size_t J = 0; J != X.FixIts.size(); ++J) {
+      EXPECT_EQ(X.FixIts[J].Remove.Begin, Y.FixIts[J].Remove.Begin);
+      EXPECT_EQ(X.FixIts[J].Insert, Y.FixIts[J].Insert);
+      EXPECT_EQ(X.FixIts[J].BeforePreviousInsertions,
+                Y.FixIts[J].BeforePreviousInsertions);
+    }
+  }
+  EXPECT_EQ(A.WarningPragmas, B.WarningPragmas);
 }
 
 TEST(DependencySerializationTest, EmptySetRoundTrips) {
@@ -126,71 +175,79 @@ TEST(DependencySerializationTest, EmbeddedNulsSurvive) {
   EXPECT_EQ(Decoded->Syntactic[0].TokenSequence, std::string("\0a\0b\0", 5));
 }
 
-TEST(DependencySerializationTest, UnknownSyntacticStateIsRejected) {
-  // A state byte this build does not know must not decode as one it does:
-  // read as NotAMacro, a record meant to require a macro would require the
-  // opposite.
+TEST(DependencySerializationTest, EachSyntacticDependencyKeepsItsRequirement) {
+  // The two requirements are stored in sections of their own. Swapped, a
+  // name required to be plain text would be required to be a macro.
   HeaderDependencySet D;
-  D.Syntactic.push_back({"M", SyntacticDependency::State::NotAMacro, ""});
-  std::string Data = encode(D);
-  // version, conditional count, syntactic count, name length, "M", state.
-  const size_t StateAt = 4 + 4 + 4 + 4 + 1;
-  ASSERT_GT(Data.size(), StateAt);
-  ASSERT_EQ(Data[StateAt], 0);
-  Data[StateAt] = 7;
-  EXPECT_FALSE(decodeDependencySet(Data).has_value());
+  D.Syntactic.push_back({"M", SyntacticDependency::State::ExpandsTo, "1"});
+  D.Syntactic.push_back({"N", SyntacticDependency::State::NotAMacro, ""});
+  auto Decoded = decodeDependencySet(encode(D));
+  ASSERT_TRUE(Decoded.has_value());
+  ASSERT_EQ(Decoded->Syntactic.size(), 2u);
+  EXPECT_EQ(Decoded->Syntactic[0].Name, "M");
+  EXPECT_EQ(Decoded->Syntactic[0].Required,
+            SyntacticDependency::State::ExpandsTo);
+  EXPECT_EQ(Decoded->Syntactic[1].Name, "N");
+  EXPECT_EQ(Decoded->Syntactic[1].Required,
+            SyntacticDependency::State::NotAMacro);
 }
 
-TEST(DependencySerializationTest, NotAMacroNamesMoveIntoTheList) {
+TEST(DependencySerializationTest, TheViewReadsTheBytesInPlace) {
+  // What every compile reads at a lookup: nothing decoded, each string in
+  // the stored bytes themselves.
   HeaderDependencySet D = makeFullSet();
   D.Syntactic.push_back({"long", SyntacticDependency::State::NotAMacro, ""});
-  std::string List = extractNotAMacroNames(D);
+  std::string Data = encode(D, "__hcp_feed");
+  std::optional<MetadataView> V = MetadataView::open(Data);
+  ASSERT_TRUE(V.has_value());
+  ASSERT_TRUE(V->validate());
+  auto Inside = [&](llvm::StringRef S) {
+    return S.data() >= Data.data() && S.end() <= Data.data() + Data.size();
+  };
+  EXPECT_EQ(V->moduleName(), "__hcp_feed");
+  EXPECT_TRUE(Inside(V->moduleName()));
+  EXPECT_EQ(V->headerName(), "./anet.h");
 
-  // Only the names left; everything else stays in the record.
-  ASSERT_EQ(D.Syntactic.size(), 1u);
-  EXPECT_EQ(D.Syntactic[0].Name, "BUFSZ");
-  EXPECT_EQ(D.Conditional.size(), 2u);
+  std::vector<llvm::StringRef> Names;
+  for (const NameView &N : V->notAMacro()) {
+    EXPECT_TRUE(Inside(N.Name));
+    Names.push_back(N.Name);
+  }
+  EXPECT_EQ(Names, (std::vector<llvm::StringRef>{"malloc", "long"}));
+  ASSERT_EQ(V->expandsTo().size(), 1u);
+  EXPECT_EQ(V->expandsTo().begin()->Name, "BUFSZ");
 
-  auto Names = splitNameList(List);
-  ASSERT_TRUE(Names.has_value());
-  ASSERT_EQ(Names->size(), 2u);
-  EXPECT_EQ((*Names)[0], "malloc");
-  EXPECT_EQ((*Names)[1], "long");
-  EXPECT_TRUE(splitNameList("").has_value()) << "no names is a valid list";
-  EXPECT_TRUE(splitNameList("")->empty());
+  std::vector<std::pair<llvm::StringRef, bool>> Effects;
+  for (const MacroEffectView &E : V->macroEffects())
+    Effects.push_back({E.Name, E.Defined});
+  EXPECT_EQ(Effects, (std::vector<std::pair<llvm::StringRef, bool>>{
+                         {"GUARD_H", true}, {"LIMIT", false}}));
+  EXPECT_EQ(V->entry().AlignPackRaw, 7u);
+  EXPECT_EQ(V->warningState(), 0xabcdefu);
 }
 
 TEST(DependencySerializationTest, DamagedNameListIsRejected) {
-  // Same rule as the record: a list that lost its tail must not read as a
-  // shorter list, which would check fewer names than the record requires.
-  // Lengths are explicit: a literal's own terminating NUL would otherwise
-  // complete the list.
+  // The ask-list's form: a list that lost its tail must not read as a
+  // shorter list. Lengths are explicit: a literal's own terminating NUL
+  // would otherwise complete the list.
+  EXPECT_TRUE(splitNameList("").has_value()) << "no names is a valid list";
+  EXPECT_TRUE(splitNameList("")->empty());
   EXPECT_FALSE(splitNameList(llvm::StringRef("malloc\0lon", 10)).has_value());
   EXPECT_FALSE(splitNameList(llvm::StringRef("malloc\0\0", 8)).has_value());
 }
 
-TEST(DependencySerializationTest, MacroEffectsMoveIntoTheirList) {
-  HeaderDependencySet D = makeFullSet();
-  std::string List = extractMacroEffects(D);
-  EXPECT_TRUE(D.MacroEffects.empty());
-  EXPECT_EQ(List, std::string("+GUARD_H\0-LIMIT\0", 16));
-
-  auto Effects = decodeMacroEffects(List);
-  ASSERT_TRUE(Effects.has_value());
-  ASSERT_EQ(Effects->size(), 2u);
-  EXPECT_EQ((*Effects)[0].Name, "GUARD_H");
-  EXPECT_TRUE((*Effects)[0].Defined);
-  EXPECT_EQ((*Effects)[1].Name, "LIMIT");
-  EXPECT_FALSE((*Effects)[1].Defined);
-  EXPECT_TRUE(decodeMacroEffects("").has_value()) << "no effects is valid";
-}
-
-TEST(DependencySerializationTest, DamagedEffectListIsRejected) {
-  // A dropped effect leaves a macro as the header would not have: an #undef
-  // that never happens is a different program.
-  EXPECT_FALSE(decodeMacroEffects(llvm::StringRef("+A\0-B", 5)).has_value());
-  EXPECT_FALSE(decodeMacroEffects(llvm::StringRef("+\0", 2)).has_value());
-  EXPECT_FALSE(decodeMacroEffects(llvm::StringRef("A\0", 2)).has_value());
+TEST(DependencySerializationTest, AnEmptyNameIsRejected) {
+  // Looked up, an empty name is never a macro, so a requirement on it
+  // passes whatever the compile defines; replayed, it changes nothing.
+  HeaderDependencySet D;
+  D.Syntactic.push_back({"", SyntacticDependency::State::NotAMacro, ""});
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = HeaderDependencySet();
+  D.Syntactic.push_back({"", SyntacticDependency::State::ExpandsTo, "1"});
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = HeaderDependencySet();
+  D.MacroEffects.push_back({"", true});
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
 }
 
 TEST(DependencySerializationTest, TruncationIsRejectedNotPartiallyDecoded) {
@@ -307,15 +364,24 @@ TEST(DeclFingerprintTest, ADeclarationMergesWithADefinitionNotTheOtherWay) {
 
 TEST(DependencySerializationTest, HugeCountDoesNotOverAllocate) {
   // A corrupt count must fail immediately rather than sizing a loop from it.
-  llvm::SmallVector<char, 16> Out;
-  encodeDependencySet(HeaderDependencySet(), Out);
-  // Overwrite the first count (immediately after the version word) with a
-  // value far larger than the buffer could hold.
+  std::string Out = encode(HeaderDependencySet());
+  // Overwrite the first section's count, where the table after the version
+  // word says it is, with a value far larger than the bytes could hold.
   ASSERT_GE(Out.size(), 8u);
+  uint32_t At = llvm::support::endian::read32le(Out.data() + 4);
+  ASSERT_LE(At + 4, Out.size());
   for (int I = 0; I != 4; ++I)
-    Out[4 + I] = static_cast<char>(0xFF);
-  EXPECT_FALSE(
-      decodeDependencySet(llvm::StringRef(Out.data(), Out.size())).has_value());
+    Out[At + I] = static_cast<char>(0xFF);
+  EXPECT_FALSE(decodeDependencySet(Out).has_value());
+}
+
+TEST(DependencySerializationTest, ASectionTableOutOfOrderIsRejected) {
+  // Each section ends where the next starts; a table that says otherwise
+  // would have two sections read the same bytes.
+  std::string Out = encode(makeFullSet());
+  llvm::support::endian::write32le(
+      Out.data() + 4, llvm::support::endian::read32le(Out.data() + 8));
+  EXPECT_FALSE(MetadataView::open(Out).has_value());
 }
 
 } // namespace

@@ -96,18 +96,17 @@ FileEntryRef refOnEntry(const SourceManager &SM, FileEntryRef File) {
 /// make them from \p Site, in order, the way Preprocessor::LookupFile makes
 /// them: a quoted lookup also searches beside the file holding the
 /// directive, and a _next lookup starts after the directory that file was
-/// found in. Fills \p Found with what each found. Returns the index of the
-/// first entry that found a different file, or -1.
-int redoLookups(
-    const HeaderDependencySet &Deps, Preprocessor &PP, const IncludeSite &Site,
+/// found in. Fills \p Found with what each found. Returns the first entry
+/// that found a different file, if any.
+std::optional<IncludeView> redoLookups(
+    const MetadataView &Deps, Preprocessor &PP, const IncludeSite &Site,
     bool CheckNames,
     std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
         &Found) {
   HeaderSearch &HS = PP.getHeaderSearchInfo();
   FileManager &FM = PP.getFileManager();
   SourceManager &SM = PP.getSourceManager();
-  for (size_t I = 0; I != Deps.Includes.size(); ++I) {
-    const IncludeDependency &D = Deps.Includes[I];
+  for (const IncludeView &D : Deps.includes()) {
     OptionalFileEntryRef Includer;
     ConstSearchDirIterator IncluderDir = nullptr;
     if (D.Includer < 0) {
@@ -120,7 +119,7 @@ int redoLookups(
     // __has_include found nothing for the file holding this directive, so
     // the directive cannot be in a file this compile reaches the same way.
     if (!Includer)
-      return static_cast<int>(I);
+      return D;
     FileEntryRef Holder = refOnEntry(SM, *Includer);
 
     bool Next = D.K == IncludeDependency::Kind::IncludeNext ||
@@ -145,19 +144,18 @@ int redoLookups(
         /*IsMapped=*/nullptr, /*IsFrameworkFound=*/nullptr);
     std::string Path = File ? FM.getCanonicalName(*File).str() : "";
     if (Path != D.Found)
-      return static_cast<int>(I);
+      return D;
     if (CheckNames && File && File->getName() != D.Name)
-      return static_cast<int>(I);
+      return D;
     Found.push_back({File, CurDir});
   }
-  return -1;
+  return std::nullopt;
 }
 
 } // namespace
 
 MismatchReason clang::ast_cache::matchesLiveState(
-    const HeaderDependencySet &Deps, Preprocessor &PP, Sema *S,
-    llvm::StringRef NotAMacroNames, std::string *Detail,
+    const MetadataView &Deps, Preprocessor &PP, Sema *S, std::string *Detail,
     const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found,
     SearchMemo *Memo) {
   // Names what failed, for a caller that reports it.
@@ -167,7 +165,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return R;
   };
 
-  // Every record carries pragma state, and only Sema holds the live value to
+  // All metadata carries pragma state, and only Sema holds the live value to
   // compare it against. Without Sema that check cannot run, and a check that
   // cannot run must reject rather than pass -- an unverifiable dependency is
   // the fail-open shape this whole design exists to avoid.
@@ -212,7 +210,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
 
   // Cheapest first: a definedness test is a hash lookup, and a header with
   // dozens of them usually fails on one.
-  for (const ConditionalDependency &D : Deps.Conditional) {
+  for (const ConditionalView &D : Deps.conditional()) {
     bool Defined = PP.isMacroDefined(Fresh(D.MacroName));
     if (Defined != D.WasDefined)
       return Because(MismatchReason::Conditional,
@@ -230,15 +228,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return PP.isMacroDefined(Fresh(Name));
   };
 
-  for (const SyntacticDependency &D : Deps.Syntactic) {
-    if (D.Name.empty())
-      return Because(MismatchReason::Syntactic, "a dependency with no name");
-    if (D.Required == SyntacticDependency::State::NotAMacro) {
-      if (IsMacro(D.Name))
-        return Because(MismatchReason::Syntactic,
-                       D.Name + " was not a macro, is");
-      continue;
-    }
+  for (const ExpandsToView &D : Deps.expandsTo()) {
     const MacroInfo *MI = PP.getMacroDefinition(Fresh(D.Name)).getMacroInfo();
     std::optional<std::string> Live =
         MI ? serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts())
@@ -250,7 +240,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
 
   // What the header's pops take from below it: the top of each name's
   // push_macro stack, as where the copy was written (REPORT.md Q11).
-  for (const MacroStackEffect &E : Deps.MacroStacks) {
+  for (const MacroStackView &Stack : Deps.macroStacks()) {
+    const MacroStackEffect &E = Stack.Effect;
     if (E.Popped.empty())
       continue;
     const auto &Pushed = PP.getPushedMacros();
@@ -274,7 +265,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // An #include the recorded compile skipped must also be skippable here,
   // which means the same file must already have been read.
   HeaderSearch &HS = PP.getHeaderSearchInfo();
-  for (const InclusionDependency &D : Deps.Inclusion) {
+  for (const InclusionView &D : Deps.inclusion()) {
     OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(D.HeaderPath);
     if (!FE || (!HS.hasFileBeenImported(*FE) && !HS.getFileInfo(*FE).isImport))
       return Because(MismatchReason::Inclusion,
@@ -284,24 +275,17 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // Several hundred names for a system header, so after the short lists.
   std::optional<llvm::TimeTraceScope> NamesScope;
   NamesScope.emplace("HeaderCache Check NotAMacro");
-  if (!NotAMacroNames.empty()) {
-    std::optional<llvm::SmallVector<llvm::StringRef, 0>> Names =
-        splitNameList(NotAMacroNames);
-    if (!Names)
+  for (const NameView &N : Deps.notAMacro())
+    if (IsMacro(N.Name))
       return Because(MismatchReason::Syntactic,
-                     "the not-a-macro name list is damaged");
-    for (llvm::StringRef Name : *Names)
-      if (IsMacro(Name))
-        return Because(MismatchReason::Syntactic,
-                       Name + " was not a macro, is");
-  }
+                     N.Name + " was not a macro, is");
 
   NamesScope.reset();
   Lap.next(CheckCost::TypeNamesAndPragmas);
 
   // Symbol dependencies last: the only ones that cost a name lookup.
   {
-    for (const SymbolDependency &D : Deps.Symbol) {
+    for (const SymbolView &D : Deps.symbol()) {
       IdentifierInfo &II = Idents.get(D.Name);
       std::string LiveType;
       bool IsType = resolvesToType(*S, II, LiveType);
@@ -320,12 +304,12 @@ MismatchReason clang::ast_cache::matchesLiveState(
     }
   }
 
-  if (capturePragmaState(*S) != Deps.Entry)
+  if (capturePragmaState(*S) != Deps.entry())
     return Because(MismatchReason::PragmaState, "#pragma pack or float state");
 
   // The copy holds the warnings its header printed under its compile's
   // flags and pragmas; under others it prints others (REPORT.md Q34).
-  if (Site && Site->WarningState != Deps.WarningState)
+  if (Site && Site->WarningState != Deps.warningState())
     return Because(MismatchReason::WarningState,
                    "the warning flags or pragmas differ");
 
@@ -343,7 +327,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
   if (Site)
     Key.append(reinterpret_cast<const char *>(&Site->SearchContext),
                sizeof(Site->SearchContext));
-  for (const FileStamp &F : Deps.Files) {
+  for (const FileStampView &F : Deps.files()) {
     if (Cost)
       ++Cost->FilesCompared;
     OptionalFileEntryRef Live =
@@ -368,8 +352,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // include path, which nothing else compares. The stored parse also holds
   // the text each __FILE__ produced, which is the name the producer's compile
   // opened the file by.
-  if (!Deps.Includes.empty() || !Deps.FileNames.empty() ||
-      !Deps.HeaderName.empty()) {
+  if (!Deps.includes().empty() || !Deps.fileNames().empty() ||
+      !Deps.headerName().empty()) {
     if (!Site)
       return Because(MismatchReason::Include,
                      "no #include site to redo the header's lookups from");
@@ -377,10 +361,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
     // that compile opened them by, which __FILE__ and debug information
     // repeat; a copy the separate producer built holds its own, and only the
     // files themselves are compared.
-    bool CheckNames = !Deps.HeaderName.empty();
-    if (CheckNames && Site->File.getName() != Deps.HeaderName)
+    bool CheckNames = !Deps.headerName().empty();
+    if (CheckNames && Site->File.getName() != Deps.headerName())
       return Because(MismatchReason::Include, "the header was opened as " +
-                                                  Deps.HeaderName + ", is " +
+                                                  Deps.headerName() + ", is " +
                                                   Site->File.getName());
 
     // Within a build the files in the include path do not appear or go away,
@@ -400,22 +384,23 @@ MismatchReason clang::ast_cache::matchesLiveState(
       auto Search = [&]() -> MismatchReason {
         std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
             Found;
-        int Bad = redoLookups(Deps, PP, *Site, CheckNames, Found);
+        std::optional<IncludeView> Bad =
+            redoLookups(Deps, PP, *Site, CheckNames, Found);
         if (Cost)
-          Cost->SearchesRedone += Bad < 0 ? Found.size() : Bad + 1;
-        if (Bad >= 0) {
-          const IncludeDependency &D = Deps.Includes[Bad];
-          std::string Written =
-              D.Angled ? "<" + D.Spelled + ">" : "\"" + D.Spelled + "\"";
+          Cost->SearchesRedone += Found.size() + (Bad ? 1 : 0);
+        if (Bad) {
+          const IncludeView &D = *Bad;
+          std::string Written = D.Angled ? "<" + D.Spelled.str() + ">"
+                                         : "\"" + D.Spelled.str() + "\"";
           std::string Was = D.Found.empty() ? std::string("nothing")
-                            : CheckNames    ? D.Name
-                                            : D.Found;
+                            : CheckNames    ? D.Name.str()
+                                            : D.Found.str();
           return Because(MismatchReason::Include,
                          Written + " found " + Was + ", finds something else");
         }
 
         Lap.next(CheckCost::FileNames);
-        for (const FileNameDependency &D : Deps.FileNames) {
+        for (const FileNameView &D : Deps.fileNames()) {
           OptionalFileEntryRef File = D.File < 0
                                           ? OptionalFileEntryRef(Site->File)
                                           : Found[D.File].first;
@@ -449,7 +434,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // name must find one with the same fingerprint: a struct fd_set with other
   // members, or an fscanf with another asm label, would compile differently.
   // The lookup is the one the reader resolves the names with.
-  for (const DeclarationDependency &D : Deps.Declarations) {
+  for (const DeclarationView &D : Deps.declarations()) {
     NamedDecl *Live = ASTReader::lookupAtFileScope(
         *S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
         /*CreateBuiltin=*/true);
@@ -516,8 +501,7 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
 CacheClient::~CacheClient() = default;
 
 llvm::StringRef CacheClient::lookup(
-    llvm::StringRef Filename, Preprocessor &PP, Sema *S,
-    HeaderDependencySet *MatchedDeps,
+    llvm::StringRef Filename, Preprocessor &PP, Sema *S, MetadataView *Matched,
     llvm::function_ref<bool(llvm::StringRef Bytes, llvm::StringRef ModuleName)>
         Use,
     const IncludeSite *Site) {
@@ -546,28 +530,21 @@ llvm::StringRef CacheClient::lookup(
   MatchedDecls.clear();
   std::vector<NamedDecl *> Found;
   for (const CacheEntryRef &E : Resp->Entries) {
-    // The names this entry requires not to be macros are in the region. If the
-    // offset addresses nothing written, they cannot be checked, and checking
-    // the rest without them would accept compiles it must not.
-    llvm::StringRef Names;
-    if (E.NamesLength) {
-      Names = Region.read(E.NamesOffset, E.NamesLength);
-      if (Names.empty()) {
-        ++Counters.CandidatesRejected;
-        ++Counters
-              .RejectedFor[static_cast<unsigned>(MismatchReason::Syntactic)];
-        continue;
-      }
-    }
+    // The metadata is read where the daemon stored it. If the offset
+    // addresses nothing written, there is nothing to check the candidate
+    // against, and it is not used.
+    std::optional<MetadataView> Deps = MetadataView::open(
+        Region.read(E.MetadataOffset, E.MetadataLength));
+    if (!Deps)
+      continue;
     std::string Detail;
     ++Counters.CandidatesChecked;
     auto Checking = std::chrono::steady_clock::now();
     MismatchReason Why;
     // What this compile, or an earlier one of its build, found the
     // candidate's searches to find under a key (REPORT.md I9).
-    uint64_t Copy = llvm::xxh3_64bits(E.ModuleName);
     auto Recall = [&](uint64_t Key) -> std::optional<uint8_t> {
-      auto Own = Outcomes.find({Copy, Key});
+      auto Own = Outcomes.find({E.MetadataOffset, Key});
       if (Own != Outcomes.end())
         return Own->second;
       for (const SearchOutcome &O : E.Searches)
@@ -579,14 +556,13 @@ llvm::StringRef CacheClient::lookup(
     {
       llvm::TimeTraceScope Scope("HeaderCache Check");
       Found.clear();
-      Why = matchesLiveState(E.Deps, PP, S, Names,
-                             LogRejections ? &Detail : nullptr, Site,
-                             &Counters.Check, &Found, &Memo);
+      Why = matchesLiveState(*Deps, PP, S, LogRejections ? &Detail : nullptr,
+                             Site, &Counters.Check, &Found, &Memo);
     }
     if (Memo.Found) {
-      Outcomes[{Copy, Memo.Found->Key}] = Memo.Found->Outcome;
+      Outcomes[{E.MetadataOffset, Memo.Found->Key}] = Memo.Found->Outcome;
       if (Build)
-        Learned.push_back({Filename.str(), E.ModuleName, *Memo.Found});
+        Learned.push_back({Filename.str(), E.MetadataOffset, *Memo.Found});
     }
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
@@ -601,23 +577,14 @@ llvm::StringRef CacheClient::lookup(
     llvm::StringRef Bytes = Region.read(E.Offset, E.Length);
     if (Bytes.empty())
       continue; // an offset that does not address written data
-    // A hit must leave the macro table as the header would have, so an entry
-    // whose effects cannot be read is not used.
-    std::optional<std::vector<MacroEffect>> Effects = decodeMacroEffects(
-        E.EffectsLength ? Region.read(E.EffectsOffset, E.EffectsLength)
-                        : llvm::StringRef());
-    if (!Effects || (E.EffectsLength && Effects->empty()))
-      continue;
     // Before Use loads the candidate: loading may read the part's
     // references to outside declarations, which the caller pins to these.
     MatchedDecls = Found;
-    if (Use && !Use(Bytes, E.ModuleName))
+    if (Use && !Use(Bytes, Deps->moduleName()))
       continue;
     ++Counters.Hits;
-    if (MatchedDeps) {
-      *MatchedDeps = E.Deps;
-      MatchedDeps->MacroEffects = std::move(*Effects);
-    }
+    if (Matched)
+      *Matched = *Deps;
     return Bytes;
   }
   return {};

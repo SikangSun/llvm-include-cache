@@ -72,39 +72,39 @@ TEST(CacheProtocolTest, RequestsRoundTrip) {
   auto Got = decodePushRequest(body(Out2));
   ASSERT_TRUE(Got.has_value());
   EXPECT_EQ(Got->Filename, "h.h");
-  EXPECT_EQ(Got->ModuleName, "__hc_0123456789abcdef");
   EXPECT_EQ(Got->Data, P.Data) << "payload must survive embedded NULs";
-  ASSERT_EQ(Got->Deps.Conditional.size(), 1u);
-  EXPECT_EQ(Got->Deps.Conditional[0].MacroName, "FEATURE");
-  EXPECT_EQ(Got->Deps.Syntactic[0].TokenSequence,
+  std::string Name;
+  auto Deps = decodeMetadata(Got->Metadata, &Name);
+  ASSERT_TRUE(Deps.has_value());
+  EXPECT_EQ(Name, "__hc_0123456789abcdef");
+  ASSERT_EQ(Deps->Conditional.size(), 1u);
+  EXPECT_EQ(Deps->Conditional[0].MacroName, "FEATURE");
+  EXPECT_EQ(Deps->Syntactic[0].TokenSequence,
             P.Deps.Syntactic[0].TokenSequence);
-  EXPECT_EQ(Got->Deps.Entry.AlignPackRaw, 7u);
+  EXPECT_EQ(Deps->Entry.AlignPackRaw, 7u);
 }
 
-TEST(CacheProtocolTest, LookupResponseSaysWhereTheListsAre) {
+TEST(CacheProtocolTest, LookupResponseSaysWhereTheMetadataIs) {
   LookupResponse Resp;
   CacheEntryRef E;
-  E.Deps = makeRecord("FEATURE", true);
+  E.MetadataOffset = 64;
+  E.MetadataLength = 36;
   E.Offset = 100;
   E.Length = 20;
-  E.NamesOffset = 64;
-  E.NamesLength = 36;
-  E.EffectsOffset = 200;
-  E.EffectsLength = 12;
-  E.ModuleName = "__hc_0123456789abcdef";
+  E.Searches.push_back({0x1234, 3});
   Resp.Entries.push_back(E);
   llvm::SmallVector<char, 0> Out;
   encodeLookupResponse(Resp, Out);
   auto Got = decodeLookupResponse(body(Out));
   ASSERT_TRUE(Got.has_value());
   ASSERT_EQ(Got->Entries.size(), 1u);
+  EXPECT_EQ(Got->Entries[0].MetadataOffset, 64u);
+  EXPECT_EQ(Got->Entries[0].MetadataLength, 36u);
   EXPECT_EQ(Got->Entries[0].Offset, 100u);
   EXPECT_EQ(Got->Entries[0].Length, 20u);
-  EXPECT_EQ(Got->Entries[0].NamesOffset, 64u);
-  EXPECT_EQ(Got->Entries[0].NamesLength, 36u);
-  EXPECT_EQ(Got->Entries[0].EffectsOffset, 200u);
-  EXPECT_EQ(Got->Entries[0].EffectsLength, 12u);
-  EXPECT_EQ(Got->Entries[0].ModuleName, "__hc_0123456789abcdef");
+  ASSERT_EQ(Got->Entries[0].Searches.size(), 1u);
+  EXPECT_EQ(Got->Entries[0].Searches[0].Key, 0x1234u);
+  EXPECT_EQ(Got->Entries[0].Searches[0].Outcome, 3u);
 }
 
 TEST(CacheProtocolTest, ASocketPathTooLongForTheAddressIsRefused) {
@@ -225,14 +225,28 @@ protected:
     return Out;
   }
 
-  LookupResponse lookup(llvm::StringRef Name) {
+  LookupResponse lookup(llvm::StringRef Name, size_t *ReplySize = nullptr) {
     llvm::SmallVector<char, 0> Msg;
     encodeLookupRequest({Name.str()}, Msg);
     auto Reply = Daemon->handleMessage(body(Msg));
     EXPECT_TRUE(Reply.has_value());
+    if (ReplySize)
+      *ReplySize = Reply->size();
     auto Resp = decodeLookupResponse(body(*Reply));
     EXPECT_TRUE(Resp.has_value());
     return Resp.value_or(LookupResponse{});
+  }
+
+  /// An entry's metadata, read from the region as a client reads it.
+  HeaderDependencySet metadata(const CacheEntryRef &E) {
+    auto Attached = SharedRegion::attach(RegionPath);
+    EXPECT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+    if (!Attached)
+      return {};
+    auto Deps =
+        decodeMetadata(Attached->read(E.MetadataOffset, E.MetadataLength));
+    EXPECT_TRUE(Deps.has_value());
+    return Deps.value_or(HeaderDependencySet());
   }
 
   void push(llvm::StringRef Name, const HeaderDependencySet &Deps,
@@ -275,57 +289,60 @@ TEST_F(DaemonTest, PushThenLookupReturnsTheEntry) {
   push("h.h", makeRecord("FEATURE", true), "PARSED-RESULT-BYTES");
   LookupResponse R = lookup("h.h");
   ASSERT_EQ(R.Entries.size(), 1u);
-  ASSERT_EQ(R.Entries[0].Deps.Conditional.size(), 1u);
-  EXPECT_EQ(R.Entries[0].Deps.Conditional[0].MacroName, "FEATURE");
+  HeaderDependencySet Deps = metadata(R.Entries[0]);
+  ASSERT_EQ(Deps.Conditional.size(), 1u);
+  EXPECT_EQ(Deps.Conditional[0].MacroName, "FEATURE");
   EXPECT_EQ(R.Entries[0].Length, 19u);
 }
 
-TEST_F(DaemonTest, NotAMacroNamesAreKeptInTheRegion) {
-  // Several hundred names for a system header: the reply says where they are
-  // and leaves them out of the record it carries.
-  HeaderDependencySet D = makeRecord("FEATURE", true);
-  D.Syntactic.push_back({"malloc", SyntacticDependency::State::NotAMacro, ""});
-  D.Syntactic.push_back({"long", SyntacticDependency::State::NotAMacro, ""});
-  push("h.h", D, "PARSED");
-  LookupResponse R = lookup("h.h");
-  ASSERT_EQ(R.Entries.size(), 1u);
-  const CacheEntryRef &E = R.Entries[0];
-  ASSERT_EQ(E.Deps.Syntactic.size(), 1u);
-  EXPECT_EQ(E.Deps.Syntactic[0].Name, "BUFSZ");
-  ASSERT_GT(E.NamesLength, 0u);
+TEST_F(DaemonTest, TheMetadataIsInTheRegionNotInTheReply) {
+  // Several hundred names for a system header, thousands of macro effects
+  // for one that pulls a system header in: all of it sits in the region,
+  // where every compile reads it in place, and a reply says only where.
+  HeaderDependencySet Small = makeRecord("FEATURE", true);
+  HeaderDependencySet Large = Small;
+  for (int I = 0; I != 1000; ++I) {
+    Large.Syntactic.push_back({"name" + std::to_string(I),
+                               SyntacticDependency::State::NotAMacro, ""});
+    Large.MacroEffects.push_back({"M" + std::to_string(I), I % 2 == 0});
+  }
+  push("small.h", Small, "PARSED");
+  push("large.h", Large, "PARSED");
+  size_t SmallReply = 0, LargeReply = 0;
+  LookupResponse S = lookup("small.h", &SmallReply);
+  LookupResponse L = lookup("large.h", &LargeReply);
+  ASSERT_EQ(S.Entries.size(), 1u);
+  ASSERT_EQ(L.Entries.size(), 1u);
+  EXPECT_EQ(SmallReply, LargeReply);
+  EXPECT_GT(L.Entries[0].MetadataLength, 10000u);
+
+  HeaderDependencySet Got = metadata(L.Entries[0]);
+  ASSERT_EQ(Got.Syntactic.size(), 1001u);
+  EXPECT_EQ(Got.Syntactic[1].Name, "name0");
+  ASSERT_EQ(Got.MacroEffects.size(), 1000u);
+  EXPECT_FALSE(Got.MacroEffects[1].Defined);
 
   auto Attached = SharedRegion::attach(RegionPath);
   ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
-  auto Names = splitNameList(Attached->read(E.NamesOffset, E.NamesLength));
-  ASSERT_TRUE(Names.has_value());
-  ASSERT_EQ(Names->size(), 2u);
-  EXPECT_EQ((*Names)[0], "malloc");
-  EXPECT_EQ((*Names)[1], "long");
-  EXPECT_EQ(Attached->read(E.Offset, E.Length), "PARSED");
+  EXPECT_EQ(Attached->read(L.Entries[0].Offset, L.Entries[0].Length),
+            "PARSED");
 }
 
-TEST_F(DaemonTest, MacroEffectsAreKeptInTheRegion) {
-  // Thousands for a header that pulls in a system header, and needed only on
-  // a hit, so a lookup reply says where they are.
+TEST_F(DaemonTest, MalformedMetadataIsRefused) {
+  // The daemon checks metadata once, when it is pushed; every compile after
+  // reads it as stored. An #include whose includer is not an earlier one
+  // would send a hit's searches to the wrong file.
   HeaderDependencySet D = makeRecord("FEATURE", true);
-  D.MacroEffects.push_back({"H_H", true});
-  D.MacroEffects.push_back({"LIMIT", false});
-  push("h.h", D, "PARSED");
-  LookupResponse R = lookup("h.h");
-  ASSERT_EQ(R.Entries.size(), 1u);
-  const CacheEntryRef &E = R.Entries[0];
-  EXPECT_TRUE(E.Deps.MacroEffects.empty());
-  ASSERT_GT(E.EffectsLength, 0u);
-
-  auto Attached = SharedRegion::attach(RegionPath);
-  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
-  auto Effects =
-      decodeMacroEffects(Attached->read(E.EffectsOffset, E.EffectsLength));
-  ASSERT_TRUE(Effects.has_value());
-  ASSERT_EQ(Effects->size(), 2u);
-  EXPECT_EQ((*Effects)[0].Name, "H_H");
-  EXPECT_FALSE((*Effects)[1].Defined);
-  EXPECT_EQ(Attached->read(E.Offset, E.Length), "PARSED");
+  D.Includes.push_back(
+      {IncludeDependency::Kind::Include, false, "x.h", 0, "/x.h", "./x.h"});
+  llvm::SmallVector<char, 0> Msg;
+  PushRequest P;
+  P.Filename = "h.h";
+  P.Deps = D;
+  P.Data = "PARSED";
+  encodePushRequest(P, Msg);
+  EXPECT_FALSE(Daemon->handleMessage(body(Msg)).has_value());
+  EXPECT_TRUE(lookup("h.h").Entries.empty());
 }
 
 TEST_F(DaemonTest, EveryVariantIsReturnedNotJustOne) {
@@ -427,7 +444,7 @@ TEST_F(DaemonTest, DistinctHeadersDoNotCollide) {
   push("b.h", makeRecord("B", true), "BBB");
   ASSERT_EQ(lookup("a.h").Entries.size(), 1u);
   ASSERT_EQ(lookup("b.h").Entries.size(), 1u);
-  EXPECT_EQ(lookup("a.h").Entries[0].Deps.Conditional[0].MacroName, "A");
+  EXPECT_EQ(metadata(lookup("a.h").Entries[0]).Conditional[0].MacroName, "A");
 }
 
 TEST_F(DaemonTest, StoredBytesComeBackExactly) {
