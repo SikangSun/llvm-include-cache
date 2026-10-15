@@ -634,13 +634,13 @@ bound on what the fix saves.
 | 1 | I8: skip replayed macro effects already in force | Finding each replayed macro's name, for effects that change nothing | 30.2 s; built 2026-10-08, removed 35.1 s | 4.3% |
 | 2 | I5: write a copy from its own range | Scanning the whole compile's source locations, macros, identifiers, comments and declarations for each copy written | 19.4 s; built 2026-10-14, removed 5.2 s | 2.7% |
 | 3 | I9: check files once per build | Header searches and file stamps every compile redoes | 17.0 s; built 2026-10-14 (searches only), removed 6.3 s | 2.4% |
-| 4 | I3: metadata in shared memory | Encoding, sending and decoding each saved copy's metadata at every query | 12.1 s | 1.7% |
+| 4 | I3: metadata in shared memory | Encoding, sending and decoding each saved copy's metadata at every query | 12.1 s (sampled 2026-10-14: 31.6 s); built 2026-10-15, removed 21.5 s | 1.7% |
 | 5 | I1: one index of names over the loaded copies | Searching every loaded copy's name table for a name | 11.5 s | 1.6% |
 | 6 | I7: send a copy without waiting | Waiting for the daemon to acknowledge each copy | 8.4 s | 1.2% |
 | 7 | I12: cross-reference IDs | Looking outside declarations up by name | 1.9 s | 0.3% |
 | 8 | I13: time headers only where needed | The hook timing every header for its ask list | 1.6 s | 0.2% |
 | 9 | I4: remember searches within a compile | The searches a compile repeats (inside I9) | 1.1 s | 0.2% |
-| 10 | I2: check options once, no record-name table | Option checks at every load; 12 KB per copy | 0.8 s | 0.1% |
+| 10 | I2: check options once, no record-name table | Option checks at every load; 12 KB per copy | 0.8 s; the record-name table built 2026-10-15 with two more tool-only records, removed 12.4 s | 0.1% |
 | 11 | I6: track only headers being written | Tracking in headers no compile writes; most of what was timed was the timers | under 0.6 s | under 0.1% |
 | -- | I11: enter a copy's names at load | Measured, both ways in one run: -1.2% to +1.6%, no gain. Drop | none | -- |
 
@@ -739,6 +739,85 @@ Notes on the top three:
   `CLANG_HEADER_CACHE_BUILD`; without one, outcomes are kept only within a
   compile.
 
+- **I3, built 2026-10-15.** Until then the daemon kept each copy's metadata
+  as C++ objects in its own memory. Every cache query copied the metadata
+  of each stored copy of the header, encoded it into the reply and freed it,
+  and the compile decoded all of it. A sampled profile of the six first
+  builds (perf, hardware call stacks, no timers of ours) put this at 31.6 s:
+  21.8 s in the daemon, 11.6 s of it copying and freeing, and 9.8 s decoding
+  in the compiles.
+
+  Now the compile that writes a copy encodes its metadata once, in its final
+  form. The daemon checks it whole once, when it is pushed, and appends it
+  to the shared region beside the copy's PCM bytes. A reply carries only
+  where each copy's metadata and bytes are. Each compile reads the metadata
+  in place (`MetadataView`): a table of where each section starts, then the
+  sections in the order the check reads them, each string pointing into the
+  region. Nothing is decoded or allocated while checking; the sections read
+  only at a hit and rarely there (`pop_macro` stacks, saved diagnostics,
+  warning pragmas) are read whole.
+
+  Measured as for I5 and I9: six first builds, the six projects at once,
+  three modes interleaved file by file (plain clang; the cache at
+  1a062123f; with I3), three builds each, both caches with a build ID:
+
+  | Project | Plain clang | Cache at 1a062123f | Cache with I3 | Saved by I3 |
+  |---|---|---|---|---|
+  | redis | 36.81 s | 33.34 s | 32.85 s | 0.49 s |
+  | nginx | 23.28 s | 19.28 s | 18.94 s | 0.33 s |
+  | curl | 59.15 s | 41.37 s | 40.38 s | 0.99 s |
+  | git | 179.56 s | 125.86 s | 120.80 s | 5.06 s |
+  | postgres | 273.27 s | 236.62 s | 225.98 s | 10.65 s |
+  | cpython | 192.90 s | 171.47 s | 167.51 s | 3.96 s |
+  | All six, mean of 3 | 764.97 s | 627.94 s | 606.46 s | 21.48 s |
+  | Speedup over plain clang | -- | 1.22x | 1.26x | -- |
+  | Waiting for the daemon (the cache's own timer) | -- | 8.34 s | 1.25 s | 7.09 s |
+  | Checking candidates (the cache's own timer) | -- | 16.01 s | 14.78 s | 1.23 s |
+
+  21.48 s is the mean of the three builds' differences (16.52 to 27.99 s).
+  The rest of the 31.6 s sampled is the daemon's work on another core,
+  which a compile waits for only in part. Every compile succeeded; every
+  object matched plain clang's. Plain clang took 5% longer than on
+  2026-10-14 (728.53 s); the modes ran side by side, so the differences
+  stand.
+
+- **Copies without what only tools read, built 2026-10-15 (your request:
+  "the copy should be as slim as possible").** Bytes of 959 copies from
+  git's and redis's first builds, by what reads them
+  (`llvm-bcanalyzer -stats`):
+
+  | What a copy holds | Read by | Share of bytes | Per copy, mean |
+  |---|---|---|---|
+  | Names of the blocks and records (block info) | llvm-bcanalyzer only | 5.1% | 11.9 KB |
+  | Declarations of each file sorted by place | ASTUnit, indexing only | 1.3% | 2.9 KB |
+  | Comments: every one the compile had met, the header's or not | clangd's documentation only | 0.2% | 0.4 KB |
+  | The compile's in-memory text: predefined macros, pasted tokens | A compile, rarely: a diagnostic pointing into a predefined macro | 1.8% | 4.1 KB |
+  | Options, warning settings, include paths | A compile, to refuse a copy built with other options | 1.1% | 2.4 KB |
+  | Name table: every name the copy declares, defines or uses | A compile, at each name lookup | 22.5% | 52.1 KB |
+  | Declarations, types, macros, locations, offsets | A compile | 68.0% | 157.3 KB |
+
+  The writer now leaves out the first three. Over 170 copies git's first
+  build wrote both ways: 13.4 KB smaller (median), 9.7% of the bytes; 42.8%
+  for copies under 40 KB. Measured as for I3, against ec6c81941:
+
+  | | Plain clang | Cache at ec6c81941 | Without tool-only records |
+  |---|---|---|---|
+  | Six first builds, mean of 3 | 720.96 s | 587.48 s | 575.06 s |
+  | Speedup over plain clang | -- | 1.23x | 1.25x |
+  | Writing and sending copies (the cache's own timer) | -- | 36.84 s | 32.66 s |
+  | Mean copy stored, over 16,243 and 16,226 copies | -- | 247.6 KiB | 233.1 KiB |
+
+  12.42 s saved, the mean of the three builds' differences (7.82 to 17.26
+  s); 4.18 s of it is writing. The rest is spread over loading and the
+  compile; the modes also store slightly different sets of copies, since
+  which headers are slow enough to ask about is decided from each build's
+  first timings, so part of it is variation. Every compile succeeded; every
+  object matched plain clang's.
+
+  The next two rows duplicate what the loading compile has or checks
+  itself; leaving them out needs the reader changed (open questions, C).
+  The last two are Clang's module format itself.
+
 Together, without double counting, the fixes could remove about 103 s.
 The cache's six first builds take 624.1 s now (1.14x over plain clang's
 711.5 s); without those 103 s, about 521 s (1.37x).
@@ -811,8 +890,8 @@ that stood here (§2.21, §2.24) are superseded.
 | # | Fix | Removes | Could remove (section 3.1) | Status |
 |---|---|---|---|---|
 | I1 | One index of names over the loaded PCMs (Clang's global module index as the model) | Each name searched for in every loaded PCM's table; most re-searches after a load | 11.5 s | Proposed (§2.24 A) |
-| I2 | Check options once per compile; drop the record-name table | The same option comparisons for every PCM; 12 KB in every PCM, 13% of the stored bytes | 0.8 s, and 13% of the bytes | Proposed (§2.24 C) |
-| I3 | Metadata in shared memory, replies carrying offsets; or no socket at all | Encoding, copying and decoding a copy's metadata on every query | 12.1 s | Proposed; the no-socket form not approved (NEXT.md 3) |
+| I2 | Check options once per compile; drop the record-name table | The same option comparisons for every PCM; 12 KB in every PCM, 13% of the stored bytes | 0.8 s, and 13% of the bytes | Record-name table, comments and per-file declaration lists dropped 2026-10-15: 12.4 s, 5.8% of the bytes. Options: proposed |
+| I3 | Metadata in shared memory, replies carrying offsets; or no socket at all | Encoding, copying and decoding a copy's metadata on every query | 12.1 s | Built 2026-10-15, replies carrying offsets, metadata read in place: 21.5 s. The no-socket form not approved (NEXT.md 3) |
 | I4 | Remember header searches and declaration checks within a compile | The 48% of header searches and 49% of declaration checks that repeat | 1.1 s | Proposed (§2.21) |
 | I5 | Write a copy from its own source range | Four scans of the compile's whole state per copy written: 2.4 of its 4.0 ms | 19.4 s | Built 2026-10-14: 5.2 s |
 | I6 | Track dependencies only around headers that will be written | Most of the tracking | under 0.6 s | Proposed (§2.21) |
@@ -921,12 +1000,28 @@ Explained and ranked in section 2; each fix is approved one at a time.
     at about 1 ms a hit, though its text takes 32 us. Proposed: the median
     of its first few readings.
 17. **Q17. Check files once per build, and queries without the socket**
-    (I9, I3).
+    (I9, I3). I9 built 2026-10-14 (the searches); I3 built 2026-10-15 with
+    the socket kept, the reply carrying offsets. Queries without the socket
+    stay open.
 18. **Q18. Memory with folding.** `server.h` has 8 folded copies of 1.5 to
     2.4 MB each. The five projects' totals are not measured. If memory
     matters, linked copies (T11) come back.
 19. **Q19. Index a header's copies by what tells them apart** (T10). Worth
     a proposal?
+37. **Q37. A copy without the compile's predefined macros** (new,
+    2026-10-15). Every copy carries the text of the writing compile's
+    predefined macros (14 KB, 3 KB compressed) and of its pasted tokens: 1.8%
+    of the bytes, compressed again for every copy. Two ways: (a) compress
+    the text once per compile, not once per copy: the bytes stay, the
+    compression time goes; (b) keep each distinct text once in the region
+    and have a copy name it by its hash: copies carry none, and the reader
+    is changed to fetch it.
+38. **Q38. Options checked by our metadata, not by the reader** (new,
+    2026-10-15; I2's other half). Every copy carries the writing compile's
+    language, target and preprocessor options, warning settings and
+    include paths (1.1%), which the reader compares at every load. Proposed:
+    a hash of the options the reader compares, checked with the rest of the
+    metadata, and copies without these blocks.
 
 ### D. Measurements not yet taken
 

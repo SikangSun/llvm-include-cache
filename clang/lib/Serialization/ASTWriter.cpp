@@ -3562,6 +3562,13 @@ void ASTWriter::WriteFileDeclIDsMap() {
 }
 
 void ASTWriter::WriteComments(ASTContext &Context) {
+  // The comments are for tools that show documentation (clangd), and in a
+  // part they would be every comment the compile has met so far, the
+  // header's or not. A compile that loads the part reads none of them; the
+  // warnings -Wdocumentation gives in the header are the part's saved
+  // diagnostics.
+  if (isWritingPart())
+    return;
   Stream.EnterSubblock(COMMENTS_BLOCK_ID, 3);
   llvm::scope_exit _([this] { Stream.ExitBlock(); });
   if (!PP->getPreprocessorOpts().WriteCommentListToPCH)
@@ -5541,7 +5548,10 @@ ASTWriter::WriteAST(llvm::PointerUnion<Sema *, Preprocessor *> Subject,
   Stream.Emit((unsigned)'C', 8);
   Stream.Emit((unsigned)'H', 8);
 
-  {
+  // The block info holds only the names of the blocks and records, for
+  // tools that print a module file (llvm-bcanalyzer); no reader of a part
+  // needs them, and they are 11.5 KB of every one.
+  if (!isWritingPart()) {
     llvm::TimeTraceScope S("WriteAST BlockInfo");
     WriteBlockInfoBlock();
   }
@@ -7318,6 +7328,12 @@ bool ASTWriter::isPartNameReference(const Decl *D) const {
 void ASTWriter::associateDeclWithFile(const Decl *D, LocalDeclID ID) {
   assert(ID.isValid());
   assert(D);
+
+  // The declarations of each file, sorted by place, are for tools that ask
+  // what a range of a file declares (ASTUnit, indexing); a compile that
+  // loads a part never asks.
+  if (isWritingPart())
+    return;
 
   SourceLocation Loc = D->getLocation();
   if (Loc.isInvalid())
