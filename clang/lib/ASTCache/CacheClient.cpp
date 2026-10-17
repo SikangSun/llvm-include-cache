@@ -344,7 +344,32 @@ MismatchReason clang::ast_cache::matchesLiveState(
   if (Site)
     Key.append(reinterpret_cast<const char *>(&Site->SearchContext),
                sizeof(Site->SearchContext));
+  // Within a build files do not change: once a compile of the build found
+  // the copy's files as they were, later ones take that (REPORT.md I9).
+  std::optional<uint8_t> FilesKnown;
+  if (Memo && Memo->Recall)
+    FilesKnown = Memo->Recall(SearchMemo::FilesKey);
+  if (FilesKnown && *FilesKnown != static_cast<uint8_t>(MismatchReason::None))
+    return Because(static_cast<MismatchReason>(*FilesKnown),
+                   "an earlier compile of the build found a file changed");
+  bool FilesVerified = FilesKnown && Memo->FindOpen;
+  auto FileChanged = [&](const llvm::Twine &What) {
+    if (Memo)
+      Memo->FilesFound = SearchOutcome{
+          SearchMemo::FilesKey,
+          static_cast<uint8_t>(MismatchReason::FileChanged)};
+    return Because(MismatchReason::FileChanged, What);
+  };
   for (const FileStampView &F : Deps.files()) {
+    if (FilesVerified) {
+      if (OptionalFileEntryRef Open = Memo->FindOpen(F.Path)) {
+        Key += F.Path;
+        Key += '\0';
+        Key += Open->getName();
+        Key += '\0';
+      }
+      continue;
+    }
     if (Cost) {
       ++Cost->FilesCompared;
       ++Cost->Read[MetadataView::Files];
@@ -352,11 +377,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
     OptionalFileEntryRef Live =
         FM.getOptionalFileRef(F.Path, /*OpenFile=*/false);
     if (!Live)
-      return Because(MismatchReason::FileChanged, F.Path + " is gone");
+      return FileChanged(F.Path + " is gone");
     if (static_cast<uint64_t>(Live->getSize()) != F.Size ||
         static_cast<int64_t>(Live->getModificationTime()) != F.ModTime)
-      return Because(MismatchReason::FileChanged,
-                     F.Path + " changed since the part was saved");
+      return FileChanged(F.Path + " changed since the part was saved");
     if (SM.hasFileInfo(&Live->getFileEntry())) {
       Key += F.Path;
       Key += '\0';
@@ -364,6 +388,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
       Key += '\0';
     }
   }
+
+  if (Memo && !FilesKnown)
+    Memo->FilesFound = SearchOutcome{
+        SearchMemo::FilesKey, static_cast<uint8_t>(MismatchReason::None)};
 
   Lap.next(CheckCost::HeaderSearches);
 
@@ -549,6 +577,29 @@ llvm::StringRef CacheClient::lookup(
   LastCandidates = Resp->Entries.size();
   LastRejection = MismatchReason::None;
   MatchedDecls.clear();
+  // A file the compile has entered, by the canonical path a copy names it
+  // by. Found by file name first, so that only a file named the same has its
+  // canonical path made.
+  SourceManager &SM = PP.getSourceManager();
+  FileManager &FM = PP.getFileManager();
+  auto FindOpen = [&](llvm::StringRef CanonicalPath) -> OptionalFileEntryRef {
+    if (SM.getNextLocalOffset() != OpenSeenUpTo) {
+      OpenSeenUpTo = SM.getNextLocalOffset();
+      for (auto It = SM.fileinfo_begin(), E = SM.fileinfo_end(); It != E; ++It)
+        if (OpenSeen.insert(&It->first.getFileEntry()).second) {
+          FileEntryRef Ref =
+              It->second->OrigEntry ? *It->second->OrigEntry : It->first;
+          OpenByName[llvm::sys::path::filename(Ref.getName())].push_back(Ref);
+        }
+    }
+    auto It = OpenByName.find(llvm::sys::path::filename(CanonicalPath));
+    if (It == OpenByName.end())
+      return std::nullopt;
+    for (FileEntryRef Ref : It->second)
+      if (FM.getCanonicalName(Ref) == CanonicalPath)
+        return Ref;
+    return std::nullopt;
+  };
   std::vector<NamedDecl *> Found;
   for (const CacheEntryRef &E : Resp->Entries) {
     // The metadata is read where the daemon stored it. If the offset
@@ -573,7 +624,7 @@ llvm::StringRef CacheClient::lookup(
           return O.Outcome;
       return std::nullopt;
     };
-    SearchMemo Memo{Recall, std::nullopt};
+    SearchMemo Memo{Recall, std::nullopt, std::nullopt, FindOpen};
     CheckCost Prev = Counters.Check;
     {
       llvm::TimeTraceScope Scope("HeaderCache Check");
@@ -630,11 +681,12 @@ llvm::StringRef CacheClient::lookup(
       OS << " detail=" << Detail;
       Counters.Checks.push_back(std::move(Line));
     }
-    if (Memo.Found) {
-      Outcomes[{E.MetadataOffset, Memo.Found->Key}] = Memo.Found->Outcome;
-      if (Build)
-        Learned.push_back({Filename.str(), E.MetadataOffset, *Memo.Found});
-    }
+    for (const std::optional<SearchOutcome> &O : {Memo.Found, Memo.FilesFound})
+      if (O) {
+        Outcomes[{E.MetadataOffset, O->Key}] = O->Outcome;
+        if (Build)
+          Learned.push_back({Filename.str(), E.MetadataOffset, *O});
+      }
     Counters.CheckMicros += microsSince(Checking);
     if (Why != MismatchReason::None) {
       if (LastRejection == MismatchReason::None)

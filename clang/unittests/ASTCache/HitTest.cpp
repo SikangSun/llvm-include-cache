@@ -1804,9 +1804,10 @@ TEST_F(ExportTest, SearchesFoundInABuildAreNotTakenUnderAnotherIncludePath) {
   EXPECT_TRUE(reads(Main, H)) << "a/inner.h's copy was served under -Ib";
 }
 
-TEST_F(ExportTest, AFileChangedInABuildIsStillCaught) {
-  // The searches' outcome is shared within a build; the files' sizes and
-  // times are checked by every compile.
+TEST_F(ExportTest, AFileChangedIsCaughtByTheNextBuild) {
+  // The searches' outcome and the files' sizes and times are shared within
+  // a build, which assumes its files do not change while it runs (REPORT.md
+  // I9); the next build looks again.
   Build = 7;
   std::string H = write("h.h", "#ifndef H_H\n#define H_H\nint h(void);\n"
                                "#endif\n");
@@ -1816,5 +1817,7 @@ TEST_F(ExportTest, AFileChangedInABuildIsStillCaught) {
   EXPECT_FALSE(reads(Main, H)) << "h.h's copy was not served";
   write("h.h", "#ifndef H_H\n#define H_H\nint h(void); int h2(void);\n"
                "#endif\n");
+  moveModificationTime(H, 10);
+  Build = 8;
   EXPECT_TRUE(reads(Main, H)) << "a copy of the old h.h was served";
 }

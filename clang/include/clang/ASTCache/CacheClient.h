@@ -93,6 +93,17 @@ struct SearchMemo {
   llvm::function_ref<std::optional<uint8_t>(uint64_t Key)> Recall;
   /// Set when the check made the searches.
   std::optional<SearchOutcome> Found;
+  /// Set when the check compared the copy's files with the file system,
+  /// under FilesKey: within a build files do not change, so later compiles
+  /// of the build take the outcome instead of looking again.
+  std::optional<SearchOutcome> FilesFound;
+  /// The file this compile has entered whose canonical path is the one
+  /// given, if any (REPORT.md I9): what a check that does not look at the
+  /// file system uses to build the search key.
+  llvm::function_ref<OptionalFileEntryRef(llvm::StringRef CanonicalPath)>
+      FindOpen;
+  /// The key FilesFound is kept under, beside the search keys.
+  static constexpr uint64_t FilesKey = 0x46494c45534f4b31ULL;
 };
 
 /// Whether the metadata \p Deps still holds in this compile, read in place.
@@ -275,6 +286,12 @@ private:
   /// daemon.
   uint64_t Build = 0;
   llvm::DenseMap<std::pair<uint64_t, uint64_t>, uint8_t> Outcomes;
+
+  /// The files this compile has entered, by file name, as far as
+  /// OpenSeenUpTo of the source manager's offsets; for SearchMemo::FindOpen.
+  llvm::StringMap<llvm::SmallVector<FileEntryRef, 1>> OpenByName;
+  llvm::DenseSet<const FileEntry *> OpenSeen;
+  unsigned OpenSeenUpTo = 0;
   std::vector<LearnedSearch> Learned;
 };
 
