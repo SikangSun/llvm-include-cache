@@ -104,6 +104,10 @@ struct LookupRequest {
   /// and what its searches found since its last message.
   uint64_t Build = 0;
   std::vector<LearnedSearch> Learned;
+  /// The copies, by metadata offset, the compile used since its last
+  /// message: the daemon offers the most recently used first (REPORT.md
+  /// I15).
+  std::vector<uint64_t> Used;
 };
 
 struct LookupResponse {
@@ -150,9 +154,10 @@ struct HeaderTiming {
 struct TimingReport {
   std::vector<HeaderTiming> Headers;
   std::vector<HeaderTiming> Hits;
-  /// As in LookupRequest: the compile's last searches.
+  /// As in LookupRequest: the compile's last searches and copies used.
   uint64_t Build = 0;
   std::vector<LearnedSearch> Learned;
+  std::vector<uint64_t> Used;
 };
 
 /// The daemon's answer to a client that has just connected: the region file

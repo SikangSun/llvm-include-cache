@@ -175,6 +175,13 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return Because(MismatchReason::PragmaState,
                    "no Sema to check pragma state");
 
+  // The copy holds the warnings its header printed under its compile's
+  // flags and pragmas; under others it prints others (REPORT.md Q34). One
+  // integer, so first (I15).
+  if (Site && Site->WarningState != Deps.warningState())
+    return Because(MismatchReason::WarningState,
+                   "the warning flags or pragmas differ");
+
   IdentifierTable &Idents = PP.getIdentifierTable();
 
   // Charges the time from one step's start to the next step's start, or to
@@ -328,12 +335,6 @@ MismatchReason clang::ast_cache::matchesLiveState(
 
   if (capturePragmaState(*S) != Deps.entry())
     return Because(MismatchReason::PragmaState, "#pragma pack or float state");
-
-  // The copy holds the warnings its header printed under its compile's
-  // flags and pragmas; under others it prints others (REPORT.md Q34).
-  if (Site && Site->WarningState != Deps.warningState())
-    return Because(MismatchReason::WarningState,
-                   "the warning flags or pragmas differ");
 
   // The part holds the parse of each file's text when it was saved. A plain
   // compile reads the file again; a hit requires it unchanged, by size and
@@ -562,8 +563,10 @@ llvm::StringRef CacheClient::lookup(
   ++Counters.Lookups;
 
   llvm::SmallVector<char, 0> Msg;
-  encodeLookupRequest({Filename.str(), Build, std::move(Learned)}, Msg);
+  encodeLookupRequest(
+      {Filename.str(), Build, std::move(Learned), std::move(Used)}, Msg);
   Learned.clear();
+  Used.clear();
   auto Asked = std::chrono::steady_clock::now();
   std::optional<std::string> Reply;
   {
@@ -711,6 +714,7 @@ llvm::StringRef CacheClient::lookup(
     if (Use && !Use(Bytes, Deps->moduleName()))
       continue;
     ++Counters.Hits;
+    Used.push_back(E.MetadataOffset);
     if (LogChecks)
       Counters.Checks.back() += " used";
     if (Matched)
@@ -742,7 +746,9 @@ bool CacheClient::reportTimings(const TimingReport &Report) {
   TimingReport WithSearches = Report;
   WithSearches.Build = Build;
   WithSearches.Learned = std::move(Learned);
+  WithSearches.Used = std::move(Used);
   Learned.clear();
+  Used.clear();
   encodeTimingReport(WithSearches, Msg);
   bool Sent = sendMessage(*Conn, Msg) && receiveMessage(*Conn).has_value();
   Counters.ReportMicros += microsSince(Start);

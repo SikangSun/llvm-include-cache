@@ -77,7 +77,10 @@ void CacheDaemon::publishLocked() {
 }
 
 void CacheDaemon::learnLocked(uint64_t Build,
-                              const std::vector<LearnedSearch> &Learned) {
+                              const std::vector<LearnedSearch> &Learned,
+                              const std::vector<uint64_t> &Used) {
+  for (uint64_t U : Used)
+    LastUsed[U] = ++UseClock;
   if (!Build)
     return;
   for (const LearnedSearch &L : Learned) {
@@ -103,7 +106,7 @@ llvm::SmallVector<char, 0>
 CacheDaemon::handleTiming(const TimingReport &Report) {
   {
     std::lock_guard<std::mutex> Lock(Mutex);
-    learnLocked(Report.Build, Report.Learned);
+    learnLocked(Report.Build, Report.Learned, Report.Used);
     ++Counters.TimingReports;
     bool Changed = false;
     for (const HeaderTiming &H : Report.Headers) {
@@ -147,7 +150,7 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
   LookupResponse Resp;
   {
     std::lock_guard<std::mutex> Lock(Mutex);
-    learnLocked(Req.Build, Req.Learned);
+    learnLocked(Req.Build, Req.Learned, Req.Used);
     ++Counters.Lookups;
     auto It = Table.find(Req.Filename);
     if (It != Table.end()) {
@@ -157,12 +160,24 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
       // that needs the client's live macro table and its Sema -- and sending
       // the client's whole state here instead would be far larger than the
       // handful of names a header actually depends on.
-      Resp.Entries.reserve(It->second.size());
+      // The most recently used first: a compile checks them in order and
+      // takes the first that fits, which is most often the one that fit
+      // the compile before it (REPORT.md I15).
+      std::vector<const StoredEntry *> Order;
+      Order.reserve(It->second.size());
       for (const StoredEntry &E : It->second)
-        Resp.Entries.push_back({E.MetadataOffset, E.MetadataLength, E.Offset,
-                                E.Length,
-                                Req.Build && E.SearchBuild == Req.Build
-                                    ? E.Searches
+        Order.push_back(&E);
+      std::stable_sort(Order.begin(), Order.end(),
+                       [&](const StoredEntry *A, const StoredEntry *B) {
+                         return LastUsed.lookup(A->MetadataOffset) >
+                                LastUsed.lookup(B->MetadataOffset);
+                       });
+      Resp.Entries.reserve(Order.size());
+      for (const StoredEntry *E : Order)
+        Resp.Entries.push_back({E->MetadataOffset, E->MetadataLength,
+                                E->Offset, E->Length,
+                                Req.Build && E->SearchBuild == Req.Build
+                                    ? E->Searches
                                     : std::vector<SearchOutcome>()});
     }
   }

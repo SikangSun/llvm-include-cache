@@ -31,6 +31,7 @@
 
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/SharedRegion.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -143,8 +144,14 @@ private:
   llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
   llvm::SmallVector<char, 0> handleHello();
 
-  /// Keeps what a compile of \p Build found its searches to find. Mutex held.
-  void learnLocked(uint64_t Build, const std::vector<LearnedSearch> &Learned);
+  /// Keeps what a compile of \p Build found its searches to find, and which
+  /// copies it used. Mutex held.
+  void learnLocked(uint64_t Build, const std::vector<LearnedSearch> &Learned,
+                   const std::vector<uint64_t> &Used);
+  /// When each copy, by metadata offset, was last used, in messages
+  /// received: copies are offered most recently used first (REPORT.md I15).
+  llvm::DenseMap<uint64_t, uint64_t> LastUsed;
+  uint64_t UseClock = 0;
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
   bool listLocked(llvm::StringRef Path);

@@ -286,6 +286,8 @@ private:
   /// daemon.
   uint64_t Build = 0;
   llvm::DenseMap<std::pair<uint64_t, uint64_t>, uint8_t> Outcomes;
+  /// The copies used since the last message, by metadata offset.
+  std::vector<uint64_t> Used;
 
   /// The files this compile has entered, by file name, as far as
   /// OpenSeenUpTo of the source manager's offsets; for SearchMemo::FindOpen.
