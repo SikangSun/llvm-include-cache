@@ -105,6 +105,7 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -2331,15 +2332,29 @@ void ASTWriter::WriteHeaderSearch(const HeaderSearch &HS) {
 
 static void emitBlob(llvm::BitstreamWriter &Stream, StringRef Blob,
                      unsigned SLocBufferBlobCompressedAbbrv,
-                     unsigned SLocBufferBlobAbbrv) {
+                     unsigned SLocBufferBlobAbbrv, bool Part) {
   using RecordDataType = ASTWriter::RecordData::value_type;
 
   // Compress the buffer if possible. We expect that almost all PCM
   // consumers will not want its contents.
   SmallVector<uint8_t, 0> CompressedBuffer;
   if (llvm::compression::zstd::isAvailable()) {
-    llvm::compression::zstd::compress(
-        llvm::arrayRefFromStringRef(Blob.drop_back(1)), CompressedBuffer, 9);
+    // A header cache part holds the same memory buffers as the compile's
+    // other parts -- its predefined macros above all -- and its readers
+    // want their text still less: each distinct text is compressed once per
+    // compile, faster (REPORT.md I16).
+    static llvm::DenseMap<uint64_t, SmallVector<uint8_t, 0>> PartBlobs;
+    uint64_t Key = Part ? llvm::xxh3_64bits(Blob) : 0;
+    if (auto It = Part ? PartBlobs.find(Key) : PartBlobs.end();
+        It != PartBlobs.end()) {
+      CompressedBuffer = It->second;
+    } else {
+      llvm::compression::zstd::compress(
+          llvm::arrayRefFromStringRef(Blob.drop_back(1)), CompressedBuffer,
+          Part ? 3 : 9);
+      if (Part)
+        PartBlobs[Key] = CompressedBuffer;
+    }
     RecordDataType Record[] = {SM_SLOC_BUFFER_BLOB_COMPRESSED, Blob.size() - 1};
     Stream.EmitRecordWithBlob(SLocBufferBlobCompressedAbbrv, Record,
                               llvm::toStringRef(CompressedBuffer));
@@ -2471,7 +2486,8 @@ void ASTWriter::WriteSourceManagerBlock(SourceManager &SourceMgr) {
           Buffer = llvm::MemoryBufferRef("<<<INVALID BUFFER>>>", "");
         StringRef Blob(Buffer->getBufferStart(), Buffer->getBufferSize() + 1);
         emitBlob(Stream, Blob, SLocBufferBlobCompressedAbbrv,
-                 SLocBufferBlobAbbrv);
+                 SLocBufferBlobAbbrv,
+                 isWritingPart());
       }
     } else {
       // The source location entry is a macro expansion.
