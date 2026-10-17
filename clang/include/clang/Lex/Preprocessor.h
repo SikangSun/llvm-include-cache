@@ -48,6 +48,7 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Registry.h"
+#include "llvm/Support/xxhash.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -146,6 +147,10 @@ struct CXXStandardLibraryVersionInfo {
 /// know anything about preprocessor-level issues like the \#include stack,
 /// token expansion, etc.
 class Preprocessor {
+  /// See noteMacroName.
+  std::unique_ptr<uint64_t[]> MacroNameBits{
+      new uint64_t[(1u << 18) / 64]()};
+
   friend class VAOptDefinitionContext;
   friend class VariadicMacroScopeGuard;
 
@@ -1396,6 +1401,24 @@ public:
   void refreshIdentifier(const IdentifierInfo &II) const {
     if (II.isOutOfDate())
       updateOutOfDateIdentifier(II);
+  }
+
+  /// Header cache (REPORT.md I14): one bit per hash of each name the compile
+  /// has made a macro, in any way -- a directive, -D, a builtin, a module.
+  /// A clear bit says the name is not a macro without looking it up; a set
+  /// one says nothing. Never cleared, #undef included.
+  static constexpr unsigned MacroNameBitsLog2 = 18;
+  void noteMacroName(StringRef Name) {
+    noteMacroNameHash(llvm::xxh3_64bits(Name));
+  }
+  /// noteMacroName, given the name's llvm::xxh3_64bits.
+  void noteMacroNameHash(uint64_t Hash) {
+    uint64_t H = Hash & ((1u << MacroNameBitsLog2) - 1);
+    MacroNameBits[H >> 6] |= uint64_t(1) << (H & 63);
+  }
+  bool mayBeMacro(StringRef Name) const {
+    uint64_t H = llvm::xxh3_64bits(Name) & ((1u << MacroNameBitsLog2) - 1);
+    return MacroNameBits[H >> 6] & (uint64_t(1) << (H & 63));
   }
 
   bool isMacroDefined(StringRef Id) {

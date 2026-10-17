@@ -70,6 +70,7 @@ void Preprocessor::appendMacroDirective(IdentifierInfo *II, MacroDirective *MD){
   assert(MD && "MacroDirective should be non-zero!");
   assert(!MD->getPrevious() && "Already attached to a MacroDirective history.");
 
+  noteMacroName(II->getName());
   MacroState &StoredMD = CurSubmoduleState->Macros[II];
   auto *OldMD = StoredMD.getLatest();
   MD->setPrevious(OldMD);
@@ -104,6 +105,7 @@ void Preprocessor::setLoadedMacroDirective(IdentifierInfo *II,
   // built-in.
 
   assert(II && MD);
+  noteMacroName(II->getName());
   MacroState &StoredMD = CurSubmoduleState->Macros[II];
 
   if (auto *OldMD = StoredMD.getLatest()) {
@@ -160,6 +162,7 @@ ModuleMacro *Preprocessor::addModuleMacro(Module *Mod, IdentifierInfo *II,
                                           MacroInfo *Macro,
                                           ArrayRef<ModuleMacro *> Overrides,
                                           bool &New) {
+  noteMacroName(II->getName());
   llvm::FoldingSetNodeID ID;
   ModuleMacro::Profile(ID, Mod, II);
 

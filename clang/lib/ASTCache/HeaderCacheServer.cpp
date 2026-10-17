@@ -719,7 +719,12 @@ private:
         !ReplayAll &&
         CI.getASTReader()->getModuleManager().size() == CopiesLoaded;
     for (const MacroEffectView &E : Effects) {
-      bool Earlier = !TouchedByCopies.insert(llvm::xxh3_64bits(E.Name)).second;
+      uint64_t Hash = llvm::xxh3_64bits(E.Name);
+      // A name the copy leaves a macro is one, replayed or not, for the
+      // check's filter (REPORT.md I14).
+      if (E.Defined)
+        PP.noteMacroNameHash(Hash);
+      bool Earlier = !TouchedByCopies.insert(Hash).second;
       if (OnlyCopies && !Earlier && Idents.find(E.Name) == Idents.end()) {
         ++EffectsSkipped;
         continue;

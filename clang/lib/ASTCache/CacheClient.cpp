@@ -217,7 +217,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
       break;
     if (Cost)
       ++Cost->Read[MetadataView::Conditional];
-    bool Defined = PP.isMacroDefined(Fresh(D.MacroName));
+    // A name never made a macro is not one, without looking it up (I14).
+    bool Defined =
+        PP.mayBeMacro(D.MacroName) && PP.isMacroDefined(Fresh(D.MacroName));
     if (Defined != D.WasDefined)
       return Because(MismatchReason::Conditional,
                      D.MacroName + (D.WasDefined ? " was defined, is not"
@@ -231,13 +233,16 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // nearly every name, and asks about module visibility only when it is set:
   // the bit alone is also set for a module's macro that is not visible.
   auto IsMacro = [&](llvm::StringRef Name) {
-    return PP.isMacroDefined(Fresh(Name));
+    return PP.mayBeMacro(Name) && PP.isMacroDefined(Fresh(Name));
   };
 
   for (const ExpandsToView &D : Deps.expandsTo()) {
     if (Cost)
       ++Cost->Read[MetadataView::ExpandsTo];
-    const MacroInfo *MI = PP.getMacroDefinition(Fresh(D.Name)).getMacroInfo();
+    const MacroInfo *MI =
+        PP.mayBeMacro(D.Name)
+            ? PP.getMacroDefinition(Fresh(D.Name)).getMacroInfo()
+            : nullptr;
     std::optional<std::string> Live =
         MI ? serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts())
            : std::nullopt;
