@@ -544,7 +544,7 @@ void ASTDeclWriter::VisitDecl(Decl *D) {
   if (D->hasAttrs())
     Record.AddAttributes(D->getAttrs());
 
-  Record.push_back(Writer.getSubmoduleID(D->getOwningModule()));
+  Record.push_back(Writer.getSubmoduleID(Writer.partOwner(D)));
 
   // If this declaration injected a name into a context different from its
   // lexical context, and that context is an imported namespace, we need to
@@ -3073,11 +3073,17 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
     RecordData Record;
     ASTDeclWriter W(*this, Context, Record, GeneratingReducedBMI);
 
+    // What its record refers to, noted as from its submodule.
+    if (PartTrack)
+      PartRefOwner =
+          partDeclOwner(D, ID.getRawValue() - FirstDeclID.getRawValue());
+
     // Build a record for this declaration
     W.Visit(D);
 
     // Emit this declaration to the bitstream.
     Offset = W.Emit(D);
+    PartRefOwner = -1;
   }
   if (PartSizes)
     PartSizes->push_back(

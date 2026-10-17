@@ -359,7 +359,12 @@ public:
       const PartExporter::Stats &E = Exporter->stats();
       OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
          << " with deep copies), declined " << E.Declined << ", "
-         << ms(E.Micros) << " ms writing and pushing\n";
+         << ms(E.Micros) << " ms writing and pushing, " << E.Submodules
+         << " headers held as submodules\n";
+      OS << "header cache write time: " << ms(E.WriterMicros)
+         << " ms in Clang's writer, "
+         << ms(E.ComposeMicros) << " in compose (" << ms(E.ChooseMicros)
+         << " choosing, " << ms(E.DepsMicros) << " tagging dependencies)\n";
       for (const std::string &Line : E.Independence)
         OS << "  indep " << Line << "\n";
       if (LogServed) {
@@ -515,13 +520,38 @@ public:
       llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
       IdentifierTable &Idents = PP.getIdentifierTable();
       size_t I = 0;
-      for (const DeclarationView &D : Deps.declarations()) {
-        if (I == Found.size())
-          break;
-        CI.getASTReader()->pinNameReference(
-            *Copy.MF, Idents.get(D.Name),
-            D.In == DeclarationDependency::Space::Tag, Found[I++]);
-      }
+      auto Pin = [&](MetadataSection<DeclarationView> Decls) {
+        for (const DeclarationView &D : Decls) {
+          if (I == Found.size())
+            break;
+          // Null for one that does not apply where the hit is.
+          if (NamedDecl *To = Found[I++])
+            CI.getASTReader()->pinNameReference(
+                *Copy.MF, Idents.get(D.Name),
+                D.In == DeclarationDependency::Space::Tag, To);
+        }
+      };
+      Pin(Deps.declarations());
+    }
+
+    // REPORT.md T17: the submodules that load, each found inside its
+    // parent's module, and which elements of the metadata apply.
+    const std::vector<bool> &Loaded = Client->lastSubmodules();
+    std::vector<Module *> Subs;
+    for (const SubmoduleView &M : Deps.submodules()) {
+      Module *In = M.Parent < 0 ? Target : Subs[M.Parent];
+      Subs.push_back(In ? In->findSubmodule(M.Name) : nullptr);
+    }
+    std::vector<char> Applies{true};
+    std::vector<int> OwnerOf{-1};
+    for (const ConditionView &C : Deps.conditions()) {
+      bool OwnerLoads = C.Owner < 0 || (C.Owner < (int)Loaded.size() &&
+                                        Loaded[C.Owner]);
+      bool ProviderSkipped = C.Provider < 0 ||
+                             C.Provider >= (int)Loaded.size() ||
+                             !Loaded[C.Provider];
+      Applies.push_back(OwnerLoads && ProviderSkipped);
+      OwnerOf.push_back(C.Owner);
     }
 
     // What the header does to its includer's macros and pragma state, which
@@ -535,16 +565,20 @@ public:
     {
       llvm::TimeTraceScope S("HeaderCache MakeVisible");
       PP.makeModuleVisible(Target, IncludeLoc);
+      for (size_t K = 0; K != Subs.size(); ++K)
+        if (K < Loaded.size() && Loaded[K] && Subs[K])
+          PP.makeModuleVisible(Subs[K], IncludeLoc);
     }
     {
       llvm::TimeTraceScope S("HeaderCache ReplayEffects");
-      replayMacroEffects(Deps.macroEffects(), *Target, IncludeLoc);
+      replayMacroEffects(Deps.macroEffects(), *Target, IncludeLoc, Applies,
+                         OwnerOf, Subs);
     }
     {
       llvm::TimeTraceScope S("HeaderCache PragmaDelta");
       applyPragmaDelta(CI.getSema(), Deps.entry(), Deps.exit());
     }
-    printDiagnostics(Deps.diagnostics(), *Copy.MF);
+    printDiagnostics(Deps.diagnostics(), *Copy.MF, Applies);
     // The warning pragmas the header left in force, as its text would have.
     for (const WarningPragmaView &W : Deps.warningPragmas())
       Pragmas.apply(CI.getDiagnostics(), W.Pragma, IncludeLoc);
@@ -711,14 +745,28 @@ private:
     }
   }
 
+  /// \p Applies, \p OwnerOf and \p Subs (REPORT.md T17): whether each
+  /// condition holds, the submodule it belongs to, and each submodule's
+  /// module. An effect of a submodule that does not load is the compile's
+  /// own header's to have had; one of a submodule that loads has its
+  /// definition in the submodule's module.
   void replayMacroEffects(MetadataSection<MacroEffectView> Effects,
-                          Module &Target, SourceLocation Loc) {
+                          Module &Target, SourceLocation Loc,
+                          llvm::ArrayRef<char> Applies = {},
+                          llvm::ArrayRef<int> OwnerOf = {},
+                          llvm::ArrayRef<Module *> Subs = {}) {
     Preprocessor &PP = CI.getPreprocessor();
     IdentifierTable &Idents = PP.getIdentifierTable();
     bool OnlyCopies =
         !ReplayAll &&
         CI.getASTReader()->getModuleManager().size() == CopiesLoaded;
     for (const MacroEffectView &E : Effects) {
+      if (E.Cond && E.Cond < Applies.size() && !Applies[E.Cond])
+        continue;
+      Module *In = &Target;
+      if (E.Cond && E.Cond < OwnerOf.size() && OwnerOf[E.Cond] >= 0 &&
+          OwnerOf[E.Cond] < (int)Subs.size() && Subs[OwnerOf[E.Cond]])
+        In = Subs[OwnerOf[E.Cond]];
       uint64_t Hash = llvm::xxh3_64bits(E.Name);
       // A name the copy leaves a macro is one, replayed or not, for the
       // check's filter (REPORT.md I14).
@@ -739,7 +787,7 @@ private:
                                         UndefMacroDirective(Loc));
         continue;
       }
-      ModuleMacro *MM = PP.getModuleMacro(&Target, II);
+      ModuleMacro *MM = PP.getModuleMacro(In, II);
       if (MM && MM->getMacroInfo())
         PP.appendDefMacroDirective(II, MM->getMacroInfo(), Loc);
       else
@@ -765,7 +813,8 @@ private:
   /// and where no warning pragma is in force, so they are the ones the
   /// header's text would print here (REPORT.md Q34).
   void printDiagnostics(MetadataSection<DiagnosticView> Saved,
-                        serialization::ModuleFile &MF) {
+                        serialization::ModuleFile &MF,
+                        llvm::ArrayRef<char> Applies = {}) {
     if (Saved.empty())
       return;
     ASTReader &Reader = *CI.getASTReader();
@@ -778,6 +827,9 @@ private:
     };
     for (const DiagnosticView &Ref : Saved) {
       const SavedDiagnostic &D = Ref.Diagnostic;
+      // Printed by the compile's own header where its submodule is skipped.
+      if (D.Cond && D.Cond < Applies.size() && !Applies[D.Cond])
+        continue;
       llvm::SmallVector<CharSourceRange, 2> Ranges;
       for (const SavedDiagnostic::Range &R : D.Ranges)
         Ranges.push_back(Range(R));
@@ -795,6 +847,53 @@ private:
       CI.getDiagnostics().Report(Stored);
       ++DiagnosticsReplayed;
     }
+  }
+
+  /// REPORT.md T17: the compile's own declaration for each declaration of
+  /// a skipped submodule that the copy's other lines refer to, found by
+  /// name where the header is included. False if the compile has none of
+  /// some name: the copy is then not used.
+  bool resolveProvided(const MetadataView &Deps,
+                       const std::vector<bool> &Loads,
+                       std::vector<std::pair<uint32_t, Decl *>> &Swaps) {
+    Sema &S = CI.getSema();
+    IdentifierTable &Idents = CI.getPreprocessor().getIdentifierTable();
+    for (const ProvidedView &D : Deps.provided()) {
+      size_t K = D.Cond - 1;
+      if (!D.Cond || (K < Loads.size() && Loads[K]))
+        continue;
+      NamedDecl *Live = ASTReader::lookupAtFileScope(
+          S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
+          /*CreateBuiltin=*/true);
+      if (!Live)
+        return false;
+      QualType Under;
+      if (auto *TD = dyn_cast<TypedefNameDecl>(Live))
+        Under = TD->getUnderlyingType();
+      for (const ProvidedView::Use &U : D.Uses) {
+        Decl *To = nullptr;
+        using How = ProvidedDeclaration::How;
+        if (U.Of == How::Self) {
+          To = Live;
+        } else if (U.Of == How::TagOfTypedef) {
+          if (!Under.isNull())
+            To = Under->getAsTagDecl();
+        } else {
+          RecordDecl *R = !Under.isNull() ? Under->getAsRecordDecl()
+                                          : dyn_cast<RecordDecl>(Live);
+          if (R && (R = R->getDefinition()))
+            for (NamedDecl *M : R->lookup(&Idents.get(U.Member)))
+              if (isa<FieldDecl, IndirectFieldDecl>(M)) {
+                To = M;
+                break;
+              }
+        }
+        if (!To)
+          return false;
+        Swaps.push_back({U.Index, To});
+      }
+    }
+    return true;
   }
 
   Module *load(llvm::StringRef Bytes, llvm::StringRef ModuleName,
@@ -816,8 +915,39 @@ private:
     // second fp, since Clang merges two copies' declarations only when they
     // are the same. Plain clang reads the second include as text, which
     // makes its fp a redeclaration of the first, and so does this compile.
+    // REPORT.md T17: the submodules this hit skips, whose declarations the
+    // reader leaves unread, each the copy's lines refer to standing for the
+    // compile's own.
+    const std::vector<bool> &Loads = Client->lastSubmodules();
+    const std::vector<std::string> &Names = Client->lastSubmoduleNames();
+    const std::vector<std::string> &Paths = Client->lastSubmodulePaths();
+    std::vector<std::string> Skips;
+    for (size_t K = 0; K != Names.size(); ++K)
+      if (K >= Loads.size() || !Loads[K])
+        Skips.push_back(Names[K]);
+
     auto Known = LoadedTargets.find(ModuleName);
     if (Known != LoadedTargets.end()) {
+      // A submodule left unread where the copy was loaded cannot load now.
+      if (Skips.size() != Names.size()) {
+        llvm::StringMap<Module *> ByName;
+        std::vector<Module *> Stack{Known->second.Target->getTopLevelModule()};
+        while (!Stack.empty()) {
+          Module *M = Stack.back();
+          Stack.pop_back();
+          for (Module *Sub : M->submodules()) {
+            ByName[Sub->Name] = Sub;
+            Stack.push_back(Sub);
+          }
+        }
+        for (size_t K = 0; K != Names.size(); ++K)
+          if (K < Loads.size() && Loads[K])
+            if (Module *Sub = ByName.lookup(Names[K]);
+                Sub && CI.getASTReader()->isPartSkipped(Sub)) {
+              ++LoadsRefused;
+              return nullptr;
+            }
+      }
       if (Known->second.Bytes.data() == Bytes.data() ||
           Known->second.Bytes == Bytes) {
         Known->second.Fresh = false;
@@ -842,10 +972,26 @@ private:
     // instead of diagnosing it. Any failure unloads what was read.
     // Imported where it is included: a diagnostic printed again from it
     // names that #include in its "In file included from" line.
-    if (Reader.ReadAST(Name, serialization::MK_ExplicitModule, IncludeLoc,
-                       ASTReader::ARR_ConfigurationMismatch,
-                       &MF) != ASTReader::Success ||
-        !MF) {
+    if (!Skips.empty()) {
+      ASTReader::PartSkip Skip;
+      Skip.Names = Skips;
+      for (size_t K = 0; K != Paths.size(); ++K)
+        if (OptionalFileEntryRef FE =
+                CI.getFileManager().getOptionalFileRef(Paths[K]))
+          Skip.Headers.push_back(
+              {&FE->getFileEntry(), K >= Loads.size() || !Loads[K]});
+      if (const std::optional<MetadataView> &Deps = Client->lastMetadata())
+        if (!resolveProvided(*Deps, Loads, Skip.Swaps)) {
+          ++LoadsRefused;
+          return nullptr;
+        }
+      Reader.setPartSkip(std::move(Skip));
+    }
+    bool Read = Reader.ReadAST(Name, serialization::MK_ExplicitModule,
+                               IncludeLoc, ASTReader::ARR_ConfigurationMismatch,
+                               &MF) == ASTReader::Success;
+    Reader.setPartSkip(std::nullopt);
+    if (!Read || !MF) {
       ++LoadsRefused;
       return nullptr;
     }
@@ -1149,6 +1295,7 @@ public:
 
     Preprocessor &PP = CI.getPreprocessor();
     uint32_t Counter = PP.getCounterValue();
+    auto Start = std::chrono::steady_clock::now();
     serialization::ModuleFile *MF = nullptr;
     ASTReader::ASTReadResult R =
         Reader.ReadAST(Name, serialization::MK_ExplicitModule, SourceLocation(),
@@ -1166,7 +1313,11 @@ public:
     }
     MM.cacheModuleLoad(*PP.getIdentifierInfo(MF->ModuleName), Top);
     llvm::errs() << "header cache load: served " << Header << " from " << In
-                 << "\n";
+                 << ", "
+                 << std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - Start)
+                        .count()
+                 << " us\n";
     return Top;
   }
 

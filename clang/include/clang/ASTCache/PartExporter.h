@@ -50,6 +50,8 @@ public:
     /// Exported parts written with deep copies, because some outside
     /// declaration could not be named, and why.
     unsigned Copied = 0;
+    /// Headers held as submodules of the parts written (REPORT.md T17).
+    unsigned Submodules = 0;
     std::vector<std::string> Copies;
     /// "<header>: <why>", one per declined part.
     std::vector<std::string> Declines;
@@ -60,8 +62,13 @@ public:
     /// guarded header inside it saying whether it is independent of the
     /// part's lines before it (REPORT.md T15).
     std::vector<std::string> Independence;
-    /// Wall time writing parts and pushing them to the daemon.
+    /// Wall time writing parts and pushing them to the daemon; of it, in
+    /// Clang's writer and in compose (REPORT.md T17).
     uint64_t Micros = 0;
+    uint64_t WriterMicros = 0;
+    uint64_t ComposeMicros = 0;
+    /// Of compose: choosing the submodules, tagging the dependencies.
+    uint64_t ChooseMicros = 0, DepsMicros = 0;
   };
 
   /// Installs an exporter on \p CI's preprocessor, which owns it. \p Deliver

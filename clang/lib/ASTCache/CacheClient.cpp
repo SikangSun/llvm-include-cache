@@ -55,6 +55,8 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
            "would too";
   case MismatchReason::MacroStack:
     return "a definition the header's #pragma pop_macro takes differs";
+  case MismatchReason::GuardWithoutHeader:
+    return "a header's guard is defined, but the header was never read";
   }
   return "unknown";
 }
@@ -104,11 +106,17 @@ std::optional<IncludeView> redoLookups(
     const MetadataView &Deps, Preprocessor &PP, const IncludeSite &Site,
     bool CheckNames,
     std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
-        &Found) {
+        &Found,
+    llvm::function_ref<bool(uint32_t)> Apply) {
   HeaderSearch &HS = PP.getHeaderSearchInfo();
   FileManager &FM = PP.getFileManager();
   SourceManager &SM = PP.getSourceManager();
   for (const IncludeView &D : Deps.includes()) {
+    // In a submodule that does not load: nothing to find.
+    if (!Apply(D.Cond)) {
+      Found.push_back({std::nullopt, nullptr});
+      continue;
+    }
     OptionalFileEntryRef Includer;
     ConstSearchDirIterator IncluderDir = nullptr;
     if (D.Includer < 0) {
@@ -159,7 +167,7 @@ std::optional<IncludeView> redoLookups(
 MismatchReason clang::ast_cache::matchesLiveState(
     const MetadataView &Deps, Preprocessor &PP, Sema *S, std::string *Detail,
     const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found,
-    SearchMemo *Memo, bool SkipConditionals) {
+    SearchMemo *Memo, bool SkipConditionals, std::vector<bool> *LoadedOut) {
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -217,9 +225,48 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return II;
   };
 
+  // Which submodules load (REPORT.md T17): each whose header the compile
+  // has not read, inside one that loads. An element applies where its own
+  // submodule loads and, if it takes something from another submodule,
+  // where that one is skipped -- then the compile's own header gives it.
+  std::vector<bool> Loaded;
+  auto WasRead = [&](llvm::StringRef Path) {
+    HeaderSearch &HS = PP.getHeaderSearchInfo();
+    OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(Path);
+    return FE && (PP.alreadyIncluded(*FE) || HS.hasFileBeenImported(*FE));
+  };
+  for (const SubmoduleView &M : Deps.submodules()) {
+    // Inside a skipped one: skipped too.
+    if (M.Parent >= 0 && !Loaded[M.Parent]) {
+      Loaded.push_back(false);
+      continue;
+    }
+    bool Read;
+    if (!M.Guard.empty()) {
+      Read = PP.mayBeMacro(M.Guard) && PP.isMacroDefined(Fresh(M.Guard));
+      // Defined by hand, not by reading the header: plain clang leaves the
+      // header out, and the rest of the copy was made with it read.
+      if (Read && !WasRead(M.Path))
+        return Because(MismatchReason::GuardWithoutHeader,
+                       M.Guard + " is defined, " + M.Path + " was not read");
+    } else {
+      Read = WasRead(M.Path);
+    }
+    Loaded.push_back(!Read);
+  }
+  std::vector<bool> Applies{true};
+  for (const ConditionView &C : Deps.conditions())
+    Applies.push_back((C.Owner < 0 || Loaded[C.Owner]) &&
+                      (C.Provider < 0 || !Loaded[C.Provider]));
+  auto Apply = [&](uint32_t Cond) { return Applies[Cond]; };
+  if (LoadedOut)
+    *LoadedOut = Loaded;
+
   // Cheapest first: a definedness test is a hash lookup, and a header with
   // dozens of them usually fails on one.
   for (const ConditionalView &D : Deps.conditional()) {
+    if (!Apply(D.Cond))
+      continue;
     if (SkipConditionals)
       break;
     if (Cost)
@@ -244,6 +291,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   };
 
   for (const ExpandsToView &D : Deps.expandsTo()) {
+    if (!Apply(D.Cond))
+      continue;
     if (Cost)
       ++Cost->Read[MetadataView::ExpandsTo];
     const MacroInfo *MI =
@@ -288,6 +337,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // which means the same file must already have been read.
   HeaderSearch &HS = PP.getHeaderSearchInfo();
   for (const InclusionView &D : Deps.inclusion()) {
+    if (!Apply(D.Cond))
+      continue;
     if (Cost)
       ++Cost->Read[MetadataView::Inclusion];
     OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(D.HeaderPath);
@@ -300,6 +351,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   std::optional<llvm::TimeTraceScope> NamesScope;
   NamesScope.emplace("HeaderCache Check NotAMacro");
   for (const NameView &N : Deps.notAMacro()) {
+    if (!Apply(N.Cond))
+      continue;
     if (Cost)
       ++Cost->Read[MetadataView::NotAMacro];
     if (IsMacro(N.Name))
@@ -313,6 +366,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // Symbol dependencies last: the only ones that cost a name lookup.
   {
     for (const SymbolView &D : Deps.symbol()) {
+      if (!Apply(D.Cond))
+        continue;
       if (Cost)
         ++Cost->Read[MetadataView::Symbol];
       IdentifierInfo &II = Idents.get(D.Name);
@@ -367,6 +422,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return Because(MismatchReason::FileChanged, What);
   };
   for (const FileStampView &F : Deps.files()) {
+    if (!Apply(F.Cond))
+      continue;
     if (FilesVerified) {
       if (OptionalFileEntryRef Open = Memo->FindOpen(F.Path)) {
         Key += F.Path;
@@ -438,7 +495,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
         std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>>
             Found;
         std::optional<IncludeView> Bad =
-            redoLookups(Deps, PP, *Site, CheckNames, Found);
+            redoLookups(Deps, PP, *Site, CheckNames, Found, Apply);
         if (Cost)
           Cost->SearchesRedone += Found.size() + (Bad ? 1 : 0);
         if (Bad) {
@@ -454,6 +511,8 @@ MismatchReason clang::ast_cache::matchesLiveState(
 
         Lap.next(CheckCost::FileNames);
         for (const FileNameView &D : Deps.fileNames()) {
+          if (!Apply(D.Cond))
+            continue;
           OptionalFileEntryRef File = D.File < 0
                                           ? OptionalFileEntryRef(Site->File)
                                           : Found[D.File].first;
@@ -488,6 +547,12 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // members, or an fscanf with another asm label, would compile differently.
   // The lookup is the one the reader resolves the names with.
   for (const DeclarationView &D : Deps.declarations()) {
+    // Kept in step with the declarations for the caller's pinning.
+    if (!Apply(D.Cond)) {
+      if (Found)
+        Found->push_back(nullptr);
+      continue;
+    }
     if (Cost)
       ++Cost->Read[MetadataView::Declarations];
     NamedDecl *Live = ASTReader::lookupAtFileScope(
@@ -609,6 +674,7 @@ llvm::StringRef CacheClient::lookup(
     return std::nullopt;
   };
   std::vector<NamedDecl *> Found;
+  std::vector<bool> CandidateLoaded;
   for (const CacheEntryRef &E : Resp->Entries) {
     // The metadata is read where the daemon stored it. If the offset
     // addresses nothing written, there is nothing to check the candidate
@@ -639,7 +705,8 @@ llvm::StringRef CacheClient::lookup(
       Found.clear();
       Why = matchesLiveState(*Deps, PP, S,
                              LogRejections || LogChecks ? &Detail : nullptr,
-                             Site, &Counters.Check, &Found, &Memo);
+                             Site, &Counters.Check, &Found, &Memo,
+                             /*SkipConditionals=*/false, &CandidateLoaded);
     }
     if (LogChecks) {
       // Where the check stopped: each step's time, and each section's
@@ -711,6 +778,14 @@ llvm::StringRef CacheClient::lookup(
     // Before Use loads the candidate: loading may read the part's
     // references to outside declarations, which the caller pins to these.
     MatchedDecls = Found;
+    LastSubmodules = CandidateLoaded;
+    LastMetadata = Deps;
+    LastSubmoduleNames.clear();
+    LastSubmodulePaths.clear();
+    for (const SubmoduleView &M : Deps->submodules()) {
+      LastSubmoduleNames.push_back(M.Name.str());
+      LastSubmodulePaths.push_back(M.Path.str());
+    }
     if (Use && !Use(Bytes, Deps->moduleName()))
       continue;
     ++Counters.Hits;

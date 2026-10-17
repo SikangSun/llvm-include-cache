@@ -1357,6 +1357,157 @@ TEST_F(ExportTest, AHeaderIsFoldedWithTheHeadersInsideItReadAsText) {
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened after all";
 }
 
+TEST_F(ExportTest, OneCopyServesAHeaderWhetherOrNotItsInnerHeaderWasRead) {
+  // inner.h reads nothing outer.h's lines set, so outer.h's copy holds it as
+  // a submodule (REPORT.md T17). After.c reads inner.h first: the copy is
+  // served with the submodule left hidden, its my_size checked against the
+  // compile's own. Other.c reads outer.h alone: the submodule loads. One
+  // copy serves both, and a later #include of inner.h is skipped.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "my_size inner_len(void);\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                       "#include \"" +
+                           Inner +
+                           "\"\n"
+                           "my_size outer_len(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Outer +
+                          "\"\n"
+                          "my_size f(void) { return outer_len(); }\n");
+  std::string After = write(
+      "after.c", "#include \"" + Inner + "\"\n#include \"" + Outer +
+                     "\"\n"
+                     "my_size g(void) { return outer_len() + inner_len(); }\n");
+  std::string Other =
+      write("other.c", "#include \"" + Outer + "\"\n#include \"" + Inner +
+                           "\"\n"
+                           "my_size h(void) { return outer_len() + "
+                           "inner_len(); }\n");
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is stored yet";
+  size_t Stored = Daemon->stats().Entries;
+  ASSERT_GE(Stored, 1u) << "outer.h was not exported";
+
+  // After.c reads inner.h, which has no copy of its own yet, and writes
+  // one; outer.h it is served.
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(After, Entered));
+  EXPECT_FALSE(Entered.count(Outer))
+      << "outer.h's copy was not served after inner.h was read";
+  EXPECT_LE(Daemon->stats().Entries, Stored + 1)
+      << "a second copy of outer.h was written for the other include order";
+
+  Stored = Daemon->stats().Entries;
+  Entered.clear();
+  ASSERT_TRUE(compile(Other, Entered));
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner))
+      << "inner.h was opened though its submodule loaded";
+  EXPECT_EQ(Daemon->stats().Entries, Stored) << "a copy was written";
+}
+
+TEST_F(ExportTest, AGuardDefinedWithoutItsHeaderReadIsNotServed) {
+  // fake.c defines inner.h's guard without reading inner.h, with a my_size
+  // of its own. Plain clang reads outer.h's text with inner.h left out; the
+  // copy was made with inner.h read, so it is not served (REPORT.md T17):
+  // fake.c reads outer.h as text, and outer_len returns int, as with plain
+  // clang.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                       "#include \"" +
+                           Inner +
+                           "\"\n"
+                           "my_size outer_len(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Outer +
+                          "\"\n"
+                          "my_size f(void) { return outer_len(); }\n");
+  std::string Fake =
+      write("fake.c", "#define INNER_H\ntypedef int my_size;\n#include \"" +
+                          Outer + "\"\nint g(void) { return outer_len(); }\n");
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is stored yet";
+  ASSERT_FALSE(reads(Main, Outer)) << "outer.h's copy was not served";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("outer_len")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        Returns = F->getReturnType().getCanonicalType().getAsString();
+  };
+  EXPECT_TRUE(reads(Fake, Outer)) << "outer.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Returns, "int");
+}
+
+TEST_F(ExportTest, ASubmodulesDependenciesAreTheCopys) {
+  // val.h's body depends on VAL, which main.c and other.c define
+  // differently. Its dependencies are folded into outer.h's copy (REPORT.md
+  // T17), so where VAL differs the copy does not fit, whether or not the
+  // compile read val.h; other.c reads outer.h as text, and Clang never
+  // compares two bodies of get_val.
+  std::string Val = write("val.h", "#ifndef VAL_H\n#define VAL_H\n"
+                                   "static inline int get_val(void) {\n"
+                                   "  return VAL;\n}\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                       "#include \"" +
+                           Val +
+                           "\"\n"
+                           "int outer(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#define VAL 1\n#include \"" + Outer +
+                          "\"\n"
+                          "int f(void) { return get_val() + outer(); }\n");
+  std::string Other =
+      write("other.c", "#define VAL 2\n#include \"" + Val +
+                           "\"\n#include \"" + Outer +
+                           "\"\n"
+                           "int g(void) { return get_val() + outer(); }\n");
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Main, Outer)) << "outer.h's copy was not served";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Other, Entered)) << "two bodies of get_val met";
+  EXPECT_TRUE(Entered.count(Outer)) << "a copy made where VAL is 1 was served";
+}
+
+TEST_F(ExportTest, ADefinitionInASubmoduleThatLoadsSurvivesALaterSkippedOne) {
+  // In outer.h's copy, def.h defines struct S and fwd.h, after it, declares
+  // it again; the copy's identifier table lists only fwd.h's. other.c reads
+  // fwd.h first, so that submodule is skipped while def.h's loads, and the
+  // definition must still complete struct S.
+  std::string Def = write("def.h", "#ifndef DEF_H\n#define DEF_H\n"
+                                   "struct S { int a; };\n#endif\n");
+  std::string Fwd = write("fwd.h", "#ifndef FWD_H\n#define FWD_H\n"
+                                   "struct S;\nint use(struct S *);\n"
+                                   "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Def + "\"\n#include \"" + Fwd +
+                           "\"\nint outer(void);\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Outer +
+                          "\"\n"
+                          "int f(void) { struct S s = {1}; return s.a; }\n");
+  std::string Other =
+      write("other.c", "#include \"" + Fwd + "\"\n#include \"" + Outer +
+                           "\"\n"
+                           "int g(void) { struct S s = {1}; return s.a + "
+                           "use(&s); }\n");
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Other, Entered)) << "struct S lost its definition";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+}
+
 TEST_F(ExportTest, APartThatDefinesAnOutsideStructIsServed) {
   // a.c declares struct pt before use.h, and use.h defines it. A hit is
   // checked where use.h begins, when struct pt is only declared, so the

@@ -284,6 +284,66 @@ public:
     bool Poisoned = false;
   };
   void measureIndependence() { Measuring = true; }
+
+  /// REPORT.md T17: what each file read inside a header being exported read
+  /// with its own text -- a definedness test, a name expanded or read as
+  /// plain text, a type name, a #pragma once #include skipped -- each with
+  /// the file whose #define, #undef or declaration gave the state read
+  /// (invalid for none: never defined, the command line). A name is
+  /// recorded again in a file when its state there has changed since, so
+  /// the dependencies of any part of the header, with some of the headers
+  /// inside it held apart as submodules, can be put together afterwards.
+  template <typename T> struct Sourced {
+    T Dep;
+    FileID Origin;
+    uint64_t Seq = 0;
+  };
+  struct FileReads {
+    FileID FID;
+    std::string Path;
+    /// When the file was entered and left, on the same clock as Seq.
+    uint64_t Enter = 0, Exit = 0;
+    std::vector<Sourced<ConditionalDependency>> Conditional;
+    std::vector<Sourced<SyntacticDependency>> Syntactic;
+    std::vector<Sourced<SymbolDependency>> Symbol;
+    std::vector<Sourced<InclusionDependency>> Inclusion;
+    /// Each macro the file's text defined or undefined, with the file whose
+    /// directive the change replaced (invalid for none).
+    struct Change {
+      const IdentifierInfo *II;
+      FileID Replaced;
+      uint64_t Seq;
+    };
+    std::vector<Change> Changes;
+    /// The last state recorded per name, to record a name again when its
+    /// state changes.
+    llvm::DenseMap<const IdentifierInfo *, const MacroInfo *> SeenMacro;
+    llvm::DenseMap<const IdentifierInfo *, std::pair<bool, FileID>> SeenTest;
+    llvm::DenseMap<const IdentifierInfo *, std::pair<unsigned, FileID>>
+        SeenType;
+    llvm::DenseSet<const FileEntry *> SeenOnce;
+  };
+  /// Keep a FileReads for each file read inside a header being exported:
+  /// the files TrackOnly accepts and every file entered while one is open.
+  void recordFiles() { RecordFiles = true; }
+  /// Every FileReads kept, in the order the files were entered.
+  llvm::ArrayRef<FileReads> allFileReads() const { return Files; }
+  /// The FileReads of the file entered as \p FID, or nullptr.
+  const FileReads *fileReads(FileID FID) const {
+    auto It = FileIndex.find(FID);
+    return It == FileIndex.end() ? nullptr : &Files[It->second];
+  }
+  /// For the header entered as \p FID, once left: the file holding each of
+  /// its record's #includes and __FILE__s, in order.
+  struct Sites {
+    std::vector<FileID> Includes, FileNames;
+  };
+  const Sites *sitesFor(FileID FID) const {
+    for (size_t I = 0; I != CompletedFIDs.size(); ++I)
+      if (CompletedFIDs[I] == FID)
+        return &CompletedSites[I];
+    return nullptr;
+  }
   bool measuringIndependence() const { return Measuring; }
   /// What was measured for the header entered as \p FID, once left.
   const Independence *independenceFor(FileID FID) const;
@@ -320,6 +380,8 @@ private:
     HeaderDependencySet Deps;
     /// For measureIndependence.
     llvm::DenseMap<FileID, std::string> ReadFrom, AltersFrom;
+    /// For recordFiles: the file holding each #include and __FILE__ of Deps.
+    Sites At;
     /// Something happened in this header that this tracker cannot record
     /// soundly, so it must not be cached at all. Checked at frame close.
     bool Poisoned = false;
@@ -378,6 +440,21 @@ private:
   std::vector<FileID> CompletedFIDs;
   std::function<bool(FileID)> TrackOnly;
   bool Measuring = false;
+  /// See recordFiles.
+  bool RecordFiles = false;
+  std::vector<FileReads> Files;
+  llvm::DenseMap<FileID, size_t> FileIndex;
+  /// The FileReads of the files open, innermost last.
+  llvm::SmallVector<size_t, 8> OpenFiles;
+  uint64_t Clock = 0;
+  std::vector<Sites> CompletedSites;
+  FileReads *currentFile() {
+    return OpenFiles.empty() ? nullptr : &Files[OpenFiles.back()];
+  }
+  /// Records a read in the file holding it, if it is recorded and the state
+  /// read came from another file. Returns whether it recorded one.
+  void fileRead(FileReads *F, const IdentifierInfo *II, const MacroInfo *MI,
+                FileID Origin);
   std::vector<Independence> Measured;
   /// Where each file was first entered, for a #pragma once skip.
   llvm::DenseMap<const FileEntry *, FileID> FirstEntered;

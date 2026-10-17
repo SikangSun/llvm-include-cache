@@ -82,6 +82,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   for (const ConditionalDependency &D : Deps.Conditional) {
     W.str(D.MacroName);
     W.u8(D.WasDefined ? 1 : 0);
+    W.vu32(D.Cond);
   }
 
   Begin(MetadataView::ExpandsTo, Requires(SD::State::ExpandsTo));
@@ -89,6 +90,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     if (D.Required == SD::State::ExpandsTo) {
       W.str(D.Name);
       W.str(D.TokenSequence);
+      W.vu32(D.Cond);
     }
 
   Begin(MetadataView::MacroStacks, Deps.MacroStacks.size());
@@ -107,18 +109,22 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   for (const InclusionDependency &D : Deps.Inclusion) {
     W.str(D.HeaderPath);
     W.u8(static_cast<uint8_t>(D.Why));
+    W.vu32(D.Cond);
   }
 
   Begin(MetadataView::NotAMacro, Requires(SD::State::NotAMacro));
   for (const SD &D : Deps.Syntactic)
-    if (D.Required == SD::State::NotAMacro)
+    if (D.Required == SD::State::NotAMacro) {
       W.str(D.Name);
+      W.vu32(D.Cond);
+    }
 
   Begin(MetadataView::Symbol, Deps.Symbol.size());
   for (const SymbolDependency &D : Deps.Symbol) {
     W.str(D.Name);
     W.u8(static_cast<uint8_t>(D.Classification));
     W.str(D.ResolvedTypeName);
+    W.vu32(D.Cond);
   }
 
   Begin(MetadataView::Files, Deps.Files.size());
@@ -126,6 +132,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.str(F.Path);
     W.u64(F.Size);
     W.u64(static_cast<uint64_t>(F.ModTime));
+    W.vu32(F.Cond);
   }
 
   Begin(MetadataView::Includes, Deps.Includes.size());
@@ -136,6 +143,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.u32(static_cast<uint32_t>(D.Includer));
     W.str(D.Found);
     W.str(D.Name);
+    W.vu32(D.Cond);
   }
 
   Begin(MetadataView::FileNames, Deps.FileNames.size());
@@ -143,19 +151,24 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.u8(static_cast<uint8_t>(D.Which));
     W.u32(static_cast<uint32_t>(D.File));
     W.str(D.Text);
+    W.vu32(D.Cond);
   }
 
-  Begin(MetadataView::Declarations, Deps.Declarations.size());
-  for (const DeclarationDependency &D : Deps.Declarations) {
+  auto Declaration = [&](const DeclarationDependency &D) {
     W.u8(static_cast<uint8_t>(D.In));
     W.str(D.Name);
     W.str(D.Fingerprint);
-  }
+    W.vu32(D.Cond);
+  };
+  Begin(MetadataView::Declarations, Deps.Declarations.size());
+  for (const DeclarationDependency &D : Deps.Declarations)
+    Declaration(D);
 
   Begin(MetadataView::MacroEffects, Deps.MacroEffects.size());
   for (const MacroEffect &E : Deps.MacroEffects) {
     W.str(E.Name);
     W.u8(E.Defined ? 1 : 0);
+    W.vu32(E.Cond);
   }
 
   Begin(MetadataView::Diagnostics, Deps.Diagnostics.size());
@@ -173,12 +186,38 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
       W.str(F.Insert);
       W.u8(F.BeforePreviousInsertions ? 1 : 0);
     }
+    W.vu32(D.Cond);
   }
 
   Begin(MetadataView::WarningPragmas, Deps.WarningPragmas.size());
   for (const WarningPragma &P : Deps.WarningPragmas) {
     W.u8(P.Severity);
     W.str(P.Option);
+  }
+
+  Begin(MetadataView::Submodules, Deps.Submodules.size());
+  for (const SubmoduleRecord &S : Deps.Submodules) {
+    W.str(S.Name);
+    W.u32(static_cast<uint32_t>(S.Parent));
+    W.str(S.Guard);
+    W.str(S.Path);
+  }
+
+  Begin(MetadataView::Conditions, Deps.Conditions.size());
+  for (const DependencyCondition &C : Deps.Conditions) {
+    W.u32(static_cast<uint32_t>(C.Owner));
+    W.u32(static_cast<uint32_t>(C.Provider));
+  }
+
+  Begin(MetadataView::Provided, Deps.Provided.size());
+  for (const ProvidedDeclaration &P : Deps.Provided) {
+    Declaration(P.Decl);
+    W.vu32(P.Uses.size());
+    for (const ProvidedDeclaration::Use &U : P.Uses) {
+      W.vu32(U.Index);
+      W.u8(static_cast<uint8_t>(U.Of));
+      W.str(U.Member);
+    }
   }
 }
 
@@ -190,6 +229,7 @@ ConditionalView ConditionalView::read(ByteReader &R) {
   ConditionalView D;
   D.MacroName = R.str();
   D.WasDefined = upTo(R, 1) != 0;
+  D.Cond = R.vu32();
   return D;
 }
 
@@ -197,10 +237,16 @@ ExpandsToView ExpandsToView::read(ByteReader &R) {
   ExpandsToView D;
   D.Name = R.str();
   D.TokenSequence = R.str();
+  D.Cond = R.vu32();
   return D;
 }
 
-NameView NameView::read(ByteReader &R) { return {R.str()}; }
+NameView NameView::read(ByteReader &R) {
+  NameView N;
+  N.Name = R.str();
+  N.Cond = R.vu32();
+  return N;
+}
 
 SymbolView SymbolView::read(ByteReader &R) {
   SymbolView D;
@@ -208,6 +254,7 @@ SymbolView SymbolView::read(ByteReader &R) {
   D.Classification = static_cast<SymbolClassification>(
       upTo(R, static_cast<uint8_t>(SymbolClassification::Template)));
   D.ResolvedTypeName = R.str();
+  D.Cond = R.vu32();
   return D;
 }
 
@@ -216,6 +263,7 @@ InclusionView InclusionView::read(ByteReader &R) {
   D.HeaderPath = R.str();
   D.Why = static_cast<InclusionDependency::Reason>(
       upTo(R, static_cast<uint8_t>(InclusionDependency::Reason::Import)));
+  D.Cond = R.vu32();
   return D;
 }
 
@@ -224,6 +272,7 @@ FileStampView FileStampView::read(ByteReader &R) {
   F.Path = R.str();
   F.Size = R.u64();
   F.ModTime = static_cast<int64_t>(R.u64());
+  F.Cond = R.vu32();
   return F;
 }
 
@@ -236,6 +285,7 @@ IncludeView IncludeView::read(ByteReader &R) {
   D.Includer = static_cast<int32_t>(R.u32());
   D.Found = R.str();
   D.Name = R.str();
+  D.Cond = R.vu32();
   return D;
 }
 
@@ -245,6 +295,7 @@ FileNameView FileNameView::read(ByteReader &R) {
       upTo(R, static_cast<uint8_t>(FileNameDependency::Macro::FileName)));
   D.File = static_cast<int32_t>(R.u32());
   D.Text = R.str();
+  D.Cond = R.vu32();
   return D;
 }
 
@@ -254,13 +305,34 @@ DeclarationView DeclarationView::read(ByteReader &R) {
       upTo(R, static_cast<uint8_t>(DeclarationDependency::Space::Tag)));
   D.Name = R.str();
   D.Fingerprint = R.str();
+  D.Cond = R.vu32();
   return D;
+}
+
+ProvidedView ProvidedView::read(ByteReader &R) {
+  ProvidedView P;
+  DeclarationView D = DeclarationView::read(R);
+  P.In = D.In;
+  P.Name = D.Name;
+  P.Fingerprint = D.Fingerprint;
+  P.Cond = D.Cond;
+  uint32_t N = R.vu32();
+  for (uint32_t I = 0; I != N && R.ok(); ++I) {
+    Use U;
+    U.Index = R.vu32();
+    U.Of = static_cast<ProvidedDeclaration::How>(
+        upTo(R, static_cast<uint8_t>(ProvidedDeclaration::How::Member)));
+    U.Member = R.str();
+    P.Uses.push_back(U);
+  }
+  return P;
 }
 
 MacroEffectView MacroEffectView::read(ByteReader &R) {
   MacroEffectView E;
   E.Name = R.str();
   E.Defined = upTo(R, 1) != 0;
+  E.Cond = R.vu32();
   return E;
 }
 
@@ -294,7 +366,24 @@ DiagnosticView DiagnosticView::read(ByteReader &R) {
     F.BeforePreviousInsertions = upTo(R, 1) != 0;
     D.FixIts.push_back(std::move(F));
   }
+  D.Cond = R.vu32();
   return Out;
+}
+
+SubmoduleView SubmoduleView::read(ByteReader &R) {
+  SubmoduleView S;
+  S.Name = R.str();
+  S.Parent = static_cast<int32_t>(R.u32());
+  S.Guard = R.str();
+  S.Path = R.str();
+  return S;
+}
+
+ConditionView ConditionView::read(ByteReader &R) {
+  ConditionView C;
+  C.Owner = static_cast<int32_t>(R.u32());
+  C.Provider = static_cast<int32_t>(R.u32());
+  return C;
 }
 
 WarningPragmaView WarningPragmaView::read(ByteReader &R) {
@@ -341,7 +430,8 @@ bool MetadataView::validate() const {
       !symbol().valid() || !files().valid() || !includes().valid() ||
       !fileNames().valid() || !declarations().valid() ||
       !macroEffects().valid() || !diagnostics().valid() ||
-      !warningPragmas().valid())
+      !warningPragmas().valid() || !submodules().valid() ||
+      !conditions().valid() || !provided().valid())
     return false;
   // A name the check looks up must be one: an empty one would pass as
   // "not a macro" whatever the compile defines.
@@ -361,9 +451,38 @@ bool MetadataView::validate() const {
       return false;
     ++I;
   }
-  return llvm::all_of(fileNames(), [&](const FileNameView &D) {
-    return D.File >= -1 && D.File < I;
-  });
+  if (!llvm::all_of(fileNames(), [&](const FileNameView &D) {
+        return D.File >= -1 && D.File < I;
+      }))
+    return false;
+  // REPORT.md T17: each submodule inside an earlier one or the copy's own,
+  // named, with a guard or a file to tell whether the compile read it; each
+  // condition naming submodules there are; each element's condition one
+  // there is. Otherwise an element would be checked, or skipped, by a
+  // submodule that does not exist.
+  int32_t S = 0;
+  for (const SubmoduleView &M : submodules()) {
+    if (M.Name.empty() || M.Parent < -1 || M.Parent >= S ||
+        (M.Guard.empty() && M.Path.empty()))
+      return false;
+    ++S;
+  }
+  if (!llvm::all_of(conditions(), [&](const ConditionView &C) {
+        return C.Owner >= -1 && C.Owner < S && C.Provider >= -1 &&
+               C.Provider < S;
+      }))
+    return false;
+  uint32_t NC = conditions().size();
+  auto Fits = [&](auto Section) {
+    return llvm::all_of(Section, [&](const auto &E) { return E.Cond <= NC; });
+  };
+  return Fits(conditional()) && Fits(expandsTo()) && Fits(inclusion()) &&
+         Fits(notAMacro()) && Fits(symbol()) && Fits(files()) &&
+         Fits(includes()) && Fits(fileNames()) && Fits(declarations()) &&
+         Fits(macroEffects()) && Fits(provided()) &&
+         llvm::all_of(diagnostics(), [&](const DiagnosticView &D) {
+           return D.Diagnostic.Cond <= NC;
+         });
 }
 
 std::optional<HeaderDependencySet>
@@ -374,36 +493,49 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
     return std::nullopt;
   HeaderDependencySet Deps;
   for (const ConditionalView &D : V->conditional())
-    Deps.Conditional.push_back({D.MacroName.str(), D.WasDefined});
+    Deps.Conditional.push_back({D.MacroName.str(), D.WasDefined, D.Cond});
   for (const ExpandsToView &D : V->expandsTo())
     Deps.Syntactic.push_back({D.Name.str(),
                               SyntacticDependency::State::ExpandsTo,
-                              D.TokenSequence.str()});
+                              D.TokenSequence.str(), D.Cond});
   for (const NameView &N : V->notAMacro())
     Deps.Syntactic.push_back(
-        {N.Name.str(), SyntacticDependency::State::NotAMacro, ""});
+        {N.Name.str(), SyntacticDependency::State::NotAMacro, "", N.Cond});
   for (const MacroStackView &E : V->macroStacks())
     Deps.MacroStacks.push_back(E.Effect);
   for (const InclusionView &D : V->inclusion())
-    Deps.Inclusion.push_back({D.HeaderPath.str(), D.Why});
+    Deps.Inclusion.push_back({D.HeaderPath.str(), D.Why, D.Cond});
   for (const SymbolView &D : V->symbol())
     Deps.Symbol.push_back(
-        {D.Name.str(), D.Classification, D.ResolvedTypeName.str()});
+        {D.Name.str(), D.Classification, D.ResolvedTypeName.str(), D.Cond});
   for (const FileStampView &F : V->files())
-    Deps.Files.push_back({F.Path.str(), F.Size, F.ModTime});
+    Deps.Files.push_back({F.Path.str(), F.Size, F.ModTime, F.Cond});
   for (const IncludeView &D : V->includes())
     Deps.Includes.push_back({D.K, D.Angled, D.Spelled.str(), D.Includer,
-                             D.Found.str(), D.Name.str()});
+                             D.Found.str(), D.Name.str(), D.Cond});
   for (const FileNameView &D : V->fileNames())
-    Deps.FileNames.push_back({D.Which, D.File, D.Text.str()});
+    Deps.FileNames.push_back({D.Which, D.File, D.Text.str(), D.Cond});
   for (const DeclarationView &D : V->declarations())
-    Deps.Declarations.push_back({D.In, D.Name.str(), D.Fingerprint.str()});
+    Deps.Declarations.push_back(
+        {D.In, D.Name.str(), D.Fingerprint.str(), D.Cond});
   for (const MacroEffectView &E : V->macroEffects())
-    Deps.MacroEffects.push_back({E.Name.str(), E.Defined});
+    Deps.MacroEffects.push_back({E.Name.str(), E.Defined, E.Cond});
   for (const DiagnosticView &D : V->diagnostics())
     Deps.Diagnostics.push_back(D.Diagnostic);
   for (const WarningPragmaView &P : V->warningPragmas())
     Deps.WarningPragmas.push_back(P.Pragma);
+  for (const SubmoduleView &S : V->submodules())
+    Deps.Submodules.push_back(
+        {S.Name.str(), S.Parent, S.Guard.str(), S.Path.str()});
+  for (const ConditionView &C : V->conditions())
+    Deps.Conditions.push_back({C.Owner, C.Provider});
+  for (const ProvidedView &D : V->provided()) {
+    ProvidedDeclaration P;
+    P.Decl = {D.In, D.Name.str(), D.Fingerprint.str(), D.Cond};
+    for (const ProvidedView::Use &U : D.Uses)
+      P.Uses.push_back({U.Index, U.Of, U.Member.str()});
+    Deps.Provided.push_back(std::move(P));
+  }
   Deps.HeaderName = V->headerName().str();
   Deps.Entry = V->entry();
   Deps.Exit = V->exit();

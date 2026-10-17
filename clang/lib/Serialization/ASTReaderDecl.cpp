@@ -2844,7 +2844,13 @@ RedeclarableResult ASTDeclReader::VisitRedeclarable(Redeclarable<T> *D) {
   } else {
     // This declaration was not the first local declaration. Read the first
     // local declaration now, to trigger the import of other redeclarations.
-    (void)readDecl();
+    GlobalDeclID FirstLocalID = readDeclID();
+    (void)Reader.GetDecl(FirstLocalID);
+    // A header cache part's first declaration of the entity is the
+    // compile's own (ASTReader::setPartSkip): this one joins that chain,
+    // which the part's chain record does not reach.
+    if (Reader.isPartSwapped(FirstLocalID))
+      Reader.PendingPartAttach.push_back(static_cast<T *>(D));
   }
 
   auto *FirstDecl = cast_or_null<T>(Reader.GetDecl(FirstDeclID));
@@ -3971,6 +3977,72 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
   return Found;
 }
 
+bool ASTReader::isPartSkippedDecl(GlobalDeclID ID) {
+  if (PartSkips.empty() || ID < NUM_PREDEF_DECL_IDS)
+    return false;
+  ModuleFile *F = getOwningModuleFile(ID);
+  auto It = F ? PartSkips.find(F) : PartSkips.end();
+  if (It == PartSkips.end())
+    return false;
+  PartSkipState &State = It->second;
+  // Clang scans a context's declarations again for each unnamed one it
+  // completes (CompleteRedeclChain), so one declaration is asked about many
+  // times: ~300,000 times in a cpython compile, each a file lookup.
+  unsigned Local = ID.getLocalDeclIndex();
+  if (State.Known[Local])
+    return State.Known[Local] == 2;
+  SourceLocation Loc =
+      ReadSourceLocation(*F, F->DeclOffsets[Local].getRawLoc());
+  bool Skipped = false;
+  if (Loc.isValid()) {
+    SourceManager &SM = getSourceManager();
+    FileID FID = SM.getFileID(SM.getExpansionLoc(Loc));
+    // The nearest submodule header the file is in, through the #includes
+    // that reached it.
+    SmallVector<FileID, 4> Walked;
+    for (FileID At = FID; At.isValid();) {
+      if (auto Known = State.SkippedFiles.find(At);
+          Known != State.SkippedFiles.end()) {
+        Skipped = Known->second;
+        break;
+      }
+      Walked.push_back(At);
+      if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(At))
+        if (auto H = State.Headers.find(&FE->getFileEntry());
+            H != State.Headers.end()) {
+          Skipped = H->second;
+          break;
+        }
+      SourceLocation Inc = SM.getIncludeLoc(At);
+      At = Inc.isValid() ? SM.getFileID(Inc) : FileID();
+    }
+    for (FileID W : Walked)
+      State.SkippedFiles[W] = Skipped;
+  }
+  State.Known[Local] = Skipped ? 2 : 1;
+  return Skipped;
+}
+
+bool ASTReader::isPartSwapped(GlobalDeclID ID) {
+  if (PartSkips.empty() || ID < NUM_PREDEF_DECL_IDS)
+    return false;
+  ModuleFile *F = getOwningModuleFile(ID);
+  auto It = F ? PartSkips.find(F) : PartSkips.end();
+  return It != PartSkips.end() &&
+         It->second.Swapped.count(translateGlobalDeclIDToIndex(ID));
+}
+
+void ASTReader::attachPartRedecl(Decl *D) {
+  Decl *Canon = D->getCanonicalDecl();
+  Decl *Latest = ASTDeclReader::getMostRecentDecl(Canon);
+  if (!Latest)
+    Latest = Canon;
+  if (Latest == D)
+    return;
+  ASTDeclReader::attachPreviousDecl(*this, D, Latest, Canon);
+  ASTDeclReader::attachLatestDecl(Canon, D);
+}
+
 Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
   SourceLocation DeclLoc;
   RecordLocation Loc = DeclCursorForID(ID, DeclLoc);
@@ -4409,7 +4481,8 @@ void ASTReader::PassInterestingDeclsToConsumer() {
   // Ensure that we've loaded all potentially-interesting declarations
   // that need to be eagerly loaded.
   for (auto ID : EagerlyDeserializedDecls)
-    GetDecl(ID);
+    if (!isPartSkippedDecl(ID))
+      GetDecl(ID);
   EagerlyDeserializedDecls.clear();
 
   auto ConsumingPotentialInterestingDecls = [this]() {
@@ -4624,7 +4697,11 @@ void ASTReader::loadPendingDeclChain(Decl *FirstLocal, uint64_t LocalOffset) {
   Decl *MostRecent = FirstLocal;
   for (unsigned I = 0, N = Record.size(); I != N; ++I) {
     unsigned Idx = N - I - 1;
-    auto *D = ReadDecl(*M, Record, Idx);
+    GlobalDeclID ID = ReadDeclID(*M, Record, Idx);
+    // One a skipped submodule owns stays out of the chain (setPartSkips).
+    if (isPartSkippedDecl(ID))
+      continue;
+    auto *D = GetDecl(ID);
     ASTDeclReader::attachPreviousDecl(*this, D, MostRecent, CanonDecl);
     MostRecent = D;
   }

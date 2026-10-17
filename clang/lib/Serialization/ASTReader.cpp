@@ -3752,6 +3752,21 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
       if (F.LocalNumDecls > 0)
         DeclsLoaded.resize(DeclsLoaded.size() + F.LocalNumDecls);
 
+      // A header cache part's skipped submodules (setPartSkip).
+      if (PendingPartSkip) {
+        PartSkipState &State = PartSkips[&F];
+        State.Known.assign(F.LocalNumDecls, 0);
+        for (const auto &[FE, Skipped] : PendingPartSkip->Headers)
+          if (FE)
+            State.Headers[FE] = Skipped;
+        for (const auto &[Local, D] : PendingPartSkip->Swaps) {
+          if (Local >= F.LocalNumDecls || !D)
+            continue;
+          DeclsLoaded[F.BaseDeclIndex + Local] = D;
+          State.Swapped.insert(F.BaseDeclIndex + Local);
+        }
+      }
+
       break;
     }
 
@@ -6255,6 +6270,9 @@ llvm::Error ASTReader::ReadSubmoduleBlock(ModuleFile &F,
 
       CurrentModule = std::invoke(CreateModule, &ModMap, Name, ParentModule,
                                   IsFramework, IsExplicit);
+      if (ParentModule && PendingPartSkip &&
+          llvm::is_contained(PendingPartSkip->Names, Name))
+        PartSkippedModules.insert(CurrentModule);
 
       SubmoduleID GlobalIndex = GlobalID - NUM_PREDEF_SUBMODULE_IDS;
       if (GlobalIndex >= SubmodulesLoaded.size() ||
@@ -8672,6 +8690,8 @@ void ASTReader::FindExternalLexicalDecls(
         PredefsVisited[ID] = true;
       }
 
+      if (isPartSkippedDecl(getGlobalDeclID(*M, LocalDeclID::get(*this, *M, ID))))
+        continue;
       if (Decl *D = GetLocalDecl(*M, LocalDeclID::get(*this, *M, ID))) {
         assert(D->getKind() == K && "wrong kind for lexical decl");
         if (!DC->isDeclInLexicalTraversal(D))
@@ -8784,6 +8804,8 @@ bool ASTReader::FindExternalVisibleDeclsByName(const DeclContext *DC,
 
   auto Find = [&, this](auto &&Table, auto &&Key) {
     for (GlobalDeclID ID : Table.find(Key)) {
+      if (isPartSkippedDecl(ID))
+        continue;
       NamedDecl *ND = cast<NamedDecl>(GetDecl(ID));
       if (ND->getDeclName() == Name && Found.insert(ND).second)
         Decls.push_back(ND);
@@ -9527,6 +9549,8 @@ void ASTReader::ReadMismatchingDeleteExpressions(llvm::MapVector<
 void ASTReader::ReadTentativeDefinitions(
                   SmallVectorImpl<VarDecl *> &TentativeDefs) {
   for (unsigned I = 0, N = TentativeDefinitions.size(); I != N; ++I) {
+    if (isPartSkippedDecl(TentativeDefinitions[I]))
+      continue;
     VarDecl *Var = dyn_cast_or_null<VarDecl>(GetDecl(TentativeDefinitions[I]));
     if (Var)
       TentativeDefs.push_back(Var);
@@ -9537,6 +9561,8 @@ void ASTReader::ReadTentativeDefinitions(
 void ASTReader::ReadUnusedFileScopedDecls(
                                SmallVectorImpl<const DeclaratorDecl *> &Decls) {
   for (unsigned I = 0, N = UnusedFileScopedDecls.size(); I != N; ++I) {
+    if (isPartSkippedDecl(UnusedFileScopedDecls[I]))
+      continue;
     DeclaratorDecl *D
       = dyn_cast_or_null<DeclaratorDecl>(GetDecl(UnusedFileScopedDecls[I]));
     if (D)
@@ -9558,6 +9584,8 @@ void ASTReader::ReadDelegatingConstructors(
 
 void ASTReader::ReadExtVectorDecls(SmallVectorImpl<TypedefNameDecl *> &Decls) {
   for (unsigned I = 0, N = ExtVectorDecls.size(); I != N; ++I) {
+    if (isPartSkippedDecl(ExtVectorDecls[I]))
+      continue;
     TypedefNameDecl *D
       = dyn_cast_or_null<TypedefNameDecl>(GetDecl(ExtVectorDecls[I]));
     if (D)
@@ -9740,6 +9768,12 @@ void ASTReader::SetGloballyVisibleDecls(
   }
 
   for (unsigned I = 0, N = DeclIDs.size(); I != N; ++I) {
+    // A part's skipped submodule's declaration: the compile has its own, or
+    // its text never declared it here (setPartSkip).
+    if (isPartSkippedDecl(DeclIDs[I])) {
+      ++PartSkipsUnread;
+      continue;
+    }
     if (!SemaObj) {
       // Queue this declaration so that it will be added to the
       // translation unit scope and identifier's declaration chain
@@ -10502,7 +10536,8 @@ void ASTReader::finishPendingActions() {
          !PendingDeducedVarTypes.empty() || !PendingDeclChains.empty() ||
          !PendingMacroIDs.empty() || !PendingDeclContextInfos.empty() ||
          !PendingUpdateRecords.empty() ||
-         !PendingObjCExtensionIvarRedeclarations.empty()) {
+         !PendingObjCExtensionIvarRedeclarations.empty() ||
+         !PendingPartAttach.empty()) {
     // If any identifiers with corresponding top-level declarations have
     // been loaded, load those declarations now.
     using TopLevelDeclsMap =
@@ -10555,6 +10590,9 @@ void ASTReader::finishPendingActions() {
       loadPendingDeclChain(PendingDeclChains[I].first,
                            PendingDeclChains[I].second);
     PendingDeclChains.clear();
+    for (unsigned I = 0; I != PendingPartAttach.size(); ++I)
+      attachPartRedecl(PendingPartAttach[I]);
+    PendingPartAttach.clear();
 
     // Make the most recent of the top-level declarations visible.
     for (TopLevelDeclsMap::iterator TLD = TopLevelDecls.begin(),

@@ -40,6 +40,9 @@ namespace ast_cache {
 struct ConditionalDependency {
   std::string MacroName;
   bool WasDefined = false;
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// An identifier the preprocessor considered for macro expansion while
@@ -67,6 +70,9 @@ struct SyntacticDependency {
   /// a separator that cannot appear in a single spelling, so two different
   /// token sequences never collide into the same recorded string.
   std::string TokenSequence;
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// An identifier's grammar-ambiguity classification (is it a type-name,
@@ -87,6 +93,9 @@ struct SymbolDependency {
   /// resolved type (e.g. its canonical name), so a hit can check "still
   /// resolves to the same type," not just "still resolves to some type."
   std::string ResolvedTypeName;
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// An #include inside the header was suppressed by Clang's multiple-include
@@ -101,6 +110,9 @@ struct InclusionDependency {
   std::string HeaderPath;
   enum class Reason : uint8_t { PragmaOnce, Import };
   Reason Why = Reason::PragmaOnce;
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// An #include, #include_next, __has_include or __has_include_next inside
@@ -140,6 +152,9 @@ struct IncludeDependency {
     return A.K == B.K && A.Angled == B.Angled && A.Spelled == B.Spelled &&
            A.Includer == B.Includer && A.Found == B.Found && A.Name == B.Name;
   }
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// A __FILE__ or __FILE_NAME__ expanded in the header or in a file the header
@@ -165,6 +180,9 @@ struct FileNameDependency {
                          const FileNameDependency &B) {
     return A.Which == B.Which && A.File == B.File && A.Text == B.Text;
   }
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// A declaration from outside the header that the header's part carries a
@@ -186,6 +204,9 @@ struct DeclarationDependency {
                          const DeclarationDependency &B) {
     return A.In == B.In && A.Name == B.Name && A.Fingerprint == B.Fingerprint;
   }
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// A file whose text a part holds the parse of, with its size and
@@ -204,6 +225,9 @@ struct FileStamp {
   friend bool operator==(const FileStamp &A, const FileStamp &B) {
     return A.Path == B.Path && A.Size == B.Size && A.ModTime == B.ModTime;
   }
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// The pragma state that was active at a single point, reduced to the values
@@ -239,6 +263,9 @@ struct PragmaSnapshot {
 struct MacroEffect {
   std::string Name;
   bool Defined = false;
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
 };
 
 /// What the header's #pragma push_macro and pop_macro did to one name's
@@ -290,6 +317,59 @@ struct SavedDiagnostic {
     bool BeforePreviousInsertions = false;
   };
   std::vector<FixIt> FixIts;
+  /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
+  /// index of its condition plus one (REPORT.md T17).
+  uint32_t Cond = 0;
+};
+
+/// A header inside a copy held as a submodule of the copy's module
+/// (REPORT.md T17): git's refs.h's copy holds object.h as one. Where the
+/// compile has read object.h already -- its guard is defined -- the
+/// submodule stays hidden and its dependencies are not checked; elsewhere
+/// they are, and it is made visible.
+struct SubmoduleRecord {
+  /// The submodule's name in the copy's module.
+  std::string Name;
+  /// The submodule holding this one, by index; -1 for the copy's module.
+  int32_t Parent = -1;
+  /// The header's include guard; empty for #pragma once, with Path the file.
+  std::string Guard;
+  std::string Path;
+};
+
+/// When a dependency applies: where its submodule (Owner) is loaded, and,
+/// for one taken from a submodule by the lines outside it (Provider), where
+/// that submodule is skipped. -1 for none.
+struct DependencyCondition {
+  int32_t Owner = -1;
+  int32_t Provider = -1;
+};
+
+/// What a part's lines outside a submodule take from it (REPORT.md T17):
+/// refs.h's lines use object.h's struct object. Where the submodule is
+/// skipped, the compile's own declaration of the name, with the same
+/// fingerprint, stands for each of the part's declarations in Uses, which
+/// the reader then never reads.
+struct ProvidedDeclaration {
+  DeclarationDependency Decl;
+  /// How a declaration of the part is found from the compile's one.
+  enum class How : uint8_t { Self, TagOfTypedef, Member };
+  struct Use {
+    /// The part's local declaration index.
+    uint32_t Index = 0;
+    How Of = How::Self;
+    /// For How::Member, the member of the struct or union (the typedef's,
+    /// for a typedef) by name.
+    std::string Member;
+    friend bool operator==(const Use &A, const Use &B) {
+      return A.Index == B.Index && A.Of == B.Of && A.Member == B.Member;
+    }
+  };
+  std::vector<Use> Uses;
+  friend bool operator==(const ProvidedDeclaration &A,
+                         const ProvidedDeclaration &B) {
+    return A.Decl == B.Decl && A.Decl.Cond == B.Decl.Cond && A.Uses == B.Uses;
+  }
 };
 
 struct HeaderDependencySet {
@@ -341,6 +421,13 @@ struct HeaderDependencySet {
   /// The header's pushes and pops that reach outside it, one per name. A hit
   /// checks Popped and replays the rest before MacroEffects.
   std::vector<MacroStackEffect> MacroStacks;
+  /// REPORT.md T17: the headers held as submodules, the conditions the
+  /// elements above refer to, and the declarations the copy's lines take
+  /// from a submodule, checked against the compile's own where it is
+  /// skipped.
+  std::vector<SubmoduleRecord> Submodules;
+  std::vector<DependencyCondition> Conditions;
+  std::vector<ProvidedDeclaration> Provided;
 };
 
 /// One header's dependency set, as observed over the region between entering

@@ -2745,7 +2745,8 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
       } else if (auto *VisMD = dyn_cast<VisibilityMacroDirective>(MD)) {
         Record.push_back(VisMD->isPublic());
       }
-      ModuleMacroRecord.push_back(getSubmoduleID(WritingModule));
+      ModuleMacroRecord.push_back(getSubmoduleID(
+          partMacroOwner(MD->getLocation(), WritingModule)));
       AddMacroRef(MD->getMacroInfo(), Name, ModuleMacroRecord);
       Stream.EmitRecord(PP_MODULE_MACRO, ModuleMacroRecord);
       ModuleMacroRecord.clear();
@@ -3452,8 +3453,11 @@ void ASTWriter::WriteType(ASTContext &Context, QualType T) {
   assert(Idx.getValue() >= FirstTypeID && "Writing predefined type");
 
   // Emit the type's representation.
+  if (PartTrack)
+    PartRefType = Idx.getValue() - FirstTypeID;
   uint64_t Offset =
       ASTTypeWriter(Context, *this).write(T) - DeclTypesBlockStartOffset;
+  PartRefType = -1;
 
   // Record the offset for this type.
   uint64_t Index = Idx.getValue() - FirstTypeID;
@@ -3980,15 +3984,26 @@ public:
     // header, or one a module loaded since holds, may have replaced the
     // header's own. The part lists the latest declaration it holds, and
     // none when it holds none.
+    // With submodules, the latest of each submodule's: where the one
+    // holding the latest is skipped, the others still load (REPORT.md T17).
     SmallVector<NamedDecl *, 16> Held;
     for (NamedDecl *D : Decls) {
+      SmallVector<Module *, 2> Owners;
       for (Decl *R = getDeclForLocalLookup(PP.getLangOpts(), D); R;
            R = R->getPreviousDecl()) {
         if (R->isFromASTFile() || !Writer.wasDeclEmitted(R))
           continue;
+        if (!Writer.hasPartOwners()) {
+          if (!llvm::is_contained(Held, R))
+            Held.push_back(cast<NamedDecl>(R));
+          break;
+        }
+        Module *Owner = Writer.partOwnerAt(R->getLocation());
+        if (llvm::is_contained(Owners, Owner))
+          continue;
+        Owners.push_back(Owner);
         if (!llvm::is_contained(Held, R))
           Held.push_back(cast<NamedDecl>(R));
-        break;
       }
     }
     return Held;
@@ -5579,6 +5594,17 @@ ASTWriter::WriteAST(llvm::PointerUnion<Sema *, Preprocessor *> Subject,
     PartNameReferences.clear();
     PartNameReferenceFailure.clear();
     PartDroppedLocations = 0;
+    PartRefOwner = PartRefType = -1;
+    PartTrack = bool(PartOwner);
+    PartOwnerModules.assign(1, nullptr);
+    PartOwnerIndex.clear();
+    PartOwnerTypes.assign(1, llvm::BitVector());
+    PartDeclOwner.clear();
+    PartDeclByIndex.clear();
+    PartTypeDecls.clear();
+    PartTypeTypes.clear();
+    PartCrossSeen.clear();
+    PartCrossRefs.clear();
   }
   ASTFileSignature Signature = WriteASTCore(SemaPtr, isysroot, WritingModule);
   // While the writer still knows where each file went (setPartLocations).
@@ -6569,6 +6595,9 @@ void ASTWriter::WriteDeclAndTypes(ASTContext &Context) {
     }
   } while (!DeclUpdates.empty());
 
+  if (PartTrack)
+    findPartCrossReferences();
+
   DoneWritingDeclsAndTypes = true;
 
   // DelayedNamespace is only meaningful in reduced BMI.
@@ -7171,7 +7200,118 @@ void ASTRecordWriter::AddTypeLoc(TypeLoc TL) {
 
 void ASTWriter::AddTypeRef(ASTContext &Context, QualType T,
                            RecordDataImpl &Record) {
-  Record.push_back(GetOrCreateTypeID(Context, T));
+  TypeID ID = GetOrCreateTypeID(Context, T);
+  Record.push_back(ID);
+  if (PartTrack && (PartRefOwner >= 0 || PartRefType >= 0))
+    notePartTypeRef(ID);
+}
+
+unsigned ASTWriter::partOwnerIndex(Module *M) {
+  if (!M)
+    return 0;
+  auto [It, New] = PartOwnerIndex.try_emplace(M, PartOwnerModules.size());
+  if (New) {
+    PartOwnerModules.push_back(M);
+    PartOwnerTypes.emplace_back();
+  }
+  return It->second;
+}
+
+int ASTWriter::partDeclOwner(const Decl *D, unsigned LocalIndex) {
+  if (PartDeclOwner.size() <= LocalIndex) {
+    PartDeclOwner.resize(LocalIndex + 1, -1);
+    PartDeclByIndex.resize(LocalIndex + 1, nullptr);
+  }
+  int &Owner = PartDeclOwner[LocalIndex];
+  if (Owner < 0) {
+    Owner = partOwnerIndex(PartOwner(D->getLocation()));
+    PartDeclByIndex[LocalIndex] = D;
+  }
+  return Owner;
+}
+
+bool ASTWriter::partCrosses(unsigned From, unsigned To) const {
+  if (!To || From == To)
+    return false;
+  // Inside the submodule it refers into, it is skipped where that is.
+  for (const Module *M = PartOwnerModules[From]; M; M = M->Parent)
+    if (M == PartOwnerModules[To])
+      return false;
+  return true;
+}
+
+void ASTWriter::notePartDeclRef(const Decl *D, LocalDeclID ID) {
+  if (ID.getRawValue() < FirstDeclID.getRawValue())
+    return;
+  unsigned Index = ID.getRawValue() - FirstDeclID.getRawValue();
+  int Owner = partDeclOwner(D, Index);
+  if (Owner <= 0)
+    return;
+  if (PartRefOwner >= 0) {
+    if (partCrosses(PartRefOwner, Owner) &&
+        PartCrossSeen.insert({Index, unsigned(PartRefOwner)}).second)
+      PartCrossRefs.push_back({D, PartOwnerModules[PartRefOwner],
+                               PartOwnerModules[Owner]});
+    return;
+  }
+  if (PartTypeDecls.size() <= unsigned(PartRefType))
+    PartTypeDecls.resize(PartRefType + 1);
+  PartTypeDecls[PartRefType].push_back(Index);
+}
+
+void ASTWriter::notePartTypeRef(TypeID ID) {
+  if (ID >> 32)
+    return;
+  uint64_t Value = (ID & 0xffffffffu) >> Qualifiers::FastWidth;
+  if (Value < FirstTypeID)
+    return;
+  unsigned T = Value - FirstTypeID;
+  if (PartRefOwner >= 0) {
+    llvm::BitVector &Types = PartOwnerTypes[PartRefOwner];
+    if (Types.size() <= T)
+      Types.resize(T + 1);
+    Types.set(T);
+    return;
+  }
+  if (PartTypeTypes.size() <= unsigned(PartRefType))
+    PartTypeTypes.resize(PartRefType + 1);
+  PartTypeTypes[PartRefType].push_back(T);
+}
+
+void ASTWriter::findPartCrossReferences() {
+  // The submodules' declarations each type refers to, through the types it
+  // refers to.
+  size_t NumTypes = std::max(PartTypeDecls.size(), PartTypeTypes.size());
+  std::vector<char> State(NumTypes, 0);
+  std::vector<SmallVector<unsigned, 2>> Reach(NumTypes);
+  std::function<const SmallVector<unsigned, 2> &(unsigned)> Find =
+      [&](unsigned T) -> const SmallVector<unsigned, 2> & {
+    static const SmallVector<unsigned, 2> None;
+    if (T >= NumTypes)
+      return None;
+    if (State[T])
+      return Reach[T];
+    State[T] = 1;
+    SmallVector<unsigned, 2> R;
+    if (T < PartTypeDecls.size())
+      R.append(PartTypeDecls[T].begin(), PartTypeDecls[T].end());
+    if (T < PartTypeTypes.size())
+      for (unsigned Inner : PartTypeTypes[T])
+        for (unsigned D : Find(Inner))
+          R.push_back(D);
+    llvm::sort(R);
+    R.erase(llvm::unique(R), R.end());
+    Reach[T] = std::move(R);
+    return Reach[T];
+  };
+  for (unsigned From = 0; From != PartOwnerTypes.size(); ++From)
+    for (unsigned T : PartOwnerTypes[From].set_bits())
+      for (unsigned D : Find(T)) {
+        unsigned To = PartDeclOwner[D];
+        if (partCrosses(From, To) && PartCrossSeen.insert({D, From}).second)
+          PartCrossRefs.push_back({PartDeclByIndex[D], PartOwnerModules[From],
+                                   PartOwnerModules[To]});
+      }
 }
 
 template <typename IdxForTypeTy>
@@ -7244,7 +7384,10 @@ void ASTWriter::AddEmittedDeclRef(const Decl *D, RecordDataImpl &Record) {
 }
 
 void ASTWriter::AddDeclRef(const Decl *D, RecordDataImpl &Record) {
-  Record.push_back(GetDeclRef(D).getRawValue());
+  LocalDeclID ID = GetDeclRef(D);
+  Record.push_back(ID.getRawValue());
+  if (PartTrack && D && (PartRefOwner >= 0 || PartRefType >= 0))
+    notePartDeclRef(D, ID);
 }
 
 LocalDeclID ASTWriter::GetDeclRef(const Decl *D) {

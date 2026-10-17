@@ -384,4 +384,107 @@ TEST(DependencySerializationTest, ASectionTableOutOfOrderIsRejected) {
   EXPECT_FALSE(MetadataView::open(Out).has_value());
 }
 
+
+/// makeFullSet with refs.h's shape (REPORT.md T17): object.h held as a
+/// submodule, hash.h inside it, and each kind of element under a condition.
+HeaderDependencySet makeSubmoduleSet() {
+  HeaderDependencySet D = makeFullSet();
+  D.Submodules.push_back({"s0", -1, "OBJECT_H", ""});
+  D.Submodules.push_back({"s1", 0, "", "/src/git/hash.h"});
+  D.Conditions.push_back({0, -1});
+  D.Conditions.push_back({-1, 0});
+  D.Conditions.push_back({1, -1});
+  D.Conditional[0].Cond = 1;
+  D.Syntactic[0].Cond = 2;
+  D.Syntactic[1].Cond = 3;
+  D.Symbol[1].Cond = 1;
+  D.Inclusion[0].Cond = 3;
+  D.MacroEffects[1].Cond = 1;
+  D.Includes[0].Cond = 1;
+  D.FileNames[1].Cond = 3;
+  D.Declarations[1].Cond = 2;
+  D.Files[0].Cond = 1;
+  D.Diagnostics[0].Cond = 3;
+  ProvidedDeclaration P;
+  P.Decl = {DeclarationDependency::Space::Tag, "object", "struct defined 77",
+            2};
+  P.Uses.push_back({12, ProvidedDeclaration::How::Self, ""});
+  P.Uses.push_back({13, ProvidedDeclaration::How::Member, "type"});
+  D.Provided.push_back(std::move(P));
+  return D;
+}
+
+TEST(DependencySerializationTest, SubmodulesAndConditionsRoundTrip) {
+  // The equality of most elements leaves out the condition, so it is
+  // compared here on its own: a condition lost on the way would check a
+  // skipped submodule's dependencies, or skip a loaded one's.
+  HeaderDependencySet D = makeSubmoduleSet();
+  auto Decoded = decodeDependencySet(encode(D));
+  ASSERT_TRUE(Decoded.has_value());
+  expectEqual(D, *Decoded);
+  const HeaderDependencySet &E = *Decoded;
+  ASSERT_EQ(E.Submodules.size(), 2u);
+  for (size_t I = 0; I != 2; ++I) {
+    EXPECT_EQ(E.Submodules[I].Name, D.Submodules[I].Name);
+    EXPECT_EQ(E.Submodules[I].Parent, D.Submodules[I].Parent);
+    EXPECT_EQ(E.Submodules[I].Guard, D.Submodules[I].Guard);
+    EXPECT_EQ(E.Submodules[I].Path, D.Submodules[I].Path);
+  }
+  ASSERT_EQ(E.Conditions.size(), 3u);
+  for (size_t I = 0; I != 3; ++I) {
+    EXPECT_EQ(E.Conditions[I].Owner, D.Conditions[I].Owner);
+    EXPECT_EQ(E.Conditions[I].Provider, D.Conditions[I].Provider);
+  }
+  EXPECT_EQ(E.Provided, D.Provided);
+  ASSERT_EQ(E.Provided.size(), 1u);
+  EXPECT_EQ(E.Provided[0].Decl.Cond, 2u);
+  ASSERT_EQ(E.Provided[0].Uses.size(), 2u);
+  EXPECT_EQ(E.Provided[0].Uses[1].Member, "type");
+  auto Conds = [](const auto &V) {
+    std::vector<uint32_t> C;
+    for (const auto &X : V)
+      C.push_back(X.Cond);
+    return C;
+  };
+  EXPECT_EQ(Conds(E.Conditional), Conds(D.Conditional));
+  EXPECT_EQ(Conds(E.Syntactic), Conds(D.Syntactic));
+  EXPECT_EQ(Conds(E.Symbol), Conds(D.Symbol));
+  EXPECT_EQ(Conds(E.Inclusion), Conds(D.Inclusion));
+  EXPECT_EQ(Conds(E.MacroEffects), Conds(D.MacroEffects));
+  EXPECT_EQ(Conds(E.Includes), Conds(D.Includes));
+  EXPECT_EQ(Conds(E.FileNames), Conds(D.FileNames));
+  EXPECT_EQ(Conds(E.Declarations), Conds(D.Declarations));
+  EXPECT_EQ(Conds(E.Files), Conds(D.Files));
+  EXPECT_EQ(Conds(E.Diagnostics), Conds(D.Diagnostics));
+}
+
+TEST(DependencySerializationTest, AConditionOutOfRangeIsRejected) {
+  // An element's condition, a condition's submodules and a submodule's
+  // parent each name an earlier entry; anything else would read past the
+  // list the check computes from them.
+  HeaderDependencySet D = makeSubmoduleSet();
+  D.Files[1].Cond = 4;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = makeSubmoduleSet();
+  D.Provided[0].Decl.Cond = 4;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = makeSubmoduleSet();
+  D.Conditions[2].Owner = 2;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = makeSubmoduleSet();
+  D.Conditions[1].Provider = 5;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D = makeSubmoduleSet();
+  D.Submodules[0].Parent = 0;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+}
+
+TEST(DependencySerializationTest, ASubmoduleWithoutAGuardOrFileIsRejected) {
+  // The check decides a submodule's loading by its guard or its file; with
+  // neither it could not tell, and must not guess.
+  HeaderDependencySet D = makeSubmoduleSet();
+  D.Submodules[1].Path.clear();
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+}
+
 } // namespace

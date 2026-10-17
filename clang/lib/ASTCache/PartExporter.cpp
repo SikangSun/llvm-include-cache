@@ -22,6 +22,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Lex/DeclBoundaryObserver.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/ModuleMap.h"
@@ -43,6 +44,8 @@
 #include "llvm/Support/xxhash.h"
 #include <chrono>
 #include <map>
+#include "llvm/ADT/StringSet.h"
+#include <set>
 #include <mutex>
 
 using namespace clang;
@@ -149,6 +152,18 @@ public:
       Expected = nullptr;
       if (!FE)
         return;
+      // A header inside one being exported can be held as a submodule of
+      // its part (REPORT.md T17) if it begins between declarations and
+      // leaves the pragmas as it found them.
+      if (!Open.empty()) {
+        Nested &N = NestedAt[FID];
+        DeclBoundaryObserver *B = CI.getPreprocessor().getDeclBoundaryObserver();
+        N.AtBoundary = B && B->isAtDeclarationBoundary();
+        if (CI.hasSema())
+          N.Entry = capturePragmaState(CI.getSema());
+        if (Pragmas)
+          N.Mark = Pragmas->mark();
+      }
       for (Part &P : Open)
         hold(P, *FE);
       bool ByPath =
@@ -161,7 +176,18 @@ public:
       begin(FID, *FE);
       return;
     }
-    if (Reason != ExitFile || Open.empty() || Open.back().FID != PrevFID)
+    if (Reason != ExitFile)
+      return;
+    if (auto It = NestedAt.find(PrevFID); It != NestedAt.end()) {
+      Nested &N = It->second;
+      std::optional<std::vector<WarningPragma>> Since;
+      if (Pragmas)
+        Since = Pragmas->since(N.Mark);
+      N.Neutral = CI.hasSema() &&
+                  capturePragmaState(CI.getSema()) == N.Entry &&
+                  (!Pragmas || (Since && Since->empty()));
+    }
+    if (Open.empty() || Open.back().FID != PrevFID)
       return;
     end();
   }
@@ -299,6 +325,16 @@ private:
     bool contains(SourceLocation::UIntTy Offset) const {
       return Begin <= Offset && Offset < End;
     }
+    /// REPORT.md T17: the submodule each file in the part's region belongs
+    /// to, for the writer; files held by the part's own module are absent.
+    llvm::DenseMap<FileID, Module *> OwnerOf;
+    /// The same by index into the metadata's Submodules, until the modules
+    /// are made.
+    llvm::DenseMap<FileID, int> SubmoduleOf;
+    /// The condition of each region's elements, by file.
+    llvm::DenseMap<FileID, uint32_t> CondOfFile;
+    /// The submodules made, by index into the metadata's Submodules.
+    std::vector<Module *> SubModules;
   };
 
   /// Puts a diagnostic into \p P, to be printed again at a hit.
@@ -557,6 +593,14 @@ private:
     for (auto &[Path, Stamp] : P.Stamps)
       Deps.Files.push_back(Stamp);
 
+    // REPORT.md T17: the headers inside held as submodules, and the
+    // dependencies put together per submodule.
+    auto Composing = std::chrono::steady_clock::now();
+    compose(P, Deps);
+    Counts.ComposeMicros += std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - Composing)
+                                .count();
+
     // The same header, metadata and compiler options give the same name in
     // any compile, which lets the daemon recognise a part it already holds.
     llvm::SmallVector<char, 256> Encoded;
@@ -577,6 +621,17 @@ private:
     Module *M = MM.createModule(Name, /*Parent=*/nullptr,
                                 /*IsFramework=*/false, /*IsExplicit=*/false);
     M->PresumedModuleMapFile = "<header-cache-part>";
+    // The headers held as submodules, each inside its parent's.
+    // Explicit: a module made visible makes visible each submodule that is
+    // not (Module::getExportedModules), and a skipped one must stay hidden.
+    std::vector<Module *> Subs;
+    for (const SubmoduleRecord &R : Deps.Submodules)
+      Subs.push_back(MM.createModule(R.Name, R.Parent < 0 ? M : Subs[R.Parent],
+                                     /*IsFramework=*/false,
+                                     /*IsExplicit=*/true));
+    for (auto &[F, K] : P.SubmoduleOf)
+      P.OwnerOf[F] = Subs[K];
+    P.SubModules = Subs;
 
     // A variable definition that must be emitted -- postgres's kwlist_d.h
     // defines `const ScanKeywordList ScanKeywords = {...}` -- reaches the
@@ -606,9 +661,13 @@ private:
       Counts.Copies.push_back(P.Stored + ": " + Why);
     }
     Deps.Declarations = std::move(W.Declarations);
+    provide(P, Deps, W.Cross);
     if (!W.DiagnosticFailure.empty())
       return decline(P, W.DiagnosticFailure);
     Deps.Diagnostics = std::move(W.Diagnostics);
+    if (!P.CondOfFile.empty())
+      for (size_t K = 0; K != Deps.Diagnostics.size(); ++K)
+        Deps.Diagnostics[K].Cond = condAt(P, P.Diagnostics[K].Loc);
     Deps.WarningState = P.WarningState;
     Deps.WarningPragmas = P.WarningPragmas;
 
@@ -633,6 +692,248 @@ private:
     dump(P, R, W.Sizes);
     llvm::TimeTraceScope PushScope("HeaderCache Push");
     Deliver(std::move(R));
+  }
+
+  /// A declaration of a part's submodule that the part's lines outside it
+  /// refer to, with the part's local index of it
+  /// (ASTWriter::getPartCrossReferences).
+  struct CrossReference {
+    const Decl *D;
+    Module *From, *To;
+    uint32_t Index;
+  };
+
+  /// REPORT.md T17. What \p P's lines outside each submodule refer to in
+  /// it (\p Cross, as the writer found it), by name and with the submodule
+  /// owning it: where that submodule is skipped, the compile's own
+  /// declaration of the name stands for each of these, and the reader never
+  /// reads the copy's.
+  void provide(const Part &P, HeaderDependencySet &Deps,
+               llvm::ArrayRef<CrossReference> Cross) {
+    llvm::DenseMap<std::pair<const NamedDecl *, int>, size_t> Entry;
+    for (const CrossReference &C : Cross) {
+      auto Sub = llvm::find(P.SubModules, C.To);
+      if (Sub == P.SubModules.end())
+        continue;
+      int K = Sub - P.SubModules.begin();
+      ProvidedDeclaration::Use U;
+      U.Index = C.Index;
+      const NamedDecl *E = nullptr;
+      if (isa<FieldDecl, IndirectFieldDecl>(C.D)) {
+        const auto *Member = cast<NamedDecl>(C.D);
+        const auto *R = dyn_cast<RecordDecl>(C.D->getDeclContext());
+        if (R && Member->getIdentifier()) {
+          E = R->getIdentifier() ? static_cast<const NamedDecl *>(R)
+                                 : R->getTypedefNameForAnonDecl();
+          U.Of = ProvidedDeclaration::How::Member;
+          U.Member = Member->getName().str();
+        }
+      } else if (const auto *TD = dyn_cast<TagDecl>(C.D);
+                 TD && !TD->getIdentifier()) {
+        E = TD->getTypedefNameForAnonDecl();
+        U.Of = ProvidedDeclaration::How::TagOfTypedef;
+      } else if (const auto *ND = dyn_cast<NamedDecl>(C.D);
+                 ND && (isa<EnumConstantDecl>(ND) ||
+                        ND->getDeclContext()->getRedeclContext()->isFileContext())) {
+        E = ND;
+      }
+      // One without a name the reader can find is read as it is.
+      if (!E || !E->getIdentifier())
+        continue;
+      auto [It, New] = Entry.try_emplace({E, K}, Deps.Provided.size());
+      if (New) {
+        ProvidedDeclaration D;
+        D.Decl.In = nameSpaceOf(*E);
+        D.Decl.Name = E->getName().str();
+        // The submodule owning it, plus one: Conditions[K] is where it loads.
+        D.Decl.Cond = K + 1;
+        Deps.Provided.push_back(std::move(D));
+      }
+      Deps.Provided[It->second].Uses.push_back(std::move(U));
+    }
+  }
+
+  /// The condition of what \p P's text holds at \p L: its submodule's.
+  uint32_t condAt(const Part &P, SourceLocation L) const {
+    if (L.isInvalid() || !SM.isLocalSourceLocation(L))
+      return 0;
+    auto It = P.CondOfFile.find(SM.getFileID(SM.getExpansionLoc(L)));
+    return It == P.CondOfFile.end() ? 0 : It->second;
+  }
+
+  /// REPORT.md T17. Chooses the headers inside \p P to hold as submodules
+  /// of its copy: each guarded (or #pragma once) header that begins between
+  /// declarations, leaves the pragmas as it found them, reads nothing the
+  /// part set before it -- in the header around it or in any header read
+  /// before it -- changes no macro the part set before it, and whose guard
+  /// nothing in the part tested before it. Such a header depends on nothing
+  /// of the part's, so the copy keeps the folded part's dependencies, less
+  /// the header's own guard test: where the compile has read the header,
+  /// the guard says to skip its submodule instead. What the header leaves
+  /// its macros as, and the warnings it printed, are its submodule's.
+  void compose(Part &P, HeaderDependencySet &Deps) {
+    auto LapStart = std::chrono::steady_clock::now();
+    auto Lap = [&](uint64_t &To) {
+      auto Now = std::chrono::steady_clock::now();
+      To += std::chrono::duration_cast<std::chrono::microseconds>(Now - LapStart)
+                .count();
+      LapStart = Now;
+    };
+    using FR = ASTCacheDependencyTracker::FileReads;
+    const FR *Root = Tracker.fileReads(P.FID);
+    if (!Root || !P.Stacks.empty() || !Root->Exit)
+      return;
+    // The files read while the header was open, in the order entered.
+    std::vector<const FR *> All;
+    for (const FR &F : Tracker.allFileReads())
+      if (F.Enter >= Root->Enter && F.Exit && F.Exit <= Root->Exit)
+        All.push_back(&F);
+    if (All.empty() || All[0] != Root)
+      return;
+    llvm::DenseMap<FileID, size_t> Index;
+    std::vector<int> Parent(All.size(), -1);
+    {
+      std::vector<size_t> Stack;
+      for (size_t I = 0; I != All.size(); ++I) {
+        while (!Stack.empty() && All[Stack.back()]->Exit < All[I]->Enter)
+          Stack.pop_back();
+        Parent[I] = Stack.empty() ? -1 : static_cast<int>(Stack.back());
+        Stack.push_back(I);
+        Index[All[I]->FID] = I;
+      }
+    }
+    auto Within = [&](size_t I, size_t Of) {
+      return All[Of]->Enter <= All[I]->Enter && All[I]->Exit <= All[Of]->Exit;
+    };
+
+    // The candidates, and the first time anything in the part tested each
+    // one's guard.
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    std::vector<std::optional<SubmoduleRecord>> Candidate(All.size());
+    llvm::StringMap<uint64_t> FirstTest;
+    for (size_t I = 1; I != All.size(); ++I) {
+      auto N = NestedAt.find(All[I]->FID);
+      if (N == NestedAt.end() || !N->second.AtBoundary || !N->second.Neutral)
+        continue;
+      OptionalFileEntryRef FE = SM.getFileEntryRefForID(All[I]->FID);
+      if (!FE)
+        continue;
+      HeaderFileInfo &Info = HS.getFileInfo(*FE);
+      SubmoduleRecord Rec;
+      if (const IdentifierInfo *G =
+              Info.getControllingMacro(HS.getExternalLookup()))
+        Rec.Guard = G->getName().str();
+      else if (!Info.isPragmaOnce)
+        continue;
+      // Where the reader finds which declarations it holds.
+      Rec.Path = absolutePath(CI.getFileManager(), FE->getName());
+      if (!Rec.Guard.empty())
+        FirstTest.try_emplace(Rec.Guard, UINT64_MAX);
+      Candidate[I] = std::move(Rec);
+    }
+    if (!FirstTest.empty())
+      for (const FR *F : All) {
+        auto Note = [&](llvm::StringRef Name, uint64_t Seq) {
+          auto It = FirstTest.find(Name);
+          if (It != FirstTest.end() && Seq < It->second)
+            It->second = Seq;
+        };
+        for (const auto &E : F->Conditional)
+          Note(E.Dep.MacroName, E.Seq);
+        for (const auto &E : F->Syntactic)
+          Note(E.Dep.Name, E.Seq);
+      }
+
+    // Choose, outermost first: each file belongs to its nearest chosen
+    // enclosing submodule, -1 for the part's own module.
+    std::vector<int> Region(All.size(), -1);
+    std::vector<SubmoduleRecord> Subs;
+    for (size_t I = 1; I != All.size(); ++I) {
+      int R = Parent[I] < 0 ? -1 : Region[Parent[I]];
+      Region[I] = R;
+      if (!Candidate[I])
+        continue;
+      SubmoduleRecord &Rec = *Candidate[I];
+      if (!Rec.Guard.empty() && FirstTest.lookup(Rec.Guard) < All[I]->Enter)
+        continue;
+      // A file of the part entered before this header and not inside it.
+      auto Before = [&](FileID O) {
+        if (O.isInvalid())
+          return false;
+        auto J = Index.find(O);
+        if (J == Index.end())
+          return false;
+        size_t G = J->second;
+        return !Within(G, I) && All[G]->Enter < All[I]->Enter;
+      };
+      bool Qualifies = true;
+      for (size_t J = I; J != All.size() && Within(J, I) && Qualifies; ++J) {
+        const FR &F = *All[J];
+        auto Reads = [&](const auto &V) {
+          for (const auto &E : V)
+            if (Before(E.Origin))
+              Qualifies = false;
+        };
+        Reads(F.Conditional);
+        Reads(F.Syntactic);
+        Reads(F.Symbol);
+        Reads(F.Inclusion);
+        for (const FR::Change &C : F.Changes)
+          if (Before(C.Replaced))
+            Qualifies = false;
+      }
+      if (!Qualifies)
+        continue;
+      Rec.Name = "s" + std::to_string(Subs.size());
+      Rec.Parent = R;
+      Subs.push_back(std::move(Rec));
+      Region[I] = static_cast<int>(Subs.size()) - 1;
+    }
+    Lap(Counts.ChooseMicros);
+    if (Subs.empty())
+      return;
+
+    // The folded part's dependencies, less each submodule's guard test,
+    // which only the header itself made.
+    llvm::StringSet<> Guards;
+    for (const SubmoduleRecord &S : Subs)
+      if (!S.Guard.empty())
+        Guards.insert(S.Guard);
+    llvm::erase_if(Deps.Conditional, [&](const ConditionalDependency &D) {
+      return !D.WasDefined && Guards.contains(D.MacroName);
+    });
+
+    // Condition K + 1 holds where submodule K loads: what the header leaves
+    // its macros as is replayed, and its warnings printed, only there.
+    Deps.Conditions.clear();
+    for (size_t K = 0; K != Subs.size(); ++K)
+      Deps.Conditions.push_back({static_cast<int32_t>(K), -1});
+    auto CondOf = [](int R) { return R < 0 ? 0u : uint32_t(R) + 1; };
+    auto RegionOf = [&](SourceLocation L) {
+      if (L.isInvalid() || !SM.isLocalSourceLocation(L))
+        return -1;
+      auto J = Index.find(SM.getFileID(SM.getExpansionLoc(L)));
+      return J == Index.end() ? -1 : Region[J->second];
+    };
+    // A macro the header left changed belongs to the submodule of the last
+    // directive it made.
+    Preprocessor &PP = CI.getPreprocessor();
+    for (MacroEffect &E : Deps.MacroEffects) {
+      const MacroDirective *MD =
+          PP.getLocalMacroDirectiveHistory(PP.getIdentifierInfo(E.Name));
+      while (MD && !inPart(P, MD->getLocation()))
+        MD = MD->getPrevious();
+      if (MD)
+        E.Cond = CondOf(RegionOf(MD->getLocation()));
+    }
+    for (const auto &[F, K] : Index) {
+      P.CondOfFile[F] = CondOf(Region[K]);
+      if (Region[K] >= 0)
+        P.SubmoduleOf[F] = Region[K];
+    }
+    Deps.Submodules = std::move(Subs);
+    Lap(Counts.DepsMicros);
+    Counts.Submodules += Deps.Submodules.size();
   }
 
   /// The declarations each file inside \p P refers to in another file inside
@@ -858,6 +1159,8 @@ private:
 
   struct Written {
     SmallVector<char, 0> Buffer;
+    /// What the part's lines outside a submodule refer to in it.
+    std::vector<CrossReference> Cross;
     long long Micros = 0;
     /// Outside declarations referred to by name.
     size_t ByName = 0;
@@ -970,6 +1273,14 @@ private:
         [&](FileEntryRef F) { return P.Files.contains(&F.getFileEntry()); });
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
+    if (!P.OwnerOf.empty())
+      Writer.setPartOwner([&](SourceLocation L) -> Module * {
+        // Most declarations a part refers to from outside it are before it.
+        if (!inPart(P, L))
+          return nullptr;
+        auto It = P.OwnerOf.find(SM.getFileID(SM.getExpansionLoc(L)));
+        return It == P.OwnerOf.end() ? nullptr : It->second;
+      });
     // What the writer needs to look at: the part's own entries, macros and
     // declarations, not the whole compile's (REPORT.md I5).
     std::vector<const IdentifierInfo *> MacroNames(P.Touched.begin(),
@@ -989,6 +1300,13 @@ private:
     W.Micros = std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::steady_clock::now() - Start)
                    .count();
+    Counts.WriterMicros += W.Micros;
+    for (const ASTWriter::PartCrossReference &C :
+         Writer.getPartCrossReferences())
+      W.Cross.push_back(
+          {C.D, C.From, C.To,
+           static_cast<uint32_t>(Writer.getDeclID(C.D).getRawValue() -
+                                 NUM_PREDEF_DECL_IDS)});
     W.DroppedLocations = Writer.getPartDroppedLocations();
     saveDiagnostics(P, Encoded, W);
     llvm::TimeTraceScope OutsideScope("HeaderCache ExportOutsideDecls");
@@ -1066,6 +1384,15 @@ private:
   unsigned BuffersSeen = 1;
   /// The latest top-level declaration the parser finished.
   const Decl *LastTopLevel = nullptr;
+  /// Each header entered inside one being exported: whether it began
+  /// between declarations, and whether it left the pragmas as it found them
+  /// (REPORT.md T17).
+  struct Nested {
+    bool AtBoundary = false, Neutral = false;
+    PragmaSnapshot Entry;
+    WarningPragmaTracker::Mark Mark;
+  };
+  llvm::DenseMap<FileID, Nested> NestedAt;
   Stats Counts;
 };
 
@@ -1139,6 +1466,12 @@ PartExporter &PartExporter::install(CompilerInstance &CI,
   } else {
     T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID); });
   }
+  // What each file inside a header being exported read, for holding the
+  // headers inside as submodules (REPORT.md T17).
+  // Measuring only: CLANG_HEADER_CACHE_NO_SUBMODULES writes folded copies,
+  // as before REPORT.md T17.
+  if (!std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES"))
+    T.recordFiles();
   PP.setExpansionCandidateObserver(T);
   // Callbacks added later run first: the exporter marks a header as tracked
   // before the tracker decides whether to open a frame for it.

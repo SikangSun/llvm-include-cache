@@ -66,6 +66,7 @@ enum class MismatchReason {
   FileChanged,
   WarningState,
   MacroStack,
+  GuardWithoutHeader,
 };
 
 llvm::StringRef describe(MismatchReason R);
@@ -159,13 +160,20 @@ struct CheckCost {
 /// the searches' outcome from earlier compiles and receives this one's.
 /// \p SkipConditionals, for measurement only, leaves out the definedness
 /// tests (REPORT.md T15).
+///
+/// A copy holding headers as submodules (REPORT.md T17) loads each whose
+/// header the compile has not read -- its guard undefined, or its #pragma
+/// once file not included -- inside one that loads; each element of its
+/// metadata applies by its condition. \p Loaded, when non-null, receives
+/// which submodules load.
 MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                 Sema *S, std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
                                 CheckCost *Cost = nullptr,
                                 std::vector<NamedDecl *> *Found = nullptr,
                                 SearchMemo *Memo = nullptr,
-                                bool SkipConditionals = false);
+                                bool SkipConditionals = false,
+                                std::vector<bool> *Loaded = nullptr);
 
 class CacheClient {
 public:
@@ -225,7 +233,7 @@ public:
     unsigned Lookups = 0;
     unsigned Hits = 0;
     unsigned CandidatesRejected = 0;
-    unsigned RejectedFor[12] = {};
+    unsigned RejectedFor[13] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".
@@ -248,10 +256,23 @@ public:
   /// and why the first rejected one was rejected (None if none was).
   unsigned lastCandidates() const { return LastCandidates; }
   MismatchReason lastRejection() const { return LastRejection; }
+  /// Which submodules of the latest lookup's match load (REPORT.md T17),
+  /// and their names.
+  const std::vector<bool> &lastSubmodules() const { return LastSubmodules; }
+  const std::vector<std::string> &lastSubmoduleNames() const {
+    return LastSubmoduleNames;
+  }
+  const std::vector<std::string> &lastSubmodulePaths() const {
+    return LastSubmodulePaths;
+  }
+  /// The latest lookup's match's metadata, read in place.
+  const std::optional<MetadataView> &lastMetadata() const {
+    return LastMetadata;
+  }
 
   /// The declaration each outside declaration of the latest lookup's match
   /// found where the header is included, in the order of its
-  /// declarations().
+  /// declarations(); null for one that does not apply.
   llvm::ArrayRef<NamedDecl *> matchedDeclarations() const {
     return MatchedDecls;
   }
@@ -277,6 +298,9 @@ private:
   bool LogChecks = false;
   unsigned LastCandidates = 0;
   MismatchReason LastRejection = MismatchReason::None;
+  std::vector<bool> LastSubmodules;
+  std::vector<std::string> LastSubmoduleNames, LastSubmodulePaths;
+  std::optional<MetadataView> LastMetadata;
   std::vector<NamedDecl *> MatchedDecls;
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;

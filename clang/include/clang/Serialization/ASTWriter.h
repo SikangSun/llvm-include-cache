@@ -27,6 +27,7 @@
 #include "clang/Serialization/SourceLocationEncoding.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -114,6 +115,16 @@ public:
   using RecordData = SmallVector<uint64_t, 64>;
   using RecordDataImpl = SmallVectorImpl<uint64_t>;
   using RecordDataRef = ArrayRef<uint64_t>;
+
+  /// A declaration a part's submodule owns that something outside the
+  /// submodule refers to: where the submodule is skipped, the loading
+  /// compile's own declaration must stand for it (REPORT.md T17).
+  struct PartCrossReference {
+    const Decl *D;
+    /// The submodule of the declaration that refers to it, null for the
+    /// part's own module; and the one owning it.
+    Module *From, *To;
+  };
 
 private:
   /// Map that provides the ID numbers of each type within the
@@ -218,9 +229,43 @@ private:
   /// setPartOutside.
   bool PartOutsideByName = false;
   std::function<bool(const Decl *)> PartLater;
+  /// The submodule a part's declaration or macro at a location belongs to;
+  /// null for the part's own module (REPORT.md T17).
+  std::function<Module *(SourceLocation)> PartOwner;
+
+  /// While a part with submodules is written: what each submodule's
+  /// declarations are referred to from outside the submodule, noted as the
+  /// references are written (see getPartCrossReferences). The record being
+  /// written is a declaration's, of the submodule at that index of
+  /// PartOwnerModules (0 for the part's own module), or a type's, at that
+  /// local index; -1 for neither.
+  bool PartTrack = false;
+  int PartRefOwner = -1;
+  int PartRefType = -1;
+  SmallVector<Module *, 16> PartOwnerModules;
+  llvm::DenseMap<Module *, unsigned> PartOwnerIndex;
+  /// By local declaration index: its owner's index, -1 not yet known.
+  std::vector<int> PartDeclOwner;
+  std::vector<const Decl *> PartDeclByIndex;
+  /// By owner: the local indices of the types its declarations refer to.
+  std::vector<llvm::BitVector> PartOwnerTypes;
+  /// By local type index: the submodules' declarations, and the types, the
+  /// type's record refers to.
+  std::vector<SmallVector<unsigned, 2>> PartTypeDecls, PartTypeTypes;
+  llvm::DenseSet<std::pair<unsigned, unsigned>> PartCrossSeen;
 
   /// The Sema of the compile being written, while writing a part.
   Sema *PartSema = nullptr;
+
+  std::vector<PartCrossReference> PartCrossRefs;
+
+  /// See PartRefOwner.
+  unsigned partOwnerIndex(Module *M);
+  int partDeclOwner(const Decl *D, unsigned LocalIndex);
+  bool partCrosses(unsigned From, unsigned To) const;
+  void notePartDeclRef(const Decl *D, LocalDeclID ID);
+  void notePartTypeRef(serialization::TypeID ID);
+  void findPartCrossReferences();
 
   /// The outside declarations a part refers to by name, and why one could
   /// not be, if one could not.
@@ -1046,6 +1091,41 @@ public:
   /// header ended, such as a definition in the main file of a function the
   /// header declared. A part never refers to one, not even through a
   /// redeclaration chain.
+  /// Assigns a part's declarations and macros to submodules by where they
+  /// are (REPORT.md T17).
+  void setPartOwner(std::function<Module *(SourceLocation)> Owner) {
+    PartOwner = std::move(Owner);
+  }
+  /// The submodule a declaration or macro at \p L belongs to, null for the
+  /// part's own module.
+  Module *partOwnerAt(SourceLocation L) const {
+    return PartOwner ? PartOwner(L) : nullptr;
+  }
+  bool hasPartOwners() const { return bool(PartOwner); }
+
+  /// The part just written's (see PartCrossReference).
+  ArrayRef<PartCrossReference> getPartCrossReferences() const {
+    return PartCrossRefs;
+  }
+  Module *partOwner(const Decl *D) const {
+    // The declaration being written: its owner is known (PartRefOwner).
+    if (PartTrack && PartRefOwner >= 0) {
+      if (Module *M = PartOwnerModules[PartRefOwner])
+        return M;
+      return D->getOwningModule();
+    }
+    if (PartOwner)
+      if (Module *M = PartOwner(D->getLocation()))
+        return M;
+    return D->getOwningModule();
+  }
+  Module *partMacroOwner(SourceLocation L, Module *Default) const {
+    if (PartOwner)
+      if (Module *M = PartOwner(L))
+        return M;
+    return Default;
+  }
+
   void setPartOutside(bool ByName, std::function<bool(const Decl *)> Later) {
     PartOutsideByName = ByName;
     PartLater = std::move(Later);

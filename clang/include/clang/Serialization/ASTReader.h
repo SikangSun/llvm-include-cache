@@ -2622,6 +2622,57 @@ public:
                  NamedDecl *>
       PinnedNameReferences;
 
+public:
+  /// What a compile that loads a header cache part skips of it (REPORT.md
+  /// T17): submodules whose headers it read itself. Their declarations are
+  /// never read: a name lookup does not find them, and each one the rest of
+  /// the part refers to is the compile's own declaration (\c Swaps, by the
+  /// part's local declaration index).
+  struct PartSkip {
+    /// The skipped submodules' names.
+    std::vector<std::string> Names;
+    /// Each submodule's header and whether it is skipped. A declaration
+    /// belongs to the submodule of the nearest of these its file is in.
+    std::vector<std::pair<const FileEntry *, bool>> Headers;
+    /// The compile's own declaration standing for each of the part's that
+    /// the rest of it refers to, by local index.
+    std::vector<std::pair<uint32_t, Decl *>> Swaps;
+  };
+
+  /// Skipped declarations a name lookup listed, left unread.
+  unsigned getPartSkipsUnread() const { return PartSkipsUnread; }
+
+private:
+  /// See setPartSkip.
+  std::optional<PartSkip> PendingPartSkip;
+  llvm::SmallPtrSet<const Module *, 16> PartSkippedModules;
+  struct PartSkipState {
+    llvm::DenseMap<const FileEntry *, bool> Headers;
+    llvm::DenseMap<FileID, bool> SkippedFiles;
+    /// Per declaration of the part, by local index: 0 not known yet, 1 kept,
+    /// 2 skipped.
+    std::vector<uint8_t> Known;
+    /// The global indices of the part's declarations swapped for the
+    /// compile's own.
+    llvm::DenseSet<unsigned> Swapped;
+  };
+  llvm::DenseMap<ModuleFile *, PartSkipState> PartSkips;
+  unsigned PartSkipsUnread = 0;
+  /// Declarations read whose chain's first declaration in their part was
+  /// swapped for the compile's own: they join the compile's chain.
+  SmallVector<Decl *, 4> PendingPartAttach;
+
+  /// Whether a skipped submodule of a header cache part owns \p ID, by the
+  /// file the declaration is in.
+  bool isPartSkippedDecl(GlobalDeclID ID);
+  /// Whether \p ID is a skipped declaration the compile's own stands for.
+  bool isPartSwapped(GlobalDeclID ID);
+
+  /// Puts \p D, whose chain's first declaration in its part is the
+  /// compile's, after the latest of that chain.
+  void attachPartRedecl(Decl *D);
+
+public:
   /// Retrieve the semantic analysis object used to analyze the
   /// translation unit in which the precompiled header is being
   /// imported.
@@ -2655,6 +2706,17 @@ public:
                                     bool Tag) const {
     return PinnedNameReferences.lookup({&MF, &II, Tag});
   }
+
+  /// What the next ReadAST, of a header cache part, skips of it; none
+  /// clears it.
+  void setPartSkip(std::optional<PartSkip> S) { PendingPartSkip = std::move(S); }
+
+  /// Whether \p M is a header cache part's submodule its loading compile
+  /// skipped.
+  bool isPartSkipped(const Module *M) const {
+    return PartSkippedModules.count(M);
+  }
+
 
   /// Get the identifier resolver used for name lookup / updates
   /// in the translation unit scope. We have one of these even if we don't

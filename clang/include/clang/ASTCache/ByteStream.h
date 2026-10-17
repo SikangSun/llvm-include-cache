@@ -49,6 +49,15 @@ public:
     Out.append(Buf, Buf + 8);
   }
 
+  /// Seven bits a byte, low first: one byte below 128.
+  void vu32(uint32_t V) {
+    do {
+      uint8_t B = V & 0x7f;
+      V >>= 7;
+      u8(V ? B | 0x80 : B);
+    } while (V);
+  }
+
   /// Length-prefixed, never NUL-terminated: an ExpandsTo syntactic
   /// dependency's token sequence contains embedded NULs by construction --
   /// they are its token separator -- so a NUL-terminated encoding would
@@ -97,6 +106,20 @@ public:
     uint64_t V = llvm::support::endian::read64le(Data.data() + Pos);
     Pos += 8;
     return V;
+  }
+
+  uint32_t vu32() {
+    uint32_t V = 0;
+    for (unsigned Shift = 0; Shift < 35; Shift += 7) {
+      uint8_t B = u8();
+      if (Failed)
+        return 0;
+      V |= static_cast<uint32_t>(B & 0x7f) << Shift;
+      if (!(B & 0x80))
+        return V;
+    }
+    Failed = true;
+    return 0;
   }
 
   llvm::StringRef str() {

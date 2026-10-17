@@ -39,7 +39,7 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 10;
+constexpr uint32_t DependencyEncodingVersion = 12;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
 /// stored form.
@@ -52,6 +52,7 @@ void encodeMetadata(const HeaderDependencySet &Deps,
 struct ConditionalView {
   llvm::StringRef MacroName;
   bool WasDefined = false;
+  uint32_t Cond = 0;
   static ConditionalView read(ByteReader &R);
 };
 /// A SyntacticDependency that requires ExpandsTo. Those that require
@@ -59,27 +60,32 @@ struct ConditionalView {
 struct ExpandsToView {
   llvm::StringRef Name;
   llvm::StringRef TokenSequence;
+  uint32_t Cond = 0;
   static ExpandsToView read(ByteReader &R);
 };
 struct NameView {
   llvm::StringRef Name;
+  uint32_t Cond = 0;
   static NameView read(ByteReader &R);
 };
 struct SymbolView {
   llvm::StringRef Name;
   SymbolClassification Classification = SymbolClassification::Unknown;
   llvm::StringRef ResolvedTypeName;
+  uint32_t Cond = 0;
   static SymbolView read(ByteReader &R);
 };
 struct InclusionView {
   llvm::StringRef HeaderPath;
   InclusionDependency::Reason Why = InclusionDependency::Reason::PragmaOnce;
+  uint32_t Cond = 0;
   static InclusionView read(ByteReader &R);
 };
 struct FileStampView {
   llvm::StringRef Path;
   uint64_t Size = 0;
   int64_t ModTime = 0;
+  uint32_t Cond = 0;
   static FileStampView read(ByteReader &R);
 };
 struct IncludeView {
@@ -89,23 +95,40 @@ struct IncludeView {
   int32_t Includer = -1;
   llvm::StringRef Found;
   llvm::StringRef Name;
+  uint32_t Cond = 0;
   static IncludeView read(ByteReader &R);
 };
 struct FileNameView {
   FileNameDependency::Macro Which = FileNameDependency::Macro::File;
   int32_t File = -1;
   llvm::StringRef Text;
+  uint32_t Cond = 0;
   static FileNameView read(ByteReader &R);
 };
 struct DeclarationView {
   DeclarationDependency::Space In = DeclarationDependency::Space::Ordinary;
   llvm::StringRef Name;
   llvm::StringRef Fingerprint;
+  uint32_t Cond = 0;
   static DeclarationView read(ByteReader &R);
+};
+struct ProvidedView {
+  DeclarationDependency::Space In = DeclarationDependency::Space::Ordinary;
+  llvm::StringRef Name;
+  llvm::StringRef Fingerprint;
+  uint32_t Cond = 0;
+  struct Use {
+    uint32_t Index;
+    ProvidedDeclaration::How Of;
+    llvm::StringRef Member;
+  };
+  llvm::SmallVector<Use, 2> Uses;
+  static ProvidedView read(ByteReader &R);
 };
 struct MacroEffectView {
   llvm::StringRef Name;
   bool Defined = false;
+  uint32_t Cond = 0;
   static MacroEffectView read(ByteReader &R);
 };
 /// Elements read only where a copy is used, and rarely there at all, are
@@ -121,6 +144,17 @@ struct DiagnosticView {
 struct WarningPragmaView {
   WarningPragma Pragma;
   static WarningPragmaView read(ByteReader &R);
+};
+/// REPORT.md T17.
+struct SubmoduleView {
+  llvm::StringRef Name;
+  int32_t Parent = -1;
+  llvm::StringRef Guard, Path;
+  static SubmoduleView read(ByteReader &R);
+};
+struct ConditionView {
+  int32_t Owner = -1, Provider = -1;
+  static ConditionView read(ByteReader &R);
 };
 
 /// One section of a MetadataView: its elements, read in order as the loop
@@ -250,6 +284,15 @@ public:
   MetadataSection<WarningPragmaView> warningPragmas() const {
     return section<WarningPragmaView>(WarningPragmas);
   }
+  MetadataSection<SubmoduleView> submodules() const {
+    return section<SubmoduleView>(Submodules);
+  }
+  MetadataSection<ConditionView> conditions() const {
+    return section<ConditionView>(Conditions);
+  }
+  MetadataSection<ProvidedView> provided() const {
+    return section<ProvidedView>(Provided);
+  }
 
   enum Section : unsigned {
     Conditional,
@@ -265,6 +308,9 @@ public:
     MacroEffects,
     Diagnostics,
     WarningPragmas,
+    Submodules,
+    Conditions,
+    Provided,
     NumSections
   };
 

@@ -41,8 +41,17 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
     PendingEntries.clear();
     if (!FE)
       return;
-    if (Measuring)
+    if (Measuring || RecordFiles)
       FirstEntered.try_emplace(&FE->getFileEntry(), FID);
+    if (RecordFiles && (!OpenFiles.empty() || (TrackOnly && TrackOnly(FID)))) {
+      FileReads R;
+      R.FID = FID;
+      R.Path = FE->getName().str();
+      R.Enter = ++Clock;
+      FileIndex[FID] = Files.size();
+      OpenFiles.push_back(Files.size());
+      Files.push_back(std::move(R));
+    }
 
     // Every open frame's closure covers everything entered beneath it.
     for (Frame &F : Stack) {
@@ -63,6 +72,11 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
 
   if (Reason != ExitFile)
     return;
+
+  if (!OpenFiles.empty() && Files[OpenFiles.back()].FID == PrevFID) {
+    Files[OpenFiles.back()].Exit = ++Clock;
+    OpenFiles.pop_back();
+  }
 
   // PrevFID names the file just left. Only close a frame that matches it --
   // leaving a synthetic buffer produces an ExitFile for a FileID no frame was
@@ -95,6 +109,7 @@ void ASTCacheDependencyTracker::closeFrame(Frame &F) {
   Rec.Deps = std::move(F.Deps);
   Completed.push_back(std::move(Rec));
   CompletedFIDs.push_back(F.FID);
+  CompletedSites.push_back(std::move(F.At));
 }
 
 void ASTCacheDependencyTracker::finalize() {
@@ -176,6 +191,7 @@ void ASTCacheDependencyTracker::recordLookup(SourceLocation Loc,
       Dep.Includer = It->second;
     }
     F.Deps.Includes.push_back(std::move(Dep));
+    F.At.Includes.push_back(Where);
     PendingEntries.push_back({I, int32_t(F.Deps.Includes.size() - 1)});
   }
 }
@@ -189,6 +205,33 @@ void ASTCacheDependencyTracker::FileSkipped(
     return;
 
   HeaderSearch &HS = PP.getHeaderSearchInfo();
+
+  // The same, in the file holding the #include (recordFiles).
+  if (FileReads *F = currentFile()) {
+    const IdentifierInfo *G =
+        HS.getFileInfo(SkippedFile).getControllingMacro(HS.getExternalLookup());
+    if (G) {
+      FileID O = stateOrigin(G, PP.getMacroDefinition(G));
+      if (O != F->FID) {
+        auto [It, New] = F->SeenTest.try_emplace(G, true, O);
+        if (New || It->second != std::make_pair(true, O)) {
+          It->second = {true, O};
+          ConditionalDependency D;
+          D.MacroName = G->getName().str();
+          D.WasDefined = true;
+          F->Conditional.push_back({std::move(D), O, ++Clock});
+        }
+      }
+    } else if (F->SeenOnce.insert(&SkippedFile.getFileEntry()).second) {
+      FileID O = FirstEntered.lookup(&SkippedFile.getFileEntry());
+      InclusionDependency D;
+      D.HeaderPath = SkippedFile.getName().str();
+      D.Why = HS.hasFileBeenImported(SkippedFile)
+                  ? InclusionDependency::Reason::Import
+                  : InclusionDependency::Reason::PragmaOnce;
+      F->Inclusion.push_back({std::move(D), O, ++Clock});
+    }
+  }
 
   // A guard-macro skip is exactly "the file was entered and its #ifndef was
   // immediately false", so it is an ordinary conditional dependency on that
@@ -245,6 +288,17 @@ void ASTCacheDependencyTracker::recordConditional(const Token &MacroNameTok,
 void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
                                                   bool WasDefined,
                                                   FileID Origin) {
+  // The file whose #if this is: its own #define pins the state.
+  if (FileReads *F = currentFile(); F && Origin != F->FID) {
+    auto [It, New] = F->SeenTest.try_emplace(II, WasDefined, Origin);
+    if (New || It->second != std::make_pair(WasDefined, Origin)) {
+      It->second = {WasDefined, Origin};
+      ConditionalDependency D;
+      D.MacroName = II->getName().str();
+      D.WasDefined = WasDefined;
+      F->Conditional.push_back({std::move(D), Origin, ++Clock});
+    }
+  }
   for (Frame &F : Stack) {
     // The first test in a frame decides, as for syntactic dependencies: a
     // state the frame's own text set before testing it stays pinned however
@@ -349,6 +403,16 @@ void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
   const IdentifierInfo *II = Identifier.getIdentifierInfo();
   if (!II)
     return;
+  if (FileReads *F = currentFile()) {
+    if (II->isOutOfDate())
+      PP.refreshIdentifier(*II);
+    const MacroInfo *MI = II->hasMacroDefinition()
+                              ? PP.getMacroDefinition(II).getMacroInfo()
+                              : nullptr;
+    auto It = F->SeenMacro.find(II);
+    if (It == F->SeenMacro.end() || It->second != MI)
+      fileRead(F, II, MI, FileID());
+  }
   // The common case: a name already seen. If the innermost frame has it,
   // every enclosing frame has it too.
   if (Stack.back().SeenSyntactic.contains(II))
@@ -447,7 +511,35 @@ void ASTCacheDependencyTracker::recordFileName(SourceLocation Loc,
     Dep.File = File;
     Dep.Text = Text;
     F.Deps.FileNames.push_back(std::move(Dep));
+    F.At.FileNames.push_back(FID);
   }
+}
+
+void ASTCacheDependencyTracker::fileRead(FileReads *F,
+                                         const IdentifierInfo *II,
+                                         const MacroInfo *MI, FileID) {
+  F->SeenMacro[II] = MI;
+  SourceManager &SM = PP.getSourceManager();
+  // Defined, or undefined, by the file's own text: pinned by it.
+  FileID Origin = MI ? SM.getFileID(MI->getDefinitionLoc())
+                     : stateOrigin(II, MacroDefinition());
+  if (Origin == F->FID)
+    return;
+  SyntacticDependency D;
+  D.Name = II->getName().str();
+  if (MI) {
+    std::optional<std::string> Tokens =
+        serializeMacroTokens(*MI, SM, PP.getLangOpts());
+    if (!Tokens) {
+      // As for a frame: a definition whose text cannot be read cannot be
+      // checked later.
+      poisonOpenFrames();
+      return;
+    }
+    D.Required = SyntacticDependency::State::ExpandsTo;
+    D.TokenSequence = std::move(*Tokens);
+  }
+  F->Syntactic.push_back({std::move(D), Origin, ++Clock});
 }
 
 void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
@@ -517,6 +609,25 @@ void ASTCacheDependencyTracker::recordSymbol(
   FileID ResolvedFID =
       HaveResolved ? SM.getFileID(SM.getExpansionLoc(Ctx.ResolvedLoc))
                    : FileID();
+
+  // In the file holding the query (recordFiles).
+  if (auto It = FileIndex.find(QueryFID); It != FileIndex.end()) {
+    FileReads &F = Files[It->second];
+    if (ResolvedFID != F.FID) {
+      auto [S, New] = F.SeenType.try_emplace(
+          Name, static_cast<unsigned>(Classification), ResolvedFID);
+      auto Now =
+          std::make_pair(static_cast<unsigned>(Classification), ResolvedFID);
+      if (New || S->second != Now) {
+        S->second = Now;
+        SymbolDependency D;
+        D.Name = Name->getName().str();
+        D.Classification = Classification;
+        D.ResolvedTypeName = Ctx.ResolvedTypeName.str();
+        F.Symbol.push_back({std::move(D), ResolvedFID, ++Clock});
+      }
+    }
+  }
 
   for (Frame &F : Stack) {
     // Only headers whose region actually covers the query depend on it.
@@ -592,6 +703,18 @@ void ASTCacheDependencyTracker::noteRead(Frame &F, FileID Origin,
 
 void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
                                              const MacroDirective *MD) {
+  if (FileReads *F = currentFile(); F && MD) {
+    FileID Replaced;
+    if (const MacroDirective *Prev = MD->getPrevious()) {
+      SourceLocation L = Prev->getLocation();
+      if (const auto *Def = dyn_cast<DefMacroDirective>(Prev))
+        if (const MacroInfo *Old = Def->getInfo())
+          L = Old->getDefinitionLoc();
+      if (L.isValid())
+        Replaced = PP.getSourceManager().getFileID(L);
+    }
+    F->Changes.push_back({MacroNameTok.getIdentifierInfo(), Replaced, ++Clock});
+  }
   if (!Measuring || Stack.empty() || !MD)
     return;
   const MacroDirective *Prev = MD->getPrevious();
@@ -619,6 +742,12 @@ void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
 void ASTCacheDependencyTracker::MacroUndefined(const Token &MacroNameTok,
                                                const MacroDefinition &MD,
                                                const MacroDirective *Undef) {
+  if (FileReads *F = currentFile()) {
+    FileID Replaced;
+    if (const MacroInfo *MI = MD.getMacroInfo())
+      Replaced = PP.getSourceManager().getFileID(MI->getDefinitionLoc());
+    F->Changes.push_back({MacroNameTok.getIdentifierInfo(), Replaced, ++Clock});
+  }
   if (!Measuring || Stack.empty())
     return;
   const MacroInfo *MI = MD.getMacroInfo();
