@@ -446,7 +446,7 @@ public:
     MetadataView Deps;
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc,
-                     warningState(WarningFlags, &Pragmas),
+                     warningState(WarningFlags, &Pragmas, IncludeLoc),
                      searchContext(File, CurDir)};
     bool AnyFits = false;
     size_t HitBytes = 0;
@@ -1221,7 +1221,9 @@ void clang::ast_cache::installHeaderCacheHook(
   if (!Client || !CI.hasPreprocessor())
     return;
   bool Detailed = Client->loggingRejections();
-  auto Tracker = std::make_unique<WarningPragmaTracker>();
+  auto Tracker =
+      std::make_unique<WarningPragmaTracker>(CI.getPreprocessor(),
+                                             CI.getDiagnosticOpts());
   WarningPragmaTracker &Pragmas = *Tracker;
   CI.getPreprocessor().addPPCallbacks(std::move(Tracker));
   auto Server = std::make_unique<HeaderCacheServer>(CI, std::move(Client),

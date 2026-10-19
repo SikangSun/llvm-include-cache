@@ -1814,6 +1814,23 @@ TEST_F(ExportTest, NotServedWhereAWarningPragmaIsInForce) {
   EXPECT_EQ(Warnings, 0u) << "the pragma did not silence the warning";
 }
 
+TEST_F(ExportTest, ServedWhereAWarningPragmaChangesNothing) {
+  // b.c ignores -Wsign-compare, which -Wall leaves off in C, as git's files
+  // do through git-compat-util.h: no warning's level changes, so a.c's copy
+  // fits b.c, and the other way round.
+  ExtraArgs = {"-Wall"};
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#pragma GCC diagnostic ignored "
+                               "\"-Wsign-compare\"\n#include \"" +
+                                   W + "\"\n");
+  EXPECT_TRUE(reads(A, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, W)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "w.h was not exported";
+  EXPECT_FALSE(reads(B, W)) << "not served under a pragma that changes nothing";
+  EXPECT_EQ(Warnings, 1u) << "the copy did not print w.h's warning";
+}
+
 TEST_F(ExportTest, AHeaderLeavingAWarningPragmaInForceIsServedWithIt) {
   // quiet.h silences -Wunused-variable for the rest of the compile, as git's
   // git-compat-util.h does -Wsign-compare. A compile served it must stay

@@ -48,6 +48,7 @@
 
 #include "clang/ASTCache/DependencyRecord.h"
 #include "clang/Lex/PPCallbacks.h"
+#include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/SmallVector.h"
 #include <optional>
 
@@ -93,8 +94,18 @@ uint64_t warningFlagsHash(const DiagnosticOptions &Opts);
 /// hit applies again the ones its header left in force (REPORT.md Q34).
 class WarningPragmaTracker : public PPCallbacks {
 public:
-  /// A hash of the pragmas in force here and of how they nest.
-  uint64_t fingerprint() const;
+  WarningPragmaTracker() = default;
+  /// With \p PP and the compile's \p Opts, a pragma counts in the
+  /// fingerprint only by the warnings whose level it leaves different from
+  /// the command line's: git's ignoring -Wsign-compare, which -Wall leaves
+  /// off in C, changes nothing a header prints.
+  WarningPragmaTracker(const Preprocessor &PP, DiagnosticOptions &Opts)
+      : PP(&PP), Opts(&Opts) {}
+
+  /// A hash of what the pragmas in force at \p At change, and of how they
+  /// nest. Without \p At, or where it is in a system header, which
+  /// silences warnings on its own, of the pragmas' text.
+  uint64_t fingerprint(SourceLocation At = SourceLocation()) const;
 
   /// Where the pragmas stand: to find what a header left in force.
   struct Mark {
@@ -121,10 +132,14 @@ public:
                         StringRef Option) override {
     Levels.back().Changes.push_back(
         {static_cast<uint8_t>(Severity), Option.str()});
+    Cached.reset();
+    CachedText.reset();
   }
   void PragmaWarning(SourceLocation, PragmaWarningSpecifier,
                      ArrayRef<int>) override {
     ++Levels.back().Opaque;
+    Cached.reset();
+    CachedText.reset();
   }
   void PragmaWarningPush(SourceLocation, int) override { push(); }
   void PragmaWarningPop(SourceLocation) override { pop(); }
@@ -136,12 +151,28 @@ private:
     /// #pragma warning(disable: ...) and the like, which are not replayed.
     unsigned Opaque = 0;
   };
-  void push() { Levels.push_back({NextId++, {}, 0}); }
+  void push() {
+    Levels.push_back({NextId++, {}, 0});
+    Cached.reset();
+    CachedText.reset();
+  }
   /// A pop with nothing pushed changes nothing, as for Clang.
   void pop() {
     if (Levels.size() > 1)
       Levels.pop_back();
+    Cached.reset();
+    CachedText.reset();
   }
+
+  const Preprocessor *PP = nullptr;
+  /// The compile's warning flags (CompilerInstance::getDiagnosticOpts).
+  DiagnosticOptions *Opts = nullptr;
+  /// The levels the command line's warning flags give, made when first
+  /// needed.
+  mutable std::unique_ptr<DiagnosticsEngine> CommandLine;
+  const DiagnosticsEngine &commandLine() const;
+  /// fingerprint, by levels and by text, until a pragma changes them.
+  mutable std::optional<uint64_t> Cached, CachedText;
 
   /// The command line's level first; a push adds one.
   std::vector<Level> Levels{Level{0, {}, 0}};
@@ -151,7 +182,8 @@ private:
 /// What decides which diagnostics a header prints where it is included:
 /// \p FlagsHash (warningFlagsHash) and the warning pragmas in force there,
 /// \p Pragmas or none.
-uint64_t warningState(uint64_t FlagsHash, const WarningPragmaTracker *Pragmas);
+uint64_t warningState(uint64_t FlagsHash, const WarningPragmaTracker *Pragmas,
+                      SourceLocation At = SourceLocation());
 
 /// Applies the difference between \p Entry and \p Exit to \p S, reproducing
 /// what a textual include of the header would have left behind. Called after

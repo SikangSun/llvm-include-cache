@@ -500,7 +500,8 @@ private:
     // The warning flags and the pragmas in force here decide what the
     // header prints; a hit compares them (REPORT.md Q34).
     P.WarningState =
-        warningState(warningFlagsHash(CI.getDiagnosticOpts()), Pragmas);
+        warningState(warningFlagsHash(CI.getDiagnosticOpts()), Pragmas,
+                     P.IncludeLoc);
     if (Pragmas)
       P.PragmasAtBegin = Pragmas->mark();
     // A part refers to a declaration from a loaded copy by name; it cannot

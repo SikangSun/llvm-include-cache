@@ -9,6 +9,7 @@
 #include "clang/ASTCache/PragmaStateCheck.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/FileManager.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/Support/xxhash.h"
 
@@ -131,18 +132,68 @@ uint64_t clang::ast_cache::warningFlagsHash(const DiagnosticOptions &Opts) {
   return llvm::xxh3_64bits(Key);
 }
 
-uint64_t WarningPragmaTracker::fingerprint() const {
+const DiagnosticsEngine &WarningPragmaTracker::commandLine() const {
+  // The levels the flags alone give. The compile's own engine cannot say:
+  // a pragma at a file's first offset changes its first state in place.
+  if (!CommandLine) {
+    CommandLine = std::make_unique<DiagnosticsEngine>(
+        PP->getDiagnostics().getDiagnosticIDs(), *Opts,
+        new IgnoringDiagConsumer());
+    ProcessWarningOptions(*CommandLine, *Opts,
+                          PP->getFileManager().getVirtualFileSystem(),
+                          /*ReportDiags=*/false);
+  }
+  return *CommandLine;
+}
+
+uint64_t WarningPragmaTracker::fingerprint(SourceLocation At) const {
+  bool ByLevel = PP && At.isValid() &&
+                 !PP->getSourceManager().isInSystemHeader(
+                     PP->getSourceManager().getExpansionLoc(At));
+  std::optional<uint64_t> &Memo = ByLevel ? Cached : CachedText;
+  if (Memo)
+    return *Memo;
   std::string Key;
   for (const Level &L : Levels) {
     Key += '\2';
     Key += std::to_string(L.Opaque);
-    for (const WarningPragma &P : L.Changes) {
-      Key += '\1';
-      Key += char('0' + P.Severity);
-      Key += P.Option;
-    }
   }
-  return llvm::xxh3_64bits(Key);
+  // What the pragmas in force change: each warning they name whose level at
+  // \p At differs from the command line's. Without a preprocessor, or for
+  // -Weverything, their text.
+  std::vector<std::pair<unsigned, unsigned>> Changed;
+  const DiagnosticsEngine *Diags = ByLevel ? &PP->getDiagnostics() : nullptr;
+  for (const Level &L : Levels)
+    for (const WarningPragma &P : L.Changes) {
+      StringRef Option = P.Option;
+      SmallVector<diag::kind, 16> IDs;
+      if (!Diags || Option.size() < 3 ||
+          Option.substr(2) == "everything" ||
+          Diags->getDiagnosticIDs()->getDiagnosticsInGroup(
+              Option[1] == 'W' ? diag::Flavor::WarningOrError
+                               : diag::Flavor::Remark,
+              Option.substr(2), IDs)) {
+        Key += '\1';
+        Key += char('0' + P.Severity);
+        Key += P.Option;
+        continue;
+      }
+      for (diag::kind ID : IDs) {
+        auto Now = Diags->getDiagnosticLevel(ID, At);
+        if (Now != commandLine().getDiagnosticLevel(ID, SourceLocation()))
+          Changed.push_back({ID, Now});
+      }
+    }
+  llvm::sort(Changed);
+  Changed.erase(llvm::unique(Changed), Changed.end());
+  for (auto [ID, Lvl] : Changed) {
+    Key += '\3';
+    Key += std::to_string(ID);
+    Key += ':';
+    Key += std::to_string(Lvl);
+  }
+  Memo = llvm::xxh3_64bits(Key);
+  return *Memo;
 }
 
 WarningPragmaTracker::Mark WarningPragmaTracker::mark() const {
@@ -176,12 +227,16 @@ void WarningPragmaTracker::apply(DiagnosticsEngine &Diags,
   else if (Diags.setSeverityForGroup(Flavor, Group, Severity, Loc))
     return;
   Levels.back().Changes.push_back(P);
+  Cached.reset();
+  CachedText.reset();
 }
 
 uint64_t clang::ast_cache::warningState(uint64_t FlagsHash,
-                                        const WarningPragmaTracker *Pragmas) {
+                                        const WarningPragmaTracker *Pragmas,
+                                        SourceLocation At) {
   static const uint64_t NoPragmas = WarningPragmaTracker().fingerprint();
-  uint64_t Words[2] = {FlagsHash, Pragmas ? Pragmas->fingerprint() : NoPragmas};
+  uint64_t Words[2] = {FlagsHash,
+                       Pragmas ? Pragmas->fingerprint(At) : NoPragmas};
   return llvm::xxh3_64bits(llvm::ArrayRef<uint8_t>(
       reinterpret_cast<const uint8_t *>(Words), sizeof(Words)));
 }
