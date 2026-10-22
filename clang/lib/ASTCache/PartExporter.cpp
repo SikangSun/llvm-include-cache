@@ -1789,6 +1789,63 @@ private:
       if (Region[K] >= 0)
         P.SubmoduleOf[F] = Region[K];
     }
+    // A macro a submodule set that the part's lines outside it test or
+    // expand: inner.h's INNER_FAST, tested by outer.h after the #include.
+    // Where the submodule is skipped, the compile's own state of the macro
+    // stands for it, and must be the one those lines were parsed with -- the
+    // compile may have changed it since it read the header. Each is a
+    // dependency of the reading lines' submodule that applies only where the
+    // providing one is skipped.
+    {
+      auto Holds = [&](int R, int K) {
+        for (; R >= 0; R = Subs[R].Parent)
+          if (R == K)
+            return true;
+        return false;
+      };
+      std::map<std::pair<int, int>, uint32_t> CondFor;
+      auto CondIndex = [&](int Owner, int Provider) {
+        auto [It, New] =
+            CondFor.try_emplace({Owner, Provider}, Deps.Conditions.size() + 1);
+        if (New)
+          Deps.Conditions.push_back({Owner, Provider});
+        return It->second;
+      };
+      std::set<std::tuple<std::string, bool, uint32_t>> SeenTest;
+      std::set<std::tuple<std::string, std::string, uint32_t>> SeenRead;
+      for (size_t J = 0; J != All.size(); ++J) {
+        int Reader = Region[J];
+        auto Provider = [&](FileID O) {
+          // No file set it: a predefined or command-line macro.
+          if (O.isInvalid())
+            return -1;
+          auto It = Index.find(O);
+          if (It == Index.end())
+            return -1;
+          int K = Region[It->second];
+          return K >= 0 && !Holds(Reader, K) ? K : -1;
+        };
+        for (const auto &E : All[J]->Conditional) {
+          int K = Provider(E.Origin);
+          if (K < 0)
+            continue;
+          ConditionalDependency D = E.Dep;
+          D.Cond = CondIndex(Reader, K);
+          if (SeenTest.insert({D.MacroName, D.WasDefined, D.Cond}).second)
+            Deps.Conditional.push_back(std::move(D));
+        }
+        for (const auto &E : All[J]->Syntactic) {
+          int K = Provider(E.Origin);
+          if (K < 0)
+            continue;
+          SyntacticDependency D = E.Dep;
+          D.Cond = CondIndex(Reader, K);
+          if (SeenRead.insert({D.Name, D.TokenSequence, D.Cond}).second)
+            Deps.Syntactic.push_back(std::move(D));
+        }
+      }
+      Counts.Crossing += SeenTest.size() + SeenRead.size();
+    }
     Deps.Submodules = std::move(Subs);
     Lap(Counts.DepsMicros);
     Counts.Submodules += Deps.Submodules.size();

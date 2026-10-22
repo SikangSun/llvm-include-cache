@@ -56,6 +56,9 @@ public:
     unsigned Copied = 0;
     /// Headers held as submodules of the parts written (REPORT.md T17).
     unsigned Submodules = 0;
+    /// Macros a submodule set that the part's other lines read, checked
+    /// where the submodule is skipped.
+    unsigned Crossing = 0;
     /// CLANG_HEADER_CACHE_LINK: links to copies served inside a header
     /// being written, and to copies of headers inside one written.
     unsigned LinksServed = 0, LinksWritten = 0;

@@ -1721,6 +1721,44 @@ TEST_F(ExportTest, OneCopyServesAHeaderWhetherOrNotItsInnerHeaderWasRead) {
   EXPECT_EQ(Daemon->stats().Entries, Stored) << "a copy was written";
 }
 
+TEST_F(ExportTest, ASkippedSubmodulesMacroTheCopyReadsIsChecked) {
+  // inner.h defines INNER_FAST and outer.h's lines after it test it.
+  // Outer.h's copy holds inner.h as a submodule (REPORT.md T17). d.c reads
+  // inner.h, then undefines INNER_FAST: the submodule would be skipped, but
+  // outer.h's lines were parsed with INNER_FAST defined, so the copy does
+  // not stand in, and fast returns long, as with plain clang.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#define INNER_FAST\n"
+                                       "int inner(void);\n#endif\n");
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#include \"" +
+                                           Inner +
+                                           "\"\n#ifdef INNER_FAST\n"
+                                           "int fast(void);\n#else\n"
+                                           "long fast(void);\n#endif\n"
+                                           "#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Inner +
+                                   "\"\n#undef INNER_FAST\n#include \"" +
+                                   Outer + "\"\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(C, Outer))
+      << "the copy was not served with inner.h's submodule skipped";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("fast")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        Returns = F->getReturnType().getAsString();
+  };
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Returns, "long");
+}
+
 TEST_F(ExportTest, AGuardDefinedWithoutItsHeaderReadIsNotServed) {
   // fake.c defines inner.h's guard without reading inner.h, with a my_size
   // of its own. Plain clang reads outer.h's text with inner.h left out; the

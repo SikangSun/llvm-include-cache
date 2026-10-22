@@ -369,7 +369,8 @@ public:
       OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
          << " with deep copies), declined " << E.Declined << ", "
          << ms(E.Micros) << " ms writing and pushing, " << E.Submodules
-         << " headers held as submodules, " << E.HeldBack
+         << " headers held as submodules (" << E.Crossing
+         << " macros they set read outside them), " << E.HeldBack
          << " held back as the first time their copy would be written, "
          << E.LinksServed << " links to copies served, " << E.LinksWritten
          << " to copies written\n";
