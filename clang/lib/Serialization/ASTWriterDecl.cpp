@@ -3055,7 +3055,7 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
   // Determine the ID for this declaration.
   LocalDeclID ID;
   bool ByName = isPartNameReference(D);
-  assert((!D->isFromASTFile() || ByName) &&
+  assert((!D->isFromASTFile() || ByName || isPartLocal(D)) &&
          "should not be emitting imported decl");
   LocalDeclID &IDR = DeclIDs[D];
   if (IDR.isInvalid())

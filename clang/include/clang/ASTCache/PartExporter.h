@@ -37,9 +37,13 @@
 #include <vector>
 
 namespace clang {
+namespace serialization {
+class ModuleFile;
+}
 class CompilerInstance;
 
 namespace ast_cache {
+class MetadataView;
 class WarningPragmaTracker;
 
 class PartExporter {
@@ -52,6 +56,12 @@ public:
     unsigned Copied = 0;
     /// Headers held as submodules of the parts written (REPORT.md T17).
     unsigned Submodules = 0;
+    /// CLANG_HEADER_CACHE_LINK: links to copies served inside a header
+    /// being written, and to copies of headers inside one written.
+    unsigned LinksServed = 0, LinksWritten = 0;
+    /// CLANG_HEADER_CACHE_SECOND_MISS: parts not written, the first time
+    /// their copy would have been.
+    unsigned HeldBack = 0;
     std::vector<std::string> Copies;
     /// "<header>: <why>", one per declined part.
     std::vector<std::string> Declines;
@@ -87,7 +97,39 @@ public:
   /// A saved copy stood in for an #include. A header open now is not
   /// exported: its part would hold the import, not the declarations. The
   /// copy may be one the compile loaded before, which loads no module file.
-  virtual void served() = 0;
+  /// With \p Fold, the copy's module file, the headers open hold its
+  /// declarations as their own instead (CLANG_HEADER_CACHE_FOLD_SERVED), and
+  /// its metadata \p Deps joins theirs; \p Loc is the #include, and
+  /// \p Resolve gives where the declaration a name finds there is.
+  virtual void
+  served(serialization::ModuleFile *Fold = nullptr,
+         const MetadataView *Deps = nullptr, SourceLocation Loc = {},
+         llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve =
+             nullptr) = 0;
+
+  /// CLANG_HEADER_CACHE_LINK: the copy of the header at \p Path, module
+  /// \p Module and file \p MF, stood in for an #include at \p Loc inside
+  /// the headers open, whose copies link it instead of holding it. \p Guard
+  /// is the header's include guard. Its metadata \p Deps joins theirs, and
+  /// \p Resolve gives where the declaration a name finds there is.
+  /// \p FirstModule: how many module files the compile had loaded before
+  /// the copy and its own links loaded.
+  virtual void
+  linked(llvm::StringRef Path, llvm::StringRef Module, llvm::StringRef Guard,
+         serialization::ModuleFile *MF, const MetadataView &Deps,
+         SourceLocation Loc,
+         llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
+         unsigned FirstModule, uint64_t Hash) = 0;
+
+  /// CLANG_HEADER_CACHE_SECOND_MISS: a part is written only if \p Seen
+  /// says a compile was about to write the same copy (header, module name)
+  /// before.
+  virtual void
+  writeOnlyIfSeen(std::function<bool(llvm::StringRef, llvm::StringRef)> Seen) = 0;
+
+  /// While \p On, Clang's diagnostics are a hit's, printed again: not the
+  /// open headers' to hold.
+  virtual void replaying(bool On) = 0;
 
   /// Whether a header this compile is exporting is open: one that missed,
   /// was entered, and has not been declined. Its part is a folded copy -- it

@@ -43,6 +43,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <chrono>
+#include <unistd.h>
 #include <map>
 #include "llvm/ADT/StringSet.h"
 #include <set>
@@ -77,6 +78,79 @@ std::string absolutePath(FileManager &FM, llvm::StringRef Name) {
   return std::string(Path);
 }
 
+/// CLANG_HEADER_CACHE_DDG: the declarations each file's text uses that another
+/// file declared first, by the file the use is written in (a macro's
+/// expansion counts where the macro is used). Kind 'D' is a name that must be
+/// declared -- a typedef, function, variable, enumerator or field; kind 'T' a
+/// struct, union or enum tag, which a pointer to it does not need declared.
+class DeclUses : public RecursiveASTVisitor<DeclUses> {
+public:
+  explicit DeclUses(const SourceManager &SM) : SM(SM) {}
+
+  bool VisitDeclRefExpr(DeclRefExpr *E) {
+    use('D', E->getLocation(), E->getDecl());
+    return true;
+  }
+  bool VisitMemberExpr(MemberExpr *E) {
+    use('D', E->getMemberLoc(), E->getMemberDecl());
+    return true;
+  }
+  bool VisitTypedefTypeLoc(TypedefTypeLoc TL) {
+    use('D', TL.getNameLoc(), TL.getDecl());
+    return true;
+  }
+  bool VisitTagTypeLoc(TagTypeLoc TL) {
+    if (!TL.isDefinition())
+      use('T', TL.getNameLoc(), TL.getDecl());
+    return true;
+  }
+
+  struct Use {
+    char Kind;
+    std::string Name;
+    FileID Origin;
+    std::string Value;
+  };
+  llvm::DenseMap<FileID, std::vector<Use>> Uses;
+
+private:
+  void use(char Kind, SourceLocation Loc, const NamedDecl *D) {
+    if (!D || Loc.isInvalid())
+      return;
+    SourceLocation Declared = D->getCanonicalDecl()->getLocation();
+    if (Declared.isInvalid())
+      return;
+    FileID From = SM.getFileID(SM.getExpansionLoc(Loc));
+    FileID Origin = SM.getFileID(SM.getExpansionLoc(Declared));
+    if (From.isInvalid() || Origin.isInvalid() || From == Origin)
+      return;
+    // A file that declares the name itself (git's progress.h, `struct
+    // repository;`) does not need it from another.
+    for (const Decl *R : D->redecls())
+      if (R->getLocation().isValid() &&
+          SM.getFileID(SM.getExpansionLoc(R->getLocation())) == From)
+        return;
+    std::string Name = D->getNameAsString();
+    if (Name.empty())
+      return;
+    std::string Value;
+    if (const auto *T = dyn_cast<TagDecl>(D)) {
+      Name = (llvm::Twine(T->getKindName()) + " " + Name).str();
+      Value = T->getDefinition() ? "defined" : "declared";
+    } else if (const auto *T = dyn_cast<TypedefNameDecl>(D)) {
+      Value = T->getUnderlyingType().getCanonicalType().getAsString();
+    } else if (const auto *E = dyn_cast<EnumConstantDecl>(D)) {
+      Value = toString(E->getInitVal(), 10);
+    } else if (const auto *V = dyn_cast<ValueDecl>(D)) {
+      Value = V->getType().getCanonicalType().getAsString();
+    }
+    Uses[From].push_back({Kind, std::move(Name), Origin,
+                          llvm::utohexstr(llvm::xxh3_64bits(Value))});
+  }
+
+  const SourceManager &SM;
+};
+
 class Exporter : public PartExporter, public PPCallbacks {
 public:
   Exporter(CompilerInstance &CI, ASTCacheDependencyTracker &Tracker,
@@ -84,6 +158,8 @@ public:
            const WarningPragmaTracker *Pragmas)
       : CI(CI), SM(CI.getSourceManager()), Tracker(Tracker),
         Deliver(std::move(Deliver)), ByName(ByName), Pragmas(Pragmas) {
+    const char *Link = std::getenv("CLANG_HEADER_CACHE_LINK");
+    LinkMode = Link && llvm::StringRef(Link) == "1";
     std::lock_guard<std::mutex> L(RegistryLock);
     registry()[&CI] = this;
   }
@@ -97,10 +173,138 @@ public:
     Expected = &File.getFileEntry();
   }
 
-  void served() override {
+  void served(serialization::ModuleFile *Fold, const MetadataView *Deps,
+              SourceLocation Loc,
+              llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve)
+      override {
+    if (!Fold || !Deps) {
+      for (Part &P : Open)
+        if (P.Decline.empty())
+          P.Decline = "a saved copy was served inside the header";
+      return;
+    }
+    // The copy's files get entries made here, inside every part open now;
+    // a part that folded the copy before has its own already.
+    llvm::DenseMap<int, FileID> Entries;
+    if (llvm::any_of(Open, [&](const Part &P) {
+          return P.Decline.empty() && !P.Folded.count(Fold);
+        }))
+      entriesFor(*Fold, Loc, Entries);
+    for (Part &P : Open) {
+      if (!P.Decline.empty())
+        continue;
+      if (P.Folded.insert(Fold).second)
+        P.FoldedEntries.insert(Entries.begin(), Entries.end());
+      // The copy's files are the part's: their stamps, and their header
+      // search marks for a loading compile.
+      for (const FileStampView &F : Deps->files()) {
+        P.Stamps[F.Path.str()] = {F.Path.str(), F.Size, F.ModTime};
+        if (OptionalFileEntryRef FE =
+                CI.getFileManager().getOptionalFileRef(F.Path))
+          P.Files.insert(&FE->getFileEntry());
+      }
+      // What the copy does to macros, the part does: the hit replays each
+      // at the #include, inside the part.
+      for (const MacroEffectView &M : Deps->macroEffects())
+        touch(P, CI.getPreprocessor().getIdentifierInfo(M.Name));
+    }
+    Tracker.foldServed(Loc, Fold->SLocEntryBaseID, Fold->LocalNumSLocEntries,
+                       *Deps, Resolve);
+  }
+
+  void linked(llvm::StringRef Path, llvm::StringRef Module,
+              llvm::StringRef Guard, serialization::ModuleFile *MF,
+              const MetadataView &Deps, SourceLocation Loc,
+              llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
+              unsigned FirstModule, uint64_t Hash) override {
+    if (Open.empty())
+      return;
+    Preprocessor &PP = CI.getPreprocessor();
+    // A hit replays the links before the copy's own directives: one that
+    // changes a macro the lines before it set would be undone by them.
     for (Part &P : Open)
-      if (P.Decline.empty())
-        P.Decline = "a saved copy was served inside the header";
+      for (const MacroEffectView &M : Deps.macroEffects())
+        if (P.Decline.empty() && P.Touched.contains(PP.getIdentifierInfo(M.Name)))
+          P.Decline = "a copy it links changes a macro its lines set before: " +
+                      M.Name.str();
+    for (Part &P : Open) {
+      if (!P.Decline.empty())
+        continue;
+      // The copy's files are the part's: their stamps, for a loading
+      // compile's check.
+      for (const FileStampView &F : Deps.files()) {
+        P.Stamps[F.Path.str()] = {F.Path.str(), F.Size, F.ModTime};
+        if (OptionalFileEntryRef FE =
+                CI.getFileManager().getOptionalFileRef(F.Path))
+          P.Files.insert(&FE->getFileEntry());
+      }
+    }
+    // The innermost header holds the link; a part not written hands it to
+    // the one around it (handOver).
+    Part &In = Open.back();
+    bool OnGuard = !Guard.empty() && !In.Touched.contains(
+                                         PP.getIdentifierInfo(Guard));
+    // Skipped where the header was read, the link must read nothing the
+    // lines before it set: no macro they defined, no name they declared.
+    auto Set = [&](llvm::StringRef Name) {
+      return In.Touched.contains(PP.getIdentifierInfo(Name));
+    };
+    for (const ConditionalView &C : Deps.conditional())
+      OnGuard = OnGuard && !Set(C.MacroName);
+    for (const ExpandsToView &E : Deps.expandsTo())
+      OnGuard = OnGuard && !Set(E.Name);
+    for (const NameView &N : Deps.notAMacro())
+      OnGuard = OnGuard && !Set(N.Name);
+    for (const SymbolView &S : Deps.symbol()) {
+      if (!OnGuard)
+        break;
+      SourceLocation At = Resolve ? Resolve(S.Name) : SourceLocation();
+      if (At.isValid() && SM.isLocalSourceLocation(At) &&
+          In.contains(SM.getExpansionLoc(At).getRawEncoding()))
+        OnGuard = false;
+    }
+    In.Links.push_back(
+        {Loc, {Path.str(), Module.str(), Guard.str(), OnGuard, {}, Hash}});
+    In.LinkSets.emplace_back();
+    for (const MacroEffectView &M : Deps.macroEffects())
+      In.LinkSets.back().push_back(M.Name.str());
+    In.LinkFroms.push_back(
+        {FirstModule, static_cast<unsigned>(modulesLoaded()), 0, 0});
+    if (getenv("DEBUG_LINK")) {
+      llvm::errs() << "SERVED " << Path << " in " << In.Stored << " decls:";
+      for (const DeclarationView &D : Deps.declarations())
+        llvm::errs() << " " << D.Name
+                     << (ownLinesDeclare(In,
+                                         D.In == DeclarationDependency::Space::Tag,
+                                         D.Name)
+                             ? "(own)"
+                             : "");
+      llvm::errs() << "\n";
+    }
+    for (const DeclarationView &D : Deps.declarations()) {
+      In.LinkOutside.push_back({int(In.Links.size()) - 1,
+                                {D.In, D.Name.str(), D.Fingerprint.str()}});
+      // A link loads before the lines of the copies around it: one that
+      // names a declaration they made cannot be linked, and they hold none
+      // of its lines either.
+      if (ownLinesDeclare(In, D.In == DeclarationDependency::Space::Tag,
+                          D.Name))
+        for (Part &O : Open)
+          if (O.Decline.empty())
+            O.Decline = "a copy served inside it names a declaration of its "
+                        "own lines: " + D.Name.str();
+    }
+    ++Counts.LinksServed;
+    if (MF)
+      Tracker.foldServed(Loc, MF->SLocEntryBaseID, MF->LocalNumSLocEntries,
+                         Deps, Resolve, /*Linked=*/true);
+  }
+
+  void replaying(bool On) override { Replaying = On; }
+
+  void writeOnlyIfSeen(
+      std::function<bool(llvm::StringRef, llvm::StringRef)> Seen) override {
+    SeenBefore = std::move(Seen);
   }
 
   bool writing() const override {
@@ -113,7 +317,7 @@ public:
 
   void diagnostic(DiagnosticsEngine::Level Level,
                   const Diagnostic &Info) override {
-    if (Level == DiagnosticsEngine::Ignored)
+    if (Level == DiagnosticsEngine::Ignored || Replaying)
       return;
     bool Note = Level == DiagnosticsEngine::Note;
     for (Part &P : Open)
@@ -256,7 +460,115 @@ public:
       writeReady();
   }
 
-  void translationUnitFinished() { writeReady(); }
+  void translationUnitFinished() {
+    writeReady();
+    if (const char *Dir = std::getenv("CLANG_HEADER_CACHE_DDG"))
+      dumpGraph(Dir);
+  }
+
+  /// CLANG_HEADER_CACHE_DDG=<dir>, for measuring a codebase's headers: for
+  /// each file this compile read, to <dir>/<pid>.ddg, the file that
+  /// included it and a hash of what its copy's metadata would say ("R"),
+  /// and each state it read that another file set ("E": the kind, the name,
+  /// the file that set it, and whether that file is inside it). The
+  /// metadata itself goes, once per hash, to <dir>/v/<hash>.
+  void dumpGraph(llvm::StringRef Dir) {
+    using FR = ASTCacheDependencyTracker::FileReads;
+    std::error_code EC;
+    llvm::raw_fd_ostream OS((Dir + "/" + llvm::Twine(::getpid()) + ".ddg").str(),
+                            EC);
+    if (EC)
+      return;
+    llvm::sys::fs::create_directories(Dir + "/v");
+    FileManager &FM = CI.getFileManager();
+    auto PathOf = [&](FileID F) -> std::string {
+      if (F.isInvalid())
+        return "-";
+      OptionalFileEntryRef FE = SM.getFileEntryRefForID(F);
+      return FE ? absolutePath(FM, FE->getName()) : "-";
+    };
+    llvm::ArrayRef<FR> All = Tracker.allFileReads();
+    std::vector<const FR *> Stack;
+    // The declarations the headers use from other files ('D', 'T').
+    DeclUses Decls(SM);
+    if (CI.hasASTContext())
+      for (Decl *D : CI.getASTContext().getTranslationUnitDecl()->decls()) {
+        SourceLocation L = SM.getExpansionLoc(D->getLocation());
+        if (L.isValid() && SM.getFileID(L) != SM.getMainFileID())
+          Decls.TraverseDecl(D);
+      }
+    OS << "C\t" << CI.getFrontendOpts().Inputs[0].getFile() << "\n";
+    for (const FR &F : All) {
+      while (!Stack.empty() && Stack.back()->Exit && Stack.back()->Exit < F.Enter)
+        Stack.pop_back();
+      std::string Path = PathOf(F.FID);
+      std::string Parent = Stack.empty() ? "-" : PathOf(Stack.back()->FID);
+      uint64_t Hash = 0;
+      if (const HeaderDependencySet *Rec = Tracker.recordFor(F.FID)) {
+        HeaderDependencySet D = *Rec;
+        D.Files.clear();
+        D.HeaderName.clear();
+        llvm::SmallVector<char, 256> Bytes;
+        encodeMetadata(D, {}, Bytes);
+        Hash = llvm::xxh3_64bits(llvm::StringRef(Bytes.data(), Bytes.size()));
+        std::string VPath = (Dir + "/v/" + llvm::utohexstr(Hash)).str();
+        int FD;
+        if (!llvm::sys::fs::openFileForWrite(VPath, FD,
+                                             llvm::sys::fs::CD_CreateNew)) {
+          llvm::raw_fd_ostream V(FD, /*shouldClose=*/true);
+          V << "header\t" << Path << "\n";
+          for (const ConditionalDependency &C : D.Conditional)
+            V << "cond\t" << C.MacroName << "\t" << C.WasDefined << "\n";
+          for (const SyntacticDependency &S : D.Syntactic)
+            V << "syn\t" << S.Name << "\t" << int(S.Required) << "\t"
+              << llvm::xxh3_64bits(S.TokenSequence) << "\n";
+          for (const SymbolDependency &S : D.Symbol)
+            V << "sym\t" << S.Name << "\t" << int(S.Classification) << "\n";
+          for (const InclusionDependency &I : D.Inclusion)
+            V << "inc\t" << I.HeaderPath << "\t" << int(I.Why) << "\n";
+        }
+      }
+      OS << "R\t" << Path << "\t" << Parent << "\t" << llvm::utohexstr(Hash)
+         << "\t" << F.Exit - F.Enter << "\n";
+      auto Inside = [&](FileID O) {
+        // No file (the command line, Clang itself) is no key of the map.
+        if (O.isInvalid())
+          return false;
+        const FR *G = Tracker.fileReads(O);
+        return G && G->Enter >= F.Enter && F.Exit && G->Exit <= F.Exit;
+      };
+      llvm::StringSet<> Seen;
+      // The seventh column is the state the file saw: whether a macro was
+      // defined; whether a name was a macro, and its expansion; a
+      // declaration's type.
+      auto Edge = [&](char Kind, llvm::StringRef Name, FileID O,
+                      llvm::StringRef Value) {
+        if (O == F.FID)
+          return;
+        std::string Key = (llvm::Twine(Kind) + Name + "\t" + PathOf(O)).str();
+        if (!Seen.insert(Key).second)
+          return;
+        OS << "E\t" << Path << "\t" << Kind << "\t" << Name << "\t"
+           << PathOf(O) << "\t" << (Inside(O) ? "in" : "out") << "\t" << Value
+           << "\n";
+      };
+      for (const auto &E : F.Conditional)
+        Edge('C', E.Dep.MacroName, E.Origin, E.Dep.WasDefined ? "1" : "0");
+      for (const auto &E : F.Syntactic)
+        Edge('S', E.Dep.Name, E.Origin,
+             (llvm::Twine(int(E.Dep.Required)) + ":" +
+              llvm::utohexstr(llvm::xxh3_64bits(E.Dep.TokenSequence)))
+                 .str());
+      for (const auto &E : F.Symbol)
+        Edge('Y', E.Dep.Name, E.Origin, std::to_string(int(E.Dep.Classification)));
+      for (const auto &E : F.Inclusion)
+        Edge('I', E.Dep.HeaderPath, E.Origin, std::to_string(int(E.Dep.Why)));
+      if (auto It = Decls.Uses.find(F.FID); It != Decls.Uses.end())
+        for (const DeclUses::Use &U : It->second)
+          Edge(U.Kind, U.Name, U.Origin, U.Value);
+      Stack.push_back(&F);
+    }
+  }
 
 private:
   /// A diagnostic as Clang printed it.
@@ -284,6 +596,47 @@ private:
 
   struct Part {
     FileID FID;
+    /// CLANG_HEADER_CACHE_LINK: the part's number, and that of the part
+    /// whose header was open around it, 0 for none.
+    unsigned Id = 0, ParentId = 0;
+    /// The copies the part's copy links, each with its #include, and the
+    /// regions of the headers inside it linked rather than held.
+    std::vector<std::pair<SourceLocation, LinkRecord>> Links;
+    /// For each link, the macros its header sets; where what it declares
+    /// comes from: the module files loaded for it, and the region of the
+    /// header written inside this one; and its place in the metadata.
+    std::vector<std::vector<std::string>> LinkSets;
+    struct LinkFrom {
+      unsigned ModLo = 0, ModHi = 0;
+      SourceLocation::UIntTy RegLo = 0, RegHi = 0;
+    };
+    std::vector<LinkFrom> LinkFroms;
+    std::vector<size_t> LinkOrder;
+    /// The outside declarations the copies it links refer to by name, which
+    /// its own check must cover; and, once written, its own.
+    /// Each with the link it is from, by index into Links.
+    std::vector<std::pair<int, DeclarationDependency>> LinkOutside;
+    std::vector<DeclarationDependency> WrittenDecls;
+    size_t ModulesAtEnd = 0;
+    std::vector<std::pair<SourceLocation::UIntTy, SourceLocation::UIntTy>>
+        LinkedRegions;
+    /// Each name the header touched: its directives inside the header,
+    /// latest first, for telling its own from a linked header's.
+    llvm::DenseMap<const IdentifierInfo *, std::vector<SourceLocation>>
+        Directives;
+    /// The names whose effect is a linked header's, not the part's.
+    llvm::DenseSet<const IdentifierInfo *> LinkedNames;
+    /// The module name the part was written under, and its bytes hashed;
+    /// empty if not written.
+    std::string Written;
+    uint64_t WrittenHash = 0;
+    /// Copies served inside the header, whose declarations the part holds
+    /// as its own (CLANG_HEADER_CACHE_FOLD_SERVED).
+    llvm::SmallPtrSet<serialization::ModuleFile *, 4> Folded;
+    /// For each file entry of those copies, by its loaded ID, the entry for
+    /// the same file made inside the header where the copy was served: a
+    /// location in the copy is written as the same offset in it.
+    llvm::DenseMap<int, FileID> FoldedEntries;
     /// The #include that entered the header.
     SourceLocation IncludeLoc;
     /// The name the compile opened the header by, and the absolute path the
@@ -322,8 +675,9 @@ private:
     /// header's, so that its notes are too.
     bool TakingNotes = false;
 
+    /// A header still open holds everything made since it began.
     bool contains(SourceLocation::UIntTy Offset) const {
-      return Begin <= Offset && Offset < End;
+      return Begin <= Offset && (End == 0 || Offset < End);
     }
     /// REPORT.md T17: the submodule each file in the part's region belongs
     /// to, for the writer; files held by the part's own module are absent.
@@ -450,7 +804,72 @@ private:
   bool inPart(const Part &P, SourceLocation L) const {
     if (L.isInvalid())
       return false;
-    return P.contains(SM.getExpansionLoc(L).getRawEncoding());
+    SourceLocation::UIntTy Offset = SM.getExpansionLoc(L).getRawEncoding();
+    return P.contains(Offset) && !inLinked(P, Offset);
+  }
+
+  /// Whether \p Offset is in a header inside \p P that its copy links.
+  static bool inLinked(const Part &P, SourceLocation::UIntTy Offset) {
+    for (auto [B, E] : P.LinkedRegions)
+      if (B <= Offset && Offset < E)
+        return true;
+    return false;
+  }
+
+  /// Makes, at \p Loc, an entry for each file in \p MF, in the order of
+  /// MF's entries, each included where MF's entry was; \p Entries maps each
+  /// of MF's loaded IDs to the one made for it.
+  void entriesFor(serialization::ModuleFile &MF, SourceLocation Loc,
+                  llvm::DenseMap<int, FileID> &Entries) {
+    for (unsigned I = 0; I != MF.LocalNumSLocEntries; ++I) {
+      int ID = MF.SLocEntryBaseID + int(I);
+      bool Invalid = false;
+      // A loaded entry's ID is -2 less its index (SourceManager).
+      const SrcMgr::SLocEntry &E =
+          SM.getLoadedSLocEntry(static_cast<unsigned>(-ID - 2), &Invalid);
+      if (Invalid || !E.isFile())
+        continue;
+      const SrcMgr::FileInfo &Info = E.getFile();
+      OptionalFileEntryRef FE = Info.getContentCache().OrigEntry;
+      if (!FE)
+        continue;
+      SourceLocation At = Info.getIncludeLoc();
+      At = At.isValid() ? translateLoaded(Entries, At) : Loc;
+      if (At.isInvalid())
+        At = Loc;
+      Entries[ID] = SM.createFileID(*FE, At, Info.getFileCharacteristic());
+    }
+  }
+
+  /// \p L, in a copy folded into a part, as a place in the part's own entry
+  /// for its file (\p Entries); invalid if none.
+  SourceLocation translateLoaded(const llvm::DenseMap<int, FileID> &Entries,
+                                 SourceLocation L) const {
+    L = SM.getFileLoc(L);
+    if (!SM.isLoadedSourceLocation(L))
+      return L;
+    auto [FID, Offset] = SM.getDecomposedLoc(L);
+    auto It = Entries.find(static_cast<int>(FID.getHashValue()));
+    if (It == Entries.end()) {
+      if (getenv("DEBUG_DROP"))
+        llvm::errs() << "DROP " << SM.getFilename(L) << " fid "
+                     << (int)FID.getHashValue() << " off " << Offset << "\n";
+      return SourceLocation();
+    }
+    return SM.getComposedLoc(It->second, Offset);
+  }
+
+  /// Whether \p Offset is in a copy served inside \p P and folded into it.
+  bool inFolded(const Part &P, SourceLocation::UIntTy Offset) const {
+    if (P.Folded.empty())
+      return false;
+    FileID F = SM.getFileID(SourceLocation::getFromRawEncoding(Offset));
+    int ID = static_cast<int>(F.getHashValue());
+    for (const serialization::ModuleFile *MF : P.Folded)
+      if (ID >= MF->SLocEntryBaseID &&
+          ID < MF->SLocEntryBaseID + int(MF->LocalNumSLocEntries))
+        return true;
+    return false;
   }
 
   /// Whether the compile made \p D after \p P's header ended. Offsets do
@@ -477,6 +896,8 @@ private:
   void begin(FileID FID, FileEntryRef FE) {
     Part P;
     P.FID = FID;
+    P.Id = ++PartsBegun;
+    P.ParentId = Open.empty() ? 0 : Open.back().Id;
     P.Name = FE.getName().str();
     P.Stored = absolutePath(CI.getFileManager(), P.Name);
     P.IncludeLoc = SM.getIncludeLoc(FID);
@@ -515,6 +936,7 @@ private:
   void end() {
     Part P = Open.pop_back_val();
     P.End = SM.getNextLocalOffset();
+    P.ModulesAtEnd = modulesLoaded();
     P.SLocEnd = SM.local_sloc_entry_size();
     Preprocessor &PP = CI.getPreprocessor();
     llvm::DenseSet<const IdentifierInfo *> Unchanged;
@@ -525,6 +947,16 @@ private:
         P.Effects.push_back(
             {II->getName().str(),
              PP.isMacroDefined(const_cast<IdentifierInfo *>(II))});
+    if (LinkMode)
+      for (const IdentifierInfo *II : P.Touched) {
+        std::vector<SourceLocation> &Dirs = P.Directives[II];
+        for (const MacroDirective *MD = PP.getLocalMacroDirectiveHistory(II);
+             MD; MD = MD->getPrevious())
+          if (MD->getLocation().isValid() &&
+              P.contains(
+                  SM.getExpansionLoc(MD->getLocation()).getRawEncoding()))
+            Dirs.push_back(MD->getLocation());
+      }
     if (CI.hasSema()) {
       Sema &S = CI.getSema();
       P.Exit = capturePragmaState(S);
@@ -542,8 +974,16 @@ private:
       else
         P.Decline = "it leaves a warning pragma pushed, or pops one";
     }
-    if (modulesLoaded() > P.ModulesAtBegin && P.Decline.empty())
-      P.Decline = "a saved copy was loaded inside the header";
+    // Unless the part folds it in (FoldServed), or links it.
+    if (modulesLoaded() > P.ModulesAtBegin && P.Decline.empty() &&
+        !LinkMode) {
+      serialization::ModuleManager &MM = CI.getASTReader()->getModuleManager();
+      for (size_t I = P.ModulesAtBegin, E = MM.size(); I != E; ++I)
+        if (!P.Folded.count(&MM[I])) {
+          P.Decline = "a saved copy was loaded inside the header";
+          break;
+        }
+    }
     Ready.push_back(std::move(P));
   }
 
@@ -554,11 +994,373 @@ private:
     llvm::TimeTraceScope Scope("HeaderCache Export");
     std::vector<Part> Parts;
     Parts.swap(Ready);
-    for (Part &P : Parts)
+    Batch = &Parts;
+    for (Part &P : Parts) {
       write(P);
+      if (LinkMode)
+        handOver(P);
+    }
+    Batch = nullptr;
     Counts.Micros += std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - Start)
                          .count();
+  }
+
+  /// The part numbered \p Id, open, waiting, or being written; null if
+  /// it was written already.
+  Part *findPart(unsigned Id) {
+    for (Part &P : Open)
+      if (P.Id == Id)
+        return &P;
+    for (Part &P : Ready)
+      if (P.Id == Id)
+        return &P;
+    if (Batch)
+      for (Part &P : *Batch)
+        if (P.Id == Id)
+          return &P;
+    return nullptr;
+  }
+
+  /// CLANG_HEADER_CACHE_LINK: once \p P is written, the part around it
+  /// links P's copy rather than hold P's header. If P was not written, or
+  /// pushes or pops a macro, which both would replay, the part around it
+  /// holds P's header and links what P would have.
+  void handOver(Part &P) {
+    Part *Parent = P.ParentId ? findPart(P.ParentId) : nullptr;
+    if (!Parent)
+      return;
+    // A link loads before the lines of the copy linking it, so it cannot
+    // name a declaration they make: git's repository.h's
+    // `struct object_id;`, after hash.h's definition, inside hash.h.
+    bool TakesParents = llvm::any_of(P.WrittenDecls,
+                                     [&](const DeclarationDependency &D) {
+      return ownLinesDeclare(*Parent,
+                             D.In == DeclarationDependency::Space::Tag, D.Name);
+    });
+    if (getenv("DEBUG_LINK")) {
+      llvm::errs() << "HANDOVER " << P.Stored << " -> " << Parent->Stored
+                   << " written=" << !P.Written.empty()
+                   << " takesparents=" << TakesParents << " decls:";
+      for (const DeclarationDependency &D : P.WrittenDecls)
+        llvm::errs() << " " << D.Name;
+      llvm::errs() << "\n";
+    }
+    if (!P.Written.empty() && P.Stacks.empty() && !TakesParents) {
+      std::string Guard = guardOf(P.FID);
+      Parent->Links.push_back(
+          {P.IncludeLoc,
+           {P.Stored, P.Written, Guard,
+            !Guard.empty() && independentOf(P, *Parent, Guard), {},
+            P.WrittenHash}});
+      Parent->LinkSets.emplace_back();
+      for (const MacroEffect &E : P.Effects)
+        Parent->LinkSets.back().push_back(E.Name);
+      Parent->LinkFroms.push_back(
+          {static_cast<unsigned>(P.ModulesAtBegin),
+           static_cast<unsigned>(P.ModulesAtEnd), P.Begin, P.End});
+      Parent->LinkedRegions.push_back({P.Begin, P.End});
+      for (const DeclarationDependency &D : P.WrittenDecls)
+        Parent->LinkOutside.push_back({int(Parent->Links.size()) - 1, D});
+      ++Counts.LinksWritten;
+    } else {
+      int Offset = Parent->Links.size();
+      for (const auto &[From, D] : P.LinkOutside)
+        Parent->LinkOutside.push_back({Offset + From, D});
+      for (size_t K = 0; K != P.Links.size(); ++K) {
+        auto &[Loc, L] = P.Links[K];
+        // Skippable inside P; the parent's lines before P are not checked.
+        L.OnGuard = false;
+        Parent->Links.push_back({Loc, std::move(L)});
+        Parent->LinkSets.push_back(std::move(P.LinkSets[K]));
+        Parent->LinkFroms.push_back(P.LinkFroms[K]);
+      }
+      Parent->LinkedRegions.insert(Parent->LinkedRegions.end(),
+                                   P.LinkedRegions.begin(),
+                                   P.LinkedRegions.end());
+    }
+    // What a linked header printed, its copy prints again.
+    llvm::erase_if(Parent->Diagnostics, [&](const Captured &C) {
+      return C.Loc.isValid() && SM.isLocalSourceLocation(C.Loc) &&
+             inLinked(*Parent,
+                      SM.getExpansionLoc(C.Loc).getRawEncoding());
+    });
+  }
+
+  /// The include guard of the file entered as \p FID; empty for none.
+  std::string guardOf(FileID FID) {
+    OptionalFileEntryRef FE = SM.getFileEntryRefForID(FID);
+    if (!FE)
+      return "";
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    if (const IdentifierInfo *G =
+            HS.getFileInfo(*FE).getControllingMacro(HS.getExternalLookup()))
+      return G->getName().str();
+    return "";
+  }
+
+  /// Whether \p P's header read nothing that \p Parent's lines before it
+  /// set, changed no macro they set, and its guard \p Guard was not tested
+  /// there first (as compose decides for a submodule, REPORT.md T17).
+  bool independentOf(const Part &P, const Part &Parent,
+                     llvm::StringRef Guard) {
+    using FR = ASTCacheDependencyTracker::FileReads;
+    const FR *Root = Tracker.fileReads(Parent.FID);
+    const FR *Self = Tracker.fileReads(P.FID);
+    if (!Root || !Self || !Self->Exit)
+      return false;
+    auto Within = [&](const FR &F) {
+      return Self->Enter <= F.Enter && F.Exit && F.Exit <= Self->Exit;
+    };
+    auto Before = [&](FileID O) {
+      if (O.isInvalid())
+        return false;
+      const FR *F = Tracker.fileReads(O);
+      return F && F->Enter >= Root->Enter && F->Enter < Self->Enter &&
+             !Within(*F);
+    };
+    for (const FR &F : Tracker.allFileReads()) {
+      if (F.Enter < Root->Enter)
+        continue;
+      if (F.Enter < Self->Enter) {
+        for (const auto &E : F.Conditional)
+          if (E.Dep.MacroName == Guard && E.Seq < Self->Enter)
+            return false;
+        for (const auto &E : F.Syntactic)
+          if (E.Dep.Name == Guard && E.Seq < Self->Enter)
+            return false;
+        continue;
+      }
+      if (!Within(F))
+        continue;
+      auto Reads = [&](const auto &V) {
+        return llvm::any_of(V, [&](const auto &E) { return Before(E.Origin); });
+      };
+      if (Reads(F.Conditional) || Reads(F.Syntactic) || Reads(F.Symbol) ||
+          Reads(F.Inclusion) ||
+          llvm::any_of(F.Changes, [&](const FR::Change &C) {
+            return Before(C.Replaced);
+          }))
+        return false;
+    }
+    return true;
+  }
+
+  /// CLANG_HEADER_CACHE_LINK: the links \p P's copy carries, in the order
+  /// of their #includes, and what they take from its metadata: the effects
+  /// their own directives made, and the guard test of each skipped where
+  /// the header was read. Returns why the part cannot be written, or "".
+  std::string takeLinks(Part &P, HeaderDependencySet &Deps) {
+    if (P.Links.empty())
+      return "";
+    Preprocessor &PP = CI.getPreprocessor();
+    auto Linked = [&](SourceLocation L) {
+      return inLinked(P, SM.getExpansionLoc(L).getRawEncoding());
+    };
+    // A name whose latest directive in the header is a linked header's is
+    // that header's effect, which its copy replays. The links replay first,
+    // so the part's own directive before it would win wrongly.
+    for (auto &[II, Dirs] : P.Directives) {
+      if (Dirs.empty() || !Linked(Dirs.front()))
+        continue;
+      if (!llvm::all_of(Dirs, Linked))
+        return "a header it links changes a macro its lines set before: " +
+               II->getName().str();
+      P.LinkedNames.insert(II);
+    }
+    llvm::erase_if(Deps.MacroEffects, [&](const MacroEffect &E) {
+      return P.LinkedNames.contains(PP.getIdentifierInfo(E.Name));
+    });
+    // Where a link is skipped the compile's own reading of its header
+    // stands in, so the part's lines must have read nothing the header
+    // sets: a macro they expanded or tested would be the copy's, made with
+    // the link loaded.
+    llvm::StringSet<> Read;
+    using FR = ASTCacheDependencyTracker::FileReads;
+    if (const FR *Root = Tracker.fileReads(P.FID))
+      for (const FR &F : Tracker.allFileReads()) {
+        if (F.Enter < Root->Enter || (Root->Exit && F.Enter > Root->Exit))
+          continue;
+        if (inLinked(P, SM.getSLocEntry(F.FID).getOffset()))
+          continue;
+        for (const auto &E : F.Conditional)
+          Read.insert(E.Dep.MacroName);
+        for (const auto &E : F.Syntactic)
+          Read.insert(E.Dep.Name);
+      }
+    else
+      for (auto &[Loc, L] : P.Links)
+        L.OnGuard = false;
+    for (size_t K = 0; K != P.Links.size(); ++K)
+      if (P.Links[K].second.OnGuard &&
+          llvm::any_of(P.LinkSets[K],
+                       [&](const std::string &N) { return Read.contains(N); }))
+        P.Links[K].second.OnGuard = false;
+    std::vector<size_t> Order(P.Links.size());
+    for (size_t K = 0; K != Order.size(); ++K)
+      Order[K] = K;
+    std::stable_sort(Order.begin(), Order.end(), [&](size_t A, size_t B) {
+      return SM.isBeforeInTranslationUnit(P.Links[A].first, P.Links[B].first);
+    });
+    llvm::StringSet<> Guards;
+    P.LinkOrder.assign(P.Links.size(), 0);
+    for (size_t K : Order) {
+      const LinkRecord &L = P.Links[K].second;
+      P.LinkOrder[K] = Deps.Links.size();
+      if (getenv("DEBUG_LINK"))
+        llvm::errs() << "WRITE " << P.Stored << " links " << L.Path << " "
+                     << L.Module << (L.OnGuard ? " on-guard " : " always ")
+                     << L.Guard << "\n";
+      Deps.Links.push_back(L);
+      if (L.OnGuard)
+        Guards.insert(L.Guard);
+    }
+    // Where the guard is defined the link is skipped, as the #include would
+    // be: the header's test of its own guard is no dependency of the copy.
+    llvm::erase_if(Deps.Conditional, [&](const ConditionalDependency &D) {
+      return !D.WasDefined && Guards.contains(D.MacroName);
+    });
+    return "";
+  }
+
+  /// The link of \p P that declares \p ND, by index into P.Links; -1 if
+  /// none does.
+  int linkOf(const Part &P, const NamedDecl &ND) const {
+    for (size_t K = 0; K != P.LinkFroms.size(); ++K) {
+      const Part::LinkFrom &F = P.LinkFroms[K];
+      if (ND.isFromASTFile()) {
+        const serialization::ModuleFile *MF =
+            CI.getASTReader()->getOwningModuleFile(&ND);
+        if (MF && MF->Index >= F.ModLo && MF->Index < F.ModHi)
+          return K;
+        continue;
+      }
+      SourceLocation L = ND.getLocation();
+      if (L.isValid() && SM.isLocalSourceLocation(L)) {
+        SourceLocation::UIntTy At = SM.getExpansionLoc(L).getRawEncoding();
+        if (F.RegLo <= At && At < F.RegHi)
+          return K;
+      }
+    }
+    return -1;
+  }
+
+  /// Where the declaration \p Name (a tag if \p Tag) found now is, for
+  /// \p P: in its link of that index, in its own lines (-2), or outside it
+  /// (-1, also for none).
+  int whereIs(const Part &P, bool Tag, llvm::StringRef Name) {
+    Preprocessor &PP = CI.getPreprocessor();
+    IdentifierInfo *II = PP.getIdentifierInfo(Name);
+    PP.refreshIdentifier(*II);
+    NamedDecl *D = ASTReader::lookupAtFileScope(CI.getSema(), *II, Tag,
+                                                /*CreateBuiltin=*/false);
+    if (!D)
+      return -1;
+    if (int K = linkOf(P, *D); K >= 0)
+      return K;
+    if (D->isFromASTFile()) {
+      const serialization::ModuleFile *MF =
+          CI.getASTReader()->getOwningModuleFile(D);
+      return MF && MF->Index >= P.ModulesAtBegin ? -2 : -1;
+    }
+    return inPart(P, D->getLocation()) ? -2 : -1;
+  }
+
+  /// The names \p P's own lines declare at file scope, for a copy that
+  /// links this one and skips it (HeaderDependencySet::Declares).
+  void declares(const Part &P, std::vector<std::string> &Out) {
+    llvm::StringSet<> Seen;
+    auto Add = [&](const NamedDecl *ND) {
+      if (!ND->getIdentifier())
+        return;
+      std::string N = (isa<TagDecl>(ND) ? "t:" : "o:") + ND->getName().str();
+      if (Seen.insert(N).second)
+        Out.push_back(std::move(N));
+    };
+    ASTContext &Ctx = CI.getASTContext();
+    Decl *First =
+        P.DeclsAfter
+            ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+            : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+    for (Decl *D = First; D; D = D->getNextDeclInContext()) {
+      if (D->isFromASTFile() || !inPart(P, D->getLocation()))
+        continue;
+      if (auto *ND = dyn_cast<NamedDecl>(D))
+        Add(ND);
+      if (auto *ED = dyn_cast<EnumDecl>(D))
+        for (const EnumConstantDecl *E : ED->enumerators())
+          Add(E);
+    }
+  }
+
+  /// Whether a declaration of \p Name (a tag if \p Tag) is in \p P's own
+  /// lines, the latest or one it redeclares.
+  bool ownLinesDeclare(const Part &P, bool Tag, llvm::StringRef Name) {
+    Preprocessor &PP = CI.getPreprocessor();
+    IdentifierInfo *II = PP.getIdentifierInfo(Name);
+    PP.refreshIdentifier(*II);
+    NamedDecl *D = ASTReader::lookupAtFileScope(CI.getSema(), *II, Tag,
+                                                /*CreateBuiltin=*/false);
+    for (Decl *R = D; R; R = R->getPreviousDecl()) {
+      if (R->isFromASTFile()) {
+        const serialization::ModuleFile *MF =
+            CI.getASTReader()->getOwningModuleFile(R);
+        if (MF && MF->Index >= P.ModulesAtBegin &&
+            linkOf(P, *cast<NamedDecl>(R)) < 0)
+          return true;
+      } else if (inPart(P, R->getLocation())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// As whereIs, for the declaration of \p Name the link \p From of \p P
+  /// found: the latest made before it, not its own or one after it.
+  int whereIsBefore(const Part &P, bool Tag, llvm::StringRef Name, int From) {
+    Preprocessor &PP = CI.getPreprocessor();
+    IdentifierInfo *II = PP.getIdentifierInfo(Name);
+    PP.refreshIdentifier(*II);
+    NamedDecl *D = ASTReader::lookupAtFileScope(CI.getSema(), *II, Tag,
+                                                /*CreateBuiltin=*/false);
+    SourceLocation At = From >= 0 && From < (int)P.Links.size()
+                            ? P.Links[From].first
+                            : SourceLocation();
+    for (Decl *R = D; R; R = R->getPreviousDecl()) {
+      auto *ND = cast<NamedDecl>(R);
+      int K = linkOf(P, *ND);
+      if (K >= 0 && K >= From)
+        continue;
+      if (K >= 0)
+        return K;
+      if (R->isFromASTFile()) {
+        const serialization::ModuleFile *MF =
+            CI.getASTReader()->getOwningModuleFile(R);
+        if (MF && MF->Index >= P.ModulesAtBegin)
+          return -2;
+        return -1;
+      }
+      if (!inPart(P, R->getLocation()))
+        return -1;
+      if (At.isValid() && SM.isBeforeInTranslationUnit(At, R->getLocation()))
+        continue;
+      return -2;
+    }
+    return -1;
+  }
+
+  /// Whether \p ND, which \p P's lines name, is a linked header's.
+  bool linkedDecl(const Part &P, const NamedDecl &ND) const {
+    if (!LinkMode)
+      return false;
+    if (ND.isFromASTFile()) {
+      const serialization::ModuleFile *MF =
+          CI.getASTReader()->getOwningModuleFile(&ND);
+      return MF && MF->Index >= P.ModulesAtBegin;
+    }
+    SourceLocation L = ND.getLocation();
+    return L.isValid() && SM.isLocalSourceLocation(L) &&
+           inLinked(P, SM.getExpansionLoc(L).getRawEncoding());
   }
 
   void decline(const Part &P, const llvm::Twine &Why) {
@@ -594,10 +1396,41 @@ private:
     for (auto &[Path, Stamp] : P.Stamps)
       Deps.Files.push_back(Stamp);
 
+    // What the copies it links refer to: outside the header, the copy's own
+    // check covers it, as a hit loads them unchecked; in another of its
+    // links, a skip of that link must find it; in its own lines, which load
+    // after the links, nothing can stand for it (postgres's pg_list.h,
+    // handed over from a header not linked, after bitmapset.h's
+    // `struct List;`), and the part is not written.
+    std::vector<DeclarationDependency> LinkNeeds;
+    if (LinkMode) {
+      if (std::string Why = takeLinks(P, Deps); !Why.empty())
+        return decline(P, Why);
+      for (const auto &[From, D] : P.LinkOutside) {
+        bool Tag = D.In == DeclarationDependency::Space::Tag;
+        int K = whereIsBefore(P, Tag, D.Name, From);
+        if (getenv("DEBUG_LINK"))
+          llvm::errs() << "OUTSIDE " << P.Stored << " " << (Tag ? "tag " : "")
+                       << D.Name << " from link " << From << " -> " << K << "\n";
+        if (K == -2)
+          return decline(P, "a copy it links names a declaration of its own "
+                            "lines: " + D.Name);
+        if (K >= 0) {
+          std::vector<std::string> &Names = Deps.Links[P.LinkOrder[K]].Names;
+          std::string N = (Tag ? "t:" : "o:") + D.Name;
+          if (!llvm::is_contained(Names, N))
+            Names.push_back(std::move(N));
+        } else if (!llvm::is_contained(LinkNeeds, D)) {
+          LinkNeeds.push_back(D);
+        }
+      }
+    }
+
     // REPORT.md T17: the headers inside held as submodules, and the
     // dependencies put together per submodule.
     auto Composing = std::chrono::steady_clock::now();
-    compose(P, Deps);
+    if (!LinkMode)
+      compose(P, Deps);
     Counts.ComposeMicros += std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - Composing)
                                 .count();
@@ -615,6 +1448,14 @@ private:
         "__hcp_" + llvm::utohexstr(llvm::xxh3_64bits(Key), /*LowerCase=*/true,
                                    /*Width=*/16);
 
+    if (getenv("DEBUG_LINK"))
+      llvm::errs() << "PART " << P.Stored << " " << Name << "\n";
+    // The first time a copy would be written, it is not: most copies are of
+    // a state no later compile reaches (copies never served).
+    if (SeenBefore && !SeenBefore(P.Stored, Name)) {
+      ++Counts.HeldBack;
+      return;
+    }
     Preprocessor &PP = CI.getPreprocessor();
     ModuleMap &MM = PP.getHeaderSearchInfo().getModuleMap();
     if (MM.findModule(Name))
@@ -654,7 +1495,7 @@ private:
     DepsScope.reset();
     Written W = writePart(P, M, ByName);
     if (ByName && !W.Failure.empty()) {
-      if (P.ModulesAtBegin)
+      if (P.ModulesAtBegin || !P.Links.empty())
         return decline(P, "cannot refer by name to " + W.Failure);
       std::string Why = std::move(W.Failure);
       W = writePart(P, M, /*ByName=*/false);
@@ -662,6 +1503,19 @@ private:
       Counts.Copies.push_back(P.Stored + ": " + Why);
     }
     Deps.Declarations = std::move(W.Declarations);
+    auto TakeName = [&](size_t K, std::string Name) {
+      std::vector<std::string> &Names = Deps.Links[P.LinkOrder[K]].Names;
+      if (!llvm::is_contained(Names, Name))
+        Names.push_back(std::move(Name));
+    };
+    for (auto &[K, Name] : W.LinkNames)
+      TakeName(K, std::move(Name));
+    for (DeclarationDependency &D : LinkNeeds)
+      if (!llvm::is_contained(Deps.Declarations, D))
+        Deps.Declarations.push_back(std::move(D));
+    P.WrittenDecls = Deps.Declarations;
+    if (LinkMode)
+      declares(P, Deps.Declares);
     provide(P, Deps, W.Cross);
     if (!W.DiagnosticFailure.empty())
       return decline(P, W.DiagnosticFailure);
@@ -688,6 +1542,9 @@ private:
       Line += ", " + std::to_string(W.DroppedLocations) +
               " locations dropped (in module files or outside the part)";
     Counts.Exports.push_back(std::move(Line));
+    P.Written = Name;
+    P.WrittenHash = llvm::xxh3_64bits(
+        llvm::StringRef(R.Data.data(), R.Data.size()));
     if (Tracker.measuringIndependence())
       measureIndependence(P, Name, W.Buffer.size());
     dump(P, R, W.Sizes);
@@ -1134,6 +1991,7 @@ private:
 
   void dump(const Part &P, const PushRequest &R,
             const std::vector<std::string> &Sizes) {
+    dumpDependencies(R);
     const char *Dir = dumpDir();
     if (!Dir)
       return;
@@ -1158,6 +2016,51 @@ private:
       SizeText << Line << "\n";
   }
 
+  /// CLANG_HEADER_CACHE_DUMP_DEPS=<dir>, for measurement: each copy's
+  /// metadata as the check reads it, one element per line, to <dir>/<module
+  /// name>.deps.
+  void dumpDependencies(const PushRequest &R) {
+    static const char *Dir = std::getenv("CLANG_HEADER_CACHE_DUMP_DEPS");
+    if (!Dir)
+      return;
+    std::error_code EC;
+    static unsigned Seq = 0;
+    llvm::raw_fd_ostream OS((llvm::Twine(Dir) + "/" + R.ModuleName + "." +
+                             llvm::Twine(::getpid()) + "." + llvm::Twine(Seq++) +
+                             ".deps")
+                                .str(),
+                            EC);
+    if (EC)
+      return;
+    const HeaderDependencySet &D = R.Deps;
+    OS << "module\t" << R.ModuleName << "\nheader\t" << R.Filename << "\nfrom\t"
+       << CI.getFrontendOpts().Inputs[0].getFile() << "\nwarn\t"
+       << D.WarningState << "\npragma\t" << D.Entry.AlignPackRaw << " "
+       << D.Entry.FpPragmaRaw << "\n";
+    for (const auto &E : D.Conditional)
+      OS << "cond\t" << E.MacroName << "\t" << E.WasDefined << "\n";
+    for (const auto &E : D.Syntactic)
+      OS << (E.Required == SyntacticDependency::State::NotAMacro ? "notmacro\t"
+                                                                 : "expands\t")
+         << E.Name << "\t" << llvm::xxh3_64bits(E.TokenSequence) << "\n";
+    for (const auto &E : D.Inclusion)
+      OS << "inclusion\t" << E.HeaderPath << "\n";
+    for (const auto &E : D.Symbol)
+      OS << "symbol\t" << E.Name << "\t" << unsigned(E.Classification) << "\t"
+         << E.ResolvedTypeName << "\n";
+    for (const auto &E : D.Files)
+      OS << "file\t" << E.Path << "\t" << E.Size << "\t" << E.ModTime << "\n";
+    for (const auto &E : D.Includes)
+      OS << "include\t" << unsigned(E.K) << "\t" << E.Angled << "\t"
+         << E.Spelled << "\t" << E.Includer << "\t" << E.Found << "\n";
+    for (const auto &E : D.FileNames)
+      OS << "filename\t" << unsigned(E.Which) << "\t" << E.File << "\t"
+         << E.Text << "\n";
+    for (const auto &E : D.Declarations)
+      OS << "decl\t" << unsigned(E.In) << "\t" << E.Name << "\t"
+         << llvm::xxh3_64bits(E.Fingerprint) << "\n";
+  }
+
   struct Written {
     SmallVector<char, 0> Buffer;
     /// What the part's lines outside a submodule refer to in it.
@@ -1168,6 +2071,9 @@ private:
     unsigned DroppedLocations = 0;
     /// The outside declarations a hit requires, by name and fingerprint.
     std::vector<DeclarationDependency> Declarations;
+    /// CLANG_HEADER_CACHE_LINK: the declarations taken from each link, by
+    /// index into Part::Links.
+    std::vector<std::pair<size_t, std::string>> LinkNames;
     /// Non-empty: an outside declaration that could not be named, and why.
     std::string Failure;
     /// The part's diagnostics, located in its own encoding; or, if one
@@ -1265,12 +2171,38 @@ private:
     llvm::BitstreamWriter Stream(W.Buffer);
     ASTWriter Writer(Stream, W.Buffer, CI.getModuleCache(), CI.getCodeGenOpts(),
                      {}, /*IncludeTimestamps=*/false);
+    std::vector<const Decl *> FoldedDecls;
+    if (!P.Folded.empty()) {
+      SmallVector<Decl *, 64> Top;
+      for (serialization::ModuleFile *MF : P.Folded)
+        CI.getASTReader()->getTopLevelDecls(*MF, Top);
+      for (Decl *D : Top)
+        if (!isa<ImportDecl>(D))
+          FoldedDecls.push_back(D);
+    }
+    Writer.setPartFoldedDecls(FoldedDecls);
+    if (!P.Folded.empty())
+      Writer.setPartLoadedLocations(
+          [&](SourceLocation L) { return translateLoaded(P.FoldedEntries, L); });
     Writer.setPartFilter(
-        [&](const Decl *D) { return inPart(P, D->getLocation()); },
-        [&](const MacroDirective *MD) {
-          return P.contains(MD->getLocation().getRawEncoding());
+        [&](const Decl *D) {
+          // The import of a copy served inside the header: the part holds
+          // what it folds in from the copy, and imports nothing.
+          if (isa<ImportDecl>(D))
+            return false;
+          if (D->isFromASTFile())
+            return !P.Folded.empty() &&
+                   P.Folded.count(
+                       CI.getASTReader()->getOwningModuleFile(D));
+          return inPart(P, D->getLocation());
         },
-        [&](SourceLocation::UIntTy Offset) { return P.contains(Offset); },
+        [&](const MacroDirective *MD) {
+          SourceLocation::UIntTy At = MD->getLocation().getRawEncoding();
+          return P.contains(At) && !inLinked(P, At);
+        },
+        [&](SourceLocation::UIntTy Offset) {
+          return P.contains(Offset) || inFolded(P, Offset);
+        },
         [&](FileEntryRef F) { return P.Files.contains(&F.getFileEntry()); });
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
@@ -1284,8 +2216,10 @@ private:
       });
     // What the writer needs to look at: the part's own entries, macros and
     // declarations, not the whole compile's (REPORT.md I5).
-    std::vector<const IdentifierInfo *> MacroNames(P.Touched.begin(),
-                                                   P.Touched.end());
+    std::vector<const IdentifierInfo *> MacroNames;
+    for (const IdentifierInfo *II : P.Touched)
+      if (!P.LinkedNames.contains(II))
+        MacroNames.push_back(II);
     for (const auto &[II, Stack] : P.Stacks)
       if (!P.Touched.contains(II))
         MacroNames.push_back(II);
@@ -1342,10 +2276,28 @@ private:
     if (Named) {
       W.Failure = Writer.getPartNameReferenceFailure().str();
       W.ByName = Writer.getPartNameReferences().size();
-      for (const NamedDecl *ND : Writer.getPartNameReferences())
+      for (const NamedDecl *ND : Writer.getPartNameReferences()) {
+        if (getenv("DEBUG_LINK"))
+          llvm::errs() << "NAMEDREF " << P.Stored << " " << ND->getName()
+                       << " linked=" << linkedDecl(P, *ND)
+                       << " link=" << linkOf(P, *ND)
+                       << " fromAST=" << ND->isFromASTFile() << "\n";
+        // A linked copy loads before the part, and declares it there.
+        if (linkedDecl(P, *ND)) {
+          int K = linkOf(P, *ND);
+          if (K >= 0 && ND->getIdentifier()) {
+            W.LinkNames.push_back(
+                {size_t(K), (nameSpaceOf(*ND) == DeclarationDependency::Space::Tag
+                                 ? "t:"
+                                 : "o:") +
+                                ND->getName().str()});
+            continue;
+          }
+        }
         if (W.Failure.empty() && !Require(*ND))
           W.Failure = std::string(ND->getDeclKindName()) + " '" +
                       ND->getNameAsString() + "': it has no fingerprint";
+      }
       return W;
     }
     // A deep copy: anything written that the header's region did not
@@ -1378,6 +2330,15 @@ private:
   /// ended, waiting for the next finished declaration.
   llvm::SmallVector<Part, 4> Open;
   std::vector<Part> Ready;
+  /// The parts writeReady is writing, out of Ready.
+  std::vector<Part> *Batch = nullptr;
+  /// CLANG_HEADER_CACHE_LINK: a copy links the copies of the headers inside
+  /// it, instead of holding them.
+  bool LinkMode = false;
+  unsigned PartsBegun = 0;
+  /// While a hit's diagnostics are printed again.
+  bool Replaying = false;
+  std::function<bool(llvm::StringRef, llvm::StringRef)> SeenBefore;
   llvm::DenseSet<FileID> Tracked;
   bool ObserverSet = false;
   /// See memoryBuffers.
@@ -1418,6 +2379,12 @@ public:
   /// fsmonitor.h was saved with its last function, mark_fsmonitor_invalid,
   /// declared but not defined.
   void HandleInterestingDecl(DeclGroupRef) override {}
+
+  /// Nor is the import a linked copy's loading makes (BuildModuleInclude),
+  /// for the same reason: git's progress.h was saved with stop_progress
+  /// declared but not defined when the token after its `}` was an #include
+  /// whose copy has links.
+  void HandleImplicitImportDecl(ImportDecl *) override {}
 
   void HandleTranslationUnit(ASTContext &) override {
     if (Exporter *E = exporterFor(CI))
@@ -1471,8 +2438,16 @@ PartExporter &PartExporter::install(CompilerInstance &CI,
   // headers inside as submodules (REPORT.md T17).
   // Measuring only: CLANG_HEADER_CACHE_NO_SUBMODULES writes folded copies,
   // as before REPORT.md T17.
-  if (!std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES"))
+  // So does linking (CLANG_HEADER_CACHE_LINK), to tell which headers
+  // inside are independent of the one around them.
+  const char *Link = std::getenv("CLANG_HEADER_CACHE_LINK");
+  if (!std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES") ||
+      (Link && llvm::StringRef(Link) == "1") ||
+      std::getenv("CLANG_HEADER_CACHE_DDG"))
     T.recordFiles();
+  // Measuring a codebase's headers: a record for every one.
+  if (std::getenv("CLANG_HEADER_CACHE_DDG"))
+    T.trackOnly([](FileID) { return true; });
   PP.setExpansionCandidateObserver(T);
   // Callbacks added later run first: the exporter marks a header as tracked
   // before the tracker decides whether to open a frame for it.

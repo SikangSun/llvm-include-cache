@@ -150,6 +150,20 @@ void clang::ast_cache::encodeHelloReply(const HelloReply &Reply,
   });
 }
 
+void clang::ast_cache::encodeSeenRequest(const SeenRequest &Req,
+                                         llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::SeenRequest, [&](ByteWriter &W) {
+    W.str(Req.Filename);
+    W.str(Req.ModuleName);
+  });
+}
+
+void clang::ast_cache::encodeSeenReply(bool Seen,
+                                       llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::SeenReply,
+        [&](ByteWriter &W) { W.u8(Seen ? 1 : 0); });
+}
+
 //===----------------------------------------------------------------------===//
 // Decoding
 //===----------------------------------------------------------------------===//
@@ -175,6 +189,10 @@ clang::ast_cache::peekMessageKind(llvm::StringRef Body) {
     return MessageKind::Hello;
   case static_cast<uint8_t>(MessageKind::HelloReply):
     return MessageKind::HelloReply;
+  case static_cast<uint8_t>(MessageKind::SeenRequest):
+    return MessageKind::SeenRequest;
+  case static_cast<uint8_t>(MessageKind::SeenReply):
+    return MessageKind::SeenReply;
   default:
     return std::nullopt;
   }
@@ -265,6 +283,29 @@ clang::ast_cache::decodeHelloReply(llvm::StringRef Body) {
   if (!R.ok() || !R.atEnd() || Reply.RegionPath.empty())
     return std::nullopt;
   return Reply;
+}
+
+std::optional<SeenRequest>
+clang::ast_cache::decodeSeenRequest(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::SeenRequest))
+    return std::nullopt;
+  SeenRequest Req;
+  Req.Filename = R.str().str();
+  Req.ModuleName = R.str().str();
+  if (!R.ok() || !R.atEnd() || Req.Filename.empty() || Req.ModuleName.empty())
+    return std::nullopt;
+  return Req;
+}
+
+std::optional<bool> clang::ast_cache::decodeSeenReply(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::SeenReply))
+    return std::nullopt;
+  uint8_t Seen = R.u8();
+  if (!R.ok() || !R.atEnd() || Seen > 1)
+    return std::nullopt;
+  return Seen == 1;
 }
 
 //===----------------------------------------------------------------------===//

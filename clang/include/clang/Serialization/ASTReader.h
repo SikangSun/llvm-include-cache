@@ -2642,6 +2642,11 @@ public:
   /// Skipped declarations a name lookup listed, left unread.
   unsigned getPartSkipsUnread() const { return PartSkipsUnread; }
 
+  /// The top-level declarations \p F holds, in order, read in; a skipped
+  /// submodule's left out. For folding a header cache part served inside
+  /// one being written into it.
+  void getTopLevelDecls(ModuleFile &F, SmallVectorImpl<Decl *> &Decls);
+
 private:
   /// See setPartSkip.
   std::optional<PartSkip> PendingPartSkip;
@@ -2690,6 +2695,17 @@ public:
   /// and the reader resolves the part's DECL_NAME_REFERENCE records to it.
   static NamedDecl *lookupAtFileScope(Sema &S, IdentifierInfo &II, bool Tag,
                                       bool CreateBuiltin);
+
+  /// The file-scope declaration of \p II that every loaded module's entry
+  /// for it gives, the latest. For a name a header cache part refers to
+  /// that the compile has not looked up since the module declaring it
+  /// loaded: a lookup reads only modules newer than the one the name was
+  /// read from, and while declarations are being read, a module's entry
+  /// only queues its declarations.
+  /// The referring module \p From is skipped: its entry for the name is
+  /// the reference itself.
+  NamedDecl *findInEveryModule(IdentifierInfo &II, bool Tag,
+                               const serialization::ModuleFile *From);
 
   /// Makes the header cache part \p MF's file-scope references to \p II, in
   /// the tag name space if \p Tag, resolve to \p D: the declaration the

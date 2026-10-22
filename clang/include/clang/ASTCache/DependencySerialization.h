@@ -39,7 +39,7 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 12;
+constexpr uint32_t DependencyEncodingVersion = 14;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
 /// stored form.
@@ -155,6 +155,14 @@ struct SubmoduleView {
 struct ConditionView {
   int32_t Owner = -1, Provider = -1;
   static ConditionView read(ByteReader &R);
+};
+/// CLANG_HEADER_CACHE_LINK.
+struct LinkView {
+  llvm::StringRef Path, Module, Guard;
+  bool OnGuard = false;
+  llvm::SmallVector<llvm::StringRef, 4> Names;
+  uint64_t Hash = 0;
+  static LinkView read(ByteReader &R);
 };
 
 /// One section of a MetadataView: its elements, read in order as the loop
@@ -293,6 +301,10 @@ public:
   MetadataSection<ProvidedView> provided() const {
     return section<ProvidedView>(Provided);
   }
+  MetadataSection<LinkView> links() const { return section<LinkView>(Links); }
+  MetadataSection<NameView> declares() const {
+    return section<NameView>(Declares);
+  }
 
   enum Section : unsigned {
     Conditional,
@@ -311,6 +323,8 @@ public:
     Submodules,
     Conditions,
     Provided,
+    Links,
+    Declares,
     NumSections
   };
 

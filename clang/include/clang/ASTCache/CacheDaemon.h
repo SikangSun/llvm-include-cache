@@ -115,8 +115,17 @@ public:
     /// parsing them.
     uint64_t HeadersDropped = 0;
     uint64_t HitsTimed = 0;
+    /// CLANG_HEADER_CACHE_SECOND_MISS: copies asked about for the first time,
+    /// and again.
+    uint64_t SeenFirst = 0, SeenAgain = 0;
   };
   Stats stats() const;
+
+  /// For measuring: one line per header and per copy stored -- the copy's
+  /// size, the compile that pushed it, how often and by how many compiles
+  /// it was used, its metadata's sizes and definedness tests. Compiles are
+  /// counted by their timing reports, one at a compile's end.
+  void dumpEntries(llvm::raw_ostream &OS) const;
 
 private:
   CacheDaemon() = default;
@@ -152,6 +161,16 @@ private:
   /// received: copies are offered most recently used first (REPORT.md I15).
   llvm::DenseMap<uint64_t, uint64_t> LastUsed;
   uint64_t UseClock = 0;
+  /// For dumpEntries, per copy by metadata offset.
+  struct Usage {
+    uint64_t PushedAt = 0;
+    unsigned Uses = 0, Compiles = 0;
+    uint64_t First = UINT64_MAX, Last = 0, LastCompile = UINT64_MAX;
+  };
+  llvm::DenseMap<uint64_t, Usage> Usages;
+  llvm::StringMap<unsigned> LookupsOf;
+  /// Each copy a compile was about to write, by header and module name.
+  llvm::StringSet<> SeenOnce;
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
   bool listLocked(llvm::StringRef Path);

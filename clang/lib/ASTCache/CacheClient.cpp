@@ -799,6 +799,53 @@ llvm::StringRef CacheClient::lookup(
   return {};
 }
 
+llvm::StringRef CacheClient::fetch(llvm::StringRef Filename,
+                                   llvm::StringRef ModuleName, uint64_t Hash,
+                                   std::optional<MetadataView> &Meta) {
+  ++Counters.Fetches;
+  llvm::SmallVector<char, 0> Msg;
+  encodeLookupRequest(
+      {Filename.str(), Build, std::move(Learned), std::move(Used)}, Msg);
+  Learned.clear();
+  Used.clear();
+  auto Asked = std::chrono::steady_clock::now();
+  std::optional<std::string> Reply;
+  if (sendMessage(*Conn, Msg))
+    Reply = receiveMessage(*Conn);
+  Counters.DaemonMicros += microsSince(Asked);
+  if (!Reply)
+    return {};
+  std::optional<LookupResponse> Resp = decodeLookupResponse(*Reply);
+  if (!Resp)
+    return {};
+  for (const CacheEntryRef &E : Resp->Entries) {
+    std::optional<MetadataView> Deps = MetadataView::open(
+        Region.read(E.MetadataOffset, E.MetadataLength));
+    if (!Deps || Deps->moduleName() != ModuleName)
+      continue;
+    llvm::StringRef Bytes = Region.read(E.Offset, E.Length);
+    if (Bytes.empty() || llvm::xxh3_64bits(Bytes) != Hash)
+      continue;
+    ++Counters.Fetched;
+    Meta = Deps;
+    return Bytes;
+  }
+  return {};
+}
+
+bool CacheClient::seenBefore(llvm::StringRef Filename,
+                             llvm::StringRef ModuleName) {
+  llvm::SmallVector<char, 0> Msg;
+  encodeSeenRequest({Filename.str(), ModuleName.str()}, Msg);
+  auto Asked = std::chrono::steady_clock::now();
+  std::optional<std::string> Reply;
+  if (sendMessage(*Conn, Msg))
+    Reply = receiveMessage(*Conn);
+  Counters.DaemonMicros += microsSince(Asked);
+  std::optional<bool> Seen = Reply ? decodeSeenReply(*Reply) : std::nullopt;
+  return !Seen || *Seen;
+}
+
 bool CacheClient::isListed(llvm::StringRef Path) {
   uint64_t Version = 0;
   llvm::StringRef List = Region.askList(&Version);

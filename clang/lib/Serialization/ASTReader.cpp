@@ -8491,6 +8491,29 @@ NamedDecl *ASTReader::lookupAtFileScope(Sema &S, IdentifierInfo &II, bool Tag,
   return R.getAsSingle<NamedDecl>();
 }
 
+NamedDecl *ASTReader::findInEveryModule(IdentifierInfo &II, bool Tag,
+                                        const ModuleFile *From) {
+  IdentifierGeneration[&II] = 0;
+  updateOutOfDateIdentifier(II);
+  if (SemaObj)
+    if (NamedDecl *D = lookupAtFileScope(*SemaObj, II, Tag,
+                                         /*CreateBuiltin=*/false))
+      return D;
+  auto It = PendingIdentifierInfos.find(&II);
+  if (It == PendingIdentifierInfos.end())
+    return nullptr;
+  unsigned IDNS = Tag ? Decl::IDNS_Tag : Decl::IDNS_Ordinary;
+  SmallVector<GlobalDeclID, 4> IDs(It->second.begin(), It->second.end());
+  NamedDecl *Found = nullptr;
+  for (GlobalDeclID ID : IDs)
+    if (getOwningModuleFile(ID) == From)
+      continue;
+    else if (auto *D = dyn_cast_or_null<NamedDecl>(GetDecl(ID)))
+      if (D->isInIdentifierNamespace(IDNS) && isAtFileScope(D))
+        Found = D;
+  return Found;
+}
+
 Decl *ASTReader::GetDecl(GlobalDeclID ID) {
   if (ID < NUM_PREDEF_DECL_IDS)
     return GetExistingDecl(ID);
@@ -8665,6 +8688,24 @@ bool ASTReader::LoadExternalSpecializations(
       LoadExternalSpecializationsImpl(SpecializationsLookups, D, TemplateArgs);
 
   return NewDeclsFound;
+}
+
+void ASTReader::getTopLevelDecls(ModuleFile &F,
+                                 SmallVectorImpl<Decl *> &Decls) {
+  for (const auto &[M, Contents] : TULexicalDecls) {
+    if (M != &F)
+      continue;
+    for (size_t I = 0, N = Contents.size(); I + 1 < N; I += 2) {
+      auto ID = (DeclID) + Contents[I + 1];
+      if (ID < NUM_PREDEF_DECL_IDS)
+        continue;
+      LocalDeclID Local = LocalDeclID::get(*this, F, ID);
+      if (isPartSkippedDecl(getGlobalDeclID(F, Local)))
+        continue;
+      if (Decl *D = GetLocalDecl(F, Local))
+        Decls.push_back(D);
+    }
+  }
 }
 
 void ASTReader::FindExternalLexicalDecls(

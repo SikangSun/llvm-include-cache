@@ -79,8 +79,18 @@ void CacheDaemon::publishLocked() {
 void CacheDaemon::learnLocked(uint64_t Build,
                               const std::vector<LearnedSearch> &Learned,
                               const std::vector<uint64_t> &Used) {
-  for (uint64_t U : Used)
+  for (uint64_t U : Used) {
     LastUsed[U] = ++UseClock;
+    Usage &X = Usages[U];
+    uint64_t C = Counters.TimingReports;
+    ++X.Uses;
+    X.First = std::min(X.First, C);
+    X.Last = std::max(X.Last, C);
+    if (X.LastCompile != C) {
+      ++X.Compiles;
+      X.LastCompile = C;
+    }
+  }
   if (!Build)
     return;
   for (const LearnedSearch &L : Learned) {
@@ -100,6 +110,38 @@ void CacheDaemon::learnLocked(uint64_t Build,
         E.Searches.push_back(L.Found);
     }
   }
+}
+
+void CacheDaemon::dumpEntries(llvm::raw_ostream &OS) const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  for (const auto &[Path, Count] : LookupsOf)
+    OS << "header\t" << Path << "\t" << Count << "\t"
+       << (Table.count(Path) ? Table.find(Path)->second.size() : 0) << "\n";
+  for (const auto &[Path, Entries] : Table)
+    for (const StoredEntry &E : Entries) {
+      Usage U = Usages.lookup(E.MetadataOffset);
+      std::optional<MetadataView> M =
+          MetadataView::open(Region.read(E.MetadataOffset, E.MetadataLength));
+      OS << "entry\t" << Path << "\t" << (M ? M->moduleName() : "") << "\t"
+         << E.Length << "\t" << E.MetadataLength << "\t" << U.PushedAt
+         << "\t" << U.Uses << "\t" << U.Compiles << "\t"
+         << (U.Uses ? U.First : 0) << "\t" << U.Last << "\t";
+      if (M)
+        OS << M->conditional().size() << "," << M->expandsTo().size() << ","
+           << M->notAMacro().size() << "," << M->symbol().size() << ","
+           << M->inclusion().size() << "," << M->files().size() << ","
+           << M->includes().size() << "," << M->declarations().size() << ","
+           << M->macroEffects().size() << "," << M->links().size();
+      OS << "\t";
+      if (M) {
+        bool First = true;
+        for (const ConditionalView &C : M->conditional()) {
+          OS << (First ? "" : ",") << C.MacroName << (C.WasDefined ? "+" : "-");
+          First = false;
+        }
+      }
+      OS << "\n";
+    }
 }
 
 llvm::SmallVector<char, 0>
@@ -152,6 +194,7 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
     std::lock_guard<std::mutex> Lock(Mutex);
     learnLocked(Req.Build, Req.Learned, Req.Used);
     ++Counters.Lookups;
+    ++LookupsOf[Req.Filename];
     auto It = Table.find(Req.Filename);
     if (It != Table.end()) {
       ++Counters.Hits;
@@ -219,6 +262,7 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
       E.MetadataLength = Req.Metadata.size();
       E.Offset = *Offset;
       E.Length = Req.Data.size();
+      Usages[*MetadataAt].PushedAt = Counters.TimingReports;
       Entries.push_back(std::move(E));
       Counters.BytesStored += Req.Data.size() + Req.Metadata.size();
       Counters.PartBytes += Req.Data.size();
@@ -265,6 +309,20 @@ CacheDaemon::handleMessage(llvm::StringRef Body) {
     return std::nullopt;
   case MessageKind::Hello:
     return handleHello();
+  case MessageKind::SeenRequest:
+    if (std::optional<SeenRequest> Req = decodeSeenRequest(Body)) {
+      bool Seen;
+      {
+        std::lock_guard<std::mutex> Lock(Mutex);
+        Seen = !SeenOnce.insert(Req->Filename + '\0' + Req->ModuleName).second;
+        ++(Seen ? Counters.SeenAgain : Counters.SeenFirst);
+      }
+      llvm::SmallVector<char, 0> Out;
+      encodeSeenReply(Seen, Out);
+      return Out;
+    }
+    return std::nullopt;
+  case MessageKind::SeenReply:
   case MessageKind::LookupResponse:
   case MessageKind::PushAck:
   case MessageKind::TimingAck:

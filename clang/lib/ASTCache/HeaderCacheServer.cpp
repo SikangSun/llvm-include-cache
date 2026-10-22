@@ -303,6 +303,15 @@ public:
        << " not at a declaration boundary, " << NotListed
        << " not on the ask-list, " << InsideWritten
        << " inside a header being written\n";
+    if (MeasureNested)
+      OS << "header cache nested asks: " << NestedAsked << " asked, "
+         << NestedFit << " a copy fits, " << NestedNoCopy << " no copy, "
+         << ms(NestedMicros) << " ms asking and checking\n";
+    if (LinkMode)
+      OS << "header cache links: " << LinksLoaded << " loaded, "
+         << LinksSkipped << " skipped by their guard, " << LinksFailed
+         << " copies not used for a link that failed, " << S.Fetches
+         << " fetched (" << S.Fetched << " found)\n";
     if (LoadsRefused)
       OS << "  refused by the module reader (built with other options?): "
          << LoadsRefused << "\n";
@@ -360,7 +369,10 @@ public:
       OS << "header cache: exported " << E.Exported << " parts (" << E.Copied
          << " with deep copies), declined " << E.Declined << ", "
          << ms(E.Micros) << " ms writing and pushing, " << E.Submodules
-         << " headers held as submodules\n";
+         << " headers held as submodules, " << E.HeldBack
+         << " held back as the first time their copy would be written, "
+         << E.LinksServed << " links to copies served, " << E.LinksWritten
+         << " to copies written\n";
       OS << "header cache write time: " << ms(E.WriterMicros)
          << " ms in Clang's writer, "
          << ms(E.ComposeMicros) << " in compose (" << ms(E.ChooseMicros)
@@ -386,6 +398,10 @@ public:
     this->PopulateOnly = PopulateOnly;
   }
 
+  bool seenBefore(llvm::StringRef Header, llvm::StringRef Module) {
+    return Client->seenBefore(Header, Module);
+  }
+
   /// Stores a part this compile exported.
   void push(const PushRequest &R) { Client->push(R); }
 
@@ -403,6 +419,12 @@ public:
     // 2.14). The list is in shared memory; this costs no socket traffic.
     NextReason.clear();
     std::string Path = storedName(File);
+    // CLANG_HEADER_CACHE_DDG, measurement: every header is read as text.
+    static const bool Graph = std::getenv("CLANG_HEADER_CACHE_DDG");
+    if (Graph) {
+      NextReason = "not-listed";
+      return nullptr;
+    }
     if (!Client->isListed(Path)) {
       ++NotListed;
       NextReason = "not-listed";
@@ -415,9 +437,12 @@ public:
     // written as references to its PCM, which no part can carry. Nothing is
     // asked either, and the header is not exported on its own; the folded
     // copy holds it.
-    if (Exporter && !PopulateOnly && Exporter->writing()) {
+    if (Exporter && !PopulateOnly && Exporter->writing() && !FoldServed &&
+        !LinkMode) {
       ++InsideWritten;
       NextReason = "inside-a-header-being-written";
+      if (MeasureNested)
+        measureNested(File, IncludeLoc, CurDir, Path);
       return nullptr;
     }
 
@@ -443,6 +468,8 @@ public:
     // The saved header itself used none -- the producer declines one that
     // does -- so the counter after it is the counter before it.
     uint32_t Counter = PP.getCounterValue();
+    unsigned ModulesBefore =
+        CI.getASTReader() ? CI.getASTReader()->getModuleManager().size() : 0;
     MetadataView Deps;
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc,
@@ -464,6 +491,15 @@ public:
           if (PopulateOnly)
             return false;
           auto Loading = std::chrono::steady_clock::now();
+          // CLANG_HEADER_CACHE_LINK: the copies it links load first.
+          if (LinkMode && Client->lastMetadata() &&
+              !Client->lastMetadata()->links().empty()) {
+            MetadataView Outer = *Client->lastMetadata();
+            if (!loadLinks(Outer, IncludeLoc)) {
+              ++LinksFailed;
+              return false;
+            }
+          }
           Target = load(Bytes, ModuleName, IncludeLoc);
           HitLoadMicros = micros(Loading);
           HitBytes = Bytes.size();
@@ -506,16 +542,40 @@ public:
         Exporter->exportNext(File);
       return nullptr;
     }
-    // A header being exported cannot hold a served one: its part would hold
-    // the import, not the declarations.
-    if (Exporter)
-      Exporter->served();
-
     // The copy's references to declarations outside it resolve to the ones
     // the check found here, as plain clang's did where it read the header;
     // otherwise each resolves when first read, to the name's latest
     // declaration, which may come after this #include (REPORT.md Q8).
     const LoadedCopy &Copy = LoadedTargets.find(LastModuleName)->second;
+
+    // A header being exported cannot hold a served one: its part would hold
+    // the import, not the declarations -- unless it folds the served copy's
+    // declarations in as its own (FoldServed).
+    bool Folding = Exporter && FoldServed && Exporter->writing() && Copy.MF;
+    if (LinkMode && Exporter && Exporter->writing()) {
+      Sema &Sem = CI.getSema();
+      IdentifierTable &Ids = PP.getIdentifierTable();
+      HeaderSearch &HS = PP.getHeaderSearchInfo();
+      const IdentifierInfo *G =
+          HS.getFileInfo(File).getControllingMacro(HS.getExternalLookup());
+      Exporter->linked(Path, LastModuleName, G ? G->getName() : "", Copy.MF,
+                       Deps, IncludeLoc, [&](llvm::StringRef Name) {
+                         NamedDecl *D = ASTReader::lookupAtFileScope(
+                             Sem, Ids.get(Name), /*Tag=*/false,
+                             /*CreateBuiltin=*/false);
+                         return D ? D->getLocation() : SourceLocation();
+                       }, ModulesBefore, llvm::xxh3_64bits(Copy.Bytes));
+    } else if (Folding) {
+      Sema &Sem = CI.getSema();
+      IdentifierTable &Ids = PP.getIdentifierTable();
+      Exporter->served(Copy.MF, &Deps, IncludeLoc, [&](llvm::StringRef Name) {
+        NamedDecl *D = ASTReader::lookupAtFileScope(
+            Sem, Ids.get(Name), /*Tag=*/false, /*CreateBuiltin=*/false);
+        return D ? D->getLocation() : SourceLocation();
+      });
+    } else if (Exporter) {
+      Exporter->served();
+    }
     if (Copy.Fresh) {
       llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
       IdentifierTable &Idents = PP.getIdentifierTable();
@@ -571,14 +631,23 @@ public:
     }
     {
       llvm::TimeTraceScope S("HeaderCache ReplayEffects");
+      // A copy folded into one being written replays every effect, so that
+      // the copy written holds each one's definition.
+      bool Was = ReplayAll;
+      ReplayAll = ReplayAll || Folding;
       replayMacroEffects(Deps.macroEffects(), *Target, IncludeLoc, Applies,
                          OwnerOf, Subs);
+      ReplayAll = Was;
     }
     {
       llvm::TimeTraceScope S("HeaderCache PragmaDelta");
       applyPragmaDelta(CI.getSema(), Deps.entry(), Deps.exit());
     }
+    if (LinkMode && Exporter)
+      Exporter->replaying(true);
     printDiagnostics(Deps.diagnostics(), *Copy.MF, Applies);
+    if (LinkMode && Exporter)
+      Exporter->replaying(false);
     // The warning pragmas the header left in force, as its text would have.
     for (const WarningPragmaView &W : Deps.warningPragmas())
       Pragmas.apply(CI.getDiagnostics(), W.Pragma, IncludeLoc);
@@ -896,6 +965,192 @@ private:
     return true;
   }
 
+  /// CLANG_HEADER_CACHE_LINK: a copy a link loads, and the links of its
+  /// own, all fetched before any loads, so that a missing one leaves the
+  /// compile as it was.
+  struct Fetched {
+    std::string Path, Module, Guard;
+    bool OnGuard = false;
+    std::vector<std::string> Names;
+    llvm::StringRef Bytes;
+    std::optional<MetadataView> Meta;
+    std::vector<Fetched> Links;
+  };
+  /// Each copy fetched for a link in this compile, by module name.
+  llvm::StringMap<std::pair<llvm::StringRef, MetadataView>> FetchedCopies;
+
+  bool fetchLinks(const MetadataView &Deps, std::vector<Fetched> &Out,
+                  unsigned Depth) {
+    if (Depth > 64)
+      return false;
+    for (const LinkView &L : Deps.links()) {
+      Fetched F;
+      F.Path = L.Path.str();
+      F.Module = L.Module.str();
+      F.Guard = L.Guard.str();
+      F.OnGuard = L.OnGuard;
+      for (llvm::StringRef N : L.Names)
+        F.Names.push_back(N.str());
+      std::string Key = L.Module.str() + "/" + llvm::utohexstr(L.Hash);
+      auto Known = FetchedCopies.find(Key);
+      if (Known != FetchedCopies.end()) {
+        F.Bytes = Known->second.first;
+        F.Meta = Known->second.second;
+      } else {
+        F.Bytes = Client->fetch(L.Path, L.Module, L.Hash, F.Meta);
+        if (F.Bytes.empty() || !F.Meta)
+          return false;
+        FetchedCopies[Key] = {F.Bytes, *F.Meta};
+      }
+      if (!fetchLinks(*F.Meta, F.Links, Depth + 1))
+        return false;
+      Out.push_back(std::move(F));
+    }
+    return true;
+  }
+
+  bool guardDefined(llvm::StringRef Guard) {
+    Preprocessor &PP = CI.getPreprocessor();
+    if (Guard.empty() || !PP.mayBeMacro(Guard))
+      return false;
+    IdentifierInfo *II = PP.getIdentifierInfo(Guard);
+    PP.refreshIdentifier(*II);
+    return PP.isMacroDefined(II);
+  }
+  bool wasRead(llvm::StringRef Path) {
+    Preprocessor &PP = CI.getPreprocessor();
+    OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(Path);
+    return FE && (PP.alreadyIncluded(*FE) ||
+                  PP.getHeaderSearchInfo().hasFileBeenImported(*FE));
+  }
+  /// The declaration a name a copy takes from a link finds here. Looking it
+  /// up also reads it from the module files loaded since the name was last
+  /// read: the reader of the copy, which finds it by name, does not.
+  NamedDecl *findLinkName(llvm::StringRef N) {
+    Preprocessor &PP = CI.getPreprocessor();
+    bool Tag = N.starts_with("t:");
+    IdentifierInfo *II = PP.getIdentifierInfo(N.drop_front(2));
+    PP.refreshIdentifier(*II);
+    return ASTReader::lookupAtFileScope(CI.getSema(), *II, Tag,
+                                        /*CreateBuiltin=*/true);
+  }
+
+  bool declaredHere(const Fetched &F) {
+    for (const NameView &N : F.Meta->declares())
+      if (!findLinkName(N.Name))
+        return false;
+    for (const Fetched &C : F.Links)
+      if (!declaredHere(C))
+        return false;
+    return true;
+  }
+
+  /// Decides, in load order, which links will be skipped: those whose guard
+  /// is defined, now or by a link loaded before them. False if one would be
+  /// skipped where its header was not read, or where a declaration the copy
+  /// takes from it is missing. Decided before anything loads.
+  bool planLinks(const std::vector<Fetched> &Links,
+                 llvm::StringSet<> &WillLoad) {
+    for (const Fetched &F : Links) {
+      if (!F.Guard.empty() && WillLoad.count(F.Guard))
+        continue;
+      if (guardDefined(F.Guard)) {
+        if (!wasRead(F.Path))
+          return false;
+        for (const std::string &N : F.Names)
+          if (!findLinkName(N))
+            return false;
+        // The compile read the header, as plain clang would have; what the
+        // copy and its links declare must be there already, or the copies
+        // that refer to it were made with a header the compile has not
+        // read so far: git's hash.h, open above its struct object_id.
+        if (!declaredHere(F))
+          return false;
+        continue;
+      }
+      if (!planLinks(F.Links, WillLoad))
+        return false;
+      if (!F.Guard.empty())
+        WillLoad.insert(F.Guard);
+    }
+    return true;
+  }
+
+  /// Loads what \p Deps links, at the #include \p Loc of the copy linking
+  /// it, as hits on the headers there would: each copy after its own links,
+  /// its effects replayed. A link whose guard is defined is skipped with
+  /// what it links, as the #include would be.
+  bool loadLinks(const MetadataView &Deps, SourceLocation Loc) {
+    std::vector<Fetched> All;
+    if (!fetchLinks(Deps, All, 0))
+      return false;
+    llvm::StringSet<> WillLoad;
+    if (!planLinks(All, WillLoad))
+      return false;
+    for (const Fetched &F : All)
+      if (!loadLink(F, Loc))
+        return false;
+    for (const Fetched &F : All)
+      for (const std::string &N : F.Names)
+        findLinkName(N);
+    return true;
+  }
+
+  bool loadLink(const Fetched &F, SourceLocation Loc) {
+    Preprocessor &PP = CI.getPreprocessor();
+    if (guardDefined(F.Guard)) {
+      if (!wasRead(F.Path))
+        return false;
+      if (getenv("DEBUG_LINK"))
+        llvm::errs() << "LINK skip " << F.Path << " " << F.Module << "\n";
+      ++LinksSkipped;
+      return true;
+    }
+    for (const Fetched &C : F.Links)
+      if (!loadLink(C, Loc))
+        return false;
+    for (const Fetched &C : F.Links)
+      for (const std::string &N : C.Names)
+        findLinkName(N);
+    Module *M = load(F.Bytes, F.Module, Loc);
+    if (getenv("DEBUG_LINK")) {
+      llvm::errs() << "LINK load " << F.Path << " " << F.Module
+                   << (M ? "" : " FAILED") << " sublinks:";
+      for (const Fetched &C : F.Links) {
+        llvm::errs() << " " << llvm::sys::path::filename(C.Path) << "[";
+        for (const std::string &N : C.Names)
+          llvm::errs() << N << ",";
+        llvm::errs() << "]";
+      }
+      llvm::errs() << " declares " << F.Meta->declares().size() << "\n";
+    }
+    if (!M)
+      return false;
+    serialization::ModuleFile *MF = LoadedTargets.find(F.Module)->second.MF;
+    const MetadataView &D = *F.Meta;
+    replayMacroStacks(D.macroStacks(), Loc);
+    // As the #include's own hit does, through Sema: visible, and imported,
+    // so that a definition the copy must emit is emitted here.
+    CI.getSema().BuildModuleInclude(Loc, M);
+    // Its macros too, which only the preprocessor shows (as for a hit).
+    PP.makeModuleVisible(M, Loc);
+    replayMacroEffects(D.macroEffects(), *M, Loc);
+    applyPragmaDelta(CI.getSema(), D.entry(), D.exit());
+    if (Exporter)
+      Exporter->replaying(true);
+    if (MF)
+      printDiagnostics(D.diagnostics(), *MF);
+    if (Exporter)
+      Exporter->replaying(false);
+    for (const WarningPragmaView &W : D.warningPragmas())
+      Pragmas.apply(CI.getDiagnostics(), W.Pragma, Loc);
+    if (OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(F.Path))
+      PP.markIncluded(*FE);
+    ++LinksLoaded;
+    return true;
+  }
+  unsigned LinksLoaded = 0, LinksSkipped = 0, LinksFailed = 0;
+
   Module *load(llvm::StringRef Bytes, llvm::StringRef ModuleName,
                SourceLocation IncludeLoc) {
     LastModuleName = ModuleName.str();
@@ -1074,6 +1329,63 @@ private:
   /// Listed headers read as text because a header this compile will write
   /// was open.
   unsigned InsideWritten = 0;
+  /// CLANG_HEADER_CACHE_FOLD_SERVED=1: inside a header being written, a
+  /// header is asked for and served too, and the copy being written holds
+  /// the served copy's declarations as its own.
+  bool FoldServed = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_FOLD_SERVED");
+    return V && llvm::StringRef(V) == "1";
+  }();
+  /// CLANG_HEADER_CACHE_MEASURE_NESTED=1, measurement only: inside a header
+  /// being written, ask for each listed header too and check its copies,
+  /// without using one. Each such read's reason says whether one fitted.
+  /// CLANG_HEADER_CACHE_LINK=1: inside a header being written, a header is
+  /// asked for and served too, and the copy being written links the served
+  /// copy, as it links the copy of a header inside it that it writes.
+  bool LinkMode = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_LINK");
+    return V && llvm::StringRef(V) == "1";
+  }();
+  bool MeasureNested = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_MEASURE_NESTED");
+    return V && llvm::StringRef(V) == "1";
+  }();
+  unsigned NestedAsked = 0, NestedFit = 0, NestedNoCopy = 0;
+  uint64_t NestedMicros = 0;
+  void measureNested(FileEntryRef File, SourceLocation IncludeLoc,
+                     ConstSearchDirIterator CurDir, const std::string &Path) {
+    Preprocessor &PP = CI.getPreprocessor();
+    DeclBoundaryObserver *Boundary = PP.getDeclBoundaryObserver();
+    if (!Boundary || !Boundary->isAtDeclarationBoundary() || !CI.hasSema()) {
+      NextReason += "/not-at-a-boundary";
+      return;
+    }
+    uint32_t Counter = PP.getCounterValue();
+    IncludeSite Site{File, CurDir, IncludeLoc,
+                     warningState(WarningFlags, &Pragmas, IncludeLoc),
+                     searchContext(File, CurDir)};
+    bool Fits = false;
+    auto Asked = std::chrono::steady_clock::now();
+    Client->lookup(
+        Path, PP, &CI.getSema(), nullptr,
+        [&](llvm::StringRef, llvm::StringRef) {
+          Fits = true;
+          return false;
+        },
+        &Site);
+    NestedMicros += micros(Asked);
+    PP.setCounterValue(Counter);
+    ++NestedAsked;
+    if (Fits) {
+      ++NestedFit;
+      NextReason += "/fits";
+    } else if (Client->lastCandidates() == 0) {
+      ++NestedNoCopy;
+      NextReason += "/no-copy";
+    } else {
+      NextReason += "/rejected:" + describe(Client->lastRejection()).str();
+    }
+  }
   /// Null unless this compile exports its misses.
   PartExporter *Exporter = nullptr;
   bool PopulateOnly = false;
@@ -1233,6 +1545,11 @@ void clang::ast_cache::installHeaderCacheHook(
     PartExporter &E = PartExporter::install(
         CI, [S](PushRequest &&R) { S->push(R); }, &Pragmas);
     S->exportMisses(E, Export == ExportMode::PopulateOnly);
+    if (const char *V = std::getenv("CLANG_HEADER_CACHE_SECOND_MISS");
+        V && llvm::StringRef(V) == "1")
+      E.writeOnlyIfSeen([S](llvm::StringRef Header, llvm::StringRef Module) {
+        return S->seenBefore(Header, Module);
+      });
     // The diagnostics printed while a header being exported is open go into
     // its part (REPORT.md Q34).
     DiagnosticsEngine &Diags = CI.getDiagnostics();

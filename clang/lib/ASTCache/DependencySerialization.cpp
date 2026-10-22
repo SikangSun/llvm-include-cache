@@ -219,6 +219,24 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
       W.str(U.Member);
     }
   }
+
+  Begin(MetadataView::Links, Deps.Links.size());
+  for (const LinkRecord &L : Deps.Links) {
+    W.str(L.Path);
+    W.str(L.Module);
+    W.str(L.Guard);
+    W.u8(L.OnGuard ? 1 : 0);
+    W.vu32(L.Names.size());
+    for (const std::string &N : L.Names)
+      W.str(N);
+    W.u64(L.Hash);
+  }
+
+  Begin(MetadataView::Declares, Deps.Declares.size());
+  for (const std::string &N : Deps.Declares) {
+    W.str(N);
+    W.vu32(0);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -379,6 +397,18 @@ SubmoduleView SubmoduleView::read(ByteReader &R) {
   return S;
 }
 
+LinkView LinkView::read(ByteReader &R) {
+  LinkView L;
+  L.Path = R.str();
+  L.Module = R.str();
+  L.Guard = R.str();
+  L.OnGuard = upTo(R, 1) != 0;
+  for (uint32_t I = 0, N = R.vu32(); I != N && R.ok(); ++I)
+    L.Names.push_back(R.str());
+  L.Hash = R.u64();
+  return L;
+}
+
 ConditionView ConditionView::read(ByteReader &R) {
   ConditionView C;
   C.Owner = static_cast<int32_t>(R.u32());
@@ -431,7 +461,14 @@ bool MetadataView::validate() const {
       !fileNames().valid() || !declarations().valid() ||
       !macroEffects().valid() || !diagnostics().valid() ||
       !warningPragmas().valid() || !submodules().valid() ||
-      !conditions().valid() || !provided().valid())
+      !conditions().valid() || !provided().valid() || !links().valid() ||
+      !declares().valid())
+    return false;
+  // A link names the copy it loads; one skipped by its guard names that.
+  if (llvm::any_of(links(), [](const LinkView &L) {
+        return L.Path.empty() || L.Module.empty() ||
+               (L.OnGuard && L.Guard.empty());
+      }))
     return false;
   // A name the check looks up must be one: an empty one would pass as
   // "not a macro" whatever the compile defines.
@@ -535,6 +572,15 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
     for (const ProvidedView::Use &U : D.Uses)
       P.Uses.push_back({U.Index, U.Of, U.Member.str()});
     Deps.Provided.push_back(std::move(P));
+  }
+  for (const NameView &N : V->declares())
+    Deps.Declares.push_back(N.Name.str());
+  for (const LinkView &L : V->links()) {
+    LinkRecord R{L.Path.str(), L.Module.str(), L.Guard.str(), L.OnGuard, {},
+                 L.Hash};
+    for (llvm::StringRef N : L.Names)
+      R.Names.push_back(N.str());
+    Deps.Links.push_back(std::move(R));
   }
   Deps.HeaderName = V->headerName().str();
   Deps.Entry = V->entry();

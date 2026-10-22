@@ -2293,6 +2293,10 @@ void ASTWriter::WriteHeaderSearch(const HeaderSearch &HS) {
     HeaderFileInfoTrait::data_type Data = {
       *HFI, Included, HS.getModuleMap().findResolvedModulesForHeader(*File), {}
     };
+    // A part imports nothing, so its guard is a name of its own: a file
+    // folded in from a copy served inside it has the ID that copy gave it.
+    if (PartDecls && Data.HFI.LazyControllingMacro.isID())
+      Data.HFI.getControllingMacro(PP->getExternalSource());
     Generator.insert(Key, Data, GeneratorTrait);
     ++NumHeaderSearchEntries;
   }
@@ -2679,9 +2683,12 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
   // It is meaningless to emit macros for named modules. It only wastes times
   // and spaces.
   // A scoped part looks only at the names its directives named.
+  // A part's names are the ones it defined or undefined, or took over from a
+  // copy served inside it, whose name was read from that copy.
   auto Consider = [&](const IdentifierInfo *II) {
     if (II->hadMacroDefinition() &&
-        (!II->isFromAST() || II->hasChangedSinceDeserialization()))
+        (PartMacros || !II->isFromAST() ||
+         II->hasChangedSinceDeserialization()))
       MacroIdentifiers.push_back(II);
   };
   if (isWritingStdCXXNamedModules()) {
@@ -3991,7 +3998,8 @@ public:
       SmallVector<Module *, 2> Owners;
       for (Decl *R = getDeclForLocalLookup(PP.getLangOpts(), D); R;
            R = R->getPreviousDecl()) {
-        if (R->isFromASTFile() || !Writer.wasDeclEmitted(R))
+        if ((R->isFromASTFile() && !Writer.isPartLocal(R)) ||
+            !Writer.wasDeclEmitted(R))
           continue;
         if (!Writer.hasPartOwners()) {
           if (!llvm::is_contained(Held, R))
@@ -4514,8 +4522,10 @@ public:
           !Writer.wasDeclEmitted(DeclForLocalLookup))
         continue;
 
-      // A part imports nothing; see ASTIdentifierTableTrait::declsFor.
-      if (Writer.isWritingPart() && DeclForLocalLookup->isFromASTFile())
+      // A part imports nothing; see ASTIdentifierTableTrait::declsFor. It
+      // holds what it folds in from a copy served inside it.
+      if (Writer.isWritingPart() && DeclForLocalLookup->isFromASTFile() &&
+          !Writer.isPartLocal(DeclForLocalLookup))
         continue;
 
       // Try to avoid writing internal decls to reduced BMI.
@@ -4745,7 +4755,9 @@ static bool isLookupResultNotInteresting(ASTWriter &Writer,
                                          StoredDeclsList &Result) {
   for (auto *D : Result.getLookupResult()) {
     auto *LocalD = getDeclForLocalLookup(Writer.getLangOpts(), D);
-    if (LocalD->isFromASTFile())
+    // One a part folds in from a copy served inside it is its own.
+    if (LocalD->isFromASTFile() &&
+        !(Writer.isWritingPart() && Writer.isPartLocal(LocalD)))
       continue;
 
     // We can only be sure whether the local declaration is reachable
@@ -5923,6 +5935,8 @@ void ASTWriter::PrepareWritingSpecialDecls(Sema &SemaRef) {
   // `int x;` at file scope, which a compile loading it emits at the end of
   // its translation unit, as it would have from the text.
   if (PartDecls) {
+    for (const Decl *D : PartFoldedDecls)
+      GetDeclRef(D);
     for (auto I = SemaRef.TentativeDefinitions.begin(nullptr, true),
               E = SemaRef.TentativeDefinitions.end();
          I != E; ++I)
@@ -6677,6 +6691,12 @@ void ASTWriter::WriteDeclAndTypes(ASTContext &Context) {
   // Create a lexical update block containing all of the declarations in the
   // translation unit that do not come from other AST files.
   SmallVector<DeclID, 128> NewGlobalKindDeclPairs;
+  for (const Decl *D : PartFoldedDecls) {
+    if (!wasDeclEmitted(D))
+      continue;
+    NewGlobalKindDeclPairs.push_back(D->getKind());
+    NewGlobalKindDeclPairs.push_back(GetDeclRef(D).getRawValue());
+  }
   for (const auto *D : TU->noload_decls()) {
     if (D->isFromASTFile())
       continue;
@@ -6976,6 +6996,16 @@ unsigned ASTWriter::getAdjustedNumCreatedFIDs(FileID FID) const {
 SourceLocation ASTWriter::getAdjustedLocation(SourceLocation Loc) const {
   if (Loc.isInvalid())
     return Loc;
+  // A place in a copy folded into the part is a place in the part's own
+  // entry for that file (setPartLoadedLocations).
+  if (PartTranslateLoaded &&
+      PP->getSourceManager().isLoadedSourceLocation(Loc)) {
+    Loc = PartTranslateLoaded(Loc);
+    if (Loc.isInvalid()) {
+      ++PartDroppedLocations;
+      return Loc;
+    }
+  }
   // A part drops the macro expansions outside it, and those spelled in a
   // file it drops. A location in one becomes the place debug information and
   // diagnostics report for it (SourceManager::getFileLoc): where the macro
@@ -7476,7 +7506,9 @@ bool ASTWriter::isPartLocal(const Decl *D) const {
       break;
     Top = cast<Decl>(DC);
   }
-  return !Top->isFromASTFile() && PartDecls(Top);
+  // One from a copy served inside the part is the part's when PartDecls
+  // says so (setPartFoldedDecls).
+  return PartDecls(Top);
 }
 
 bool ASTWriter::isPartNameReference(const Decl *D) const {

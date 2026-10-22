@@ -34,6 +34,7 @@
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Options/OptionUtils.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -1355,6 +1356,317 @@ TEST_F(ExportTest, AHeaderIsFoldedWithTheHeadersInsideItReadAsText) {
   ASSERT_TRUE(compile(Other, Entered));
   EXPECT_FALSE(Entered.count(Outer)) << "outer.h's folded copy was not served";
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened after all";
+}
+
+TEST_F(ExportTest, AServedHeaderIsFoldedIntoTheCopyBeingWritten) {
+  // Fold everything (CLANG_HEADER_CACHE_FOLD_SERVED): b.c writes outer.h's
+  // copy, and inner.h inside it is served from inner.h's own copy instead of
+  // read as text. outer.h's copy still holds inner.h's declarations and
+  // macros, so c.c is served outer.h alone and never opens inner.h.
+  setenv("CLANG_HEADER_CACHE_FOLD_SERVED", "1", 1);
+  auto Unset = llvm::make_scope_exit(
+      [] { unsetenv("CLANG_HEADER_CACHE_FOLD_SERVED"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "struct pair { int a, b; };\n"
+                                       "static inline int twice(int x) "
+                                       "{ return 2 * x; }\n"
+                                       "#define INNER_MAX 42\n"
+                                       "my_size inner_len(void);\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nmy_size outer_len(struct pair *p);\n"
+                           "#define OUTER_MAX (INNER_MAX + 1)\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n"
+                               "int a(void) { return twice(INNER_MAX); }\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n"
+                               "int b(void) { return OUTER_MAX; }\n");
+  std::string C = write(
+      "c.c", "#include \"" + Outer +
+                 "\"\nint c(void) {\n  struct pair p = {1, 2};\n"
+                 "  my_size s = INNER_MAX + OUTER_MAX + outer_len(&p);\n"
+                 "  return twice(p.a) + (int)s + (int)inner_len();\n}\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(A, Inner)) << "inner.h's copy was not served";
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h is not listed yet";
+  size_t Before = Daemon->stats().Entries;
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h's text was not read";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was read as text";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 1) << "outer.h was not written";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, AFoldedHeadersDependenciesAreTheCopys) {
+  // inner.h's text tests FAST. b.c writes outer.h's copy with inner.h served
+  // and folded in, so outer.h's copy depends on FAST as inner.h's did: d.c,
+  // which defines FAST, reads outer.h as text, and gets inner.h's other
+  // branch.
+  setenv("CLANG_HEADER_CACHE_FOLD_SERVED", "1", 1);
+  auto Unset = llvm::make_scope_exit(
+      [] { unsetenv("CLANG_HEADER_CACHE_FOLD_SERVED"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#ifdef FAST\nint speed(void);\n"
+                                       "#else\nlong speed(void);\n#endif\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nint outer(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#define FAST 1\n#include \"" + Outer +
+                                   "\"\nint d(void) { return speed(); }\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h is not listed yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was read as text";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("speed")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        Returns = F->getReturnType().getAsString();
+  };
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served under FAST";
+  AtEnd = nullptr;
+  EXPECT_EQ(Returns, "int");
+}
+
+TEST_F(ExportTest, ACopyIsWrittenTheSecondTimeItWouldBe) {
+  // CLANG_HEADER_CACHE_SECOND_MISS: b.c's second compile misses outer.h and
+  // holds its copy back; the third misses in the same state and writes it;
+  // the fourth is served it. c.c, in another state, never gets a copy
+  // written.
+  setenv("CLANG_HEADER_CACHE_SECOND_MISS", "1", 1);
+  auto Unset = llvm::make_scope_exit(
+      [] { unsetenv("CLANG_HEADER_CACHE_SECOND_MISS"); });
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#ifdef WIDE\nlong f(void);\n#else\n"
+                                       "int f(void);\n#endif\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#define WIDE 1\n#include \"" + Outer + "\"\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  size_t Before = Daemon->stats().Entries;
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  EXPECT_EQ(Daemon->stats().Entries, Before) << "written the first time";
+  EXPECT_TRUE(reads(C, Outer)) << "c.c's state has no copy";
+  EXPECT_EQ(Daemon->stats().Entries, Before) << "c.c's copy was written";
+  EXPECT_TRUE(reads(B, Outer)) << "the copy is not written until now";
+  EXPECT_EQ(Daemon->stats().Entries, Before + 1)
+      << "not written the second time";
+  EXPECT_FALSE(reads(B, Outer)) << "the copy written was not served";
+}
+
+TEST_F(ExportTest, ACopyBeingWrittenLinksAServedHeader) {
+  // CLANG_HEADER_CACHE_LINK: b.c writes outer.h's copy with inner.h served
+  // inside it. outer.h's copy links inner.h's instead of holding it: c.c is
+  // served outer.h, inner.h's copy loads first, and neither file is opened.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "struct pair { int a, b; };\n"
+                                       "static inline int twice(int x) "
+                                       "{ return 2 * x; }\n"
+                                       "#define INNER_MAX 42\n"
+                                       "my_size inner_len(void);\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nmy_size outer_len(struct pair *p);\n"
+                           "#define OUTER_MAX (INNER_MAX + 1)\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n"
+                               "int a(void) { return twice(INNER_MAX); }\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n"
+                               "int b(void) { return OUTER_MAX; }\n");
+  std::string C = write(
+      "c.c", "#include \"" + Outer +
+                 "\"\nint c(void) {\n  struct pair p = {1, 2};\n"
+                 "  my_size s = INNER_MAX + OUTER_MAX + outer_len(&p);\n"
+                 "  return twice(p.a) + (int)s + (int)inner_len();\n}\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(A, Inner)) << "inner.h's copy was not served";
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h is not listed yet";
+  size_t Before = Daemon->stats().Entries;
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h's text was not read";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was read as text";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 1) << "outer.h was not written";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, AHeaderEndingInAFunctionBeforeALinkIsSavedWithItsBody) {
+  // As AHeaderEndingInAFunctionIsSavedWithItsBody, with the token past
+  // last_fn's `}` an #include served a copy that links another: loading the
+  // link hands the compile's consumers an import, and last.h must not be
+  // written then either (git's progress.h, saved without stop_progress's
+  // body).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  ExtraArgs = {"-Werror=undefined-internal"};
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string Last = write("last.h", "#ifndef LAST_H\n#define LAST_H\n"
+                                     "static inline int last_fn(int x) {\n"
+                                     "  return x + 1;\n}\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string X = write("x.c", "#include \"" + Last + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint x(void) { return last_fn(1); }\n");
+  std::string Y = write("y.c", "#include \"" + Last +
+                                   "\"\nint y(void) { return last_fn(2); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  size_t Before = Daemon->stats().Entries;
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 2)
+      << "outer.h and inner.h were not both written";
+  EXPECT_FALSE(reads(X, Outer)) << "outer.h's copy was not served";
+  EXPECT_TRUE(reads(X, Last)) << "last.h is not stored yet";
+  EXPECT_FALSE(reads(Y, Last)) << "last.h's copy was not served";
+}
+
+TEST_F(ExportTest, AHeaderWrittenInsideOneBeingWrittenIsLinked) {
+  // Both miss in b.c's second compile: inner.h's copy is written inside
+  // outer.h's, and outer.h's links it. c.c is served both.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C =
+      write("c.c", "#include \"" + Outer +
+                       "\"\nint c(void) { struct pair p = {1, INNER_MAX}; "
+                       "return outer_sum(&p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  size_t Before = Daemon->stats().Entries;
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 2)
+      << "outer.h and inner.h were not both written";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, ALinkIsSkippedWhereItsHeaderWasRead) {
+  // inner.h reads nothing outer.h's lines set, and outer.h's lines read
+  // nothing inner.h sets, so the link is skipped where inner.h was read:
+  // d.c reads inner.h first, and is still served outer.h.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "my_size inner_len(void);\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nmy_size outer_len(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint d(void) { return (int)(inner_len()"
+                                   " + outer_len()); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+}
+
+TEST_F(ExportTest, ALinkReadingTheLinesBeforeItIsNotSkipped) {
+  // inner.h tests WIDE, which outer.h defines before including it: inner.h
+  // depends on outer.h's lines, so where inner.h was read first outer.h's
+  // copy is not served -- outer.h's #include of inner.h is skipped there,
+  // and plain clang's speed() is d.c's, returning int.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#ifdef WIDE\nlong speed(void);\n"
+                                       "#else\nint speed(void);\n#endif\n"
+                                       "#endif\n");
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#define WIDE 1\n#include \"" +
+                                           Inner +
+                                           "\"\nint outer(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint d(void) { return speed(); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("speed")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        Returns = F->getReturnType().getAsString();
+  };
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Returns, "int");
+}
+
+TEST_F(ExportTest, ALinkWhoseMacroTheLinesReadIsNotSkipped) {
+  // outer.h's lines test INNER_FAST, which inner.h defines: where inner.h
+  // was read with another INNER_FAST, outer.h's copy, made with inner.h's,
+  // does not stand in.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#ifndef NO_FAST\n#define INNER_FAST\n"
+                                       "#endif\nint inner(void);\n#endif\n");
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#include \"" +
+                                           Inner +
+                                           "\"\n#ifdef INNER_FAST\n"
+                                           "int fast(void);\n#else\n"
+                                           "long fast(void);\n#endif\n"
+                                           "#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#define NO_FAST\n#include \"" + Inner +
+                                   "\"\n#undef NO_FAST\n#include \"" + Outer +
+                                   "\"\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("fast")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        Returns = F->getReturnType().getAsString();
+  };
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Returns, "long");
 }
 
 TEST_F(ExportTest, OneCopyServesAHeaderWhetherOrNotItsInnerHeaderWasRead) {

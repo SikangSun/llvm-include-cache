@@ -114,6 +114,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // For measuring: every copy stored and how it was used.
+  if (const char *Dump = std::getenv("CLANG_HEADER_CACHE_DAEMON_DUMP")) {
+    std::error_code EC;
+    raw_fd_ostream OS(Dump, EC);
+    if (!EC)
+      (*D)->dumpEntries(OS);
+  }
   if (Verbose) {
     CacheDaemon::Stats S = (*D)->stats();
     outs() << "lookups " << S.Lookups << " (" << S.Hits << " with entries)\n"

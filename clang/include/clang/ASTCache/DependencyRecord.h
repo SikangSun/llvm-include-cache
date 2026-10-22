@@ -372,6 +372,34 @@ struct ProvidedDeclaration {
   }
 };
 
+/// A header inside a copy that the copy does not hold: it loads the
+/// header's own copy instead (CLANG_HEADER_CACHE_LINK). postgres's
+/// syscache.h's copy links access/htup.h's. Each link loads, before the
+/// copy itself, unless it is OnGuard and the compile has read the header
+/// already: its guard is defined and the file was read.
+struct LinkRecord {
+  /// The header, by the absolute path the daemon stores it under, and the
+  /// module name of the copy linked.
+  std::string Path;
+  std::string Module;
+  /// The header's include guard; empty for none.
+  std::string Guard;
+  /// Whether the header reads nothing the copy's lines before it set, so
+  /// that where it was read already, the link is skipped.
+  bool OnGuard = false;
+  /// The declarations the copy's lines take from the link, by name ("t:" a
+  /// tag, "o:" any other): a loading compile looks each up before loading
+  /// the copy, and where the link is skipped requires that it finds one.
+  std::vector<std::string> Names;
+  /// The copy's bytes, hashed: two copies of a header can share a module
+  /// name (the name is taken before the outside declarations are known).
+  uint64_t Hash = 0;
+  friend bool operator==(const LinkRecord &A, const LinkRecord &B) {
+    return A.Path == B.Path && A.Module == B.Module && A.Guard == B.Guard &&
+           A.OnGuard == B.OnGuard && A.Names == B.Names && A.Hash == B.Hash;
+  }
+};
+
 struct HeaderDependencySet {
   std::vector<ConditionalDependency> Conditional;
   std::vector<SyntacticDependency> Syntactic;
@@ -428,6 +456,13 @@ struct HeaderDependencySet {
   std::vector<SubmoduleRecord> Submodules;
   std::vector<DependencyCondition> Conditions;
   std::vector<ProvidedDeclaration> Provided;
+  /// The headers inside whose own copies this one loads, in the order
+  /// their #includes were reached.
+  std::vector<LinkRecord> Links;
+  /// CLANG_HEADER_CACHE_LINK: the names the copy's own lines declare at file
+  /// scope ("t:" a tag, "o:" any other). Where a copy linking this one skips
+  /// it, the compile has read the header already, and must declare each.
+  std::vector<std::string> Declares;
 };
 
 /// One header's dependency set, as observed over the region between entering

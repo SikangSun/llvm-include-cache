@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/ASTCache/ASTCacheDependencyTracker.h"
+#include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/MacroTokens.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/SourceManager.h"
@@ -251,7 +252,7 @@ void ASTCacheDependencyTracker::FileSkipped(
         continue;
       // The file was read earlier inside this header, which defined the
       // guard itself: stdio.h reaching <features.h> a second time.
-      if (GuardOrigin.isValid() && F.Closure.contains(GuardOrigin))
+      if (GuardOrigin.isValid() && F.holds(GuardOrigin))
         continue;
       noteRead(F, GuardOrigin, "skips " + SkippedFile.getName());
       ConditionalDependency Dep;
@@ -305,7 +306,7 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
     // often it is tested again.
     if (!F.SeenConditional.insert(II).second)
       continue;
-    if (Origin.isValid() && F.Closure.contains(Origin))
+    if (Origin.isValid() && F.holds(Origin))
       continue;
     noteRead(F, Origin, "tests " + II->getName());
     ConditionalDependency Dep;
@@ -561,7 +562,7 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
   for (Frame &F : Stack) {
     if (!F.SeenSyntactic.insert(II).second)
       continue;
-    if (MI && F.Closure.contains(DefFID))
+    if (MI && F.holds(DefFID))
       continue;
     noteRead(F, ReadOrigin,
              (MI ? "expands " : "reads as plain text ") + II->getName());
@@ -635,7 +636,7 @@ void ASTCacheDependencyTracker::recordSymbol(
       continue;
     // Answered from inside this header's own closure: its text pins the
     // answer, so it cannot vary between compiles.
-    if (HaveResolved && F.Closure.contains(ResolvedFID))
+    if (HaveResolved && F.holds(ResolvedFID))
       continue;
     if (!F.SeenSymbol.insert(Name).second)
       continue;
@@ -789,4 +790,94 @@ ASTCacheDependencyTracker::findByPath(llvm::StringRef PathSuffix) const {
     if (llvm::StringRef(Rec.HeaderPath).ends_with(PathSuffix))
       return &Rec.Deps;
   return nullptr;
+}
+
+void ASTCacheDependencyTracker::foldServed(
+    SourceLocation Loc, int FirstID, unsigned NumIDs, const MetadataView &Deps,
+    llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve, bool Linked) {
+  SourceManager &SM = PP.getSourceManager();
+  FileID Where = SM.getFileID(SM.getExpansionLoc(Loc));
+  bool Unfoldable = !Deps.submodules().empty() ||
+                    (!Linked && !Deps.warningPragmas().empty()) ||
+                    !Deps.macroStacks().empty();
+  for (Frame &F : Stack) {
+    if (!F.Closure.contains(Where))
+      continue;
+    if (Unfoldable)
+      F.Poisoned = true;
+    else
+      F.Folded.push_back({FirstID, NumIDs});
+  }
+  if (Unfoldable)
+    return;
+
+  // What the copy's text tested, expanded and named, as if read here: each
+  // frame depends on what of it a state outside the frame decides.
+  for (const ConditionalView &C : Deps.conditional()) {
+    const IdentifierInfo *II = PP.getIdentifierInfo(C.MacroName);
+    recordConditional(II, C.WasDefined,
+                      stateOrigin(II, PP.getMacroDefinition(
+                                          const_cast<IdentifierInfo *>(II))));
+  }
+  for (const NameView &N : Deps.notAMacro())
+    recordSyntactic(PP.getIdentifierInfo(N.Name), nullptr);
+  for (const ExpandsToView &E : Deps.expandsTo()) {
+    IdentifierInfo *II = PP.getIdentifierInfo(E.Name);
+    recordSyntactic(II, PP.getMacroInfo(II));
+  }
+  for (const SymbolView &S : Deps.symbol()) {
+    QueryContext Ctx;
+    Ctx.QueryLoc = Loc;
+    Ctx.ResolvedLoc = Resolve(S.Name);
+    Ctx.ResolvedTypeName = S.ResolvedTypeName;
+    recordSymbol(PP.getIdentifierInfo(S.Name), S.Classification, Ctx);
+  }
+
+  for (size_t I = 0; I != Stack.size(); ++I) {
+    Frame &F = Stack[I];
+    if (!F.Closure.contains(Where))
+      continue;
+    // A #pragma once skip of a file the frame read stays inside it.
+    for (const InclusionView &V : Deps.inclusion()) {
+      OptionalFileEntryRef FE =
+          PP.getFileManager().getOptionalFileRef(V.HeaderPath);
+      if (FE && F.ClosureFiles.contains(&FE->getFileEntry()))
+        continue;
+      InclusionDependency D;
+      D.HeaderPath = V.HeaderPath.str();
+      D.Why = V.Why;
+      F.Deps.Inclusion.push_back(std::move(D));
+    }
+    // The copy's #include searches and __FILE__s, numbered after the
+    // frame's own: the copy's header is the file the frame's pending
+    // #include found.
+    int32_t Self = -1;
+    for (auto [FrameIndex, Index] : PendingEntries)
+      if (FrameIndex == I)
+        Self = Index;
+    if (Self < 0) {
+      F.Poisoned = true;
+      continue;
+    }
+    int32_t Base = F.Deps.Includes.size();
+    for (const IncludeView &V : Deps.includes()) {
+      IncludeDependency D;
+      D.K = V.K;
+      D.Angled = V.Angled;
+      D.Spelled = V.Spelled.str();
+      D.Includer = V.Includer < 0 ? Self : Base + V.Includer;
+      D.Found = V.Found.str();
+      D.Name = V.Name.str();
+      F.Deps.Includes.push_back(std::move(D));
+      F.At.Includes.push_back(Where);
+    }
+    for (const FileNameView &V : Deps.fileNames()) {
+      FileNameDependency D;
+      D.Which = V.Which;
+      D.File = V.File < 0 ? Self : Base + V.File;
+      D.Text = V.Text.str();
+      F.Deps.FileNames.push_back(std::move(D));
+      F.At.FileNames.push_back(Where);
+    }
+  }
 }

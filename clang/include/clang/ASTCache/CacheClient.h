@@ -214,6 +214,18 @@ public:
                              Use = nullptr,
                          const IncludeSite *Site = nullptr);
 
+  /// The stored copy of \p Filename whose module is \p ModuleName, and its
+  /// metadata in \p Meta, with no check: a copy that links it
+  /// (CLANG_HEADER_CACHE_LINK) was checked for both. Empty if the daemon
+  /// holds none.
+  llvm::StringRef fetch(llvm::StringRef Filename, llvm::StringRef ModuleName,
+                        uint64_t Hash, std::optional<MetadataView> &Meta);
+
+  /// CLANG_HEADER_CACHE_SECOND_MISS: whether a compile was about to write
+  /// the copy of \p Filename named \p ModuleName before; the daemon notes
+  /// this one. True if the daemon cannot say, so that the copy is written.
+  bool seenBefore(llvm::StringRef Filename, llvm::StringRef ModuleName);
+
   /// Stores a newly produced entry. Blocks until the daemon acknowledges, so
   /// a caller that does not want to wait should run this off the critical
   /// path.
@@ -232,6 +244,8 @@ public:
   struct Stats {
     unsigned Lookups = 0;
     unsigned Hits = 0;
+    /// Copies fetched by name for a link, and how many the daemon held.
+    unsigned Fetches = 0, Fetched = 0;
     unsigned CandidatesRejected = 0;
     unsigned RejectedFor[13] = {};
     /// With logRejections on: the header and what failed, one per rejected

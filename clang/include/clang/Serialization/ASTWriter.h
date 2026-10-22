@@ -207,6 +207,8 @@ private:
   /// declarations reach, and only macros whose latest directive PartMacros
   /// accepts are written, as the writing module's macros. Unlike reduced BMI,
   /// nothing reached is elided. See setPartFilter.
+  std::function<SourceLocation(SourceLocation)> PartTranslateLoaded;
+  std::vector<const Decl *> PartFoldedDecls;
   std::function<bool(const Decl *)> PartDecls;
   std::function<bool(const MacroDirective *)> PartMacros;
   std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
@@ -880,8 +882,9 @@ public:
   /// our AST file)? This is the case for declarations that are neither imported
   /// from another AST file nor predefined.
   bool IsLocalDecl(const Decl *D) {
+    // A part writes again what it folds in from a copy served inside it.
     if (D->isFromASTFile())
-      return false;
+      return PartDecls && isPartLocal(D);
     auto I = DeclIDs.find(D);
     if (I != DeclIDs.end() && I->second < clang::NUM_PREDEF_DECL_IDS)
       return false;
@@ -1052,6 +1055,20 @@ public:
     PartKeepsHeaderInfo = std::move(KeepsHeaderInfo);
   }
   bool isWritingPart() const { return bool(PartDecls); }
+
+  /// The top-level declarations of copies served inside the part, which it
+  /// holds as its own, in order, before its own (CLANG_HEADER_CACHE_
+  /// FOLD_SERVED). PartDecls must accept them.
+  void setPartFoldedDecls(std::vector<const Decl *> Decls) {
+    PartFoldedDecls = std::move(Decls);
+  }
+  /// Where a location in a copy folded into the part is in the part: in the
+  /// local entry the compile made for its file (setPartFoldedDecls); invalid
+  /// for one the part drops.
+  void setPartLoadedLocations(
+      std::function<SourceLocation(SourceLocation)> Translate) {
+    PartTranslateLoaded = std::move(Translate);
+  }
 
   /// Where a part's own state lies, so that the writer visits only that
   /// instead of the whole compile (REPORT.md I5); the filters above still

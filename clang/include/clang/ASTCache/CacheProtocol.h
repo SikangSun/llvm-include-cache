@@ -63,6 +63,8 @@ enum class MessageKind : uint8_t {
   TimingAck = 6,
   Hello = 7,
   HelloReply = 8,
+  SeenRequest = 9,
+  SeenReply = 10,
 };
 
 /// What a copy's #include searches found in one build, under one search key
@@ -171,6 +173,13 @@ struct HelloReply {
   uint64_t InstanceId = 0;
 };
 
+/// CLANG_HEADER_CACHE_SECOND_MISS: a compile about to write the copy of
+/// \p Filename named \p ModuleName asks whether a compile was about to
+/// write that same copy before. The reply says so, and the daemon notes it.
+struct SeenRequest {
+  std::string Filename, ModuleName;
+};
+
 /// Largest message accepted, in bytes. A parsed header is the big payload
 /// here and runs to a few megabytes; the cap exists so a corrupt length
 /// prefix fails immediately instead of trying to allocate whatever 32 bits
@@ -194,6 +203,9 @@ void encodeTimingAck(llvm::SmallVectorImpl<char> &Out);
 void encodeHello(llvm::SmallVectorImpl<char> &Out);
 void encodeHelloReply(const HelloReply &Reply,
                       llvm::SmallVectorImpl<char> &Out);
+void encodeSeenRequest(const SeenRequest &Req,
+                       llvm::SmallVectorImpl<char> &Out);
+void encodeSeenReply(bool Seen, llvm::SmallVectorImpl<char> &Out);
 
 //===----------------------------------------------------------------------===//
 // Decoding. \p Body is one message with the length prefix already stripped;
@@ -210,6 +222,8 @@ std::optional<LookupResponse> decodeLookupResponse(llvm::StringRef Body);
 std::optional<ReceivedPush> decodePushRequest(llvm::StringRef Body);
 std::optional<TimingReport> decodeTimingReport(llvm::StringRef Body);
 std::optional<HelloReply> decodeHelloReply(llvm::StringRef Body);
+std::optional<SeenRequest> decodeSeenRequest(llvm::StringRef Body);
+std::optional<bool> decodeSeenReply(llvm::StringRef Body);
 
 //===----------------------------------------------------------------------===//
 // Framed transport over a connected socket.

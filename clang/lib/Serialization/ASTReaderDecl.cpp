@@ -3937,6 +3937,14 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
         if (Sema *S = Reader.getSema())
           Found = ASTReader::lookupAtFileScope(*S, *II, Tag,
                                                /*CreateBuiltin=*/false);
+      // A copy a header cache link loads, with no check to look its names
+      // up first, can name a declaration of a module the name was not read
+      // from.
+      if (!Found)
+        Found = Reader.findInEveryModule(*II, Tag, &F);
+      if (!Found && getenv("DEBUG_LINK"))
+        llvm::errs() << "NAMEREF missing " << (Tag ? "tag " : "") << II->getName()
+                     << " in " << F.ModuleName << "\n";
       break;
     }
     auto *RD = dyn_cast<RecordDecl>(Parent);

@@ -53,6 +53,7 @@ class MacroInfo;
 class Preprocessor;
 
 namespace ast_cache {
+class MetadataView;
 
 /// Collects one HeaderDependencySet per header processed by the Preprocessor
 /// it is attached to. See DependencyRecord.h for what each dependency
@@ -285,6 +286,21 @@ public:
   };
   void measureIndependence() { Measuring = true; }
 
+  /// CLANG_HEADER_CACHE_FOLD_SERVED: a saved copy stood in for the #include
+  /// at \p Loc, and the headers open hold its declarations as their own.
+  /// Its module file's source-location entries, \p NumIDs of them from ID
+  /// \p FirstID, count as inside each, and its metadata \p Deps is theirs
+  /// where it reads a state set outside them (the header boundary
+  /// principle). \p Resolve gives where the declaration a name finds here
+  /// is. A copy with submodules, warning pragmas or push_macro stacks
+  /// poisons them instead.
+  /// \p Linked: the copy is linked (CLANG_HEADER_CACHE_LINK), and replays
+  /// its warning pragmas itself.
+  void foldServed(SourceLocation Loc, int FirstID, unsigned NumIDs,
+                  const MetadataView &Deps,
+                  llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
+                  bool Linked = false);
+
   /// REPORT.md T17: what each file read inside a header being exported read
   /// with its own text -- a definedness test, a name expanded or read as
   /// plain text, a type name, a #pragma once #include skipped -- each with
@@ -385,6 +401,20 @@ private:
     /// Something happened in this header that this tracker cannot record
     /// soundly, so it must not be cached at all. Checked at frame close.
     bool Poisoned = false;
+    /// Copies served inside this header and folded into it (foldServed):
+    /// the first ID of each one's source-location entries, and how many.
+    SmallVector<std::pair<int, unsigned>, 2> Folded;
+    /// Whether \p FID is in this header: in its closure or in a copy folded
+    /// into it.
+    bool holds(FileID FID) const {
+      if (Closure.contains(FID))
+        return true;
+      int ID = static_cast<int>(FID.getHashValue());
+      for (auto [First, N] : Folded)
+        if (ID >= First && ID < First + int(N))
+          return true;
+      return false;
+    }
   };
 
   /// Records a definedness test into every open frame it is external to.
