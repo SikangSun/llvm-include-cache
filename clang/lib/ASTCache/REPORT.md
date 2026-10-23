@@ -734,10 +734,14 @@ Notes on the top three:
   starts from those). A compile that finds a known outcome skips the
   searches; one that does not makes them and sends the outcome with its next
   message, so nothing waits. The assumption: during a build no header
-  appears in or disappears from the include path. Every compile still checks
-  the size and modification time of each file a copy holds. The build ID is
-  `CLANG_HEADER_CACHE_BUILD`; without one, outcomes are kept only within a
-  compile.
+  appears in or disappears from the include path. Since 2026-10-17 the size
+  and modification time of each file a copy holds are also compared once per
+  build: the first compile to compare them sends the outcome, and later
+  compiles of the build take it, so a file changed during a build is caught
+  only by the next build. The build ID is `CLANG_HEADER_CACHE_BUILD`;
+  without one, outcomes are kept only within a compile. Two builds must never
+  share an ID: the second would take the first's comparisons and miss every
+  file edited between them.
 
 - **I3, built 2026-10-15.** Until then the daemon kept each copy's metadata
   as C++ objects in its own memory. Every cache query copied the metadata

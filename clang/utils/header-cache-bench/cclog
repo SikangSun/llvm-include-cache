@@ -1,0 +1,8 @@
+#!/bin/bash
+# Compiler wrapper for recording a build: when CCLOG names a directory, logs
+# each call (working directory and arguments, NUL-separated) to a new file
+# there, then runs the real clang (CCLOG_CLANG, a release build of this tree).
+if [ -n "$CCLOG" ]; then
+  { printf '%s\0' "$PWD"; printf '%s\0' "$@"; } > "$CCLOG/$(date +%s%N).$$"
+fi
+exec "${CCLOG_CLANG:?set CCLOG_CLANG to a clang binary}" "$@"
