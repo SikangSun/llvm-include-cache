@@ -813,11 +813,12 @@ public:
     // where the #include it stands in for was.
     if (File && isStandIn(File->getName()))
       File = std::nullopt;
-    Open.push_back({File ? &File->getFileEntry() : nullptr,
-                    File ? File->getName().str() : std::string(),
+    const FileEntry *Entry = File ? &File->getFileEntry() : nullptr;
+    Open.push_back({Entry, File ? File->getName().str() : std::string(),
                     std::chrono::steady_clock::now(), cacheMicros(), 0,
                     NextReason.empty() ? std::string("not-asked")
-                                       : std::move(NextReason)});
+                                       : std::move(NextReason),
+                    Entry && Timed.insert(Entry).second});
     NextReason.clear();
   }
 
@@ -847,7 +848,7 @@ public:
                           std::to_string(Own) + " why " + F.Reason);
     // Only a header's first entry in this compile is its parse; a later one
     // of an unguarded header says nothing about what a saved copy saves.
-    if (!F.Entry || !Timed.insert(F.Entry).second)
+    if (!F.First)
       return;
     Timings.Headers.push_back(
         {storedName(F.Name), static_cast<uint64_t>(Micros)});
@@ -1758,6 +1759,10 @@ private:
     /// rejected:<check>, load-refused, or not-asked when the cache was not
     /// consulted.
     std::string Reason;
+    /// The compile's first entry of this file, decided when it is entered:
+    /// a header included again from inside itself (nginx's ngx_core.h) is
+    /// left first by that inner entry, which its guard skips.
+    bool First;
   };
   std::string NextReason;
   /// The cache's own time so far: lookups, the loads they made included,

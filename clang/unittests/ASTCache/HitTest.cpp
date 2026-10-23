@@ -941,6 +941,34 @@ TEST_F(AskListTest, AHeaderReadFasterThanTheCutoffIsNeverAskedAbout) {
   EXPECT_EQ(Daemon->stats().Lookups, 0u);
 }
 
+TEST_F(AskListTest, AHeaderIncludedBackFromInsideItselfIsTimedByItsOuterRead) {
+  // self.h includes back.h, which includes self.h again while self.h is
+  // still open (nginx's ngx_core.h has this shape). The guard skips that
+  // inner entry, which is left before the outer one; the time reported for
+  // self.h must be the outer read's, which includes big.h.
+  Daemon->stop();
+  if (Server.joinable())
+    Server.join();
+  llvm::sys::fs::remove(SocketPath);
+  Cutoff = 2000; // 2 ms: big.h takes longer, a guard-skipped entry far less
+  SetUp();
+
+  std::string Decls;
+  for (int I = 0; I < 20000; ++I)
+    Decls += "int f" + std::to_string(I) + "(int);\n";
+  std::string Big = write("big.h", Decls);
+  write("back.h", "#include \"self.h\"\n");
+  std::string Self = write("self.h", "#ifndef SELF_H\n#define SELF_H\n"
+                                     "#include \"back.h\"\n"
+                                     "#include \"big.h\"\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Self + "\"\n");
+  EXPECT_TRUE(reads(Main, Self));
+  auto C = client();
+  ASSERT_TRUE(C);
+  ASSERT_TRUE(C->isListed(Big)) << "big.h must take longer than the cutoff";
+  EXPECT_TRUE(C->isListed(Self)) << "self.h was timed by its inner entry";
+}
+
 TEST_F(HitTest, AHitLeavesTheCounterWhereTheHeaderFoundIt) {
   // plain.h is saved after ctx.h, whose two uses of __COUNTER__ the module
   // file records as the count it ended with. Loading it must not set the live
