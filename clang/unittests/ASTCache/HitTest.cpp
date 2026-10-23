@@ -969,6 +969,27 @@ TEST_F(AskListTest, AHeaderIncludedBackFromInsideItselfIsTimedByItsOuterRead) {
   EXPECT_TRUE(C->isListed(Self)) << "self.h was timed by its inner entry";
 }
 
+TEST_F(HitTest, AServedHeaderAndTheHeadersInItAreInTheDependencyFile) {
+  // make's dependency file (-MD) must name a header served from a copy, and
+  // the headers inside it, as it would had the compile read them; otherwise
+  // an edit to any of them rebuilds nothing.
+  write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                   "typedef int inner_t;\n#endif\n");
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#include \"inner.h\"\n"
+                                       "inner_t f(void);\n#endif\n");
+  ASSERT_NO_FATAL_FAILURE(store(Outer));
+  std::string Main = write("main.c", "#include \"" + Outer + "\"\n");
+  std::string DepFile = Dir + "/main.d";
+  ExtraArgs = {"-MD", "-MF", DepFile};
+  EXPECT_FALSE(reads(Main, Outer)) << "outer.h must be served";
+  auto Buf = llvm::MemoryBuffer::getFile(DepFile);
+  ASSERT_TRUE(bool(Buf));
+  llvm::StringRef D = (*Buf)->getBuffer();
+  EXPECT_TRUE(D.contains("outer.h")) << D;
+  EXPECT_TRUE(D.contains("inner.h")) << D;
+}
+
 TEST_F(HitTest, AHitLeavesTheCounterWhereTheHeaderFoundIt) {
   // plain.h is saved after ctx.h, whose two uses of __COUNTER__ the module
   // file records as the count it ended with. Loading it must not set the live

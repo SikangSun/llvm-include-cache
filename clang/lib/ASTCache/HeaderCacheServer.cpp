@@ -732,6 +732,7 @@ public:
         }
       };
       Pin(Deps.declarations());
+      reportInputFiles(*Copy.MF);
     }
 
     // REPORT.md T17: the submodules that load, each found inside its
@@ -1420,6 +1421,31 @@ private:
     LoadedTargets[MF->ModuleName] = {Target, Bytes, MF, /*Fresh=*/true};
     ++CopiesLoaded;
     return Target;
+  }
+
+  /// A served copy's headers are this compile's dependencies, as if it had
+  /// read them: make's dependency file (-MD) must name them. The reader
+  /// tells its listeners about an explicit module's input files as parts of
+  /// the module, which the dependency collector leaves out
+  /// (DepCollectorASTListener::visitInputFile), so they are told here, as
+  /// headers, once per copy loaded.
+  void reportInputFiles(serialization::ModuleFile &MF) {
+    ASTReader &Reader = *CI.getASTReader();
+    std::unique_ptr<ASTReaderListener> L = Reader.takeListener();
+    if (L && L->needsInputFileVisitation())
+      Reader.visitInputFileInfos(
+          MF, L->needsSystemInputFileVisitation(),
+          [&](const serialization::InputFileInfo &IFI, bool IsSystem) {
+            if (IFI.Overridden || IFI.Transient || IFI.ModuleMap)
+              return;
+            llvm::SmallString<256> Name(
+                IFI.UnresolvedImportedFilenameAsRequested);
+            if (!MF.BaseDirectory.empty())
+              llvm::sys::path::make_absolute(MF.BaseDirectory, Name);
+            L->visitInputFile(Name, IsSystem, /*IsOverridden=*/false,
+                              /*IsExplicitModule=*/false);
+          });
+    Reader.setListener(std::move(L));
   }
 
   CompilerInstance &CI;
