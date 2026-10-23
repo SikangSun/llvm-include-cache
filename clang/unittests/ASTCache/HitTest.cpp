@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
@@ -1675,6 +1676,10 @@ TEST_F(ExportTest, OneCopyServesAHeaderWhetherOrNotItsInnerHeaderWasRead) {
   // served with the submodule left hidden, its my_size checked against the
   // compile's own. Other.c reads outer.h alone: the submodule loads. One
   // copy serves both, and a later #include of inner.h is skipped.
+  // Headers held as sections are asked for (REPORT.md T17).
+  setenv("CLANG_HEADER_CACHE_SECTIONS", "1", 1);
+  auto Sections =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_SECTIONS"); });
   std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
                                        "typedef unsigned long my_size;\n"
                                        "my_size inner_len(void);\n"
@@ -1727,6 +1732,10 @@ TEST_F(ExportTest, ASkippedSubmodulesMacroTheCopyReadsIsChecked) {
   // inner.h, then undefines INNER_FAST: the submodule would be skipped, but
   // outer.h's lines were parsed with INNER_FAST defined, so the copy does
   // not stand in, and fast returns long, as with plain clang.
+  // Headers held as sections are asked for (REPORT.md T17).
+  setenv("CLANG_HEADER_CACHE_SECTIONS", "1", 1);
+  auto Sections =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_SECTIONS"); });
   std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
                                        "#define INNER_FAST\n"
                                        "int inner(void);\n#endif\n");
@@ -1757,6 +1766,206 @@ TEST_F(ExportTest, ASkippedSubmodulesMacroTheCopyReadsIsChecked) {
   EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
   AtEnd = nullptr;
   EXPECT_EQ(Returns, "long");
+}
+
+TEST_F(ExportTest, ACopyLeavingOutAHeaderServesOnceTheHeaderIsReadFirst) {
+  // a.c reads inner.h before outer.h, so outer.h's copy leaves inner.h out:
+  // its #include was skipped by inner.h's guard. b.c includes outer.h
+  // alone. The copy fails only on what inner.h gives, so b.c reads inner.h
+  // first and outer.h's copy serves (a partial hit), with inner.h's
+  // my_size and INNER_MAX as plain clang has them.
+  // Top-level folding, the mode partial hits are for: no submodules.
+  setenv("CLANG_HEADER_CACHE_PARTIAL", "1", 1);
+  setenv("CLANG_HEADER_CACHE_NO_SUBMODULES", "1", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_PARTIAL");
+    unsetenv("CLANG_HEADER_CACHE_NO_SUBMODULES");
+  });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#define INNER_MAX 7\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nmy_size outer_len(void);\n"
+                           "enum { OUTER_MAX = INNER_MAX };\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer + "\"\n");
+  std::string B =
+      write("b.c", "#include \"" + Outer +
+                       "\"\nmy_size f(void) { return outer_len() + OUTER_MAX "
+                       "+ INNER_MAX; }\n");
+  EXPECT_TRUE(reads(A, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Outer)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(A, Outer)) << "outer.h's copy was not served";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("outer_len")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        Returns = F->getReturnType().getCanonicalType().getAsString();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered)) << "b.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Outer))
+      << "outer.h's copy was not served after inner.h was read first";
+  EXPECT_EQ(Returns, "unsigned long");
+}
+
+TEST_F(ExportTest, ALeftOutHeaderReadingWhatTheLinesBeforeItSetIsNotReadFirst) {
+  // outer.h defines WANT_LONG and then includes inner.h, which tests it.
+  // a.c reads inner.h first, without WANT_LONG, so outer.h's copy leaves
+  // inner.h out. Read first, before outer.h's lines, inner.h would declare
+  // t2 as int where plain clang, reading it after them, declares long: the
+  // copy records no left-out header, b.c reads outer.h as text, and outer
+  // returns long.
+  setenv("CLANG_HEADER_CACHE_PARTIAL", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_PARTIAL"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#ifdef WANT_LONG\ntypedef long t2;\n"
+                                       "#else\ntypedef int t2;\n#endif\n"
+                                       "#endif\n");
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#define WANT_LONG\n#include \"" +
+                                           Inner +
+                                           "\"\nt2 outer(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer + "\"\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  EXPECT_TRUE(reads(A, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Outer)) << "nothing is stored yet";
+  std::string Returns;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("outer")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        Returns = F->getReturnType().getCanonicalType().getAsString();
+  };
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Returns, "long");
+}
+
+TEST_F(ExportTest, ABaseServesWithAnotherVersionOfASection) {
+  // hex.h is a base with two sections: hash.h, which a.c read before it,
+  // so a.c's copy has no version of it, and strbuf.h, whose struct's size
+  // depends on STRBUF_INIT_ALLOC (CLANG_HEADER_CACHE_PIECES).
+  setenv("CLANG_HEADER_CACHE_PIECES", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_PIECES"); });
+  std::string Hash = write("hash.h", "#ifndef HASH_H\n#define HASH_H\n"
+                                     "#define GIT_MAX_RAWSZ 32\n"
+                                     "struct object_id {\n"
+                                     "  unsigned char hash[GIT_MAX_RAWSZ];\n"
+                                     "};\n#endif\n");
+  std::string Strbuf = write("strbuf.h", "#ifndef STRBUF_H\n#define STRBUF_H\n"
+                                         "#ifdef STRBUF_INIT_ALLOC\n"
+                                         "#define STRBUF_ALLOC STRBUF_INIT_ALLOC\n"
+                                         "#else\n#define STRBUF_ALLOC 8\n#endif\n"
+                                         "struct strbuf { char buf[STRBUF_ALLOC]; };\n"
+                                         "#endif\n");
+  std::string Hex = write("hex.h", "#ifndef HEX_H\n#define HEX_H\n#include \"" +
+                                       Hash + "\"\n#include \"" + Strbuf +
+                                       "\"\n#define HEX_LEN (2 * GIT_MAX_RAWSZ)\n"
+                                       "#ifdef HEX_UPPER\nint hex_upper(void);\n"
+                                       "#endif\n"
+                                       "int hex_to_bytes(struct object_id *oid, "
+                                       "const char *hex);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Hash + "\"\n#include \"" + Hex +
+                                   "\"\n");
+  std::string Use = "\nint n = HEX_LEN;\nstruct strbuf sb;\n";
+  std::string B = write("b.c", "#include \"" + Hex + "\"" + Use);
+  std::string B2 = write("b2.c", "#include \"" + Hex + "\"" + Use);
+  std::string D = write("d.c", "#define STRBUF_INIT_ALLOC 64\n#include \"" +
+                                   Hex + "\"" + Use);
+  std::string D2 = write("d2.c", "#define STRBUF_INIT_ALLOC 64\n#include \"" +
+                                     Hex + "\"" + Use);
+  std::string E = write("e.c", "#define HEX_UPPER\n#include \"" + Hex + "\"" +
+                                   Use);
+  EXPECT_TRUE(reads(A, Hex)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Hex)) << "nothing is stored yet";
+
+  // b.c has not read hash.h: the copy has no version of it. hash.h is read
+  // first and written as one, and the base serves.
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_FALSE(Entered.count(Hex)) << "the base did not serve";
+  EXPECT_TRUE(Entered.count(Hash)) << "hash.h was not read";
+  // b2.c: the version of hash.h b.c wrote serves too.
+  Entered.clear();
+  ASSERT_TRUE(compile(B2, Entered));
+  EXPECT_FALSE(Entered.count(Hex)) << "the base did not serve";
+  EXPECT_FALSE(Entered.count(Hash)) << "hash.h's version did not serve";
+
+  // d.c needs another version of strbuf.h; the base still fits.
+  unsigned Size = 0;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("strbuf")))
+      if (auto *R = dyn_cast<RecordDecl>(Dl))
+        if (R->getDefinition())
+          Size = Ctx.getASTRecordLayout(R->getDefinition()).getSize().getQuantity();
+  };
+  Entered.clear();
+  ASSERT_TRUE(compile(D, Entered));
+  EXPECT_FALSE(Entered.count(Hex)) << "the base did not serve";
+  EXPECT_TRUE(Entered.count(Strbuf)) << "strbuf.h was not read";
+  EXPECT_EQ(Size, 64u);
+  Size = 0;
+  Entered.clear();
+  ASSERT_TRUE(compile(D2, Entered));
+  EXPECT_FALSE(Entered.count(Hex)) << "the base did not serve";
+  EXPECT_FALSE(Entered.count(Strbuf)) << "strbuf.h's version did not serve";
+  EXPECT_EQ(Size, 64u);
+  AtEnd = nullptr;
+
+  // e.c changes what hex.h's own lines read: the base does not fit.
+  Entered.clear();
+  ASSERT_TRUE(compile(E, Entered));
+  EXPECT_TRUE(Entered.count(Hex)) << "a base made without HEX_UPPER served";
+}
+
+TEST_F(ExportTest, AMacroAPieceSetsThatTheBaseReadsIsChecked) {
+  // size.h sets BUF_SIZE by BIG, and buf.h's own lines read it after the
+  // #include (CLANG_HEADER_CACHE_PIECES). Where BIG is defined, size.h is
+  // read first as another version, and the base made with BUF_SIZE 8 is
+  // not served: buf.h is read, and struct buf holds 64 bytes, as with
+  // plain clang.
+  setenv("CLANG_HEADER_CACHE_PIECES", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_PIECES"); });
+  std::string Size = write("size.h", "#ifndef SIZE_H\n#define SIZE_H\n"
+                                     "#ifdef BIG\n#define BUF_SIZE 64\n"
+                                     "#else\n#define BUF_SIZE 8\n#endif\n"
+                                     "#endif\n");
+  std::string Buf = write("buf.h", "#ifndef BUF_H\n#define BUF_H\n#include \"" +
+                                       Size +
+                                       "\"\nstruct buf { char b[BUF_SIZE]; };\n"
+                                       "#endif\n");
+  std::string A = write("a.c", "#include \"" + Buf + "\"\nstruct buf x;\n");
+  std::string B =
+      write("b.c", "#define BIG\n#include \"" + Buf + "\"\nstruct buf y;\n");
+  EXPECT_TRUE(reads(A, Buf)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Buf)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(A, Buf)) << "buf.h's copy was not served";
+  unsigned Bytes = 0;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("buf")))
+      if (auto *R = dyn_cast<RecordDecl>(Dl))
+        if (R->getDefinition())
+          Bytes = Ctx.getASTRecordLayout(R->getDefinition())
+                      .getSize()
+                      .getQuantity();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  AtEnd = nullptr;
+  EXPECT_TRUE(Entered.count(Size)) << "size.h was not read";
+  EXPECT_TRUE(Entered.count(Buf)) << "a base made with BUF_SIZE 8 served";
+  EXPECT_EQ(Bytes, 64u);
 }
 
 TEST_F(ExportTest, AGuardDefinedWithoutItsHeaderReadIsNotServed) {
@@ -1833,6 +2042,10 @@ TEST_F(ExportTest, ADefinitionInASubmoduleThatLoadsSurvivesALaterSkippedOne) {
   // it again; the copy's identifier table lists only fwd.h's. other.c reads
   // fwd.h first, so that submodule is skipped while def.h's loads, and the
   // definition must still complete struct S.
+  // Headers held as sections are asked for (REPORT.md T17).
+  setenv("CLANG_HEADER_CACHE_SECTIONS", "1", 1);
+  auto Sections =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_SECTIONS"); });
   std::string Def = write("def.h", "#ifndef DEF_H\n#define DEF_H\n"
                                    "struct S { int a; };\n#endif\n");
   std::string Fwd = write("fwd.h", "#ifndef FWD_H\n#define FWD_H\n"

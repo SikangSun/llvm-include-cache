@@ -42,6 +42,14 @@ public:
   /// nothing suitable costs only the time it took to decide that.
   virtual Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc,
                            ConstSearchDirIterator CurDir) = 0;
+
+  /// Called where tryServe returned null: a file to enter in \p File's
+  /// place, or an invalid FileID to enter \p File. A cache that can serve
+  /// \p File once other headers are read first enters a file that includes
+  /// them and then \p File again.
+  virtual FileID enterInstead(FileEntryRef File, SourceLocation IncludeLoc) {
+    return FileID();
+  }
 };
 
 } // namespace clang

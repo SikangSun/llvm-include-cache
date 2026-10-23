@@ -192,6 +192,9 @@ private:
   /// filename later, but that is not needed to get a prototype running.
   mutable std::mutex Mutex;
   llvm::StringMap<std::vector<StoredEntry>> Table;
+  /// CLANG_HEADER_CACHE_PIECES: per header, the names its copies' section
+  /// versions are stored under ("<header>#section:<section>").
+  llvm::StringMap<std::vector<std::string>> VersionsOf;
   Stats Counters;
   /// The first time any compile reported for each header. The first is kept:
   /// it lands on the same side of the cutoff as later ones for 93.8% of

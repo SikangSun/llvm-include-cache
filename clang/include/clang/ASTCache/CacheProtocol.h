@@ -116,6 +116,14 @@ struct LookupResponse {
   /// Empty means nothing is stored under that filename -- a clean miss, not
   /// an error.
   std::vector<CacheEntryRef> Entries;
+  /// CLANG_HEADER_CACHE_PIECES: the versions of the copies' sections, stored
+  /// with them under "<filename>#section:<section>": per section, its
+  /// header and its versions, the most recently used first.
+  struct SectionVersions {
+    std::string Section;
+    std::vector<CacheEntryRef> Entries;
+  };
+  std::vector<SectionVersions> Versions;
 };
 
 struct PushRequest {

@@ -294,6 +294,18 @@ public:
     // replays every effect, as before it (REPORT.md I8).
     const char *All = std::getenv("CLANG_HEADER_CACHE_REPLAY_ALL");
     ReplayAll = All && llvm::StringRef(All) == "1";
+    const char *Partial = std::getenv("CLANG_HEADER_CACHE_PARTIAL");
+    PartialMode =
+        !LinkMode && !FoldServed && Partial && llvm::StringRef(Partial) == "1";
+    this->Client->partialHits(PartialMode);
+    const char *Pieces = std::getenv("CLANG_HEADER_CACHE_PIECES");
+    if (!LinkMode && !FoldServed && !PartialMode && Pieces && *Pieces &&
+        llvm::StringRef(Pieces) != "0" &&
+        !std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES")) {
+      PiecesMode = true;
+      ParseWholeBase = llvm::StringRef(Pieces) == "A";
+    }
+    this->Client->pieces(PiecesMode);
   }
 
   void report(llvm::raw_ostream &OS) const {
@@ -303,6 +315,19 @@ public:
        << " not at a declaration boundary, " << NotListed
        << " not on the ask-list, " << InsideWritten
        << " inside a header being written\n";
+    if (PiecesMode)
+      OS << "header cache pieces: " << S.BaseFits
+         << " bases fit with sections needing another version (" << StandInBases
+         << " asked again after them: " << AgainServed << " served, "
+         << AgainMissed << " not; " << ParsedBases
+         << " parsed with them); versions: " << VersionsServed << " served, "
+         << VersionsWritten << " written\n";
+    for (const std::string &L : ReuseProbes)
+      OS << "  reuse " << L << "\n";
+    if (PartialMode)
+      OS << "header cache partial hits: " << PartialHits
+         << " headers asked again after the headers their copy left out, "
+         << S.Partial - PartialHits << " not (no stand-in could be made)\n";
     if (MeasureNested)
       OS << "header cache nested asks: " << NestedAsked << " asked, "
          << NestedFit << " a copy fits, " << NestedNoCopy << " no copy, "
@@ -426,7 +451,20 @@ public:
       NextReason = "not-listed";
       return nullptr;
     }
-    if (!Client->isListed(Path)) {
+    // CLANG_HEADER_CACHE_PIECES: a section of a copy whose base fits, read
+    // again for that copy: its versions are asked for, under the copy's
+    // header and its own, and on a miss it is written as a new one.
+    std::string VersionOf;
+    if (PiecesMode) {
+      auto It = PendingVersions.find(
+          CI.getFileManager().getCanonicalName(File).str());
+      if (It != PendingVersions.end()) {
+        VersionOf = It->second;
+        Path = VersionOf;
+        PendingVersions.erase(It);
+      }
+    }
+    if (VersionOf.empty() && !Client->isListed(Path)) {
       ++NotListed;
       NextReason = "not-listed";
       return nullptr;
@@ -485,6 +523,16 @@ public:
     unsigned CheckedBefore = Before.CandidatesChecked;
     auto Asked = std::chrono::steady_clock::now();
     llvm::TimeTraceScope QueryScope("HeaderCache Query", Path);
+    // CLANG_HEADER_CACHE_PIECES: a version serves only whole; the header a
+    // stand-in includes after its sections has the copy its plan chose.
+    // Any other header the stand-in reads serves only whole.
+    CacheClient::PiecesStep Step = CacheClient::PiecesStep::Plan;
+    if (!VersionOf.empty())
+      Step = CacheClient::PiecesStep::WholeOnly;
+    else if (PiecesMode && inStandIn(IncludeLoc))
+      Step = &File.getFileEntry() == AskAgain
+                 ? CacheClient::PiecesStep::Again
+                 : CacheClient::PiecesStep::WholeOnly;
     Client->lookup(
         Path, PP, &CI.getSema(), &Deps,
         [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
@@ -509,7 +557,7 @@ public:
             Served.push_back(Path + " from " + ModuleName.str());
           return Target != nullptr;
         },
-        &Site);
+        &Site, Step);
     uint64_t Took = micros(Asked);
     LookupMicros += Took;
     // Notes this query, with LogServed. Replay is the time a hit spent
@@ -530,8 +578,99 @@ public:
           " bytes=" + std::to_string(HitBytes));
     };
     PP.setCounterValue(Counter);
+    // A section read inside another left its name pending: none is now.
+    if (Step == CacheClient::PiecesStep::Again) {
+      ++(Target ? AgainServed : AgainMissed);
+      PendingVersions.clear();
+      AskAgain = nullptr;
+    }
+    if (!VersionOf.empty() && Target)
+      ++VersionsServed;
+    if (!Target && !VersionOf.empty()) {
+      Log(0);
+      ++VersionsWritten;
+      // CLANG_HEADER_CACHE_PROBE_REUSE, measurement: whether a copy of the
+      // section's header made elsewhere would fit here instead -- one of
+      // its own copies, or one of its versions in another base -- and how
+      // large the first that fits is.
+      if (ProbeReuse) {
+        size_t Own = 0, Other = 0;
+        auto Fits = [](size_t &Size) {
+          return [&Size](llvm::StringRef Bytes, llvm::StringRef) {
+            if (!Size)
+              Size = Bytes.size();
+            return false;
+          };
+        };
+        std::string Canonical =
+            CI.getFileManager().getCanonicalName(File).str();
+        Client->lookup(storedName(File), PP, &CI.getSema(), nullptr,
+                       Fits(Own), &Site, CacheClient::PiecesStep::WholeOnly);
+        Client->lookup("*#section:" + Canonical, PP, &CI.getSema(), nullptr,
+                       Fits(Other), &Site, CacheClient::PiecesStep::WholeOnly);
+        ReuseProbes.push_back(Canonical + " own=" + std::to_string(Own) +
+                              " other=" + std::to_string(Other));
+      }
+      if (LogServed) {
+        QueryLines.back() += " version";
+        NextReason = "version-written";
+      }
+      if (Exporter)
+        Exporter->exportNext(File, VersionOf);
+      return nullptr;
+    }
+    if (!Target && PiecesMode && !Client->lastPieces().empty() &&
+        !inStandIn(IncludeLoc)) {
+      Log(0);
+      // CLANG_HEADER_CACHE_PIECES: a copy's base fits and some sections need
+      // another version. Each is read for that copy -- served as a version
+      // that fits, or parsed and written as one -- and this header is not
+      // written: its base is stored already.
+      // By canonical path, as the stand-in's #include finds each.
+      std::string Base = storedName(File);
+      FileManager &FM = CI.getFileManager();
+      for (const LeftOutRecord &R : Client->lastPieces())
+        if (OptionalFileEntryRef FE = FM.getOptionalFileRef(R.Path))
+          PendingVersions[FM.getCanonicalName(*FE).str()] =
+              Base + "#section:" + R.Path;
+      if (LogServed)
+        QueryLines.back() +=
+            " pieces=" + std::to_string(Client->lastPieces().size());
+      // Policy B: they are read first, from a stand-in, then this header is
+      // asked for again and its base serves. Policy A, or where no stand-in
+      // can say the same: this header is parsed with them.
+      if (!ParseWholeBase) {
+        FileID F =
+            piecesStandIn(File, IncludeLoc, CurDir, Client->lastPieces());
+        if (F.isValid()) {
+          ++StandInBases;
+          PendingStandIn = {&File.getFileEntry(), F};
+          AskAgain = &File.getFileEntry();
+          return nullptr;
+        }
+      }
+      ++ParsedBases;
+      if (LogServed)
+        NextReason = "pieces-parsed";
+      return nullptr;
+    }
     if (!Target) {
       Log(0);
+      // CLANG_HEADER_CACHE_PARTIAL: a copy serves once the headers it left
+      // out are parsed. They are entered first, from a stand-in file that
+      // then includes this header again; this header is not written.
+      if (PartialMode && !Client->lastPartial().empty() &&
+          !inStandIn(IncludeLoc)) {
+        FileID F = standIn(IncludeLoc, Client->lastPartial());
+        if (F.isValid()) {
+          ++PartialHits;
+          PendingStandIn = {&File.getFileEntry(), F};
+          if (LogServed)
+            QueryLines.back() += " partial=" +
+                                 std::to_string(Client->lastPartial().size());
+          return nullptr;
+        }
+      }
       if (LogServed)
         NextReason = Client->lastCandidates() == 0 ? std::string("no-saved-PCM")
                      : Client->lastRejection() != MismatchReason::None
@@ -661,7 +800,19 @@ public:
 
   /// A header the compile is entering. Timed until it is left, headers it
   /// includes on the way counted in, since a saved copy holds all of them.
+  FileID enterInstead(FileEntryRef File, SourceLocation) override {
+    if (!PendingStandIn || PendingStandIn->first != &File.getFileEntry())
+      return FileID();
+    FileID F = PendingStandIn->second;
+    PendingStandIn.reset();
+    return F;
+  }
+
   void headerEntered(OptionalFileEntryRef File) {
+    // A stand-in is no header: what it includes is timed as if included
+    // where the #include it stands in for was.
+    if (File && isStandIn(File->getName()))
+      File = std::nullopt;
     Open.push_back({File ? &File->getFileEntry() : nullptr,
                     File ? File->getName().str() : std::string(),
                     std::chrono::steady_clock::now(), cacheMicros(), 0,
@@ -1330,6 +1481,208 @@ private:
   /// Listed headers read as text because a header this compile will write
   /// was open.
   unsigned InsideWritten = 0;
+  /// CLANG_HEADER_CACHE_PIECES=1 (or B), =A: where a copy's base fits and
+  /// some sections need another version, those sections are read for it
+  /// first, from a stand-in, and the header asked for again (B); or the
+  /// header is parsed with them (A). Either way each such section is served
+  /// as a version of the copy that fits, or written as a new one.
+  bool PiecesMode = false, ParseWholeBase = false;
+  unsigned AgainServed = 0, AgainMissed = 0;
+  /// The base a pieces stand-in asks for again, after its sections.
+  const FileEntry *AskAgain = nullptr;
+  bool ProbeReuse = std::getenv("CLANG_HEADER_CACHE_PROBE_REUSE");
+  std::vector<std::string> ReuseProbes;
+  unsigned StandInBases = 0, ParsedBases = 0, VersionsServed = 0,
+           VersionsWritten = 0;
+  /// The sections to read as versions, by canonical path, and the name their
+  /// versions are stored under.
+  std::map<std::string, std::string> PendingVersions;
+
+  /// The #include at \p IncludeLoc, spelled as written with its delimiters,
+  /// or empty where no stand-in can say the same: one a macro wrote, or an
+  /// #include_next or #import.
+  std::string spelledInclude(SourceLocation IncludeLoc) {
+    SourceManager &SM = CI.getSourceManager();
+    if (IncludeLoc.isMacroID())
+      return {};
+    bool Invalid = false;
+    llvm::StringRef Buffer =
+        SM.getBufferData(SM.getFileID(IncludeLoc), &Invalid);
+    if (Invalid)
+      return {};
+    size_t At = SM.getFileOffset(IncludeLoc);
+    if (At >= Buffer.size() || (Buffer[At] != '"' && Buffer[At] != '<'))
+      return {};
+    size_t End = Buffer.find(Buffer[At] == '<' ? '>' : '"', At + 1);
+    size_t Line = Buffer.rfind('\n', At);
+    Line = Line == llvm::StringRef::npos ? 0 : Line + 1;
+    if (End == llvm::StringRef::npos || Buffer.slice(At, End).contains('\n'))
+      return {};
+    llvm::StringRef Directive = Buffer.slice(Line, At);
+    if (!Directive.contains("include") || Directive.contains("include_next"))
+      return {};
+    return Buffer.slice(At, End + 1).str();
+  }
+
+  /// A file in the includer's directory holding \p Text, standing in for
+  /// the #include at \p IncludeLoc.
+  FileID makeStandIn(SourceLocation IncludeLoc, const std::string &Text) {
+    SourceManager &SM = CI.getSourceManager();
+    OptionalFileEntryRef IncluderFE =
+        SM.getFileEntryRefForID(SM.getFileID(IncludeLoc));
+    if (!IncluderFE)
+      return FileID();
+    llvm::SmallString<256> Path(
+        llvm::sys::path::parent_path(IncluderFE->getName()));
+    llvm::sys::path::append(Path,
+                            "__hc_partial_" + std::to_string(++StandIns) + ".h");
+    FileEntryRef FE =
+        CI.getFileManager().getVirtualFileRef(Path, Text.size(), 0);
+    SM.overrideFileContents(FE,
+                            llvm::MemoryBuffer::getMemBufferCopy(Text, Path));
+    SrcMgr::CharacteristicKind Kind = SM.getFileCharacteristic(IncludeLoc);
+    CI.getPreprocessor().getHeaderSearchInfo().getFileInfo(FE).DirInfo = Kind;
+    return SM.createFileID(FE, IncludeLoc, Kind);
+  }
+
+  /// CLANG_HEADER_CACHE_PIECES: a stand-in for the #include of \p Header at
+  /// \p IncludeLoc, in the header's own directory: it includes each section
+  /// of \p Need as the header's lines spell it, so each is found by the same
+  /// search and opened by the same name, then the header by its file name,
+  /// which opens it by the name it has. Invalid where that cannot be: an
+  /// #include written by a macro, an #include_next or #import, or a header
+  /// opened by a name other than its directory's and its file's.
+  FileID piecesStandIn(FileEntryRef Header, SourceLocation IncludeLoc,
+                       ConstSearchDirIterator CurDir,
+                       const std::vector<LeftOutRecord> &Need) {
+    SourceManager &SM = CI.getSourceManager();
+    Preprocessor &PP = CI.getPreprocessor();
+    if (spelledInclude(IncludeLoc).empty())
+      return FileID();
+    llvm::StringRef HDir = Header.getDir().getName();
+    llvm::StringRef File = llvm::sys::path::filename(Header.getName());
+    llvm::SmallString<256> Self(HDir);
+    llvm::sys::path::append(Self, File);
+    if (Self.str() != Header.getName())
+      return FileID();
+    std::string Text;
+    for (const LeftOutRecord &R : Need) {
+      if (R.Angled) {
+        // Found by the search from its start wherever it is written.
+        ConstSearchDirIterator Dir = nullptr;
+        OptionalFileEntryRef Found = PP.LookupFile(
+            IncludeLoc, R.Spelled, /*isAngled=*/true, /*FromDir=*/nullptr,
+            /*FromFile=*/nullptr, &Dir, nullptr, nullptr, nullptr, nullptr,
+            nullptr);
+        if (!Found || CI.getFileManager().getCanonicalName(*Found) != R.Path)
+          return FileID();
+        Text += "#include <" + R.Spelled + ">\n";
+      } else {
+        Text += "#include \"" + R.Spelled + "\"\n";
+      }
+    }
+    Text += "#include \"" + File.str() + "\"\n";
+    llvm::SmallString<256> Path(HDir);
+    llvm::sys::path::append(Path,
+                            "__hc_partial_" + std::to_string(++StandIns) + ".h");
+    FileEntryRef FE =
+        CI.getFileManager().getVirtualFileRef(Path, Text.size(), 0);
+    SM.overrideFileContents(FE,
+                            llvm::MemoryBuffer::getMemBufferCopy(Text, Path));
+    // A file a quoted #include finds beside its includer is of the
+    // includer's kind: the stand-in is of the header's, so that the header
+    // and its sections are what they were.
+    SrcMgr::CharacteristicKind Kind = CurDir
+                                          ? CurDir->getDirCharacteristic()
+                                          : SM.getFileCharacteristic(IncludeLoc);
+    PP.getHeaderSearchInfo().getFileInfo(FE).DirInfo = Kind;
+    return SM.createFileID(FE, IncludeLoc, Kind);
+  }
+
+  /// CLANG_HEADER_CACHE_PARTIAL=1: where a copy fails only on what headers
+  /// it left out gave it, and the compile has not read them, they are parsed
+  /// first and the header asked for again (a partial hit).
+  bool PartialMode = false;
+  unsigned PartialHits = 0, StandIns = 0;
+  /// The header whose #include the stand-in made for it replaces.
+  std::optional<std::pair<const FileEntry *, FileID>> PendingStandIn;
+  static bool isStandIn(llvm::StringRef Name) {
+    return llvm::sys::path::filename(Name).starts_with("__hc_partial_");
+  }
+  bool inStandIn(SourceLocation Loc) {
+    SourceManager &SM = CI.getSourceManager();
+    OptionalFileEntryRef FE =
+        SM.getFileEntryRefForID(SM.getFileID(SM.getExpansionLoc(Loc)));
+    return FE && isStandIn(FE->getName());
+  }
+
+  /// A file standing in for the #include at \p IncludeLoc: it includes each
+  /// header of \p Plug, then the header as the #include spelled it. It sits
+  /// in the includer's directory, so that a quoted #include searches from
+  /// where the includer's did. A left-out header spelled with angle
+  /// brackets is included as spelled, where an #include_next inside it
+  /// continues from where it is found; it must find the same file. Invalid
+  /// where no stand-in can say the same: an #include written by a macro, or
+  /// an #include_next or #import.
+  FileID standIn(SourceLocation IncludeLoc,
+                 const std::vector<LeftOutRecord> &Plug) {
+    SourceManager &SM = CI.getSourceManager();
+    Preprocessor &PP = CI.getPreprocessor();
+    if (IncludeLoc.isMacroID())
+      return FileID();
+    FileID Includer = SM.getFileID(IncludeLoc);
+    bool Invalid = false;
+    llvm::StringRef Buffer = SM.getBufferData(Includer, &Invalid);
+    if (Invalid)
+      return FileID();
+    size_t At = SM.getFileOffset(IncludeLoc);
+    if (At >= Buffer.size() || (Buffer[At] != '"' && Buffer[At] != '<'))
+      return FileID();
+    size_t End = Buffer.find(Buffer[At] == '<' ? '>' : '"', At + 1);
+    size_t Line = Buffer.rfind('\n', At);
+    Line = Line == llvm::StringRef::npos ? 0 : Line + 1;
+    if (End == llvm::StringRef::npos ||
+        Buffer.slice(At, End).contains('\n'))
+      return FileID();
+    llvm::StringRef Directive = Buffer.slice(Line, At);
+    if (!Directive.contains("include") || Directive.contains("include_next"))
+      return FileID();
+    std::string Text;
+    for (const LeftOutRecord &R : Plug) {
+      if (!R.Angled) {
+        Text += "#include \"" + R.Path + "\"\n";
+        continue;
+      }
+      ConstSearchDirIterator CurDir = nullptr;
+      OptionalFileEntryRef Found = PP.LookupFile(
+          IncludeLoc, R.Spelled, /*isAngled=*/true, /*FromDir=*/nullptr,
+          /*FromFile=*/nullptr, &CurDir, /*SearchPath=*/nullptr,
+          /*RelativePath=*/nullptr, /*SuggestedModule=*/nullptr,
+          /*IsMapped=*/nullptr, /*IsFrameworkFound=*/nullptr);
+      if (!Found || CI.getFileManager().getCanonicalName(*Found) != R.Path)
+        return FileID();
+      Text += "#include <" + R.Spelled + ">\n";
+    }
+    Text += "#include " + Buffer.slice(At, End + 1).str() + "\n";
+    OptionalFileEntryRef IncluderFE = SM.getFileEntryRefForID(Includer);
+    if (!IncluderFE)
+      return FileID();
+    llvm::SmallString<256> Path(
+        llvm::sys::path::parent_path(IncluderFE->getName()));
+    llvm::sys::path::append(Path,
+                            "__hc_partial_" + std::to_string(++StandIns) + ".h");
+    FileEntryRef FE =
+        CI.getFileManager().getVirtualFileRef(Path, Text.size(), 0);
+    SM.overrideFileContents(FE,
+                            llvm::MemoryBuffer::getMemBufferCopy(Text, Path));
+    // A file an #include searches from has the header search's record of
+    // it, which an #include of the file itself would have made: user or
+    // system, as its includer is.
+    SrcMgr::CharacteristicKind Kind = SM.getFileCharacteristic(IncludeLoc);
+    PP.getHeaderSearchInfo().getFileInfo(FE).DirInfo = Kind;
+    return SM.createFileID(FE, IncludeLoc, Kind);
+  }
+
   /// CLANG_HEADER_CACHE_FOLD_SERVED=1: inside a header being written, a
   /// header is asked for and served too, and the copy being written holds
   /// the served copy's declarations as its own.

@@ -2685,6 +2685,13 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
         makeModuleVisible(Cached, EndLoc);
         return {ImportAction::ModuleImport, Cached};
       }
+      // A file standing in for this one: it includes other headers first,
+      // then this one again.
+      FileID Instead = Hook->enterInstead(*File, FilenameTok.getLocation());
+      if (Instead.isValid()) {
+        EnterSourceFile(Instead, nullptr, FilenameTok.getLocation());
+        return {ImportAction::None};
+      }
     }
     break;
   }

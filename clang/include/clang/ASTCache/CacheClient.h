@@ -44,6 +44,7 @@ class raw_socket_stream;
 }
 
 namespace clang {
+class Decl;
 class NamedDecl;
 class Preprocessor;
 class Sema;
@@ -92,8 +93,9 @@ struct IncludeSite {
 struct SearchMemo {
   /// The outcome known under a search key, if any.
   llvm::function_ref<std::optional<uint8_t>(uint64_t Key)> Recall;
-  /// Set when the check made the searches.
-  std::optional<SearchOutcome> Found;
+  /// What the check found where it made searches: one per group of a
+  /// grouped copy (HeaderDependencySet::Grouped) it searched.
+  llvm::SmallVector<SearchOutcome, 2> Found;
   /// Set when the check compared the copy's files with the file system,
   /// under FilesKey: within a build files do not change, so later compiles
   /// of the build take the outcome instead of looking again.
@@ -103,6 +105,10 @@ struct SearchMemo {
   /// file system uses to build the search key.
   llvm::function_ref<OptionalFileEntryRef(llvm::StringRef CanonicalPath)>
       FindOpen;
+  /// The name the compile has the file whose canonical path is the one
+  /// given by: opened as text, or held by a copy it served, whose names
+  /// its check compared. None if neither.
+  llvm::function_ref<std::optional<llvm::StringRef>(llvm::StringRef)> NameOf;
   /// The key FilesFound is kept under, beside the search keys.
   static constexpr uint64_t FilesKey = 0x46494c45534f4b31ULL;
 };
@@ -166,6 +172,39 @@ struct CheckCost {
 /// once file not included -- inside one that loads; each element of its
 /// metadata applies by its condition. \p Loaded, when non-null, receives
 /// which submodules load.
+///
+/// \p Plugged, when non-null, says which headers the copy left out
+/// (CLANG_HEADER_CACHE_PARTIAL) are to be parsed first: what the copy takes
+/// from one of them is not checked.
+///
+/// CLANG_HEADER_CACHE_PIECES: which sections of a copy fail, where its
+/// base -- the header's own lines -- fits.
+struct SectionFailures {
+  /// Per submodule.
+  std::vector<bool> Failing;
+  /// The first failure, and with a Detail asked for, what failed.
+  MismatchReason First = MismatchReason::None;
+  std::string Detail;
+};
+
+/// \p Sections, when non-null, checks a copy whose headers are sections
+/// (CLANG_HEADER_CACHE_PIECES) in the same pass for its base: what only a
+/// section's files read failing marks that section in \p Sections, and the
+/// check goes on without the section; anything else failing refuses the
+/// copy. None then means the base fits.
+///
+/// \p Definedness, when non-null, for measurement: every definedness test
+/// that fails outside a failing section is added to it ("NAME+" for "was
+/// not defined, is", "NAME-" for the opposite) and the check goes on; the
+/// result is then the first other failure, else Conditional if any test
+/// failed.
+///
+/// \p StateOnly checks again a copy checked before in the same compile,
+/// after headers were read: its files, and what its #includes find, are as
+/// they were, and are not looked at. \p Prior, when non-null, is what that
+/// check found for each of the copy's declarations, with the declaration's
+/// latest redeclaration then: one the same name still finds, with no
+/// redeclaration since, is as it was.
 MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                 Sema *S, std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
@@ -173,7 +212,14 @@ MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                 std::vector<NamedDecl *> *Found = nullptr,
                                 SearchMemo *Memo = nullptr,
                                 bool SkipConditionals = false,
-                                std::vector<bool> *Loaded = nullptr);
+                                std::vector<bool> *Loaded = nullptr,
+                                const std::vector<bool> *Plugged = nullptr,
+                                SectionFailures *Sections = nullptr,
+                                std::vector<std::string> *Definedness = nullptr,
+                                bool StateOnly = false,
+                                const std::vector<std::pair<const NamedDecl *,
+                                                            const Decl *>>
+                                    *Prior = nullptr);
 
 class CacheClient {
 public:
@@ -207,12 +253,20 @@ public:
   ///
   /// \p Site is where the header is being included, as matchesLiveState
   /// takes it.
+  ///
+  /// CLANG_HEADER_CACHE_PIECES, \p Step: whether a copy whose base fits
+  /// may give a plan, lastPieces(); or only a copy that fits whole serves,
+  /// for a version of a section; or \p Filename is asked again after its
+  /// plan's sections were read, and only the copy the plan chose is checked,
+  /// with no request to the daemon.
+  enum class PiecesStep { Plan, WholeOnly, Again };
   llvm::StringRef lookup(llvm::StringRef Filename, Preprocessor &PP, Sema *S,
                          MetadataView *Matched = nullptr,
                          llvm::function_ref<bool(llvm::StringRef Bytes,
                                                  llvm::StringRef ModuleName)>
                              Use = nullptr,
-                         const IncludeSite *Site = nullptr);
+                         const IncludeSite *Site = nullptr,
+                         PiecesStep Step = PiecesStep::Plan);
 
   /// The stored copy of \p Filename whose module is \p ModuleName, and its
   /// metadata in \p Meta, with no check: a copy that links it
@@ -244,6 +298,12 @@ public:
   struct Stats {
     unsigned Lookups = 0;
     unsigned Hits = 0;
+    /// CLANG_HEADER_CACHE_PARTIAL: lookups that found a copy usable once the
+    /// headers it left out are parsed first.
+    unsigned Partial = 0;
+    /// CLANG_HEADER_CACHE_PIECES: lookups that found a copy whose base fits
+    /// and some of whose sections need another version.
+    unsigned BaseFits = 0;
     /// Copies fetched by name for a link, and how many the daemon held.
     unsigned Fetches = 0, Fetched = 0;
     unsigned CandidatesRejected = 0;
@@ -279,6 +339,18 @@ public:
   const std::vector<std::string> &lastSubmodulePaths() const {
     return LastSubmodulePaths;
   }
+  /// CLANG_HEADER_CACHE_PARTIAL: where the latest lookup found no copy,
+  /// the headers a copy left out that, parsed first, would let it serve,
+  /// in order; empty for none.
+  const std::vector<LeftOutRecord> &lastPartial() const { return LastPartial; }
+  void partialHits(bool On) { PartialMode = On; }
+  /// CLANG_HEADER_CACHE_PIECES: where the latest lookup found no copy, the
+  /// sections of a copy whose base fits that need another version -- one
+  /// whose own version does not fit, or one the copy has none of -- in the
+  /// order the header includes them; empty for none.
+  const std::vector<LeftOutRecord> &lastPieces() const { return LastPieces; }
+  void pieces(bool On) { PiecesMode = On; }
+
   /// The latest lookup's match's metadata, read in place.
   const std::optional<MetadataView> &lastMetadata() const {
     return LastMetadata;
@@ -310,6 +382,20 @@ private:
   Stats Counters;
   bool LogRejections = false;
   bool LogChecks = false;
+  bool PartialMode = false;
+  std::vector<LeftOutRecord> LastPartial;
+  bool PiecesMode = false;
+  std::vector<LeftOutRecord> LastPieces;
+  /// The header the latest plan is for, and the copy it chose.
+  std::optional<std::pair<std::string, CacheEntryRef>> Planned;
+  /// The versions of its copies' sections, which came with the copies, by
+  /// the name they are stored under: asked for, they need no request.
+  llvm::StringMap<std::vector<CacheEntryRef>> PlannedVersions;
+  /// What the chosen copy's declarations found when it was planned.
+  std::vector<std::pair<const NamedDecl *, const Decl *>> PlannedDecls;
+  /// CLANG_HEADER_CACHE_PIECES: by canonical path, the name each file a
+  /// served copy holds has in this compile.
+  llvm::StringMap<std::string> ServedNames;
   unsigned LastCandidates = 0;
   MismatchReason LastRejection = MismatchReason::None;
   std::vector<bool> LastSubmodules;

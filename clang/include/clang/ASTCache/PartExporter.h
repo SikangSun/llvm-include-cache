@@ -94,8 +94,10 @@ public:
   virtual ~PartExporter();
 
   /// The compile is about to enter \p File at an #include where a saved copy
-  /// could have stood in, and none fit: export the header.
-  virtual void exportNext(FileEntryRef File) = 0;
+  /// could have stood in, and none fit: export the header. \p StoredAs, when
+  /// given, is the name the daemon stores it under instead of its path: a
+  /// version of a section of another header's copy (CLANG_HEADER_CACHE_PIECES).
+  virtual void exportNext(FileEntryRef File, llvm::StringRef StoredAs = {}) = 0;
 
   /// A saved copy stood in for an #include. A header open now is not
   /// exported: its part would hold the import, not the declarations. The

@@ -39,7 +39,7 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 14;
+constexpr uint32_t DependencyEncodingVersion = 17;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
 /// stored form.
@@ -149,12 +149,21 @@ struct WarningPragmaView {
 struct SubmoduleView {
   llvm::StringRef Name;
   int32_t Parent = -1;
-  llvm::StringRef Guard, Path;
+  llvm::StringRef Guard, Path, Spelled;
+  bool Angled = false;
+  uint32_t At = 0;
   static SubmoduleView read(ByteReader &R);
 };
 struct ConditionView {
-  int32_t Owner = -1, Provider = -1;
+  int32_t Owner = -1, Provider = -1, LeftOut = -1;
   static ConditionView read(ByteReader &R);
+};
+/// CLANG_HEADER_CACHE_PARTIAL.
+struct LeftOutView {
+  llvm::StringRef Guard, Path, Spelled;
+  bool Angled = false;
+  uint32_t At = 0;
+  static LeftOutView read(ByteReader &R);
 };
 /// CLANG_HEADER_CACHE_LINK.
 struct LinkView {
@@ -169,8 +178,13 @@ struct LinkView {
 /// advances.
 template <typename T> class MetadataSection {
 public:
+  using value_type = T;
   MetadataSection() = default;
   explicit MetadataSection(llvm::StringRef Bytes) : Bytes(Bytes) {}
+  /// \p Count elements in \p Bytes, with no count before them: one group
+  /// of a grouped section (MetadataView::group).
+  MetadataSection(llvm::StringRef Bytes, uint32_t Count)
+      : Bytes(Bytes), Fixed(Count) {}
 
   class iterator {
   public:
@@ -202,11 +216,13 @@ public:
 
   iterator begin() const {
     ByteReader R(Bytes);
-    uint32_t N = R.count();
+    uint32_t N = Fixed != NoCount ? Fixed : R.count();
     return iterator(R, N);
   }
   iterator end() const { return iterator(ByteReader({}), 0); }
   uint32_t size() const {
+    if (Fixed != NoCount)
+      return Fixed;
     ByteReader R(Bytes);
     return R.count();
   }
@@ -216,13 +232,16 @@ public:
   /// section ends where its last element does.
   bool valid() const {
     ByteReader R(Bytes);
-    for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I)
+    for (uint32_t I = 0, N = Fixed != NoCount ? Fixed : R.count();
+         I < N && R.ok(); ++I)
       T::read(R);
     return R.atEnd();
   }
 
 private:
+  static constexpr uint32_t NoCount = UINT32_MAX;
   llvm::StringRef Bytes;
+  uint32_t Fixed = NoCount;
 };
 
 /// A copy's metadata, read in place from the bytes encodeMetadata wrote.
@@ -305,6 +324,9 @@ public:
   MetadataSection<NameView> declares() const {
     return section<NameView>(Declares);
   }
+  MetadataSection<LeftOutView> leftOut() const {
+    return section<LeftOutView>(LeftOut);
+  }
 
   enum Section : unsigned {
     Conditional,
@@ -325,10 +347,41 @@ public:
     Provided,
     Links,
     Declares,
+    LeftOut,
+    Groups,
     NumSections
   };
+  /// The sections a grouped copy keeps in groups, in the order their marks
+  /// are stored.
+  static constexpr Section GroupedSections[] = {
+      Conditional, ExpandsTo, Inclusion, NotAMacro, Symbol,
+      Files,       Includes,  FileNames, Declarations};
+  static int groupedIndex(Section S) {
+    for (unsigned I = 0; I != std::size(GroupedSections); ++I)
+      if (GroupedSections[I] == S)
+        return I;
+    return -1;
+  }
+
+  /// CLANG_HEADER_CACHE_PIECES (HeaderDependencySet::Grouped): how many
+  /// groups each grouped section is in -- the base's, then one per
+  /// submodule -- or 0 for a copy that is not grouped, whose sections are
+  /// read whole.
+  uint32_t groups() const { return NumGroups; }
+  /// Group \p G of section \p S, one of the grouped sections
+  /// (GroupedSections).
+  template <typename T> MetadataSection<T> group(Section S, uint32_t G) const {
+    auto [Offset, Count] = groupMark(S, G);
+    llvm::StringRef Elements = Bytes.slice(Starts[S] + 4, Starts[S + 1]);
+    uint32_t End = G + 1 < groups() ? groupMark(S, G + 1).first
+                                    : static_cast<uint32_t>(Elements.size());
+    return MetadataSection<T>(Elements.slice(Offset, End), Count);
+  }
 
 private:
+  /// Where group \p G of grouped section \p S starts, in bytes from its
+  /// first element, and how many elements it holds.
+  std::pair<uint32_t, uint32_t> groupMark(Section S, uint32_t G) const;
   template <typename T> MetadataSection<T> section(Section S) const {
     return MetadataSection<T>(Bytes.slice(Starts[S], Starts[S + 1]));
   }
@@ -339,6 +392,7 @@ private:
   llvm::StringRef ModuleName, HeaderName;
   PragmaSnapshot Entry, Exit;
   uint64_t WarningState = 0;
+  uint32_t NumGroups = 0;
 };
 
 /// The metadata in \p Bytes as a HeaderDependencySet, and its module name in

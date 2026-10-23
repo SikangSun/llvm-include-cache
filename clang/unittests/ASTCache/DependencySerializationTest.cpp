@@ -414,6 +414,91 @@ HeaderDependencySet makeSubmoduleSet() {
   return D;
 }
 
+TEST(DependencySerializationTest, LeftOutHeadersAndTheirConditionsRoundTrip) {
+  // hex.h's copy left out hash.h: what it takes from hash.h applies only
+  // where hash.h is not plugged in first (CLANG_HEADER_CACHE_PARTIAL).
+  HeaderDependencySet D = makeFullSet();
+  D.LeftOut.push_back({"HASH_H", "/src/git/hash.h", "/src/git/hash.h", false});
+  D.LeftOut.push_back({"_STDINT_H", "/usr/include/stdint.h", "stdint.h", true});
+  D.Conditions.push_back({-1, -1, 0});
+  D.Conditions.push_back({-1, -1, 1});
+  D.Conditional[0].Cond = 1;
+  D.Syntactic[0].Cond = 2;
+  auto Decoded = decodeDependencySet(encode(D));
+  ASSERT_TRUE(Decoded.has_value());
+  expectEqual(D, *Decoded);
+  EXPECT_EQ(Decoded->LeftOut, D.LeftOut);
+  ASSERT_EQ(Decoded->Conditions.size(), 2u);
+  EXPECT_EQ(Decoded->Conditions[1].LeftOut, 1);
+  EXPECT_EQ(Decoded->Conditional[0].Cond, 1u);
+  EXPECT_EQ(Decoded->Syntactic[0].Cond, 2u);
+
+  // A condition naming a left-out header there is not would plug in
+  // nothing, and skip what the copy took from it.
+  D.Conditions.push_back({-1, -1, 2});
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+  D.Conditions.pop_back();
+  // One with no guard could not tell whether to plug it in.
+  D.LeftOut[0].Guard.clear();
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+}
+
+TEST(DependencySerializationTest, GroupedListsAreMarkedWhereEachGroupStarts) {
+  // hex.h's base with two pieces, hash.h and strbuf.h: each list holds the
+  // base's group, then each piece's, and the stored metadata marks where
+  // each group starts (CLANG_HEADER_CACHE_PIECES). What hash.h sets that
+  // the base's lines read is the base's, checked where hash.h is skipped.
+  using SD = SyntacticDependency;
+  HeaderDependencySet D;
+  D.Submodules.push_back({"s0", -1, "HASH_H", "/src/git/hash.h"});
+  D.Submodules.push_back({"s1", -1, "STRBUF_H", "/src/git/strbuf.h"});
+  D.Conditions.push_back({0, -1});
+  D.Conditions.push_back({1, -1});
+  D.Conditions.push_back({-1, 0});
+  D.Conditional = {{"HEX_UPPER", false, 0},
+                   {"GIT_SHA256", true, 3},
+                   {"STRBUF_INIT_ALLOC", false, 2}};
+  D.Syntactic = {{"GIT_MAX_RAWSZ", SD::State::ExpandsTo, "32", 3},
+                 {"size_t", SD::State::NotAMacro, "", 0},
+                 {"uint32_t", SD::State::NotAMacro, "", 1},
+                 {"alloc_nr", SD::State::NotAMacro, "", 2}};
+  D.Grouped = true;
+  std::string Bytes = encode(D);
+  auto Decoded = decodeDependencySet(Bytes);
+  ASSERT_TRUE(Decoded.has_value());
+  EXPECT_TRUE(Decoded->Grouped);
+  expectEqual(D, *Decoded);
+  std::optional<MetadataView> V = MetadataView::open(Bytes);
+  ASSERT_TRUE(V.has_value());
+  ASSERT_EQ(V->groups(), 3u);
+  auto Names = [&](MetadataView::Section S, uint32_t G) {
+    std::vector<std::string> Out;
+    if (S == MetadataView::Conditional)
+      for (const ConditionalView &C : V->group<ConditionalView>(S, G))
+        Out.push_back(C.MacroName.str());
+    else
+      for (const NameView &N : V->group<NameView>(S, G))
+        Out.push_back(N.Name.str());
+    return Out;
+  };
+  using Strings = std::vector<std::string>;
+  EXPECT_EQ(Names(MetadataView::Conditional, 0),
+            (Strings{"HEX_UPPER", "GIT_SHA256"}));
+  EXPECT_EQ(Names(MetadataView::Conditional, 1), Strings{});
+  EXPECT_EQ(Names(MetadataView::Conditional, 2),
+            Strings{"STRBUF_INIT_ALLOC"});
+  EXPECT_EQ(Names(MetadataView::NotAMacro, 0), Strings{"size_t"});
+  EXPECT_EQ(Names(MetadataView::NotAMacro, 1), Strings{"uint32_t"});
+  EXPECT_EQ(Names(MetadataView::NotAMacro, 2), Strings{"alloc_nr"});
+
+  // Out of order, a list cannot be read by group: the copy is stored
+  // ungrouped, and read whole.
+  std::swap(D.Conditional[1], D.Conditional[2]);
+  auto Unsorted = decodeDependencySet(encode(D));
+  ASSERT_TRUE(Unsorted.has_value());
+  EXPECT_FALSE(Unsorted->Grouped);
+}
+
 TEST(DependencySerializationTest, SubmodulesAndConditionsRoundTrip) {
   // The equality of most elements leaves out the condition, so it is
   // compared here on its own: a condition lost on the way would check a

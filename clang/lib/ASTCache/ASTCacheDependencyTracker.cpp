@@ -42,7 +42,7 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
     PendingEntries.clear();
     if (!FE)
       return;
-    if (Measuring || RecordFiles)
+    if (Measuring || RecordFiles || PiecesBase)
       FirstEntered.try_emplace(&FE->getFileEntry(), FID);
     if (RecordFiles && (!OpenFiles.empty() || (TrackOnly && TrackOnly(FID)))) {
       FileReads R;
@@ -58,6 +58,15 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
     for (Frame &F : Stack) {
       F.Closure.insert(FID);
       F.ClosureFiles.insert(&FE->getFileEntry());
+      // A file the base's own lines include starts a piece; one below it
+      // is in that piece.
+      if (PiecesState *P = F.P.get()) {
+        if (P->Depth++ == 0) {
+          P->Rec.Pieces.push_back({FID, P->NoPieces});
+          P->Cur = P->NoPieces ? -1 : int32_t(P->Rec.Pieces.size() - 1);
+        }
+        P->Rec.PieceOf[FID] = P->Cur;
+      }
     }
     if (TrackOnly && !TrackOnly(FID))
       return;
@@ -67,12 +76,19 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
     New.Path = FE->getName().str();
     New.Closure.insert(FID);
     New.ClosureFiles.insert(&FE->getFileEntry());
+    if (PiecesBase && PiecesBase(FID))
+      New.P = std::make_unique<PiecesState>();
     Stack.push_back(std::move(New));
     return;
   }
 
   if (Reason != ExitFile)
     return;
+
+  for (Frame &F : Stack)
+    if (PiecesState *P = F.P.get(); P && P->Rec.PieceOf.count(PrevFID))
+      if (--P->Depth == 0)
+        P->Cur = -1;
 
   if (!OpenFiles.empty() && Files[OpenFiles.back()].FID == PrevFID) {
     Files[OpenFiles.back()].Exit = ++Clock;
@@ -105,12 +121,38 @@ void ASTCacheDependencyTracker::closeFrame(Frame &F) {
   // which is precisely the shape that validates where it must not.
   if (F.Poisoned)
     return;
+  std::unique_ptr<PiecesRecord> Pieces;
+  if (PiecesState *P = F.P.get()) {
+    // A dependency read in a piece that turned out not to be one is the
+    // base's; so is a crossing such a piece provides.
+    auto Remap = [&](auto &Deps) {
+      for (auto &D : Deps)
+        if (D.Cond)
+          D.Cond = P->eff(int32_t(D.Cond) - 1) + 1;
+    };
+    Remap(F.Deps.Conditional);
+    Remap(F.Deps.Syntactic);
+    Remap(F.Deps.Symbol);
+    Remap(F.Deps.Inclusion);
+    Remap(F.Deps.Includes);
+    Remap(F.Deps.FileNames);
+    llvm::erase_if(P->Rec.Crossings, [&](const PiecesRecord::Crossing &C) {
+      return P->eff(C.Provider) < 0;
+    });
+    for (auto &[FID, K] : P->Rec.PieceOf)
+      K = P->eff(K);
+    for (const auto &[II, S] : P->Names)
+      if (S.Changer != -3)
+        P->Rec.ChangedBy[II] = P->eff(S.Changer);
+    Pieces = std::make_unique<PiecesRecord>(std::move(P->Rec));
+  }
   HeaderRecord Rec;
   Rec.HeaderPath = std::move(F.Path);
   Rec.Deps = std::move(F.Deps);
   Completed.push_back(std::move(Rec));
   CompletedFIDs.push_back(F.FID);
   CompletedSites.push_back(std::move(F.At));
+  CompletedPieces.push_back(std::move(Pieces));
 }
 
 void ASTCacheDependencyTracker::finalize() {
@@ -182,6 +224,12 @@ void ASTCacheDependencyTracker::recordLookup(SourceLocation Loc,
     Dep.Spelled = Spelled.str();
     Dep.Found = FoundPath;
     Dep.Name = FoundName;
+    // In a base, the piece holding it. Where the piece is skipped, its files
+    // were read already, and only the names they were opened by are
+    // compared (matchesLiveState): a skipped piece's declarations can still
+    // reach the compile, a type the base's lines name, under those names.
+    if (F.P && Where != F.FID)
+      Dep.Cond = uint32_t(F.P->Rec.PieceOf.lookup(Where) + 1);
     if (Where != F.FID) {
       auto It = F.EntryOf.find(Where);
       // A file in the region that no recorded lookup entered.
@@ -213,8 +261,13 @@ void ASTCacheDependencyTracker::FileSkipped(
         HS.getFileInfo(SkippedFile).getControllingMacro(HS.getExternalLookup());
     if (G) {
       FileID O = stateOrigin(G, PP.getMacroDefinition(G));
+      if (!FilenameTok.getLocation().isMacroID())
+        F->Skips.push_back(
+            {PP.getFileManager().getCanonicalName(SkippedFile).str(),
+             G->getName().str(), O, PP.getSpelling(FilenameTok),
+             FilenameTok.getLocation(), ++Clock});
       if (O != F->FID) {
-        auto [It, New] = F->SeenTest.try_emplace(G, true, O);
+        auto [It, New] = F->Seen->Test.try_emplace(G, true, O);
         if (New || It->second != std::make_pair(true, O)) {
           It->second = {true, O};
           ConditionalDependency D;
@@ -223,7 +276,7 @@ void ASTCacheDependencyTracker::FileSkipped(
           F->Conditional.push_back({std::move(D), O, ++Clock});
         }
       }
-    } else if (F->SeenOnce.insert(&SkippedFile.getFileEntry()).second) {
+    } else if (F->Seen->Once.insert(&SkippedFile.getFileEntry()).second) {
       FileID O = FirstEntered.lookup(&SkippedFile.getFileEntry());
       InclusionDependency D;
       D.HeaderPath = SkippedFile.getName().str();
@@ -244,6 +297,10 @@ void ASTCacheDependencyTracker::FileSkipped(
       Guard ? stateOrigin(Guard, PP.getMacroDefinition(Guard)) : FileID();
 
   for (Frame &F : Stack) {
+    if (F.P) {
+      piecesSkip(F, SkippedFile, FilenameTok, Guard, GuardOrigin);
+      continue;
+    }
     if (!F.SeenSkipped.insert(&SkippedFile.getFileEntry()).second)
       continue;
 
@@ -291,7 +348,7 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
                                                   FileID Origin) {
   // The file whose #if this is: its own #define pins the state.
   if (FileReads *F = currentFile(); F && Origin != F->FID) {
-    auto [It, New] = F->SeenTest.try_emplace(II, WasDefined, Origin);
+    auto [It, New] = F->Seen->Test.try_emplace(II, WasDefined, Origin);
     if (New || It->second != std::make_pair(WasDefined, Origin)) {
       It->second = {WasDefined, Origin};
       ConditionalDependency D;
@@ -301,6 +358,10 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
     }
   }
   for (Frame &F : Stack) {
+    if (F.P) {
+      piecesConditional(F, II, WasDefined, Origin);
+      continue;
+    }
     // The first test in a frame decides, as for syntactic dependencies: a
     // state the frame's own text set before testing it stays pinned however
     // often it is tested again.
@@ -410,14 +471,26 @@ void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
     const MacroInfo *MI = II->hasMacroDefinition()
                               ? PP.getMacroDefinition(II).getMacroInfo()
                               : nullptr;
-    auto It = F->SeenMacro.find(II);
-    if (It == F->SeenMacro.end() || It->second != MI)
+    auto It = F->Seen->Macro.find(II);
+    if (It == F->Seen->Macro.end() || It->second != MI)
       fileRead(F, II, MI, FileID());
   }
   // The common case: a name already seen. If the innermost frame has it,
-  // every enclosing frame has it too.
-  if (Stack.back().SeenSyntactic.contains(II))
+  // every enclosing frame has it too. In a base, a name read again by the
+  // same group, in the state it read before, records nothing new.
+  if (const PiecesState *P = Stack.back().P.get()) {
+    if (Stack.size() == 1) {
+      auto It = P->Names.find(II);
+      if (It != P->Names.end()) {
+        const NameState &S = It->second;
+        if (S.Syn != -2 && (S.Syn == P->Cur || S.Syn == -1) &&
+            (S.Changer == -3 || S.Changer == P->Cur))
+          return;
+      }
+    }
+  } else if (Stack.back().SeenSyntactic.contains(II)) {
     return;
+  }
   // This runs just before HandleIdentifier would update an identifier that a
   // module load left out of date, so do that here first, or the macro state
   // read below could be stale.
@@ -428,8 +501,15 @@ void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
 void ASTCacheDependencyTracker::PragmaPushMacro(SourceLocation,
                                                 const IdentifierInfo *II,
                                                 const MacroInfo *) {
-  for (Frame &F : Stack)
+  for (Frame &F : Stack) {
     ++F.MacroPushes[II];
+    if (PiecesState *P = F.P.get()) {
+      P->NoPieces = true;
+      for (PiecesRecord::Piece &Piece : P->Rec.Pieces)
+        Piece.Bad = true;
+      P->Cur = -1;
+    }
+  }
 }
 
 void ASTCacheDependencyTracker::PragmaPopMacro(SourceLocation,
@@ -442,6 +522,19 @@ void ASTCacheDependencyTracker::PragmaPopMacro(SourceLocation,
     auto It = F.MacroPushes.find(II);
     if (It != F.MacroPushes.end() && It->second) {
       --It->second;
+      continue;
+    }
+    if (PiecesState *P = F.P.get()) {
+      // Pieces cannot hold a push or pop: the base's lines are one.
+      P->NoPieces = true;
+      for (PiecesRecord::Piece &Piece : P->Rec.Pieces)
+        Piece.Bad = true;
+      P->Cur = -1;
+      NameState &S = P->Names[II];
+      if (S.Syn == -2) {
+        S.Syn = -1;
+        TookFromBelow = true;
+      }
       continue;
     }
     TookFromBelow |= F.SeenSyntactic.insert(II).second;
@@ -511,6 +604,8 @@ void ASTCacheDependencyTracker::recordFileName(SourceLocation Loc,
                                   : FileNameDependency::Macro::File;
     Dep.File = File;
     Dep.Text = Text;
+    if (F.P && FID != F.FID)
+      Dep.Cond = uint32_t(F.P->Rec.PieceOf.lookup(FID) + 1);
     F.Deps.FileNames.push_back(std::move(Dep));
     F.At.FileNames.push_back(FID);
   }
@@ -519,7 +614,7 @@ void ASTCacheDependencyTracker::recordFileName(SourceLocation Loc,
 void ASTCacheDependencyTracker::fileRead(FileReads *F,
                                          const IdentifierInfo *II,
                                          const MacroInfo *MI, FileID) {
-  F->SeenMacro[II] = MI;
+  F->Seen->Macro[II] = MI;
   SourceManager &SM = PP.getSourceManager();
   // Defined, or undefined, by the file's own text: pinned by it.
   FileID Origin = MI ? SM.getFileID(MI->getDefinitionLoc())
@@ -560,6 +655,10 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
   bool Built = false;
 
   for (Frame &F : Stack) {
+    if (F.P) {
+      piecesSyntactic(F, II, MI, DefFID, Sequence, Built);
+      continue;
+    }
     if (!F.SeenSyntactic.insert(II).second)
       continue;
     if (MI && F.holds(DefFID))
@@ -615,7 +714,7 @@ void ASTCacheDependencyTracker::recordSymbol(
   if (auto It = FileIndex.find(QueryFID); It != FileIndex.end()) {
     FileReads &F = Files[It->second];
     if (ResolvedFID != F.FID) {
-      auto [S, New] = F.SeenType.try_emplace(
+      auto [S, New] = F.Seen->Type.try_emplace(
           Name, static_cast<unsigned>(Classification), ResolvedFID);
       auto Now =
           std::make_pair(static_cast<unsigned>(Classification), ResolvedFID);
@@ -634,6 +733,11 @@ void ASTCacheDependencyTracker::recordSymbol(
     // Only headers whose region actually covers the query depend on it.
     if (!F.Closure.contains(QueryFID))
       continue;
+    if (F.P) {
+      piecesSymbol(F, Name, Classification, QueryFID, ResolvedFID,
+                   HaveResolved, Ctx.ResolvedTypeName);
+      continue;
+    }
     // Answered from inside this header's own closure: its text pins the
     // answer, so it cannot vary between compiles.
     if (HaveResolved && F.holds(ResolvedFID))
@@ -704,6 +808,9 @@ void ASTCacheDependencyTracker::noteRead(Frame &F, FileID Origin,
 
 void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
                                              const MacroDirective *MD) {
+  for (Frame &F : Stack)
+    if (F.P)
+      piecesChange(F, MacroNameTok.getIdentifierInfo());
   if (FileReads *F = currentFile(); F && MD) {
     FileID Replaced;
     if (const MacroDirective *Prev = MD->getPrevious()) {
@@ -743,6 +850,9 @@ void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
 void ASTCacheDependencyTracker::MacroUndefined(const Token &MacroNameTok,
                                                const MacroDefinition &MD,
                                                const MacroDirective *Undef) {
+  for (Frame &F : Stack)
+    if (F.P)
+      piecesChange(F, MacroNameTok.getIdentifierInfo());
   if (FileReads *F = currentFile()) {
     FileID Replaced;
     if (const MacroInfo *MI = MD.getMacroInfo())
@@ -847,6 +957,8 @@ void ASTCacheDependencyTracker::foldServed(
       D.HeaderPath = V.HeaderPath.str();
       D.Why = V.Why;
       F.Deps.Inclusion.push_back(std::move(D));
+      if (F.P)
+        F.P->Rec.Origins[3].push_back(FileID());
     }
     // The copy's #include searches and __FILE__s, numbered after the
     // frame's own: the copy's header is the file the frame's pending
@@ -880,4 +992,268 @@ void ASTCacheDependencyTracker::foldServed(
       F.At.FileNames.push_back(Where);
     }
   }
+}
+
+//===----------------------------------------------------------------------===//
+// CLANG_HEADER_CACHE_PIECES: a base's dependencies, marked with their piece
+// as they are recorded.
+//===----------------------------------------------------------------------===//
+
+void ASTCacheDependencyTracker::piecesInternal(Frame &F,
+                                               const IdentifierInfo *II,
+                                               PiecesRecord::Crossing C) {
+  PiecesState &P = *F.P;
+  int32_t R = P.eff(P.Cur);
+  int32_t G = P.eff(C.Provider);
+  if (G == R)
+    return;
+  // A piece reading what the base's lines or another piece set depends on
+  // them: it is the base's.
+  if (R >= 0) {
+    P.bad(R);
+    R = -1;
+  }
+  if (G < 0)
+    return;
+  // The base's lines read what piece G set.
+  uintptr_t State = C.Cond ? 2 + C.Cond->WasDefined
+                    : C.Sym ? 8 + uintptr_t(C.Sym->Classification)
+                    : C.Syn && C.Syn->Required ==
+                                   SyntacticDependency::State::ExpandsTo
+                        ? 16 + std::hash<std::string>()(C.Syn->TokenSequence)
+                        : 4;
+  if (!P.Crossed.insert({II, G, State}).second)
+    return;
+  C.Provider = G;
+  P.Rec.Crossings.push_back(std::move(C));
+}
+
+void ASTCacheDependencyTracker::piecesConditional(Frame &F,
+                                                  const IdentifierInfo *II,
+                                                  bool WasDefined,
+                                                  FileID Origin) {
+  PiecesState &P = *F.P;
+  int32_t R = P.Cur;
+  if (P.Depth == 0 && !P.FirstRootTest)
+    P.FirstRootTest = II;
+  NameState &S = P.Names[II];
+  if (Origin.isValid() && F.holds(Origin)) {
+    int16_t Changer = S.Changer;
+    if (S.Cond == -2)
+      S.Cond = R;
+    else if (S.Cond != R)
+      S.Cond = -1;
+    PiecesRecord::Crossing C;
+    C.Provider = Changer == -3 ? -1 : Changer;
+    C.Cond = ConditionalDependency{II->getName().str(), WasDefined, 0};
+    piecesInternal(F, II, std::move(C));
+    return;
+  }
+  if (S.Cond == -2) {
+    S.Cond = R;
+    noteRead(F, Origin, "tests " + II->getName());
+    P.depOf(II, 0) = F.Deps.Conditional.size();
+    F.Deps.Conditional.push_back(
+        {II->getName().str(), WasDefined, uint32_t(R + 1)});
+    P.Rec.Origins[0].push_back(Origin);
+    return;
+  }
+  // The same state outside read by another group: the base's.
+  if (S.Cond != R && S.Cond != -1) {
+    S.Cond = -1;
+    if (int32_t D = P.depOf(II, 0); D >= 0)
+      F.Deps.Conditional[D].Cond = 0;
+  }
+}
+
+void ASTCacheDependencyTracker::piecesSyntactic(
+    Frame &F, const IdentifierInfo *II, const MacroInfo *MI, FileID DefFID,
+    std::optional<std::string> &Sequence, bool &Built) {
+  PiecesState &P = *F.P;
+  int32_t R = P.Cur;
+  NameState &S = P.Names[II];
+  int16_t Changer = S.Changer;
+  auto Tokens = [&]() -> bool {
+    if (!Built) {
+      Sequence =
+          serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts());
+      Built = true;
+    }
+    return Sequence.has_value();
+  };
+  if (S.Syn == -2) {
+    S.Syn = R;
+    if (!(MI && F.holds(DefFID))) {
+      noteRead(F, MI ? DefFID : FileID(),
+               (MI ? "expands " : "reads as plain text ") + II->getName());
+      SyntacticDependency Dep;
+      Dep.Name = II->getName().str();
+      if (MI) {
+        if (!Tokens()) {
+          F.Poisoned = true;
+          return;
+        }
+        Dep.Required = SyntacticDependency::State::ExpandsTo;
+        Dep.TokenSequence = *Sequence;
+      }
+      Dep.Cond = uint32_t(R + 1);
+      int32_t Index = F.Deps.Syntactic.size();
+      F.Deps.Syntactic.push_back(std::move(Dep));
+      P.Rec.Origins[1].push_back(MI ? DefFID : FileID());
+      P.depOf(II, 1) = Index;
+    }
+  } else if (S.Syn != R && S.Syn != -1) {
+    S.Syn = -1;
+    if (int32_t D = P.depOf(II, 1); D >= 0)
+      F.Deps.Syntactic[D].Cond = 0;
+  }
+  // A state set inside the base: by this group, another piece or the
+  // base's lines.
+  if (Changer == -3 || Changer == R)
+    return;
+  PiecesRecord::Crossing C;
+  C.Provider = Changer;
+  SyntacticDependency Dep;
+  Dep.Name = II->getName().str();
+  if (MI) {
+    if (!Tokens()) {
+      F.Poisoned = true;
+      return;
+    }
+    Dep.Required = SyntacticDependency::State::ExpandsTo;
+    Dep.TokenSequence = *Sequence;
+  }
+  C.Syn = std::move(Dep);
+  piecesInternal(F, II, std::move(C));
+}
+
+void ASTCacheDependencyTracker::piecesSymbol(
+    Frame &F, const IdentifierInfo *Name, SymbolClassification Classification,
+    FileID QueryFID, FileID ResolvedFID, bool HaveResolved,
+    llvm::StringRef ResolvedTypeName) {
+  PiecesState &P = *F.P;
+  auto GroupOf = [&](FileID FID) {
+    if (FID == F.FID)
+      return int32_t(-1);
+    auto It = P.Rec.PieceOf.find(FID);
+    return It == P.Rec.PieceOf.end() ? int32_t(-1) : P.eff(It->second);
+  };
+  int32_t R = GroupOf(QueryFID);
+  if (HaveResolved && F.holds(ResolvedFID)) {
+    int32_t G = GroupOf(ResolvedFID);
+    if (G == R)
+      return;
+    if (R >= 0) {
+      P.bad(R);
+      R = -1;
+    }
+    if (G < 0)
+      return;
+    // The base's lines name what piece G declared: checked where another
+    // version of G is read.
+    PiecesRecord::Crossing C;
+    C.Provider = G;
+    C.Sym = SymbolDependency{Name->getName().str(), Classification,
+                             ResolvedTypeName.str(), 0};
+    piecesInternal(F, Name, std::move(C));
+    return;
+  }
+  NameState &S = P.Names[Name];
+  if (S.Sym == -2) {
+    S.Sym = R;
+    noteRead(F, ResolvedFID, "names " + Name->getName());
+    P.depOf(Name, 2) = F.Deps.Symbol.size();
+    F.Deps.Symbol.push_back({Name->getName().str(), Classification,
+                             ResolvedTypeName.str(), uint32_t(R + 1)});
+    P.Rec.Origins[2].push_back(HaveResolved ? ResolvedFID : FileID());
+    return;
+  }
+  if (S.Sym != R && S.Sym != -1) {
+    S.Sym = -1;
+    if (int32_t D = P.depOf(Name, 2); D >= 0)
+      F.Deps.Symbol[D].Cond = 0;
+  }
+}
+
+void ASTCacheDependencyTracker::piecesChange(Frame &F,
+                                             const IdentifierInfo *II) {
+  PiecesState &P = *F.P;
+  int32_t R = P.Cur;
+  NameState &S = P.Names[II];
+  if (R >= 0) {
+    // A piece replacing what another group set, or changing what another
+    // group read before it: read first, another version of it would change
+    // what those lines read.
+    auto Other = [&](int16_t G) { return G != -2 && P.eff(G) != R; };
+    if ((S.Changer != -3 && P.eff(S.Changer) != R) || Other(S.Cond) ||
+        Other(S.Syn) || Other(S.Sym))
+      P.bad(R);
+  }
+  // The base's own include guard, which its first test tested, is no
+  // change a header it leaves out could read.
+  if (!(P.Depth == 0 && P.Changes == 0 && II == P.FirstRootTest))
+    ++P.Changes;
+  S.Changer = int16_t(P.Cur);
+}
+
+void ASTCacheDependencyTracker::piecesSkip(Frame &F,
+                                           const FileEntryRef &SkippedFile,
+                                           const Token &FilenameTok,
+                                           const IdentifierInfo *Guard,
+                                           FileID GuardOrigin) {
+  PiecesState &P = *F.P;
+  if (Guard) {
+    // An #include in the base's own lines of a header read before the
+    // base: one the copy leaves out.
+    if (P.Depth == 0 && GuardOrigin.isValid() && !F.holds(GuardOrigin) &&
+        !FilenameTok.getLocation().isMacroID()) {
+      PiecesRecord::Skip K;
+      K.Path = PP.getFileManager().getCanonicalName(SkippedFile).str();
+      K.Guard = Guard->getName().str();
+      K.Spelled = PP.getSpelling(FilenameTok);
+      K.Origin = GuardOrigin;
+      K.Loc = FilenameTok.getLocation();
+      K.Before[0] = F.Deps.Conditional.size();
+      K.Before[1] = F.Deps.Syntactic.size();
+      K.Before[2] = F.Deps.Symbol.size();
+      K.Before[3] = F.Deps.Inclusion.size();
+      K.Clean = P.Changes == 0;
+      P.Rec.Skips.push_back(std::move(K));
+    }
+    piecesConditional(F, Guard, true, GuardOrigin);
+    return;
+  }
+  // A #pragma once or #import file read before: inside the base, by a
+  // group, or outside it.
+  int32_t R = P.Cur;
+  const FileEntry *FE = &SkippedFile.getFileEntry();
+  FileID O = FirstEntered.lookup(FE);
+  if (F.ClosureFiles.contains(FE)) {
+    int32_t G = -1;
+    if (auto It = P.Rec.PieceOf.find(O); It != P.Rec.PieceOf.end())
+      G = P.eff(It->second);
+    if (G != R && R >= 0)
+      P.bad(R);
+    return;
+  }
+  auto [It, New] = P.Skipped.try_emplace(
+      FE, int16_t(R), int32_t(F.Deps.Inclusion.size()));
+  if (!New) {
+    if (It->second.first != R && It->second.first != -1) {
+      F.Deps.Inclusion[It->second.second].Cond = 0;
+      It->second.first = -1;
+    }
+    return;
+  }
+  if (Measuring)
+    noteRead(F, O, "skips " + SkippedFile.getName());
+  HeaderSearch &HS = PP.getHeaderSearchInfo();
+  InclusionDependency Dep;
+  Dep.HeaderPath = SkippedFile.getName().str();
+  Dep.Why = HS.hasFileBeenImported(SkippedFile)
+                ? InclusionDependency::Reason::Import
+                : InclusionDependency::Reason::PragmaOnce;
+  Dep.Cond = uint32_t(R + 1);
+  F.Deps.Inclusion.push_back(std::move(Dep));
+  P.Rec.Origins[3].push_back(O);
 }

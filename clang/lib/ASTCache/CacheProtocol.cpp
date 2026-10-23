@@ -90,17 +90,25 @@ void clang::ast_cache::encodeLookupRequest(const LookupRequest &Req,
 void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
                                             llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::LookupResponse, [&](ByteWriter &W) {
-    W.u32(static_cast<uint32_t>(Resp.Entries.size()));
-    for (const CacheEntryRef &E : Resp.Entries) {
-      W.u64(E.MetadataOffset);
-      W.u64(E.MetadataLength);
-      W.u64(E.Offset);
-      W.u64(E.Length);
-      W.u32(static_cast<uint32_t>(E.Searches.size()));
-      for (const SearchOutcome &O : E.Searches) {
-        W.u64(O.Key);
-        W.u8(O.Outcome);
+    auto Entries = [&](const std::vector<CacheEntryRef> &List) {
+      W.u32(static_cast<uint32_t>(List.size()));
+      for (const CacheEntryRef &E : List) {
+        W.u64(E.MetadataOffset);
+        W.u64(E.MetadataLength);
+        W.u64(E.Offset);
+        W.u64(E.Length);
+        W.u32(static_cast<uint32_t>(E.Searches.size()));
+        for (const SearchOutcome &O : E.Searches) {
+          W.u64(O.Key);
+          W.u8(O.Outcome);
+        }
       }
+    };
+    Entries(Resp.Entries);
+    W.u32(static_cast<uint32_t>(Resp.Versions.size()));
+    for (const LookupResponse::SectionVersions &V : Resp.Versions) {
+      W.str(V.Section);
+      Entries(V.Entries);
     }
   });
 }
@@ -217,20 +225,29 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
     return std::nullopt;
 
   LookupResponse Resp;
-  uint32_t N = R.count();
-  for (uint32_t I = 0; I < N && R.ok(); ++I) {
-    CacheEntryRef E;
-    E.MetadataOffset = R.u64();
-    E.MetadataLength = R.u64();
-    E.Offset = R.u64();
-    E.Length = R.u64();
-    for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
-      SearchOutcome O;
-      O.Key = R.u64();
-      O.Outcome = R.u8();
-      E.Searches.push_back(O);
+  auto Entries = [&](std::vector<CacheEntryRef> &List) {
+    uint32_t N = R.count();
+    for (uint32_t I = 0; I < N && R.ok(); ++I) {
+      CacheEntryRef E;
+      E.MetadataOffset = R.u64();
+      E.MetadataLength = R.u64();
+      E.Offset = R.u64();
+      E.Length = R.u64();
+      for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
+        SearchOutcome O;
+        O.Key = R.u64();
+        O.Outcome = R.u8();
+        E.Searches.push_back(O);
+      }
+      List.push_back(std::move(E));
     }
-    Resp.Entries.push_back(std::move(E));
+  };
+  Entries(Resp.Entries);
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    LookupResponse::SectionVersions V;
+    V.Section = R.str().str();
+    Entries(V.Entries);
+    Resp.Versions.push_back(std::move(V));
   }
   if (!R.atEnd())
     return std::nullopt;

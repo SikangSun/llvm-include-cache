@@ -335,6 +335,13 @@ struct SubmoduleRecord {
   /// The header's include guard; empty for #pragma once, with Path the file.
   std::string Guard;
   std::string Path;
+  /// CLANG_HEADER_CACHE_PIECES: how the copy's header spelled the #include
+  /// ("hash.h" or <stdint.h>, without the delimiters), and where in the
+  /// header's text it is, by offset: a compile that needs another version of
+  /// the section includes it again, in order.
+  std::string Spelled;
+  bool Angled = false;
+  uint32_t At = 0;
 };
 
 /// When a dependency applies: where its submodule (Owner) is loaded, and,
@@ -343,6 +350,37 @@ struct SubmoduleRecord {
 struct DependencyCondition {
   int32_t Owner = -1;
   int32_t Provider = -1;
+  /// CLANG_HEADER_CACHE_PARTIAL: for one taken from a header the copy left
+  /// out (LeftOutRecord, by index), where that header is not plugged in
+  /// first. -1 for none.
+  int32_t LeftOut = -1;
+};
+
+/// CLANG_HEADER_CACHE_PARTIAL: a header the copy left out -- its #include
+/// inside the header was skipped by its guard, the compile having read it
+/// before -- that a compile which has not read it can parse first, before
+/// the copy loads (a partial hit). git's hex.h's copy, written after hash.h
+/// was read, leaves hash.h out. Recorded only where parsing it first gives
+/// what parsing it at its #include would: it reads nothing the copy's lines
+/// before the #include set, and those lines read nothing it sets. What the
+/// copy takes from it applies, by its condition, only where it is not
+/// plugged in.
+struct LeftOutRecord {
+  /// The header's include guard, and its file, by canonical path.
+  std::string Guard;
+  std::string Path;
+  /// How the #include spelled it, and whether with angle brackets; an
+  /// angled one is included again as spelled, so that an #include_next
+  /// inside it continues from where it was found.
+  std::string Spelled;
+  bool Angled = false;
+  /// CLANG_HEADER_CACHE_PIECES: where in the header's own text the #include
+  /// is, by offset; 0 where it is in a header the header includes.
+  uint32_t At = 0;
+  friend bool operator==(const LeftOutRecord &A, const LeftOutRecord &B) {
+    return A.Guard == B.Guard && A.Path == B.Path && A.Spelled == B.Spelled &&
+           A.Angled == B.Angled && A.At == B.At;
+  }
 };
 
 /// What a part's lines outside a submodule take from it (REPORT.md T17):
@@ -463,6 +501,14 @@ struct HeaderDependencySet {
   /// scope ("t:" a tag, "o:" any other). Where a copy linking this one skips
   /// it, the compile has read the header already, and must declare each.
   std::vector<std::string> Declares;
+  /// CLANG_HEADER_CACHE_PARTIAL: the headers the copy left out that a
+  /// compile can plug in first, in the order their #includes were reached.
+  std::vector<LeftOutRecord> LeftOut;
+  /// CLANG_HEADER_CACHE_PIECES: each list of dependencies above that a
+  /// check reads is in groups -- the base's, then each submodule's, in
+  /// order -- and the stored metadata marks where each group starts, so a
+  /// check reads the base's group first and skips a submodule's whole.
+  bool Grouped = false;
 };
 
 /// One header's dependency set, as observed over the region between entering

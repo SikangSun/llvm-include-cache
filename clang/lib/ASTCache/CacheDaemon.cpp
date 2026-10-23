@@ -195,8 +195,22 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
     learnLocked(Req.Build, Req.Learned, Req.Used);
     ++Counters.Lookups;
     ++LookupsOf[Req.Filename];
+    // Measurement (CLANG_HEADER_CACHE_PROBE_REUSE): "*<suffix>" asks for
+    // the entries of every name ending in the suffix.
+    std::vector<StoredEntry> Matching;
+    llvm::StringRef Suffix;
+    if (Req.Filename.size() > 1 && Req.Filename[0] == '*') {
+      Suffix = llvm::StringRef(Req.Filename).drop_front();
+      for (const auto &KV : Table)
+        if (KV.getKey().ends_with(Suffix))
+          llvm::append_range(Matching, KV.getValue());
+    }
     auto It = Table.find(Req.Filename);
-    if (It != Table.end()) {
+    if (!Suffix.empty()) {
+      for (const StoredEntry &E : Matching)
+        Resp.Entries.push_back({E.MetadataOffset, E.MetadataLength, E.Offset,
+                                E.Length, std::vector<SearchOutcome>()});
+    } else if (It != Table.end()) {
       ++Counters.Hits;
       // Where every stored entry for the name is, with no comparison of its
       // metadata here. The daemon has no way to evaluate a dependency --
@@ -206,22 +220,37 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
       // The most recently used first: a compile checks them in order and
       // takes the first that fits, which is most often the one that fit
       // the compile before it (REPORT.md I15).
-      std::vector<const StoredEntry *> Order;
-      Order.reserve(It->second.size());
-      for (const StoredEntry &E : It->second)
-        Order.push_back(&E);
-      std::stable_sort(Order.begin(), Order.end(),
-                       [&](const StoredEntry *A, const StoredEntry *B) {
-                         return LastUsed.lookup(A->MetadataOffset) >
-                                LastUsed.lookup(B->MetadataOffset);
-                       });
-      Resp.Entries.reserve(Order.size());
-      for (const StoredEntry *E : Order)
-        Resp.Entries.push_back({E->MetadataOffset, E->MetadataLength,
-                                E->Offset, E->Length,
-                                Req.Build && E->SearchBuild == Req.Build
-                                    ? E->Searches
-                                    : std::vector<SearchOutcome>()});
+      auto Recent = [&](const std::vector<StoredEntry> &Stored,
+                        std::vector<CacheEntryRef> &Out) {
+        std::vector<const StoredEntry *> Order;
+        Order.reserve(Stored.size());
+        for (const StoredEntry &E : Stored)
+          Order.push_back(&E);
+        std::stable_sort(Order.begin(), Order.end(),
+                         [&](const StoredEntry *A, const StoredEntry *B) {
+                           return LastUsed.lookup(A->MetadataOffset) >
+                                  LastUsed.lookup(B->MetadataOffset);
+                         });
+        Out.reserve(Order.size());
+        for (const StoredEntry *E : Order)
+          Out.push_back({E->MetadataOffset, E->MetadataLength, E->Offset,
+                         E->Length,
+                         Req.Build && E->SearchBuild == Req.Build
+                             ? E->Searches
+                             : std::vector<SearchOutcome>()});
+      };
+      Recent(It->second, Resp.Entries);
+      // CLANG_HEADER_CACHE_PIECES: the versions of its copies' sections, in
+      // the same reply.
+      if (auto V = VersionsOf.find(Req.Filename); V != VersionsOf.end())
+        for (const std::string &Name : V->second) {
+          auto Stored = Table.find(Name);
+          if (Stored == Table.end())
+            continue;
+          LookupResponse::SectionVersions &Out = Resp.Versions.emplace_back();
+          Out.Section = Name.substr(Req.Filename.size() + 9);
+          Recent(Stored->second, Out.Entries);
+        }
     }
   }
 
@@ -235,7 +264,16 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
   {
     std::lock_guard<std::mutex> Lock(Mutex);
     ++Counters.Pushes;
-    std::vector<StoredEntry> &Entries = Table[Req.Filename];
+    auto [Slot, NewName] = Table.try_emplace(Req.Filename);
+    std::vector<StoredEntry> &Entries = Slot->second;
+    // CLANG_HEADER_CACHE_PIECES: a version of a section, kept with the
+    // header whose copy holds the section.
+    if (NewName) {
+      size_t At = Req.Filename.find("#section:");
+      if (At != std::string::npos)
+        VersionsOf[Req.Filename.take_front(At)].push_back(
+            Req.Filename.str());
+    }
 
     for (const StoredEntry &E : Entries) {
       if (E.Hash == Hash &&

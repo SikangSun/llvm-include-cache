@@ -42,9 +42,12 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include <array>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace clang {
@@ -331,17 +334,91 @@ public:
       uint64_t Seq;
     };
     std::vector<Change> Changes;
+    /// CLANG_HEADER_CACHE_PARTIAL: each #include the file's text reached
+    /// that was skipped by the header's include guard: the header, by
+    /// canonical path, its guard, the file whose #define gave the guard, how
+    /// the #include spelled it ("<stdint.h>", "\"hash.h\""), and where.
+    struct Skip {
+      std::string Path;
+      std::string Guard;
+      FileID Origin;
+      std::string Spelled;
+      SourceLocation Loc;
+      uint64_t Seq;
+    };
+    std::vector<Skip> Skips;
     /// The last state recorded per name, to record a name again when its
-    /// state changes.
-    llvm::DenseMap<const IdentifierInfo *, const MacroInfo *> SeenMacro;
-    llvm::DenseMap<const IdentifierInfo *, std::pair<bool, FileID>> SeenTest;
-    llvm::DenseMap<const IdentifierInfo *, std::pair<unsigned, FileID>>
-        SeenType;
-    llvm::DenseSet<const FileEntry *> SeenOnce;
+    /// state changes. Held apart so that the vector of FileReads grows by
+    /// moving them: DenseMap's move may throw, and std::vector copies an
+    /// element whose move may.
+    struct SeenState {
+      llvm::DenseMap<const IdentifierInfo *, const MacroInfo *> Macro;
+      llvm::DenseMap<const IdentifierInfo *, std::pair<bool, FileID>> Test;
+      llvm::DenseMap<const IdentifierInfo *, std::pair<unsigned, FileID>>
+          Type;
+      llvm::DenseSet<const FileEntry *> Once;
+    };
+    std::unique_ptr<SeenState> Seen = std::make_unique<SeenState>();
   };
   /// Keep a FileReads for each file read inside a header being exported:
   /// the files TrackOnly accepts and every file entered while one is open.
   void recordFiles() { RecordFiles = true; }
+
+  /// CLANG_HEADER_CACHE_PIECES: the headers \p IsBase accepts are bases.
+  /// Each dependency a base's frame records is marked, as it is recorded,
+  /// with the piece it was read in -- a header the base's own lines include,
+  /// with everything below it -- or the base's own lines; one read in two
+  /// of them is the base's.
+  void piecesFor(std::function<bool(FileID)> IsBase) {
+    PiecesBase = std::move(IsBase);
+  }
+  /// What a base's frame recorded about its pieces. Each dependency of its
+  /// record has its piece in Cond: 0 the base's own lines, K + 1 piece K.
+  struct PiecesRecord {
+    struct Piece {
+      FileID FID;
+      /// Read a state the base's lines or another piece set, changed one
+      /// they set, or changed one they read before it: the base's.
+      bool Bad = false;
+    };
+    std::vector<Piece> Pieces;
+    /// The piece of each file entered under the base, -1 for the base's.
+    llvm::DenseMap<FileID, int32_t> PieceOf;
+    /// Per macro the base's lines or pieces changed, the group that changed
+    /// it last (-1 the base's lines).
+    llvm::DenseMap<const IdentifierInfo *, int32_t> ChangedBy;
+    /// For each element of the record's Conditional, Syntactic, Symbol and
+    /// Inclusion: the file whose directive or declaration gave the state
+    /// read, invalid for none.
+    std::vector<FileID> Origins[4];
+    /// A state a piece set that the base's lines read: checked where the
+    /// piece is skipped or another version of it is read.
+    struct Crossing {
+      int32_t Provider;
+      std::optional<ConditionalDependency> Cond;
+      std::optional<SyntacticDependency> Syn;
+      std::optional<SymbolDependency> Sym;
+    };
+    std::vector<Crossing> Crossings;
+    /// Each #include in the base's own lines that an include guard defined
+    /// before the base skipped: a header the copy leaves out. Before: the
+    /// record's Conditional, Syntactic, Symbol and Inclusion sizes there.
+    /// Clean: the base's lines changed no macro before it but their guard.
+    struct Skip {
+      std::string Path, Guard, Spelled;
+      FileID Origin;
+      SourceLocation Loc;
+      size_t Before[4];
+      bool Clean;
+    };
+    std::vector<Skip> Skips;
+  };
+  const PiecesRecord *piecesRecordFor(FileID FID) const {
+    for (size_t I = 0; I != CompletedFIDs.size(); ++I)
+      if (CompletedFIDs[I] == FID)
+        return CompletedPieces[I].get();
+    return nullptr;
+  }
   /// Every FileReads kept, in the order the files were entered.
   llvm::ArrayRef<FileReads> allFileReads() const { return Files; }
   /// The FileReads of the file entered as \p FID, or nullptr.
@@ -371,6 +448,54 @@ public:
                       const MacroDirective *Undef) override;
 
 private:
+  /// CLANG_HEADER_CACHE_PIECES: per name a base's lines or pieces read or
+  /// changed, which group read it first (-1 the base's lines, or more than
+  /// one group; -2 none) and which group changed it last (-3 none). Read for
+  /// every identifier, so small.
+  struct NameState {
+    int16_t Cond = -2, Syn = -2, Sym = -2, Changer = -3;
+  };
+  struct PiecesState {
+    PiecesRecord Rec;
+    /// How deep the file being read is below the base's, and its piece.
+    int32_t Depth = 0, Cur = -1;
+    llvm::DenseMap<const IdentifierInfo *, NameState> Names;
+    /// Per name, the dependency its first reading recorded, by kind
+    /// (definedness, syntactic, symbol): made the base's when another group
+    /// reads the name too.
+    llvm::DenseMap<const IdentifierInfo *, std::array<int32_t, 3>> DepOf;
+    int32_t &depOf(const IdentifierInfo *II, unsigned Kind) {
+      auto [It, New] = DepOf.try_emplace(II);
+      if (New)
+        It->second.fill(-1);
+      return It->second[Kind];
+    }
+    /// Per #pragma once file skipped, the group that first skipped it and
+    /// its dependency.
+    llvm::DenseMap<const FileEntry *, std::pair<int16_t, int32_t>> Skipped;
+    /// The crossings recorded: name, piece, and the state read.
+    llvm::DenseSet<std::tuple<const IdentifierInfo *, int32_t, uintptr_t>>
+        Crossed;
+    /// Macros the base's lines and pieces changed, and the first the base's
+    /// own lines tested: its include guard, whose #define is not counted.
+    unsigned Changes = 0;
+    const IdentifierInfo *FirstRootTest = nullptr;
+    /// A #pragma push_macro or pop_macro was read: no piece.
+    bool NoPieces = false;
+    /// A piece's group as it stands: a piece that turned out not to be one
+    /// is the base's.
+    int32_t eff(int32_t G) const {
+      return G >= 0 && Rec.Pieces[G].Bad ? -1 : G;
+    }
+    void bad(int32_t K) {
+      if (K < 0 || Rec.Pieces[K].Bad)
+        return;
+      Rec.Pieces[K].Bad = true;
+      if (Cur == K)
+        Cur = -1;
+    }
+  };
+
   /// One header's in-flight state, live between its EnterFile and ExitFile.
   struct Frame {
     FileID FID;
@@ -401,6 +526,8 @@ private:
     /// Something happened in this header that this tracker cannot record
     /// soundly, so it must not be cached at all. Checked at frame close.
     bool Poisoned = false;
+    /// CLANG_HEADER_CACHE_PIECES, for a base.
+    std::unique_ptr<PiecesState> P;
     /// Copies served inside this header and folded into it (foldServed):
     /// the first ID of each one's source-location entries, and how many.
     SmallVector<std::pair<int, unsigned>, 2> Folded;
@@ -416,6 +543,27 @@ private:
       return false;
     }
   };
+
+  /// CLANG_HEADER_CACHE_PIECES: a base's frame reads \p II, changes it, or
+  /// skips a header (see PiecesRecord).
+  void piecesConditional(Frame &F, const IdentifierInfo *II, bool WasDefined,
+                         FileID Origin);
+  void piecesSyntactic(Frame &F, const IdentifierInfo *II, const MacroInfo *MI,
+                       FileID DefFID, std::optional<std::string> &Sequence,
+                       bool &Built);
+  void piecesSymbol(Frame &F, const IdentifierInfo *Name,
+                    SymbolClassification Classification, FileID QueryFID,
+                    FileID ResolvedFID, bool HaveResolved,
+                    llvm::StringRef ResolvedTypeName);
+  void piecesChange(Frame &F, const IdentifierInfo *II);
+  void piecesSkip(Frame &F, const FileEntryRef &SkippedFile,
+                  const Token &FilenameTok, const IdentifierInfo *Guard,
+                  FileID GuardOrigin);
+  /// The state \p II has in \p F was set inside it: by the group reading
+  /// it, by another piece (a crossing, which the base's lines read), or by
+  /// the base's lines (which no piece may read).
+  void piecesInternal(Frame &F, const IdentifierInfo *II,
+                      PiecesRecord::Crossing C);
 
   /// Records a definedness test into every open frame it is external to.
   void recordConditional(const Token &MacroNameTok, const MacroDefinition &MD);
@@ -478,6 +626,8 @@ private:
   llvm::SmallVector<size_t, 8> OpenFiles;
   uint64_t Clock = 0;
   std::vector<Sites> CompletedSites;
+  std::vector<std::unique_ptr<PiecesRecord>> CompletedPieces;
+  std::function<bool(FileID)> PiecesBase;
   FileReads *currentFile() {
     return OpenFiles.empty() ? nullptr : &Files[OpenFiles.back()];
   }

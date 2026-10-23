@@ -66,11 +66,47 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   W.str(ModuleName);
   W.str(Deps.HeaderName);
 
+  // CLANG_HEADER_CACHE_PIECES: for each grouped section, where each group
+  // -- the base's, then each submodule's -- starts, in bytes from the
+  // section's first element, and how many elements it holds. Elements come
+  // grouped (HeaderDependencySet::Grouped); one out of order leaves the copy
+  // ungrouped, which a check reads whole.
+  constexpr unsigned NG = std::size(MetadataView::GroupedSections);
+  uint32_t G = Deps.Grouped ? Deps.Submodules.size() + 1 : 0;
+  std::vector<std::pair<uint32_t, uint32_t>> Marks(G * NG, {UINT32_MAX, 0});
+  uint32_t Ends[NG] = {};
+  int Kind = -1;
+  uint32_t Last = 0;
+  size_t ElementsAt = 0;
+  bool Unsorted = false;
+  auto Mark = [&](uint32_t Cond) {
+    if (!G || Kind < 0)
+      return;
+    uint32_t Group =
+        Cond && Cond <= Deps.Conditions.size()
+            ? static_cast<uint32_t>(Deps.Conditions[Cond - 1].Owner + 1)
+            : 0;
+    if (Group >= G || Group < Last) {
+      Unsorted = true;
+      return;
+    }
+    Last = Group;
+    auto &M = Marks[Kind * G + Group];
+    if (M.first == UINT32_MAX)
+      M.first = static_cast<uint32_t>(Out.size() - ElementsAt);
+    ++M.second;
+  };
+
   // Notes where section S starts and writes its count.
   auto Begin = [&](MetadataView::Section S, size_t Count) {
+    if (Kind >= 0)
+      Ends[Kind] = static_cast<uint32_t>(Out.size() - ElementsAt);
     llvm::support::endian::write32le(Out.data() + Table + 4 * S,
                                      static_cast<uint32_t>(Out.size() - Base));
     W.u32(static_cast<uint32_t>(Count));
+    Kind = MetadataView::groupedIndex(S);
+    ElementsAt = Out.size();
+    Last = 0;
   };
   using SD = SyntacticDependency;
   auto Requires = [&](SD::State S) {
@@ -80,6 +116,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
 
   Begin(MetadataView::Conditional, Deps.Conditional.size());
   for (const ConditionalDependency &D : Deps.Conditional) {
+    Mark(D.Cond);
     W.str(D.MacroName);
     W.u8(D.WasDefined ? 1 : 0);
     W.vu32(D.Cond);
@@ -88,6 +125,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   Begin(MetadataView::ExpandsTo, Requires(SD::State::ExpandsTo));
   for (const SD &D : Deps.Syntactic)
     if (D.Required == SD::State::ExpandsTo) {
+      Mark(D.Cond);
       W.str(D.Name);
       W.str(D.TokenSequence);
       W.vu32(D.Cond);
@@ -107,6 +145,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
 
   Begin(MetadataView::Inclusion, Deps.Inclusion.size());
   for (const InclusionDependency &D : Deps.Inclusion) {
+    Mark(D.Cond);
     W.str(D.HeaderPath);
     W.u8(static_cast<uint8_t>(D.Why));
     W.vu32(D.Cond);
@@ -115,12 +154,14 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   Begin(MetadataView::NotAMacro, Requires(SD::State::NotAMacro));
   for (const SD &D : Deps.Syntactic)
     if (D.Required == SD::State::NotAMacro) {
+      Mark(D.Cond);
       W.str(D.Name);
       W.vu32(D.Cond);
     }
 
   Begin(MetadataView::Symbol, Deps.Symbol.size());
   for (const SymbolDependency &D : Deps.Symbol) {
+    Mark(D.Cond);
     W.str(D.Name);
     W.u8(static_cast<uint8_t>(D.Classification));
     W.str(D.ResolvedTypeName);
@@ -129,6 +170,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
 
   Begin(MetadataView::Files, Deps.Files.size());
   for (const FileStamp &F : Deps.Files) {
+    Mark(F.Cond);
     W.str(F.Path);
     W.u64(F.Size);
     W.u64(static_cast<uint64_t>(F.ModTime));
@@ -137,6 +179,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
 
   Begin(MetadataView::Includes, Deps.Includes.size());
   for (const IncludeDependency &D : Deps.Includes) {
+    Mark(D.Cond);
     W.u8(static_cast<uint8_t>(D.K));
     W.u8(D.Angled ? 1 : 0);
     W.str(D.Spelled);
@@ -148,6 +191,7 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
 
   Begin(MetadataView::FileNames, Deps.FileNames.size());
   for (const FileNameDependency &D : Deps.FileNames) {
+    Mark(D.Cond);
     W.u8(static_cast<uint8_t>(D.Which));
     W.u32(static_cast<uint32_t>(D.File));
     W.str(D.Text);
@@ -161,8 +205,10 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.vu32(D.Cond);
   };
   Begin(MetadataView::Declarations, Deps.Declarations.size());
-  for (const DeclarationDependency &D : Deps.Declarations)
+  for (const DeclarationDependency &D : Deps.Declarations) {
+    Mark(D.Cond);
     Declaration(D);
+  }
 
   Begin(MetadataView::MacroEffects, Deps.MacroEffects.size());
   for (const MacroEffect &E : Deps.MacroEffects) {
@@ -201,12 +247,16 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.u32(static_cast<uint32_t>(S.Parent));
     W.str(S.Guard);
     W.str(S.Path);
+    W.str(S.Spelled);
+    W.u8(S.Angled ? 1 : 0);
+    W.u32(S.At);
   }
 
   Begin(MetadataView::Conditions, Deps.Conditions.size());
   for (const DependencyCondition &C : Deps.Conditions) {
     W.u32(static_cast<uint32_t>(C.Owner));
     W.u32(static_cast<uint32_t>(C.Provider));
+    W.u32(static_cast<uint32_t>(C.LeftOut));
   }
 
   Begin(MetadataView::Provided, Deps.Provided.size());
@@ -236,6 +286,33 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   for (const std::string &N : Deps.Declares) {
     W.str(N);
     W.vu32(0);
+  }
+
+  Begin(MetadataView::LeftOut, Deps.LeftOut.size());
+  for (const LeftOutRecord &L : Deps.LeftOut) {
+    W.str(L.Guard);
+    W.str(L.Path);
+    W.str(L.Spelled);
+    W.u8(L.Angled ? 1 : 0);
+    W.u32(L.At);
+  }
+
+  if (Unsorted)
+    G = 0;
+  Begin(MetadataView::Groups, G);
+  for (unsigned K = 0; K != NG && G; ++K) {
+    // A group with no elements starts where the next one does.
+    uint32_t Next = Ends[K];
+    for (uint32_t I = G; I-- > 0;) {
+      auto &M = Marks[K * G + I];
+      if (M.first == UINT32_MAX)
+        M.first = Next;
+      Next = M.first;
+    }
+    for (uint32_t I = 0; I != G; ++I) {
+      W.u32(Marks[K * G + I].first);
+      W.u32(Marks[K * G + I].second);
+    }
   }
 }
 
@@ -394,6 +471,9 @@ SubmoduleView SubmoduleView::read(ByteReader &R) {
   S.Parent = static_cast<int32_t>(R.u32());
   S.Guard = R.str();
   S.Path = R.str();
+  S.Spelled = R.str();
+  S.Angled = upTo(R, 1) != 0;
+  S.At = R.u32();
   return S;
 }
 
@@ -413,7 +493,18 @@ ConditionView ConditionView::read(ByteReader &R) {
   ConditionView C;
   C.Owner = static_cast<int32_t>(R.u32());
   C.Provider = static_cast<int32_t>(R.u32());
+  C.LeftOut = static_cast<int32_t>(R.u32());
   return C;
+}
+
+LeftOutView LeftOutView::read(ByteReader &R) {
+  LeftOutView L;
+  L.Guard = R.str();
+  L.Path = R.str();
+  L.Spelled = R.str();
+  L.Angled = upTo(R, 1) != 0;
+  L.At = R.u32();
+  return L;
 }
 
 WarningPragmaView WarningPragmaView::read(ByteReader &R) {
@@ -451,7 +542,23 @@ std::optional<MetadataView> MetadataView::open(llvm::StringRef Bytes) {
   V.HeaderName = Fixed.str();
   if (!Fixed.atEnd())
     return std::nullopt;
+  ByteReader Marks(Bytes.slice(V.Starts[Groups], V.Starts[Groups + 1]));
+  V.NumGroups = Marks.count();
+  // Each group of each grouped section has its mark.
+  if (V.Starts[Groups + 1] - V.Starts[Groups] !=
+      4 + 8 * uint64_t(V.NumGroups) * std::size(GroupedSections))
+    return std::nullopt;
   return V;
+}
+
+std::pair<uint32_t, uint32_t> MetadataView::groupMark(Section S,
+                                                      uint32_t G) const {
+  ByteReader R(Bytes.slice(Starts[Groups] + 4 +
+                               8 * (groupedIndex(S) * NumGroups + G),
+                           Starts[Groups + 1]));
+  uint32_t Offset = R.u32();
+  uint32_t Count = R.u32();
+  return {Offset, Count};
 }
 
 bool MetadataView::validate() const {
@@ -462,7 +569,13 @@ bool MetadataView::validate() const {
       !macroEffects().valid() || !diagnostics().valid() ||
       !warningPragmas().valid() || !submodules().valid() ||
       !conditions().valid() || !provided().valid() || !links().valid() ||
-      !declares().valid())
+      !declares().valid() || !leftOut().valid())
+    return false;
+  // A left-out header names its guard, which decides whether to plug it
+  // in, and its file and spelling, which plug it in.
+  if (llvm::any_of(leftOut(), [](const LeftOutView &L) {
+        return L.Guard.empty() || L.Path.empty() || L.Spelled.empty();
+      }))
     return false;
   // A link names the copy it loads; one skipped by its guard names that.
   if (llvm::any_of(links(), [](const LinkView &L) {
@@ -504,15 +617,59 @@ bool MetadataView::validate() const {
       return false;
     ++S;
   }
+  int32_t NL = leftOut().size();
   if (!llvm::all_of(conditions(), [&](const ConditionView &C) {
         return C.Owner >= -1 && C.Owner < S && C.Provider >= -1 &&
-               C.Provider < S;
+               C.Provider < S && C.LeftOut >= -1 && C.LeftOut < NL;
       }))
     return false;
   uint32_t NC = conditions().size();
   auto Fits = [&](auto Section) {
     return llvm::all_of(Section, [&](const auto &E) { return E.Cond <= NC; });
   };
+  // CLANG_HEADER_CACHE_PIECES: a grouped copy has a group per submodule
+  // and the base's; in each grouped section the groups start in order,
+  // hold every element between them, and each element is its group's.
+  uint32_t G = groups();
+  if (Starts[Groups + 1] - Starts[Groups] !=
+      4 + 8 * G * std::size(GroupedSections))
+    return false;
+  if (G) {
+    if (G != uint32_t(S) + 1)
+      return false;
+    std::vector<int32_t> OwnerOf{-1};
+    for (const ConditionView &C : conditions())
+      OwnerOf.push_back(C.Owner);
+    auto Grouped = [&](auto Whole, Section Sec, auto *Tag) {
+      using T = std::remove_pointer_t<decltype(Tag)>;
+      uint32_t Total = 0, Prev = 0;
+      uint32_t Size = Starts[Sec + 1] - Starts[Sec] - 4;
+      for (uint32_t I = 0; I != G; ++I) {
+        auto [Offset, Count] = groupMark(Sec, I);
+        if (Offset < Prev || Offset > Size)
+          return false;
+        Prev = Offset;
+        MetadataSection<T> Part = group<T>(Sec, I);
+        if (!Part.valid())
+          return false;
+        for (const T &E : Part)
+          if (E.Cond > NC || OwnerOf[E.Cond] + 1 != int32_t(I))
+            return false;
+        Total += Count;
+      }
+      return Total == Whole.size();
+    };
+    if (!Grouped(conditional(), Conditional, (ConditionalView *)nullptr) ||
+        !Grouped(expandsTo(), ExpandsTo, (ExpandsToView *)nullptr) ||
+        !Grouped(inclusion(), Inclusion, (InclusionView *)nullptr) ||
+        !Grouped(notAMacro(), NotAMacro, (NameView *)nullptr) ||
+        !Grouped(symbol(), Symbol, (SymbolView *)nullptr) ||
+        !Grouped(files(), Files, (FileStampView *)nullptr) ||
+        !Grouped(includes(), Includes, (IncludeView *)nullptr) ||
+        !Grouped(fileNames(), FileNames, (FileNameView *)nullptr) ||
+        !Grouped(declarations(), Declarations, (DeclarationView *)nullptr))
+      return false;
+  }
   return Fits(conditional()) && Fits(expandsTo()) && Fits(inclusion()) &&
          Fits(notAMacro()) && Fits(symbol()) && Fits(files()) &&
          Fits(includes()) && Fits(fileNames()) && Fits(declarations()) &&
@@ -562,10 +719,13 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
   for (const WarningPragmaView &P : V->warningPragmas())
     Deps.WarningPragmas.push_back(P.Pragma);
   for (const SubmoduleView &S : V->submodules())
-    Deps.Submodules.push_back(
-        {S.Name.str(), S.Parent, S.Guard.str(), S.Path.str()});
+    Deps.Submodules.push_back({S.Name.str(), S.Parent, S.Guard.str(),
+                               S.Path.str(), S.Spelled.str(), S.Angled, S.At});
   for (const ConditionView &C : V->conditions())
-    Deps.Conditions.push_back({C.Owner, C.Provider});
+    Deps.Conditions.push_back({C.Owner, C.Provider, C.LeftOut});
+  for (const LeftOutView &L : V->leftOut())
+    Deps.LeftOut.push_back(
+        {L.Guard.str(), L.Path.str(), L.Spelled.str(), L.Angled, L.At});
   for (const ProvidedView &D : V->provided()) {
     ProvidedDeclaration P;
     P.Decl = {D.In, D.Name.str(), D.Fingerprint.str(), D.Cond};
@@ -582,6 +742,7 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
       R.Names.push_back(N.str());
     Deps.Links.push_back(std::move(R));
   }
+  Deps.Grouped = V->groups() != 0;
   Deps.HeaderName = V->headerName().str();
   Deps.Entry = V->entry();
   Deps.Exit = V->exit();

@@ -33,15 +33,19 @@
 #include "clang/Serialization/ASTWriter.h"
 #include "clang/Serialization/ModuleManager.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
+#include <array>
 #include <chrono>
 #include <unistd.h>
 #include <map>
@@ -160,6 +164,21 @@ public:
         Deliver(std::move(Deliver)), ByName(ByName), Pragmas(Pragmas) {
     const char *Link = std::getenv("CLANG_HEADER_CACHE_LINK");
     LinkMode = Link && llvm::StringRef(Link) == "1";
+    const char *Partial = std::getenv("CLANG_HEADER_CACHE_PARTIAL");
+    PartialMode = !LinkMode && Partial && llvm::StringRef(Partial) == "1";
+    // Guard conflicts are resolved only where asked: headers held as
+    // sections a compile skips where it read them (REPORT.md T17,
+    // CLANG_HEADER_CACHE_SECTIONS=1), or bases and pieces
+    // (CLANG_HEADER_CACHE_PIECES). By default a copy folds in every header
+    // inside it, with no sections.
+    const char *Sections = std::getenv("CLANG_HEADER_CACHE_SECTIONS");
+    const char *Pieces = std::getenv("CLANG_HEADER_CACHE_PIECES");
+    bool PiecesAsked = Pieces && *Pieces && llvm::StringRef(Pieces) != "0";
+    NoSubmodules = std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES") ||
+                   !((Sections && llvm::StringRef(Sections) == "1") ||
+                     PiecesAsked);
+    PiecesMode = !LinkMode && !NoSubmodules && PiecesAsked;
+
     std::lock_guard<std::mutex> L(RegistryLock);
     registry()[&CI] = this;
   }
@@ -169,8 +188,9 @@ public:
     registry().erase(&CI);
   }
 
-  void exportNext(FileEntryRef File) override {
+  void exportNext(FileEntryRef File, llvm::StringRef StoredAs) override {
     Expected = &File.getFileEntry();
+    ExpectedStored = StoredAs.str();
   }
 
   void served(serialization::ModuleFile *Fold, const MetadataView *Deps,
@@ -341,6 +361,9 @@ public:
   /// Whether the tracker should keep a record for \p FID: only for the
   /// headers being exported.
   bool tracks(FileID FID) const { return Tracked.contains(FID); }
+  bool piecesBase(FileID FID) const { return PiecesBases.contains(FID); }
+  bool pieces() const { return PiecesMode; }
+  bool sections() const { return !NoSubmodules; }
   /// Whether a header being exported is open.
   bool inside() const { return !Open.empty(); }
 
@@ -354,6 +377,8 @@ public:
       OptionalFileEntryRef FE = SM.getFileEntryRefForID(FID);
       const FileEntry *Want = Expected;
       Expected = nullptr;
+      std::string StoredAs = std::move(ExpectedStored);
+      ExpectedStored.clear();
       if (!FE)
         return;
       // A header inside one being exported can be held as a submodule of
@@ -377,7 +402,7 @@ public:
         return;
       if (ByPath)
         ExpectedPath.clear();
-      begin(FID, *FE);
+      begin(FID, *FE, StoredAs);
       return;
     }
     if (Reason != ExitFile)
@@ -642,6 +667,9 @@ private:
     /// The name the compile opened the header by, and the absolute path the
     /// daemon stores it under.
     std::string Name, Stored;
+    /// CLANG_HEADER_CACHE_PIECES: stored as a version of another header's
+    /// section.
+    bool Version = false;
     /// The offsets of every location made while the header was open, and
     /// the local source-location entries that hold them, from FID's on.
     SourceLocation::UIntTy Begin = 0, End = 0;
@@ -689,6 +717,10 @@ private:
     llvm::DenseMap<FileID, uint32_t> CondOfFile;
     /// The submodules made, by index into the metadata's Submodules.
     std::vector<Module *> SubModules;
+    /// CLANG_HEADER_CACHE_PARTIAL: the headers the copy left out, by
+    /// canonical path, and the condition of what the copy takes from each.
+    std::vector<std::string> LeftOutPaths;
+    std::vector<uint32_t> LeftOutCond;
   };
 
   /// Puts a diagnostic into \p P, to be printed again at a hit.
@@ -893,13 +925,17 @@ private:
     return CI.getASTReader()->getModuleManager().size();
   }
 
-  void begin(FileID FID, FileEntryRef FE) {
+  void begin(FileID FID, FileEntryRef FE, llvm::StringRef StoredAs = {}) {
     Part P;
     P.FID = FID;
     P.Id = ++PartsBegun;
     P.ParentId = Open.empty() ? 0 : Open.back().Id;
     P.Name = FE.getName().str();
-    P.Stored = absolutePath(CI.getFileManager(), P.Name);
+    P.Stored = StoredAs.empty() ? absolutePath(CI.getFileManager(), P.Name)
+                                : StoredAs.str();
+    P.Version = !StoredAs.empty();
+    if (PiecesMode && !P.Version)
+      PiecesBases.insert(FID);
     P.IncludeLoc = SM.getIncludeLoc(FID);
     P.Begin = SM.getSLocEntry(FID).getOffset();
     P.DeclsAfter = LastTopLevel;
@@ -1429,8 +1465,19 @@ private:
     // REPORT.md T17: the headers inside held as submodules, and the
     // dependencies put together per submodule.
     auto Composing = std::chrono::steady_clock::now();
-    if (!LinkMode)
-      compose(P, Deps);
+    // A version of a section (CLANG_HEADER_CACHE_PIECES) holds everything
+    // below it folded, as a top-level copy does, and is never a base.
+    if (PiecesMode) {
+      if (!P.Version)
+        composePieces(P, Deps);
+    } else {
+      if (!LinkMode && !NoSubmodules)
+        compose(P, Deps);
+      if (PartialMode) {
+        PartReads R = partReads(P);
+        leftOut(P, Deps, R);
+      }
+    }
     Counts.ComposeMicros += std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - Composing)
                                 .count();
@@ -1513,6 +1560,8 @@ private:
     for (DeclarationDependency &D : LinkNeeds)
       if (!llvm::is_contained(Deps.Declarations, D))
         Deps.Declarations.push_back(std::move(D));
+    if (!P.LeftOutPaths.empty())
+      leftOutDeclarations(P, Deps, W.DeclarationLocs);
     P.WrittenDecls = Deps.Declarations;
     if (LinkMode)
       declares(P, Deps.Declares);
@@ -1670,6 +1719,10 @@ private:
     std::vector<std::optional<SubmoduleRecord>> Candidate(All.size());
     llvm::StringMap<uint64_t> FirstTest;
     for (size_t I = 1; I != All.size(); ++I) {
+      // CLANG_HEADER_CACHE_PIECES: sections are the headers the header's
+      // own lines include; below them everything is folded.
+      if (PiecesMode && Parent[I] != 0)
+        continue;
       auto N = NestedAt.find(All[I]->FID);
       if (N == NestedAt.end() || !N->second.AtBoundary || !N->second.Neutral)
         continue;
@@ -1685,6 +1738,9 @@ private:
         continue;
       // Where the reader finds which declarations it holds.
       Rec.Path = absolutePath(CI.getFileManager(), FE->getName());
+      if (PiecesMode && !spelling(SM.getIncludeLoc(All[I]->FID), Rec.Spelled,
+                                  Rec.Angled, Rec.At))
+        continue;
       if (!Rec.Guard.empty())
         FirstTest.try_emplace(Rec.Guard, UINT64_MAX);
       Candidate[I] = std::move(Rec);
@@ -1739,6 +1795,30 @@ private:
         for (const FR::Change &C : F.Changes)
           if (Before(C.Replaced))
             Qualifies = false;
+      }
+      // CLANG_HEADER_CACHE_PIECES: another version of the section is read
+      // before the header's lines, so those lines before the #include must
+      // read nothing the section sets.
+      if (Qualifies && PiecesMode) {
+        llvm::SmallPtrSet<const IdentifierInfo *, 16> Sets;
+        for (size_t J = I; J != All.size() && Within(J, I); ++J)
+          for (const FR::Change &C : All[J]->Changes)
+            Sets.insert(C.II);
+        auto Reads = [&](llvm::StringRef Name) {
+          return llvm::any_of(Sets, [&](const IdentifierInfo *II) {
+            return II->getName() == Name;
+          });
+        };
+        for (size_t G = 0; G != All.size() && Qualifies; ++G) {
+          if (Within(G, I))
+            continue;
+          for (const auto &E : All[G]->Conditional)
+            if (E.Seq < All[I]->Enter && Reads(E.Dep.MacroName))
+              Qualifies = false;
+          for (const auto &E : All[G]->Syntactic)
+            if (E.Seq < All[I]->Enter && Reads(E.Dep.Name))
+              Qualifies = false;
+        }
       }
       if (!Qualifies)
         continue;
@@ -1849,6 +1929,784 @@ private:
     Deps.Submodules = std::move(Subs);
     Lap(Counts.DepsMicros);
     Counts.Submodules += Deps.Submodules.size();
+  }
+
+  /// CLANG_HEADER_CACHE_PIECES: base \p P's copy, from what the tracker
+  /// marked as it recorded (ASTCacheDependencyTracker::PiecesRecord). Each
+  /// piece that stayed one and can be held apart -- it begins between
+  /// declarations, leaves the pragmas as it found them, has an include
+  /// guard or is #pragma once, and its #include is spelled in the base's
+  /// text -- is a section; each dependency is in its section's group or
+  /// the base's; a state a section set that the base's lines read is
+  /// checked where the section is skipped; and each header the base's
+  /// lines skipped, read before the base, that can be read first instead
+  /// is left out. Each list of dependencies is then in groups, the base's
+  /// first.
+  void composePieces(Part &P, HeaderDependencySet &Deps) {
+    auto LapStart = std::chrono::steady_clock::now();
+    auto Lap = [&](uint64_t &To) {
+      auto Now = std::chrono::steady_clock::now();
+      To += std::chrono::duration_cast<std::chrono::microseconds>(Now - LapStart)
+                .count();
+      LapStart = Now;
+    };
+    using PR = ASTCacheDependencyTracker::PiecesRecord;
+    const PR *R = Tracker.piecesRecordFor(P.FID);
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    // The section each piece is, -1 for none.
+    std::vector<int32_t> SectionOf;
+    Deps.Conditions.clear();
+    if (R && P.Stacks.empty())
+      for (const PR::Piece &Piece : R->Pieces) {
+        SectionOf.push_back(-1);
+        if (Piece.Bad)
+          continue;
+        auto N = NestedAt.find(Piece.FID);
+        if (N == NestedAt.end() || !N->second.AtBoundary || !N->second.Neutral)
+          continue;
+        OptionalFileEntryRef FE = SM.getFileEntryRefForID(Piece.FID);
+        if (!FE)
+          continue;
+        SubmoduleRecord Rec;
+        HeaderFileInfo &Info = HS.getFileInfo(*FE);
+        if (const IdentifierInfo *G =
+                Info.getControllingMacro(HS.getExternalLookup()))
+          Rec.Guard = G->getName().str();
+        else if (!Info.isPragmaOnce)
+          continue;
+        Rec.Path = absolutePath(CI.getFileManager(), FE->getName());
+        if (!spelling(SM.getIncludeLoc(Piece.FID), Rec.Spelled, Rec.Angled,
+                      Rec.At))
+          continue;
+        SectionOf.back() = Deps.Submodules.size();
+        Rec.Name = "s" + std::to_string(Deps.Submodules.size());
+        Deps.Submodules.push_back(std::move(Rec));
+        Deps.Conditions.push_back({SectionOf.back(), -1});
+      }
+    auto Map = [&](uint32_t &C) {
+      size_t K = C - 1;
+      C = C && K < SectionOf.size() && SectionOf[K] >= 0 ? SectionOf[K] + 1
+                                                         : 0;
+    };
+    for (auto &D : Deps.Conditional)
+      Map(D.Cond);
+    for (auto &D : Deps.Syntactic)
+      Map(D.Cond);
+    for (auto &D : Deps.Symbol)
+      Map(D.Cond);
+    for (auto &D : Deps.Inclusion)
+      Map(D.Cond);
+    for (auto &D : Deps.Includes)
+      Map(D.Cond);
+    for (auto &D : Deps.FileNames)
+      Map(D.Cond);
+    Lap(Counts.ChooseMicros);
+
+    // The condition of what the copy takes from left-out header K, for an
+    // element under condition C (0: always).
+    std::map<std::pair<uint32_t, int>, uint32_t> CondFor;
+    auto CondOf = [&](uint32_t C, int K) {
+      auto [It, New] = CondFor.try_emplace({C, K}, 0);
+      if (New) {
+        DependencyCondition D;
+        if (C)
+          D = Deps.Conditions[C - 1];
+        D.LeftOut = K;
+        Deps.Conditions.push_back(D);
+        It->second = Deps.Conditions.size();
+      }
+      return It->second;
+    };
+    if (R && !R->Skips.empty())
+      leftOutPieces(P, Deps, *R, CondOf);
+
+    // What a section set that the base's lines read: checked where the
+    // section is skipped, or another version of it is read.
+    std::vector<uint32_t> CrossCond(Deps.Submodules.size(), 0);
+    if (R)
+      for (const PR::Crossing &C : R->Crossings) {
+        int32_t K = C.Provider < int32_t(SectionOf.size())
+                        ? SectionOf[C.Provider]
+                        : -1;
+        if (K < 0)
+          continue;
+        if (!CrossCond[K]) {
+          Deps.Conditions.push_back({-1, K});
+          CrossCond[K] = Deps.Conditions.size();
+        }
+        if (C.Cond) {
+          Deps.Conditional.push_back(*C.Cond);
+          Deps.Conditional.back().Cond = CrossCond[K];
+        } else if (C.Syn) {
+          Deps.Syntactic.push_back(*C.Syn);
+          Deps.Syntactic.back().Cond = CrossCond[K];
+        } else if (C.Sym) {
+          Deps.Symbol.push_back(*C.Sym);
+          Deps.Symbol.back().Cond = CrossCond[K];
+        }
+        ++Counts.Crossing;
+      }
+
+    // Which section each condition belongs to; a section's own guard test
+    // decides whether it loads, and is not checked besides.
+    auto GroupOf = [&](uint32_t C) {
+      return C ? Deps.Conditions[C - 1].Owner + 1 : 0;
+    };
+    llvm::erase_if(Deps.Conditional, [&](const ConditionalDependency &D) {
+      int G = GroupOf(D.Cond);
+      return G && !D.WasDefined && Deps.Conditions[D.Cond - 1].Provider < 0 &&
+             Deps.Submodules[G - 1].Guard == D.MacroName;
+    });
+
+    // The section of each file the base held, and of each macro it left
+    // changed, by its last directive there.
+    if (R)
+      for (const auto &[F, K] : R->PieceOf) {
+        int32_t S = K >= 0 && K < int32_t(SectionOf.size()) ? SectionOf[K] : -1;
+        if (S < 0)
+          continue;
+        P.CondOfFile[F] = S + 1;
+        P.SubmoduleOf[F] = S;
+      }
+    // By the group that changed it last, as the tracker saw.
+    Preprocessor &PP = CI.getPreprocessor();
+    if (R && !Deps.Submodules.empty())
+      for (MacroEffect &E : Deps.MacroEffects) {
+        auto It = R->ChangedBy.find(PP.getIdentifierInfo(E.Name));
+        if (It != R->ChangedBy.end() && It->second >= 0 &&
+            It->second < int32_t(SectionOf.size()) && SectionOf[It->second] >= 0)
+          E.Cond = SectionOf[It->second] + 1;
+      }
+
+    // In groups: the base's, then each section's, each in the order read.
+    // Each element moves once, to where its group's count puts it.
+    std::vector<uint32_t> Start(Deps.Submodules.size() + 2);
+    auto ByGroup = [&](auto &V) {
+      std::fill(Start.begin(), Start.end(), 0);
+      bool InOrder = true;
+      int Last = 0;
+      for (const auto &E : V) {
+        int G = GroupOf(E.Cond);
+        ++Start[G + 1];
+        InOrder &= G >= Last;
+        Last = G;
+      }
+      if (InOrder)
+        return;
+      for (size_t G = 1; G != Start.size(); ++G)
+        Start[G] += Start[G - 1];
+      std::remove_reference_t<decltype(V)> Out(V.size());
+      for (auto &E : V)
+        Out[Start[GroupOf(E.Cond)]++] = std::move(E);
+      V = std::move(Out);
+    };
+    ByGroup(Deps.Conditional);
+    ByGroup(Deps.Syntactic);
+    ByGroup(Deps.Symbol);
+    ByGroup(Deps.Inclusion);
+    // The #includes, renumbered where they move: each names its includer,
+    // and each __FILE__ its file, by index.
+    {
+      std::vector<std::pair<int, size_t>> Order;
+      for (size_t I = 0; I != Deps.Includes.size(); ++I)
+        Order.push_back({GroupOf(Deps.Includes[I].Cond), I});
+      if (!llvm::is_sorted(Order)) {
+        llvm::stable_sort(Order, [](const auto &A, const auto &B) {
+          return A.first < B.first;
+        });
+        std::vector<int32_t> NewIndex(Order.size());
+        std::vector<IncludeDependency> Includes;
+        Includes.reserve(Order.size());
+        for (size_t J = 0; J != Order.size(); ++J) {
+          NewIndex[Order[J].second] = J;
+          Includes.push_back(std::move(Deps.Includes[Order[J].second]));
+        }
+        for (IncludeDependency &D : Includes)
+          if (D.Includer >= 0)
+            D.Includer = NewIndex[D.Includer];
+        Deps.Includes = std::move(Includes);
+        for (FileNameDependency &D : Deps.FileNames)
+          if (D.File >= 0)
+            D.File = NewIndex[D.File];
+      }
+    }
+    ByGroup(Deps.FileNames);
+    Deps.Grouped = true;
+    Counts.Submodules += Deps.Submodules.size();
+    Lap(Counts.DepsMicros);
+  }
+
+  /// The headers base \p P's lines skipped, read before the base, that a
+  /// compile can read first instead (LeftOutRecord): the base's lines
+  /// changed no macro and declared nothing before the #include, which the
+  /// header could have read, and read nothing before it that the header
+  /// set. What the copy takes from one applies only where it is not read
+  /// first.
+  template <typename CondOfT>
+  void leftOutPieces(Part &P, HeaderDependencySet &Deps,
+                     const ASTCacheDependencyTracker::PiecesRecord &R,
+                     CondOfT &CondOf) {
+    using PR = ASTCacheDependencyTracker::PiecesRecord;
+    FileManager &FM = CI.getFileManager();
+    // The first skip of each header.
+    std::vector<const PR::Skip *> Cand;
+    llvm::StringSet<> SeenPath;
+    llvm::DenseMap<const FileEntry *, unsigned> CandOf;
+    for (const PR::Skip &S : R.Skips)
+      if (SeenPath.insert(S.Path).second)
+        if (OptionalFileEntryRef FE = FM.getOptionalFileRef(S.Path))
+          if (CandOf.try_emplace(&FE->getFileEntry(), Cand.size()).second)
+            Cand.push_back(&S);
+    if (Cand.empty())
+      return;
+    // The earliest declaration of the base's own lines: file-scope
+    // declarations are added in the order they are parsed.
+    SourceLocation AnyDecl;
+    {
+      ASTContext &Ctx = CI.getASTContext();
+      Decl *First =
+          P.DeclsAfter
+              ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+              : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+      for (Decl *D = First; D && AnyDecl.isInvalid();
+           D = D->getNextDeclInContext()) {
+        if (D->isFromASTFile() || !isa<NamedDecl>(D))
+          continue;
+        SourceLocation L = SM.getExpansionLoc(D->getLocation());
+        if (inPart(P, L))
+          AnyDecl = L;
+      }
+    }
+    // Only a header no change or declaration came before can be left out;
+    // where none is, nothing more is looked at.
+    llvm::erase_if(Cand, [&](const PR::Skip *S) {
+      return !S->Clean ||
+             (AnyDecl.isValid() &&
+              SM.isBeforeInTranslationUnit(AnyDecl,
+                                           SM.getExpansionLoc(S->Loc)));
+    });
+    if (Cand.empty())
+      return;
+    CandOf.clear();
+    for (unsigned C = 0; C != Cand.size(); ++C)
+      if (OptionalFileEntryRef FE = FM.getOptionalFileRef(Cand[C]->Path))
+        CandOf.try_emplace(&FE->getFileEntry(), C);
+    // The candidates each file was read inside, following each file's
+    // #include up -- through a copy's module as well, whose files keep
+    // where they were included -- as an index into Lists.
+    std::vector<llvm::SmallVector<unsigned, 2>> Lists(1);
+    llvm::DenseMap<FileID, unsigned> ListOf;
+    auto Around = [&](FileID F) -> unsigned {
+      llvm::SmallVector<FileID, 16> Up;
+      unsigned Base = 0;
+      for (unsigned Depth = 0; F.isValid() && Depth != 256; ++Depth) {
+        if (auto It = ListOf.find(F); It != ListOf.end()) {
+          Base = It->second;
+          break;
+        }
+        Up.push_back(F);
+        SourceLocation Inc = SM.getIncludeLoc(F);
+        if (Inc.isInvalid())
+          break;
+        F = SM.getFileID(Inc);
+      }
+      for (FileID U : llvm::reverse(Up)) {
+        if (auto C = CandOf.find(SM.getFileEntryForID(U)); C != CandOf.end()) {
+          llvm::SmallVector<unsigned, 2> L = Lists[Base];
+          L.push_back(C->second);
+          Lists.push_back(std::move(L));
+          Base = Lists.size() - 1;
+        }
+        ListOf[U] = Base;
+      }
+      return Base;
+    };
+    // Per candidate and list, the first element whose state a file inside
+    // the header gave.
+    size_t Sizes[4] = {Deps.Conditional.size(), Deps.Syntactic.size(),
+                       Deps.Symbol.size(), Deps.Inclusion.size()};
+    std::vector<std::array<size_t, 4>> First(Cand.size());
+    for (auto &A : First)
+      A.fill(SIZE_MAX);
+    std::vector<unsigned> ListAt[4];
+    for (unsigned K = 0; K != 4; ++K) {
+      ListAt[K].resize(Sizes[K], 0);
+      for (size_t I = 0; I != Sizes[K] && I != R.Origins[K].size(); ++I) {
+        FileID O = R.Origins[K][I];
+        if (O.isInvalid())
+          continue;
+        unsigned L = Around(O);
+        ListAt[K][I] = L;
+        for (unsigned C : Lists[L])
+          First[C][K] = std::min(First[C][K], I);
+      }
+    }
+    std::vector<int> LeftOutOf(Cand.size(), -1);
+    for (unsigned C = 0; C != Cand.size(); ++C) {
+      const PR::Skip &S = *Cand[C];
+      SourceLocation At = SM.getExpansionLoc(S.Loc);
+      bool ReadBefore = false;
+      for (unsigned K = 0; K != 4; ++K)
+        ReadBefore |= First[C][K] < S.Before[K];
+      if (ReadBefore)
+        continue;
+      llvm::StringRef Spelled = S.Spelled;
+      if (Spelled.size() < 2)
+        continue;
+      bool Angled = Spelled.front() == '<';
+      LeftOutOf[C] = P.LeftOutPaths.size();
+      P.LeftOutPaths.push_back(S.Path);
+      uint32_t Offset =
+          SM.getFileID(At) == P.FID ? SM.getFileOffset(At) : 0;
+      Deps.LeftOut.push_back({S.Guard, S.Path,
+                              Spelled.drop_front().drop_back().str(), Angled,
+                              Offset});
+    }
+    InsideOf.clear();
+    if (Deps.LeftOut.empty())
+      return;
+    for (size_t K = 0; K != P.LeftOutPaths.size(); ++K)
+      P.LeftOutCond.push_back(CondOf(0, K));
+    // An element whose state a left-out header gave is taken from it.
+    auto Tag = [&](uint32_t &Cond, unsigned L) {
+      int In = -1;
+      for (unsigned C : Lists[L])
+        if (LeftOutOf[C] >= 0 && (In < 0 || LeftOutOf[C] < In))
+          In = LeftOutOf[C];
+      if (In >= 0)
+        Cond = CondOf(Cond, In);
+    };
+    for (size_t I = 0; I != Sizes[0]; ++I)
+      Tag(Deps.Conditional[I].Cond, ListAt[0][I]);
+    for (size_t I = 0; I != Sizes[1]; ++I)
+      Tag(Deps.Syntactic[I].Cond, ListAt[1][I]);
+    for (size_t I = 0; I != Sizes[2]; ++I)
+      Tag(Deps.Symbol[I].Cond, ListAt[2][I]);
+    for (size_t I = 0; I != Sizes[3]; ++I)
+      Tag(Deps.Inclusion[I].Cond, ListAt[3][I]);
+  }
+
+  /// The file \p F is, by canonical path, or "" for none.
+  std::string pathOf(FileID F) {
+    auto It = CanonicalOf.find(F);
+    if (It != CanonicalOf.end())
+      return It->second;
+    std::string Path;
+    if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(F))
+      Path = CI.getFileManager().getCanonicalName(*FE).str();
+    return CanonicalOf[F] = Path;
+  }
+
+  /// Whether the file \p F is \p Header or was read inside it, following
+  /// each file's #include up -- through a copy's module as well, whose files
+  /// keep where they were included.
+  bool readInside(FileID F, llvm::StringRef Header) {
+    for (unsigned Depth = 0; F.isValid() && Depth != 256; ++Depth) {
+      if (pathOf(F) == Header)
+        return true;
+      SourceLocation Up = SM.getIncludeLoc(F);
+      if (Up.isInvalid())
+        return false;
+      F = SM.getFileID(Up);
+    }
+    return false;
+  }
+  /// The same for the part being written's left-out header \p K, kept.
+  bool readInside(FileID F, size_t K, llvm::StringRef Header) {
+    if (InsideOf.size() <= K)
+      InsideOf.resize(K + 1);
+    auto [It, New] = InsideOf[K].try_emplace(F, false);
+    if (New)
+      It->second = readInside(F, Header);
+    return It->second;
+  }
+
+  /// How the #include whose filename is at \p Loc spelled it, without the
+  /// delimiters, whether with angle brackets, and its offset in its file.
+  /// False for one a macro wrote.
+  bool spelling(SourceLocation Loc, std::string &Spelled, bool &Angled,
+                uint32_t &At) const {
+    if (Loc.isInvalid() || Loc.isMacroID())
+      return false;
+    bool Invalid = false;
+    llvm::StringRef Buffer = SM.getBufferData(SM.getFileID(Loc), &Invalid);
+    size_t Off = SM.getFileOffset(Loc);
+    if (Invalid || Off >= Buffer.size() ||
+        (Buffer[Off] != '"' && Buffer[Off] != '<'))
+      return false;
+    Angled = Buffer[Off] == '<';
+    size_t End = Buffer.find(Angled ? '>' : '"', Off + 1);
+    if (End == llvm::StringRef::npos ||
+        Buffer.slice(Off, End).contains('\n'))
+      return false;
+    Spelled = Buffer.slice(Off + 1, End).str();
+    At = Off;
+    return true;
+  }
+
+  /// The files read inside the part being written, in the order entered,
+  /// and for each dependency they read -- by a hash of its kind and value --
+  /// the files whose state it read, and the one section whose files read
+  /// it: -1 for the header's own lines, or for several sections.
+  struct PartReads {
+    std::vector<const ASTCacheDependencyTracker::FileReads *> Files;
+    struct Readers {
+      int Owner = -2;
+      llvm::SmallVector<FileID, 2> Origins;
+    };
+    llvm::DenseMap<uint64_t, Readers> Of;
+  };
+  static uint64_t keyOf(const ConditionalDependency &D) {
+    return llvm::hash_combine('c', D.MacroName, D.WasDefined);
+  }
+  static uint64_t keyOf(const SyntacticDependency &D) {
+    return llvm::hash_combine('s', D.Name, int(D.Required), D.TokenSequence);
+  }
+  static uint64_t keyOf(const SymbolDependency &D) {
+    return llvm::hash_combine('y', D.Name, int(D.Classification),
+                              D.ResolvedTypeName);
+  }
+  static uint64_t keyOf(const InclusionDependency &D) {
+    return llvm::hash_combine('i', D.HeaderPath);
+  }
+  PartReads partReads(const Part &P) {
+    using FR = ASTCacheDependencyTracker::FileReads;
+    PartReads R;
+    const FR *Root = Tracker.fileReads(P.FID);
+    if (!Root || !Root->Exit)
+      return R;
+    // The files are kept in the order entered: the part's follow its own.
+    llvm::ArrayRef<FR> All = Tracker.allFileReads();
+    for (size_t I = Root - All.data();
+         I != All.size() && All[I].Enter <= Root->Exit; ++I) {
+      const FR &F = All[I];
+      if (!F.Exit || F.Exit > Root->Exit)
+        continue;
+      R.Files.push_back(&F);
+      auto Sub = P.SubmoduleOf.find(F.FID);
+      int O = Sub == P.SubmoduleOf.end() ? -1 : Sub->second;
+      auto Note = [&](uint64_t Key, FileID Origin) {
+        PartReads::Readers &X = R.Of[Key];
+        X.Owner = X.Owner == -2 || X.Owner == O ? O : -1;
+        X.Origins.push_back(Origin);
+      };
+      for (const auto &E : F.Conditional)
+        Note(keyOf(E.Dep), E.Origin);
+      for (const auto &E : F.Syntactic)
+        Note(keyOf(E.Dep), E.Origin);
+      for (const auto &E : F.Symbol)
+        Note(keyOf(E.Dep), E.Origin);
+      for (const auto &E : F.Inclusion)
+        Note(keyOf(E.Dep), E.Origin);
+    }
+    return R;
+  }
+
+  /// CLANG_HEADER_CACHE_PIECES: each of the copy's dependencies read only by
+  /// the files of one section is that section's: it applies where the
+  /// section loads, and a compile that needs another version of the section
+  /// is not refused by it. One read by the header's own lines, or by several
+  /// sections, stays the base's.
+  void ownSections(HeaderDependencySet &Deps, const PartReads &R) {
+    if (Deps.Submodules.empty())
+      return;
+    auto Own = [&](uint32_t &Cond, uint64_t Key) {
+      auto It = R.Of.find(Key);
+      if (Cond == 0 && It != R.Of.end() && It->second.Owner >= 0)
+        Cond = It->second.Owner + 1;
+    };
+    for (ConditionalDependency &D : Deps.Conditional)
+      Own(D.Cond, keyOf(D));
+    for (SyntacticDependency &D : Deps.Syntactic)
+      Own(D.Cond, keyOf(D));
+    for (SymbolDependency &D : Deps.Symbol)
+      Own(D.Cond, keyOf(D));
+    for (InclusionDependency &D : Deps.Inclusion)
+      Own(D.Cond, keyOf(D));
+  }
+
+  /// CLANG_HEADER_CACHE_PARTIAL. The headers \p P's copy leaves out: each
+  /// whose #include inside the header was skipped by its guard, defined
+  /// when the compile read it before the header. One is recorded where it
+  /// can be parsed before the copy loads with the same result as at its
+  /// #include: the part's lines before the #include read nothing it set,
+  /// and it reads nothing they set -- no macro they changed, no name they
+  /// declared; where the compile did not read it as text here, the lines
+  /// before the #include must change and declare nothing at all. What the
+  /// copy takes from such a header -- its guard, its macros, its #pragma
+  /// once files -- applies only where it is not plugged in.
+  void leftOut(Part &P, HeaderDependencySet &Deps, const PartReads &R) {
+    using FR = ASTCacheDependencyTracker::FileReads;
+    if (R.Files.empty())
+      return;
+    const FR *Root = R.Files.front();
+    llvm::DenseSet<FileID> InPart;
+    for (const FR *F : R.Files)
+      InPart.insert(F->FID);
+    // The header's own guard, which its first lines define.
+    std::string OwnGuard;
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(P.FID))
+      if (const IdentifierInfo *G =
+              HS.getFileInfo(*FE).getControllingMacro(HS.getExternalLookup()))
+        OwnGuard = G->getName().str();
+
+    // The skips of a guard defined before the header, in order; the first
+    // of each header is a candidate.
+    std::vector<const FR::Skip *> Skips;
+    for (const FR *F : R.Files)
+      if (!PiecesMode || F == Root)
+        for (const FR::Skip &S : F->Skips)
+          if (!S.Guard.empty() && S.Origin.isValid() && !InPart.count(S.Origin))
+            Skips.push_back(&S);
+    llvm::sort(Skips, [](const FR::Skip *A, const FR::Skip *B) {
+      return A->Seq < B->Seq;
+    });
+    if (Skips.empty())
+      return;
+    std::vector<const FR::Skip *> Cand;
+    llvm::StringSet<> SeenPath;
+    llvm::DenseMap<const FileEntry *, unsigned> CandOf;
+    for (const FR::Skip *S : Skips)
+      if (SeenPath.insert(S->Path).second)
+        if (OptionalFileEntryRef FE =
+                CI.getFileManager().getOptionalFileRef(S->Path))
+          if (CandOf.try_emplace(&FE->getFileEntry(), Cand.size()).second)
+            Cand.push_back(S);
+
+    // When the part's lines first changed each macro, and where they first
+    // declared each name at file scope: what this compile parsed, never a
+    // loaded copy's declarations.
+    llvm::StringMap<uint64_t> FirstChange;
+    uint64_t AnyChange = UINT64_MAX;
+    for (const FR *F : R.Files)
+      for (const FR::Change &C : F->Changes) {
+        llvm::StringRef Name = C.II->getName();
+        if (Name == OwnGuard)
+          continue;
+        auto [It, New] = FirstChange.try_emplace(Name, C.Seq);
+        if (!New)
+          It->second = std::min(It->second, C.Seq);
+        AnyChange = std::min(AnyChange, C.Seq);
+      }
+    // The declarations by name are made only if some header needs them.
+    std::vector<std::pair<SourceLocation, llvm::StringRef>> Decls;
+    SourceLocation AnyDecl;
+    {
+      ASTContext &Ctx = CI.getASTContext();
+      Decl *First =
+          P.DeclsAfter
+              ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+              : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+      for (Decl *D = First; D; D = D->getNextDeclInContext()) {
+        if (D->isFromASTFile())
+          continue;
+        auto *ND = dyn_cast<NamedDecl>(D);
+        if (!ND || !ND->getDeclName().isIdentifier())
+          continue;
+        SourceLocation L = SM.getExpansionLoc(ND->getLocation());
+        if (!inPart(P, L))
+          continue;
+        Decls.push_back({L, ND->getName()});
+        if (AnyDecl.isInvalid() || SM.isBeforeInTranslationUnit(L, AnyDecl))
+          AnyDecl = L;
+      }
+    }
+    llvm::StringMap<SourceLocation> FirstDecl;
+    bool FirstDeclMade = false;
+    auto MakeFirstDecl = [&] {
+      if (FirstDeclMade)
+        return;
+      FirstDeclMade = true;
+      for (const auto &[L, Name] : Decls) {
+        auto [It, New] = FirstDecl.try_emplace(Name, L);
+        if (!New && SM.isBeforeInTranslationUnit(L, It->second))
+          It->second = L;
+      }
+    };
+
+    // The candidates each file was read inside, following each file's
+    // #include up -- through a copy's module as well, whose files keep
+    // where they were included -- as an index into Lists.
+    std::vector<llvm::SmallVector<unsigned, 2>> Lists(1);
+    llvm::DenseMap<FileID, unsigned> ListOf;
+    auto Around = [&](FileID F) -> unsigned {
+      llvm::SmallVector<FileID, 16> Up;
+      unsigned Base = 0;
+      for (unsigned Depth = 0; F.isValid() && Depth != 256; ++Depth) {
+        if (auto It = ListOf.find(F); It != ListOf.end()) {
+          Base = It->second;
+          break;
+        }
+        Up.push_back(F);
+        SourceLocation Inc = SM.getIncludeLoc(F);
+        if (Inc.isInvalid())
+          break;
+        F = SM.getFileID(Inc);
+      }
+      for (FileID U : llvm::reverse(Up)) {
+        if (auto C = CandOf.find(SM.getFileEntryForID(U));
+            C != CandOf.end()) {
+          llvm::SmallVector<unsigned, 2> L = Lists[Base];
+          L.push_back(C->second);
+          Lists.push_back(std::move(L));
+          Base = Lists.size() - 1;
+        }
+        ListOf[U] = Base;
+      }
+      return Base;
+    };
+    // Per candidate, when the part's lines first read a state that a file
+    // inside its header gave.
+    std::vector<uint64_t> FirstRead(Cand.size(), UINT64_MAX);
+    for (const FR *F : R.Files) {
+      auto Note = [&](const auto &V) {
+        for (const auto &E : V) {
+          if (!E.Origin.isValid())
+            continue;
+          unsigned L = Around(E.Origin);
+          for (unsigned K : Lists[L])
+            FirstRead[K] = std::min(FirstRead[K], E.Seq);
+        }
+      };
+      Note(F->Conditional);
+      Note(F->Syntactic);
+      Note(F->Symbol);
+      Note(F->Inclusion);
+    }
+
+    llvm::ArrayRef<FR> All = Tracker.allFileReads();
+    std::vector<int> LeftOutOf(Cand.size(), -1);
+    for (unsigned K = 0; K != Cand.size(); ++K) {
+      const FR::Skip *S = Cand[K];
+      SourceLocation At = SM.getExpansionLoc(S->Loc);
+      // Whether the header reads what the part's lines before the #include
+      // changed or declared: by what it read as text here, or, unknown, as
+      // if it did whenever there is one.
+      auto SetBefore = [&](llvm::StringRef Name) {
+        auto C = FirstChange.find(Name);
+        if (C != FirstChange.end() && C->second < S->Seq)
+          return true;
+        auto D = FirstDecl.find(Name);
+        return D != FirstDecl.end() &&
+               SM.isBeforeInTranslationUnit(D->second, At);
+      };
+      bool ReadsEarlier = false;
+      bool AnyBefore = AnyChange < S->Seq ||
+                       (AnyDecl.isValid() &&
+                        SM.isBeforeInTranslationUnit(AnyDecl, At));
+      if (!AnyBefore) {
+        // Nothing to read.
+      } else if (const FR *NR = Tracker.fileReads(S->Origin);
+                 NR && NR->Exit) {
+        MakeFirstDecl();
+        for (size_t I = NR - All.data();
+             I != All.size() && All[I].Enter <= NR->Exit && !ReadsEarlier;
+             ++I) {
+          const FR &F = All[I];
+          ReadsEarlier =
+              llvm::any_of(F.Conditional,
+                           [&](const auto &E) {
+                             return SetBefore(E.Dep.MacroName);
+                           }) ||
+              llvm::any_of(F.Syntactic,
+                           [&](const auto &E) { return SetBefore(E.Dep.Name); }) ||
+              llvm::any_of(F.Symbol,
+                           [&](const auto &E) { return SetBefore(E.Dep.Name); });
+        }
+      } else {
+        ReadsEarlier = true;
+      }
+      // And whether the lines before the #include read what the header set.
+      if (ReadsEarlier || FirstRead[K] < S->Seq)
+        continue;
+      std::string Spelled = S->Spelled;
+      bool Angled = Spelled.size() >= 2 && Spelled.front() == '<';
+      if (Spelled.size() < 2)
+        continue;
+      Spelled = Spelled.substr(1, Spelled.size() - 2);
+      LeftOutOf[K] = P.LeftOutPaths.size();
+      P.LeftOutPaths.push_back(S->Path);
+      uint32_t Offset = 0;
+      if (PiecesMode && SM.getFileID(At) == P.FID)
+        Offset = SM.getFileOffset(At);
+      Deps.LeftOut.push_back({S->Guard, S->Path, Spelled, Angled, Offset});
+    }
+    InsideOf.clear();
+    if (Deps.LeftOut.empty())
+      return;
+
+    // The condition of what the copy takes from left-out header K, for an
+    // element under condition C (0: always).
+    std::map<std::pair<uint32_t, int>, uint32_t> CondFor;
+    auto CondOf = [&](uint32_t C, int K) {
+      auto [It, New] = CondFor.try_emplace({C, K}, 0);
+      if (New) {
+        DependencyCondition D;
+        if (C)
+          D = Deps.Conditions[C - 1];
+        D.LeftOut = K;
+        Deps.Conditions.push_back(D);
+        It->second = Deps.Conditions.size();
+      }
+      return It->second;
+    };
+    for (size_t K = 0; K != P.LeftOutPaths.size(); ++K)
+      P.LeftOutCond.push_back(CondOf(0, K));
+    // The left-out header every file that gave a state read was read
+    // inside, the first recorded, or -1.
+    auto From = [&](llvm::ArrayRef<FileID> Origins) {
+      int K = -1;
+      for (FileID O : Origins) {
+        int In = -1;
+        if (O.isValid()) {
+          unsigned L = Around(O);
+          for (unsigned C : Lists[L])
+            if (LeftOutOf[C] >= 0 && (In < 0 || LeftOutOf[C] < In))
+              In = LeftOutOf[C];
+        }
+        if (In < 0 || (K >= 0 && In != K))
+          return -1;
+        K = In;
+      }
+      return K;
+    };
+    auto Tag = [&](uint32_t &Cond, uint64_t Key) {
+      auto It = R.Of.find(Key);
+      if (It == R.Of.end() || It->second.Origins.empty())
+        return;
+      int K = From(It->second.Origins);
+      if (K >= 0)
+        Cond = CondOf(Cond, K);
+    };
+    for (ConditionalDependency &D : Deps.Conditional)
+      Tag(D.Cond, keyOf(D));
+    for (SyntacticDependency &D : Deps.Syntactic)
+      Tag(D.Cond, keyOf(D));
+    for (SymbolDependency &D : Deps.Symbol)
+      Tag(D.Cond, keyOf(D));
+    for (InclusionDependency &D : Deps.Inclusion)
+      Tag(D.Cond, keyOf(D));
+  }
+
+  /// CLANG_HEADER_CACHE_PARTIAL: an outside declaration the copy refers to
+  /// that a left-out header declared is taken from it. \p Locs: where each
+  /// of the copy's outside declarations was declared, in order.
+  void leftOutDeclarations(Part &P, HeaderDependencySet &Deps,
+                           llvm::ArrayRef<SourceLocation> Locs) {
+    for (size_t I = 0; I != Deps.Declarations.size() && I != Locs.size();
+         ++I) {
+      DeclarationDependency &D = Deps.Declarations[I];
+      SourceLocation L = Locs[I];
+      if (D.Cond || L.isInvalid())
+        continue;
+      FileID F = SM.getFileID(SM.getExpansionLoc(L));
+      for (size_t K = 0; K != P.LeftOutPaths.size(); ++K)
+        if (readInside(F, K, P.LeftOutPaths[K])) {
+          D.Cond = P.LeftOutCond[K];
+          break;
+        }
+    }
   }
 
   /// The declarations each file inside \p P refers to in another file inside
@@ -2126,8 +2984,10 @@ private:
     /// Outside declarations referred to by name.
     size_t ByName = 0;
     unsigned DroppedLocations = 0;
-    /// The outside declarations a hit requires, by name and fingerprint.
+    /// The outside declarations a hit requires, by name and fingerprint,
+    /// and where each was declared (CLANG_HEADER_CACHE_PARTIAL).
     std::vector<DeclarationDependency> Declarations;
+    std::vector<SourceLocation> DeclarationLocs;
     /// CLANG_HEADER_CACHE_LINK: the declarations taken from each link, by
     /// index into Part::Links.
     std::vector<std::pair<size_t, std::string>> LinkNames;
@@ -2264,13 +3124,29 @@ private:
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
     if (!P.OwnerOf.empty())
-      Writer.setPartOwner([&](SourceLocation L) -> Module * {
-        // Most declarations a part refers to from outside it are before it.
-        if (!inPart(P, L))
-          return nullptr;
-        auto It = P.OwnerOf.find(SM.getFileID(SM.getExpansionLoc(L)));
-        return It == P.OwnerOf.end() ? nullptr : It->second;
-      });
+      Writer.setPartOwner(
+          [&, Begin = SourceLocation::UIntTy(1), End = SourceLocation::UIntTy(0),
+           Last = static_cast<Module *>(nullptr)](
+              SourceLocation L) mutable -> Module * {
+            // Most declarations a part refers to from outside it are before
+            // it.
+            if (L.isInvalid())
+              return nullptr;
+            SourceLocation E = L.isFileID() ? L : SM.getExpansionLoc(L);
+            SourceLocation::UIntTy Offset = E.getRawEncoding();
+            if (!P.contains(Offset) || inLinked(P, Offset))
+              return nullptr;
+            // The declarations come file by file: the last file's owner
+            // stands until a location outside it.
+            if (Offset >= Begin && Offset < End)
+              return Last;
+            FileID F = SM.getFileID(E);
+            auto It = P.OwnerOf.find(F);
+            Last = It == P.OwnerOf.end() ? nullptr : It->second;
+            Begin = SM.getSLocEntry(F).getOffset();
+            End = Begin + SM.getFileIDSize(F) + 1;
+            return Last;
+          });
     // What the writer needs to look at: the part's own entries, macros and
     // declarations, not the whole compile's (REPORT.md I5).
     std::vector<const IdentifierInfo *> MacroNames;
@@ -2328,6 +3204,7 @@ private:
       if (!F)
         return false;
       W.Declarations.push_back({In, ND.getName().str(), std::move(*F)});
+      W.DeclarationLocs.push_back((AtEntry ? AtEntry : &ND)->getLocation());
       return true;
     };
     if (Named) {
@@ -2382,6 +3259,7 @@ private:
   const WarningPragmaTracker *Pragmas;
   /// Set by exportNext for the file about to be entered.
   const FileEntry *Expected = nullptr;
+  std::string ExpectedStored;
   std::string ExpectedPath;
   /// Parts whose header is open, innermost last, and parts whose header has
   /// ended, waiting for the next finished declaration.
@@ -2392,6 +3270,23 @@ private:
   /// CLANG_HEADER_CACHE_LINK: a copy links the copies of the headers inside
   /// it, instead of holding them.
   bool LinkMode = false;
+  /// CLANG_HEADER_CACHE_PARTIAL: a copy records the headers it left out
+  /// that a compile can plug in first.
+  bool PartialMode = false;
+  /// No headers held as submodules: the default, unless
+  /// CLANG_HEADER_CACHE_SECTIONS=1 or CLANG_HEADER_CACHE_PIECES asks for
+  /// them; CLANG_HEADER_CACHE_NO_SUBMODULES forces it.
+  bool NoSubmodules = true;
+  /// CLANG_HEADER_CACHE_PIECES: a copy is a base -- its header's own lines --
+  /// with a section for each header its lines include, everything below
+  /// folded in; a compile that needs another version of a section adds one.
+  bool PiecesMode = false;
+  /// CLANG_HEADER_CACHE_PIECES: the headers begun as bases.
+  llvm::DenseSet<FileID> PiecesBases;
+  llvm::DenseMap<FileID, std::string> CanonicalOf;
+  /// For the part being written: per left-out header, whether each file was
+  /// read inside it (readInside).
+  std::vector<llvm::DenseMap<FileID, bool>> InsideOf;
   unsigned PartsBegun = 0;
   /// While a hit's diagnostics are printed again.
   bool Replaying = false;
@@ -2492,16 +3387,22 @@ PartExporter &PartExporter::install(CompilerInstance &CI,
     T.trackOnly([&Ex](FileID FID) { return Ex.tracks(FID); });
   }
   // What each file inside a header being exported read, for holding the
-  // headers inside as submodules (REPORT.md T17).
-  // Measuring only: CLANG_HEADER_CACHE_NO_SUBMODULES writes folded copies,
-  // as before REPORT.md T17.
+  // headers inside as submodules (REPORT.md T17,
+  // CLANG_HEADER_CACHE_SECTIONS=1).
   // So does linking (CLANG_HEADER_CACHE_LINK), to tell which headers
-  // inside are independent of the one around them.
+  // inside are independent of the one around them, and partial hits
+  // (CLANG_HEADER_CACHE_PARTIAL), to tell which headers a copy left out.
+  // Bases and pieces (CLANG_HEADER_CACHE_PIECES) mark each dependency with
+  // its piece as the tracker records it, and keep no such reads.
   const char *Link = std::getenv("CLANG_HEADER_CACHE_LINK");
-  if (!std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES") ||
+  const char *Partial = std::getenv("CLANG_HEADER_CACHE_PARTIAL");
+  if ((Ex.sections() && !Ex.pieces()) ||
       (Link && llvm::StringRef(Link) == "1") ||
+      (Partial && llvm::StringRef(Partial) == "1") ||
       std::getenv("CLANG_HEADER_CACHE_DDG"))
     T.recordFiles();
+  if (Ex.pieces())
+    T.piecesFor([&Ex](FileID FID) { return Ex.piecesBase(FID); });
   // Measuring a codebase's headers: a record for every one.
   if (std::getenv("CLANG_HEADER_CACHE_DDG"))
     T.trackOnly([](FileID) { return true; });

@@ -166,6 +166,15 @@ as the first version did; a compile then stops exporting at its first load.
 `<dir>/<module name>.pcm`, with the outside declarations it requires in a
 `.txt` beside it.
 
+A part holds its header and every header read inside it, folded in. Nothing
+resolves include-guard conflicts by default. `CLANG_HEADER_CACHE_SECTIONS=1`
+holds the headers inside as sections, which a compile that read one already
+skips (REPORT.md T17). `CLANG_HEADER_CACHE_PIECES=1` makes a copy a base: its
+header's own lines, with a section for each header those lines include. Where
+the base fits but a section does not, the compile reads another version of
+that section first, served or parsed, then the base serves; `A` parses the
+header with the other versions instead.
+
 For looking at one part with no daemon: `CLANG_HEADER_CACHE_EXPORT=<abs
 header>=<out.pcm>` writes the part to a file, and
 `CLANG_HEADER_CACHE_LOAD=<abs header>=<in.pcm>` serves the header from it in a
