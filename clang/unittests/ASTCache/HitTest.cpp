@@ -1318,10 +1318,11 @@ TEST_F(ExportTest, AHeaderEndingInAFunctionIsSavedWithItsBody) {
   // attached. last.h must not be written then, or it is saved with last_fn
   // declared but not defined, and a compile served it calls a function it
   // never emits. Every compile has the flag that makes that an error: a copy
-  // is served only under the warning flags it was written with.
+  // is served only under the warning flags it was written with. (next_value
+  // is a variable: a header defining a function not inline is not written.)
   ExtraArgs = {"-Werror=undefined-internal"};
   std::string Next = write("next.h", "#ifndef NEXT_H\n#define NEXT_H\n"
-                                     "int next_value(void) { return 4; }\n"
+                                     "int next_value = 4;\n"
                                      "#endif\n");
   std::string Last = write("last.h", "#ifndef LAST_H\n#define LAST_H\n"
                                      "static inline int last_fn(int x) {\n"
@@ -2582,6 +2583,55 @@ TEST_F(ExportTest, SearchesFoundInABuildAreNotTakenUnderAnotherIncludePath) {
   EXPECT_FALSE(reads(Main, H)) << "nor again in the same build";
   ExtraArgs = {"-I" + Dir + "/b", "-DINNER_WANTED=2"};
   EXPECT_TRUE(reads(Main, H)) << "a/inner.h's copy was served under -Ib";
+}
+
+TEST_F(ExportTest, AHeaderUsingAnUnnameableOutsideDeclarationIsNotWritten) {
+  // main.c declares _clar with a struct type that has no name, then
+  // includes use.h, whose inline function uses it. A copy of use.h can
+  // refer to _clar's type by no name; a copy holding its own _clar made
+  // main.c's later use of _clar ambiguous (git's clar.c and clar/print.h).
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "static inline int count(void) "
+                                   "{ return _clar.n; }\n#endif\n");
+  std::string Main =
+      write("main.c", "static struct { int n; } _clar;\n#include \"" + Use +
+                          "\"\nint f(void) { return _clar.n + count(); }\n");
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is stored yet";
+  EXPECT_EQ(Daemon->stats().Entries, 0u) << "use.h was written";
+  EXPECT_TRUE(reads(Main, Use)) << "use.h has no copy";
+}
+
+TEST_F(ExportTest, AHeaderDefiningAFunctionTheFileDeclaredIsNotWritten) {
+  // main.c declares and calls name() before gen.h defines it, as postgres's
+  // wait_event.c does with utils/pgstat_wait_event.c: loaded from a copy,
+  // the definition is emitted in another order and the object's string
+  // constants move. ext.h defines a function with external linkage, which
+  // every includer emits. stub.h's static function only it declares is
+  // emitted when used, as when parsed (curl's typecheck-gcc.h).
+  std::string Gen = write("gen.h", "#ifndef GEN_H\n#define GEN_H\n"
+                                   "static const char *name(int w) "
+                                   "{ return w ? \"one\" : \"zero\"; }\n"
+                                   "#endif\n");
+  std::string Ext = write("ext.h", "#ifndef EXT_H\n#define EXT_H\n"
+                                   "int ext_fn(void) { return 1; }\n"
+                                   "#endif\n");
+  std::string Stub = write("stub.h", "#ifndef STUB_H\n#define STUB_H\n"
+                                     "__attribute__((unused)) static void "
+                                     "stub(void) {}\n#endif\n");
+  std::string Main = write(
+      "main.c", "static const char *name(int w);\n"
+                "const char *f(int w) { return name(w); }\n#include \"" +
+                    Stub + "\"\n#include \"" + Ext + "\"\n#include \"" +
+                    Gen + "\"\n");
+  EXPECT_TRUE(reads(Main, Gen)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Gen)) << "nothing is stored yet";
+  EXPECT_EQ(Daemon->stats().Entries, 1u) << "not stub.h alone was written";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered));
+  EXPECT_TRUE(Entered.count(Gen)) << "gen.h was served";
+  EXPECT_TRUE(Entered.count(Ext)) << "ext.h was served";
+  EXPECT_FALSE(Entered.count(Stub)) << "stub.h was not served";
 }
 
 TEST_F(ExportTest, AFileChangedIsCaughtByTheNextBuild) {

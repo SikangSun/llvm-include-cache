@@ -481,6 +481,36 @@ public:
       if (Last->getLexicalDeclContext()->isTranslationUnit())
         LastTopLevel = Last;
     }
+    // A function not inline that the including file emits whatever it
+    // uses -- one with external linkage, or one it declared before the
+    // #include and may have called already -- is emitted in the order Clang
+    // parses it; loaded from a copy, in another, and the object's string
+    // constants move. postgres's wait_event.c declares and calls the static
+    // functions utils/pgstat_wait_event.c defines, included at its end;
+    // redis's commands.def defines commandGroupStr. A static function only
+    // the header declares is emitted when used, as when parsed: curl's
+    // typecheck-gcc.h warning stubs, git's commit-slab functions.
+    for (Decl *D : Group) {
+      const auto *FD = dyn_cast<FunctionDecl>(D);
+      if (!FD || !FD->doesThisDeclarationHaveABody() || FD->isInlined())
+        continue;
+      auto Check = [&](Part &P) {
+        if (!P.Decline.empty() || !inPart(P, FD->getLocation()))
+          return;
+        bool DeclaredBefore = false;
+        for (const FunctionDecl *Prev = FD->getPreviousDecl(); Prev;
+             Prev = Prev->getPreviousDecl())
+          DeclaredBefore |= !inPart(P, Prev->getLocation());
+        if (FD->isExternallyVisible() || DeclaredBefore)
+          P.Decline = "it defines " + FD->getNameAsString() +
+                      (DeclaredBefore ? ", declared before it" : "") +
+                      ", not inline";
+      };
+      for (Part &P : Open)
+        Check(P);
+      for (Part &P : Ready)
+        Check(P);
+    }
     if (!Ready.empty())
       writeReady();
   }
@@ -1541,14 +1571,13 @@ private:
 
     DepsScope.reset();
     Written W = writePart(P, M, ByName);
-    if (ByName && !W.Failure.empty()) {
-      if (P.ModulesAtBegin || !P.Links.empty())
-        return decline(P, "cannot refer by name to " + W.Failure);
-      std::string Why = std::move(W.Failure);
-      W = writePart(P, M, /*ByName=*/false);
-      ++Counts.Copied;
-      Counts.Copies.push_back(P.Stored + ": " + Why);
-    }
+    // An outside declaration the part cannot name is not copied into it
+    // either: the compiles it serves declare it themselves, before the
+    // #include, and would then see two. git's clar.c declares
+    // `static struct {...} _clar;` and clar/print.h uses it; a copy holding
+    // its own _clar made every later use of the name ambiguous.
+    if (ByName && !W.Failure.empty())
+      return decline(P, "cannot refer by name to " + W.Failure);
     Deps.Declarations = std::move(W.Declarations);
     auto TakeName = [&](size_t K, std::string Name) {
       std::vector<std::string> &Names = Deps.Links[P.LinkOrder[K]].Names;
