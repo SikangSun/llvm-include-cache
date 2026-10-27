@@ -134,7 +134,13 @@ int main(int argc, char **argv) {
            << " on the ask-list; " << S.HitsTimed << " hits timed, "
            << S.HeadersDropped
            << " headers dropped as costing more than "
-              "parsing\n";
+              "parsing\n"
+           << "waits   " << S.Waits << " (" << S.WaitsServed
+           << " ended by a new copy, " << S.WaitsTimedOut
+           << " by the time limit, " << (S.WaitMicros / 1000) << " ms), "
+           << S.WaitsGated << " lookups the gate did not hold; claims "
+           << S.ClaimsGranted << " granted, " << S.ClaimsRefused
+           << " refused\n";
   }
   return 0;
 }

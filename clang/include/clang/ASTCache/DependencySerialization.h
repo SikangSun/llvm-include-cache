@@ -39,7 +39,7 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 17;
+constexpr uint32_t DependencyEncodingVersion = 18;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
 /// stored form.
@@ -268,6 +268,9 @@ public:
   const PragmaSnapshot &entry() const { return Entry; }
   const PragmaSnapshot &exit() const { return Exit; }
   uint64_t warningState() const { return WarningState; }
+  uint32_t counterStart() const { return CounterStart; }
+  uint32_t counterUses() const { return CounterUses; }
+  bool counterSemantic() const { return CounterSemantic; }
 
   /// The sections, in the order they are stored and checked.
   MetadataSection<ConditionalView> conditional() const {
@@ -392,6 +395,8 @@ private:
   llvm::StringRef ModuleName, HeaderName;
   PragmaSnapshot Entry, Exit;
   uint64_t WarningState = 0;
+  uint32_t CounterStart = 0, CounterUses = 0;
+  bool CounterSemantic = false;
   uint32_t NumGroups = 0;
 };
 

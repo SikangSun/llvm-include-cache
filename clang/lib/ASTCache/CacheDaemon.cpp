@@ -12,6 +12,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_socket_stream.h"
 #include "llvm/Support/xxhash.h"
+#include <chrono>
 #include <thread>
 
 using namespace clang;
@@ -187,14 +188,112 @@ llvm::SmallVector<char, 0> CacheDaemon::handleHello() {
   return Out;
 }
 
+void CacheDaemon::endWritingLocked(uint64_t Conn, llvm::StringRef Filename) {
+  auto End = [&](Writers &W) {
+    size_t Before = W.List.size();
+    llvm::erase_if(W.List, [&](const Writer &X) { return X.Conn == Conn; });
+    if (W.List.size() != Before)
+      W.Arrived.notify_all();
+  };
+  if (!Filename.empty()) {
+    if (auto It = WritersOf.find(Filename); It != WritersOf.end())
+      End(*It->second);
+    return;
+  }
+  for (auto &KV : WritersOf)
+    End(*KV.second);
+}
+
+void CacheDaemon::settleWaitLocked(uint64_t Conn,
+                                   const std::vector<uint64_t> &Used) {
+  auto It = WaitedFor.find(Conn);
+  if (It == WaitedFor.end())
+    return;
+  WaitHistory &H = WaitsOf[It->second.first];
+  bool Fit = llvm::any_of(It->second.second, [&](uint64_t Offset) {
+    return llvm::is_contained(Used, Offset);
+  });
+  ++(Fit ? H.Fit : H.Missed);
+  WaitedFor.erase(It);
+}
+
+bool CacheDaemon::waitForWriterLocked(std::unique_lock<std::mutex> &Lock,
+                                      const LookupRequest &Req,
+                                      uint64_t Conn) {
+  auto W = WritersOf.find(Req.Filename);
+  if (W == WritersOf.end())
+    return false;
+  Writers *Ws = W->second.get();
+  auto Other = [&] {
+    return llvm::any_of(Ws->List, [&](const Writer &X) {
+      return X.ClientId != Req.ClientId;
+    });
+  };
+  if (!Other())
+    return false;
+  // The gate: once a few waits for this header ended in a copy the waiting
+  // compile could not use, its copies differ from compile to compile, and
+  // parsing beats waiting.
+  if (auto H = WaitsOf.find(Req.Filename); H != WaitsOf.end()) {
+    unsigned Checked = H->second.Fit + H->second.Missed;
+    if (Checked >= 3 && 2 * H->second.Fit < Checked) {
+      ++Counters.WaitsGated;
+      return false;
+    }
+  }
+  // A writer's copy arrives once it has parsed the header and written the
+  // copy; it began before this compile asked, so waiting for it ends sooner
+  // than parsing and writing here would. Twice the header's parse time,
+  // from the earliest writer's start, covers both, unless it stalled.
+  auto Parse = FirstTiming.find(Req.Filename);
+  if (Parse == FirstTiming.end() || !Parse->second)
+    return false;
+  auto Stored = [&] {
+    auto T = Table.find(Req.Filename);
+    return T == Table.end() ? size_t(0) : T->second.size();
+  };
+  size_t Before = Stored();
+  auto Start = std::chrono::steady_clock::now();
+  auto Earliest = Start;
+  for (const Writer &X : Ws->List)
+    if (X.ClientId != Req.ClientId)
+      Earliest = std::min(Earliest, X.Since);
+  auto Deadline =
+      std::max(Start + std::chrono::milliseconds(1),
+               Earliest + 2 * std::chrono::microseconds(Parse->second));
+  ++Counters.Waits;
+  while (Other() && Stored() == Before)
+    if (Ws->Arrived.wait_until(Lock, Deadline) == std::cv_status::timeout) {
+      ++Counters.WaitsTimedOut;
+      break;
+    }
+  if (size_t After = Stored(); After != Before) {
+    ++Counters.WaitsServed;
+    std::vector<uint64_t> New;
+    const std::vector<StoredEntry> &Entries = Table.find(Req.Filename)->second;
+    for (size_t I = Before; I != After; ++I)
+      New.push_back(Entries[I].MetadataOffset);
+    WaitedFor[Conn] = {Req.Filename, std::move(New)};
+  }
+  Counters.WaitMicros += std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - Start)
+                             .count();
+  return true;
+}
+
 llvm::SmallVector<char, 0>
-CacheDaemon::handleLookup(const LookupRequest &Req) {
+CacheDaemon::handleLookup(const LookupRequest &Req, uint64_t Conn) {
   LookupResponse Resp;
   {
-    std::lock_guard<std::mutex> Lock(Mutex);
+    std::unique_lock<std::mutex> Lock(Mutex);
+    settleWaitLocked(Conn, Req.Used);
     learnLocked(Req.Build, Req.Learned, Req.Used);
     ++Counters.Lookups;
     ++LookupsOf[Req.Filename];
+    // CLANG_HEADER_CACHE_WAIT: a copy another compile is writing may serve
+    // this one; the reply then holds it.
+    if (Req.Wait)
+      Resp.Waited = waitForWriterLocked(Lock, Req, Conn);
     // Measurement (CLANG_HEADER_CACHE_PROBE_REUSE): "*<suffix>" asks for
     // the entries of every name ending in the suffix.
     std::vector<StoredEntry> Matching;
@@ -259,10 +358,22 @@ CacheDaemon::handleLookup(const LookupRequest &Req) {
   return Out;
 }
 
-llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
+llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req,
+                                                   uint64_t Conn) {
   uint64_t Hash = llvm::xxh3_64bits(Req.Metadata);
+  std::optional<MetadataView> V = MetadataView::open(Req.Metadata);
+  std::string Name = V ? V->moduleName().str() : std::string();
   {
     std::lock_guard<std::mutex> Lock(Mutex);
+    // Whether stored or a duplicate, a copy of this header now exists: the
+    // pushing compile's writing ends, and a claim on the copy is settled.
+    auto Done = [&] {
+      if (!Name.empty()) {
+        PushedNames.insert(Name);
+        Claimed.erase(Name);
+      }
+      endWritingLocked(Conn, Req.Filename);
+    };
     ++Counters.Pushes;
     auto [Slot, NewName] = Table.try_emplace(Req.Filename);
     std::vector<StoredEntry> &Entries = Slot->second;
@@ -282,6 +393,7 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
         // compiling. Discard it and acknowledge: the client that lost the
         // race already holds its own result and has no use for the winner.
         ++Counters.Duplicates;
+        Done();
         llvm::SmallVector<char, 0> Ack;
         encodePushAck(Ack);
         return Ack;
@@ -310,6 +422,7 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
       if (Opts.ListStored && listLocked(Req.Filename))
         publishLocked();
     }
+    Done();
     // A full region is not an error the client can act on -- it already has
     // its own result -- so a failed append is acknowledged like any other
     // push and the entry is simply not recorded.
@@ -320,8 +433,67 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req) {
   return Ack;
 }
 
+llvm::SmallVector<char, 0>
+CacheDaemon::handleNotice(const WritingNotice &Notice, uint64_t Conn) {
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (Notice.Ended) {
+      endWritingLocked(Conn, Notice.Filename);
+    } else {
+      std::unique_ptr<Writers> &W = WritersOf[Notice.Filename];
+      if (!W)
+        W = std::make_unique<Writers>();
+      W->List.push_back(
+          {Conn, Notice.ClientId, std::chrono::steady_clock::now()});
+    }
+  }
+  llvm::SmallVector<char, 0> Ack;
+  encodeNoticeAck(Ack);
+  return Ack;
+}
+
+llvm::SmallVector<char, 0> CacheDaemon::handleClaim(const ClaimRequest &Req,
+                                                    uint64_t Conn) {
+  bool Granted = true;
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (Req.Release) {
+      if (auto It = Claimed.find(Req.ModuleName);
+          It != Claimed.end() && It->second == Conn)
+        Claimed.erase(It);
+    } else if (PushedNames.contains(Req.ModuleName) ||
+               Claimed.contains(Req.ModuleName)) {
+      Granted = false;
+      ++Counters.ClaimsRefused;
+    } else {
+      Claimed[Req.ModuleName] = Conn;
+      ++Counters.ClaimsGranted;
+    }
+  }
+  llvm::SmallVector<char, 0> Out;
+  encodeClaimReply(Granted, Out);
+  return Out;
+}
+
+void CacheDaemon::connectionClosed(uint64_t Conn) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  endWritingLocked(Conn, /*Filename=*/{});
+  // A claim still held when its compile ends is for a copy it wrote: one
+  // declined is given back. Claims by the whole dependency list
+  // (CLANG_HEADER_CACHE_CLAIM=deps) are not module names, which pushes mark.
+  for (auto It = Claimed.begin(); It != Claimed.end();) {
+    auto Next = std::next(It);
+    if (It->second == Conn) {
+      PushedNames.insert(It->getKey());
+      Claimed.erase(It);
+    }
+    It = Next;
+  }
+  WaitedFor.erase(Conn);
+}
+
 std::optional<llvm::SmallVector<char, 0>>
-CacheDaemon::handleMessage(llvm::StringRef Body) {
+CacheDaemon::handleMessage(llvm::StringRef Body, uint64_t Conn) {
   std::optional<MessageKind> Kind = peekMessageKind(Body);
   if (!Kind)
     return std::nullopt;
@@ -329,7 +501,15 @@ CacheDaemon::handleMessage(llvm::StringRef Body) {
   switch (*Kind) {
   case MessageKind::LookupRequest:
     if (std::optional<LookupRequest> Req = decodeLookupRequest(Body))
-      return handleLookup(*Req);
+      return handleLookup(*Req, Conn);
+    return std::nullopt;
+  case MessageKind::WritingNotice:
+    if (std::optional<WritingNotice> Notice = decodeWritingNotice(Body))
+      return handleNotice(*Notice, Conn);
+    return std::nullopt;
+  case MessageKind::ClaimRequest:
+    if (std::optional<ClaimRequest> Req = decodeClaimRequest(Body))
+      return handleClaim(*Req, Conn);
     return std::nullopt;
   case MessageKind::PushRequest:
     // The metadata is checked whole once, here, outside the lock; every
@@ -339,11 +519,16 @@ CacheDaemon::handleMessage(llvm::StringRef Body) {
     if (std::optional<ReceivedPush> Req = decodePushRequest(Body))
       if (std::optional<MetadataView> V = MetadataView::open(Req->Metadata))
         if (V->validate())
-          return handlePush(*Req);
+          return handlePush(*Req, Conn);
     return std::nullopt;
   case MessageKind::TimingReport:
-    if (std::optional<TimingReport> Report = decodeTimingReport(Body))
+    if (std::optional<TimingReport> Report = decodeTimingReport(Body)) {
+      {
+        std::lock_guard<std::mutex> Lock(Mutex);
+        settleWaitLocked(Conn, Report->Used);
+      }
       return handleTiming(*Report);
+    }
     return std::nullopt;
   case MessageKind::Hello:
     return handleHello();
@@ -361,6 +546,8 @@ CacheDaemon::handleMessage(llvm::StringRef Body) {
     }
     return std::nullopt;
   case MessageKind::SeenReply:
+  case MessageKind::NoticeAck:
+  case MessageKind::ClaimReply:
   case MessageKind::LookupResponse:
   case MessageKind::PushAck:
   case MessageKind::TimingAck:
@@ -395,6 +582,7 @@ llvm::Error CacheDaemon::run(llvm::StringRef SocketPath) {
     return L.takeError();
   Listener = &*L;
 
+  uint64_t Connections = 0;
   while (!Stopping.load(std::memory_order_acquire)) {
     llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> Conn = L->accept();
     if (!Conn) {
@@ -405,14 +593,16 @@ llvm::Error CacheDaemon::run(llvm::StringRef SocketPath) {
 
     // A connection's start is the daemon accepting a socket and its end is
     // the socket closing -- there are no connect or disconnect messages.
-    std::thread([this, S = std::move(*Conn)]() mutable {
+    std::thread([this, S = std::move(*Conn), Id = ++Connections]() mutable {
       while (std::optional<std::string> Body = receiveMessage(*S)) {
-        std::optional<llvm::SmallVector<char, 0>> Reply = handleMessage(*Body);
+        std::optional<llvm::SmallVector<char, 0>> Reply =
+            handleMessage(*Body, Id);
         if (!Reply)
           break;
         if (!sendMessage(*S, *Reply))
           break;
       }
+      connectionClosed(Id);
     }).detach();
   }
 

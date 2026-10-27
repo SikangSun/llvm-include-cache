@@ -2711,6 +2711,106 @@ TEST_F(ExportTest, ACopyWrittenInOneDirectoryFindsItsFilesFromAnother) {
   EXPECT_FALSE(ReadsH("y.c", Deep)) << "from another depth: should serve";
 }
 
+/// CLANG_HEADER_CACHE_FIRST_READ on, with \p Micros as the time a first read
+/// must take to be written; off again when the result goes.
+static auto firstReads(const char *Micros) {
+  setenv("CLANG_HEADER_CACHE_FIRST_READ", "1", 1);
+  setenv("CLANG_HEADER_CACHE_FIRST_READ_US", Micros, 1);
+  return llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_FIRST_READ");
+    unsetenv("CLANG_HEADER_CACHE_FIRST_READ_US");
+  });
+}
+
+TEST_F(ExportTest, AFirstReadIsWrittenAndTheNextCompileServesIt) {
+  // The first compile reads use.h before any compile has listed it, and
+  // writes its copy anyway, since reading it took at least the cutoff (0
+  // here). Without the switch the second compile misses and only the third
+  // is served (AMissExportsAPartTheNextCompileServes).
+  auto Off = firstReads("0");
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "#define USE_OK 1\nint count(void);\n"
+                                   "#endif\n");
+  std::string Main = write("main.c", "#include \"" + Use + "\"\n"
+                                     "int f(void) { return count() + USE_OK; }\n");
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is listed yet";
+  EXPECT_EQ(Daemon->stats().Entries, 1u) << "the first read was not written";
+  EXPECT_FALSE(reads(Main, Use)) << "the first read's copy was not served";
+}
+
+TEST_F(ExportTest, AFirstReadFasterThanTheCutoffIsNotWritten) {
+  auto Off = firstReads("1000000000");
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "int count(void);\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Use + "\"\n"
+                                     "int f(void) { return count(); }\n");
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is listed yet";
+  EXPECT_EQ(Daemon->stats().Entries, 0u) << "a fast first read was written";
+  EXPECT_TRUE(reads(Main, Use)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Main, Use)) << "the miss's copy was not served";
+}
+
+TEST_F(ExportTest, AFirstReadWithACopyServedInsideIsNotWritten) {
+  // inner.h is served inside outer.h's first read, so outer.h's copy would
+  // hold an import rather than inner.h's declarations: it is not written,
+  // and the next compile misses outer.h as it would without the switch.
+  auto Off = firstReads("0");
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nmy_size outer_len(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n"
+                               "my_size a(void) { return 1; }\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n"
+                               "my_size b(void) { return outer_len(); }\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  EXPECT_FALSE(reads(A, Inner)) << "inner.h's first read was not served";
+  size_t Before = Daemon->stats().Entries;
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h is not listed yet";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was not served inside it";
+  EXPECT_EQ(Daemon->stats().Entries, Before) << "outer.h was written";
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h has no copy yet";
+  EXPECT_FALSE(reads(B, Outer)) << "the miss's copy was not served";
+}
+
+TEST_F(ExportTest, AHeaderMissedInsideAFirstReadIsWrittenToo) {
+  // inner.h is listed (a.c read it with the switch off) but has no copy.
+  // b.c's first read of outer.h asks for inner.h inside it, misses, and
+  // writes inner.h's copy; outer.h's copy, holding inner.h, is written too.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#define INNER_MAX 42\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nmy_size outer_len(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n"
+                               "my_size a(void) { return INNER_MAX; }\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n"
+                               "my_size b(void) { return outer_len(); }\n");
+  std::string C = write("c.c", "#include \"" + Outer + "\"\n"
+                               "my_size c(void) {\n"
+                               "  return outer_len() + INNER_MAX;\n}\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  ASSERT_EQ(Daemon->stats().Entries, 0u) << "the switch is off for a.c";
+  auto Off = firstReads("0");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer));
+  EXPECT_TRUE(Entered.count(Inner)) << "inner.h has no copy yet";
+  EXPECT_EQ(Daemon->stats().Entries, 2u)
+      << "inner.h's miss and outer.h's first read were not both written";
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+  EXPECT_FALSE(reads(A, Inner)) << "inner.h's copy was not served";
+}
+
 TEST_F(ExportTest, AHeaderUsingAnUnnameableOutsideDeclarationIsNotWritten) {
   // main.c declares _clar with a struct type that has no name, then
   // includes use.h, whose inline function uses it. A copy of use.h can
@@ -2776,6 +2876,32 @@ TEST_F(ExportTest, AHeaderUsingAFunctionOfTheFileIsNotWritten) {
   EXPECT_EQ(Daemon->stats().Entries, 0u);
 }
 
+TEST_F(ExportTest, ACopyUsingTheCounterIsMeasuredNotServed) {
+  // CLANG_HEADER_CACHE_COUNTER_PROBE: a header that expands __COUNTER__ is
+  // written rather than declined, and never served: its values are the
+  // writing compile's.
+  setenv("CLANG_HEADER_CACHE_COUNTER_PROBE", "1", 1);
+  auto Unset = llvm::make_scope_exit(
+      [] { unsetenv("CLANG_HEADER_CACHE_COUNTER_PROBE"); });
+  std::string Name = write("name.h", "#ifndef NAME_H\n#define NAME_H\n"
+                                     "#define CAT_(a, b) a##b\n"
+                                     "#define CAT(a, b) CAT_(a, b)\n"
+                                     "int CAT(unique_, __COUNTER__);\n"
+                                     "#endif\n");
+  std::string Value = write("value.h", "#ifndef VALUE_H\n#define VALUE_H\n"
+                                       "enum { first = __COUNTER__ };\n"
+                                       "#endif\n");
+  std::string Main = write("main.c", "#include \"" + Name + "\"\n#include \"" +
+                                         Value + "\"\nint main_v = first;\n");
+  EXPECT_TRUE(reads(Main, Name)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Name)) << "nothing is stored yet";
+  EXPECT_EQ(Daemon->stats().Entries, 2u) << "both were written";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered));
+  EXPECT_TRUE(Entered.count(Name)) << "name.h was not served";
+  EXPECT_TRUE(Entered.count(Value)) << "value.h was not served";
+}
+
 TEST_F(ExportTest, AHeaderIncludedInsideAnEnumIsNotServedThere) {
   // The kernel's arch/x86/events/perf_event.h and qemu's linux-user/syscall.c
   // include an X-macro header inside an enum body. The parser looks ahead
@@ -2791,6 +2917,31 @@ TEST_F(ExportTest, AHeaderIncludedInsideAnEnumIsNotServedThere) {
   EXPECT_TRUE(reads(Top, Flags)) << "nothing is stored yet";
   EXPECT_FALSE(reads(Top, Flags)) << "flags.h's copy was not served";
   EXPECT_TRUE(reads(Enum, Flags)) << "flags.h was served inside the enum";
+}
+
+TEST_F(ExportTest, ACopyUsingTheCounterServesWhereItStartsTheSame) {
+  // CLANG_HEADER_CACHE_COUNTER=1 (DECISIONS.md 2.7): u.h pastes __COUNTER__
+  // into a name, as the kernel's __UNIQUE_ID and glib's G_STATIC_ASSERT do.
+  // Its copy holds u_0 and u_1; it serves where the counter starts at 0,
+  // and leaves it at 2, as reading u.h would.
+  setenv("CLANG_HEADER_CACHE_COUNTER", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_COUNTER"); });
+  std::string U = write("u.h", "#ifndef U_H\n#define U_H\n"
+                               "#define CAT_(a, b) a##b\n"
+                               "#define CAT(a, b) CAT_(a, b)\n"
+                               "int CAT(u_, __COUNTER__);\n"
+                               "int CAT(u_, __COUNTER__);\n#endif\n");
+  std::string First =
+      write("first.c", "#include \"" + U +
+                           "\"\nint *p = &u_1;\n"
+                           "_Static_assert(__COUNTER__ == 2, \"moved\");\n");
+  std::string Later = write("later.c", "int before = __COUNTER__;\n#include \"" +
+                                           U + "\"\nint *q = &u_2;\n");
+  EXPECT_TRUE(reads(First, U)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(First, U)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(First, U)) << "u.h's copy was not served at 0";
+  EXPECT_TRUE(reads(Later, U)) << "u.h's copy was served at 1";
 }
 
 TEST_F(ExportTest, APoisoningIsCarriedOnlyByTheHeaderThatDidIt) {

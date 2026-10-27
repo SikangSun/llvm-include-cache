@@ -63,6 +63,9 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   encodeSnapshot(W, Deps.Entry);
   encodeSnapshot(W, Deps.Exit);
   W.u64(Deps.WarningState);
+  W.u32(Deps.CounterStart);
+  W.u32(Deps.CounterUses);
+  W.u8(Deps.CounterSemantic ? 1 : 0);
   W.str(ModuleName);
   W.str(Deps.HeaderName);
 
@@ -538,6 +541,9 @@ std::optional<MetadataView> MetadataView::open(llvm::StringRef Bytes) {
   V.Entry = decodeSnapshot(Fixed);
   V.Exit = decodeSnapshot(Fixed);
   V.WarningState = Fixed.u64();
+  V.CounterStart = Fixed.u32();
+  V.CounterUses = Fixed.u32();
+  V.CounterSemantic = Fixed.u8() != 0;
   V.ModuleName = Fixed.str();
   V.HeaderName = Fixed.str();
   if (!Fixed.atEnd())
@@ -747,6 +753,9 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
   Deps.Entry = V->entry();
   Deps.Exit = V->exit();
   Deps.WarningState = V->warningState();
+  Deps.CounterStart = V->counterStart();
+  Deps.CounterUses = V->counterUses();
+  Deps.CounterSemantic = V->counterSemantic();
   if (ModuleName)
     *ModuleName = V->moduleName().str();
   return Deps;

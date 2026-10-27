@@ -9,6 +9,7 @@
 #include "clang/ASTCache/HeaderCacheServer.h"
 #include "clang/ASTCache/ASTCacheProducer.h"
 #include "clang/ASTCache/CacheClient.h"
+#include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/PartExporter.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
@@ -403,6 +404,28 @@ public:
          << " held back as the first time their copy would be written, "
          << E.LinksServed << " links to copies served, " << E.LinksWritten
          << " to copies written\n";
+      if (Client->sendThread() || !Client->claimMode().empty()) {
+        const CacheClient::Stats &C = Client->stats();
+        OS << "header cache concurrency: " << C.Waited
+           << " lookups held for a copy being written, " << C.WaitedHits
+           << " of them hits; " << E.ClaimRefused
+           << " copies not written, claimed elsewhere";
+        if (Client->claimMode().ends_with("check"))
+          OS << " (" << C.ClaimSame << " identical to the stored copy, "
+             << C.ClaimDiffers << " differing, " << C.ClaimNotStored
+             << " not stored yet)";
+        OS << "\n";
+      }
+      if (CounterFits[0] || CounterFits[1] || CounterFits[2])
+        OS << "header cache counter probe: misses where a copy fit but for "
+              "__COUNTER__: "
+           << CounterFits[2] << " begun at the same value, " << CounterFits[1]
+           << " renamable, " << CounterFits[0]
+           << " with a value used as a number or by an #if\n";
+      if (FirstReadCutoff)
+        OS << "header cache first reads: " << E.FirstReads << " recorded, "
+           << E.FirstReadsWritten << " written, " << E.FirstReadsFast
+           << " faster than the ask cutoff\n";
       OS << "header cache write time: " << ms(E.WriterMicros)
          << " ms in Clang's writer, "
          << ms(E.ComposeMicros) << " in compose (" << ms(E.ChooseMicros)
@@ -416,6 +439,8 @@ public:
           OS << "  deep copies in " << Line << "\n";
         for (const std::string &Line : E.Declines)
           OS << "  not exported " << Line << "\n";
+        for (const std::string &Line : E.Counters)
+          OS << "  counter " << Line << "\n";
       }
     }
   }
@@ -434,6 +459,21 @@ public:
 
   /// Stores a part this compile exported.
   void push(const PushRequest &R) { Client->push(R); }
+
+  /// The concurrency switches and their calls (CLANG_HEADER_CACHE_SEND_THREAD,
+  /// _WAIT, _CLAIM).
+  CacheClient &client() { return *Client; }
+  void finishSending() { Client->finishSending(); }
+  void writingEnded(llvm::StringRef Header) {
+    Client->noteWriting(Header, /*Ended=*/true);
+  }
+  bool claim(llvm::StringRef Header, llvm::StringRef Module) {
+    return Client->claim(Header, Module);
+  }
+  void release(llvm::StringRef Header, llvm::StringRef Module) {
+    Client->claim(Header, Module, /*Release=*/true);
+  }
+  void compareStored(const PushRequest &R) { Client->compareStored(R); }
 
   Module *tryServe(FileEntryRef File, SourceLocation IncludeLoc,
                    ConstSearchDirIterator CurDir) override {
@@ -471,6 +511,16 @@ public:
     if (VersionOf.empty() && !Client->isListed(Path)) {
       ++NotListed;
       NextReason = "not-listed";
+      // CLANG_HEADER_CACHE_FIRST_READ: the compile that reads a header
+      // before any compile has listed it records the header, and writes its
+      // copy if the header turns out slow enough to be listed. Otherwise
+      // this compile's context gets a copy only at a later build's miss.
+      // Inside a header being recorded, a header is that header's.
+      DeclBoundaryObserver *B = PP.getDeclBoundaryObserver();
+      if (FirstReadCutoff && Exporter && !PopulateOnly &&
+          !Exporter->recording() && CI.hasSema() && B &&
+          B->isAtDeclarationBoundary())
+        Exporter->exportIfSlow(File, *FirstReadCutoff);
       return nullptr;
     }
 
@@ -592,7 +642,11 @@ public:
           std::to_string(HitLoadMicros) + " replay=" + std::to_string(Replay) +
           " bytes=" + std::to_string(HitBytes));
     };
-    PP.setCounterValue(Counter);
+    // Loading set the counter to where the writing compile left it; a hit
+    // leaves it where the header would have (CLANG_HEADER_CACHE_COUNTER).
+    PP.setCounterValue(Counter + (Target && Client->lastMetadata()
+                                      ? Client->lastMetadata()->counterUses()
+                                      : 0));
     // A section read inside another left its name pending: none is now.
     if (Step == CacheClient::PiecesStep::Again) {
       ++(Target ? AgainServed : AgainMissed);
@@ -686,15 +740,25 @@ public:
           return nullptr;
         }
       }
+      int CounterFit = Client->lastCounterFit();
+      if (CounterFit >= 0)
+        ++CounterFits[CounterFit];
+      static const char *const CounterFitNames[] = {
+          "counter-semantic", "counter-renamable", "counter-same"};
       if (LogServed)
         NextReason = Client->lastCandidates() == 0 ? std::string("no-saved-PCM")
+                     : CounterFit >= 0 ? std::string(CounterFitNames[CounterFit])
                      : Client->lastRejection() != MismatchReason::None
                          ? "rejected:" + describe(Client->lastRejection()).str()
                          : std::string("load-refused");
       // A miss where a copy could have stood in: save this header's part of
       // this compile for the next one (DECISIONS.md 2.17).
-      if (Exporter && !(PopulateOnly && AnyFits))
+      if (Exporter && !(PopulateOnly && AnyFits)) {
         Exporter->exportNext(File);
+        // CLANG_HEADER_CACHE_WAIT: compiles asking for it meanwhile may wait
+        // for this copy rather than parse the header too.
+        Client->noteWriting(Path, /*Ended=*/false);
+      }
       return nullptr;
     }
     // The copy's references to declarations outside it resolve to the ones
@@ -1494,6 +1558,10 @@ private:
   /// Hashes of every name a loaded copy's macro effects touched.
   llvm::DenseSet<uint64_t> TouchedByCopies;
   unsigned EffectsReplayed = 0, EffectsSkipped = 0;
+  /// CLANG_HEADER_CACHE_COUNTER_PROBE: misses where a copy whose header
+  /// expanded __COUNTER__ fit otherwise, by what it would have needed
+  /// (CacheClient::lastCounterFit): neither, renaming, nothing.
+  unsigned CounterFits[3] = {};
   bool ReplayAll = false;
   /// Each hit's header and module, for CLANG_HEADER_CACHE_STATS=2: which
   /// copy a compile used is what a failure after a hit needs traced to.
@@ -1727,6 +1795,20 @@ private:
     return SM.createFileID(FE, IncludeLoc, Kind);
   }
 
+  /// CLANG_HEADER_CACHE_FIRST_READ=1: a header no compile has listed is
+  /// recorded by the compile reading it and written if reading it took at
+  /// least the ask cutoff: the daemon's default, or
+  /// CLANG_HEADER_CACHE_FIRST_READ_US.
+  std::optional<uint64_t> FirstReadCutoff = []() -> std::optional<uint64_t> {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_FIRST_READ");
+    if (!V || llvm::StringRef(V) != "1")
+      return std::nullopt;
+    uint64_t Micros = DefaultAskCutoffMicros;
+    if (const char *C = std::getenv("CLANG_HEADER_CACHE_FIRST_READ_US"))
+      if (llvm::StringRef(C).getAsInteger(10, Micros))
+        Micros = DefaultAskCutoffMicros;
+    return Micros;
+  }();
   /// CLANG_HEADER_CACHE_FOLD_SERVED=1: inside a header being written, a
   /// header is asked for and served too, and the copy being written holds
   /// the served copy's declarations as its own.
@@ -1952,6 +2034,23 @@ void clang::ast_cache::installHeaderCacheHook(
       E.writeOnlyIfSeen([S](llvm::StringRef Header, llvm::StringRef Module) {
         return S->seenBefore(Header, Module);
       });
+    CacheClient &C = S->client();
+    if (C.sendThread())
+      E.whenFinished([S] { S->finishSending(); });
+    if (C.waitMode())
+      E.whenDeclined([S](llvm::StringRef Header) { S->writingEnded(Header); });
+    if (!C.claimMode().empty())
+      E.writeOnlyIfClaimed(
+          [S](llvm::StringRef Header, llvm::StringRef Module) {
+            return S->claim(Header, Module);
+          },
+          [S](llvm::StringRef Header, llvm::StringRef Module) {
+            S->release(Header, Module);
+          },
+          C.claimMode() == "check" || C.claimMode() == "depscheck"
+              ? std::function<void(const PushRequest &)>(
+                    [S](const PushRequest &R) { S->compareStored(R); })
+              : nullptr);
     // The diagnostics printed while a header being exported is open go into
     // its part (REPORT.md Q34).
     DiagnosticsEngine &Diags = CI.getDiagnostics();

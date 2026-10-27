@@ -93,6 +93,10 @@ public:
   /// declaration.
   virtual void recordDeductionGuideNameQuery(const IdentifierInfo *Name,
                                               bool IsDeductionGuide) = 0;
+
+  /// Called where a name, in an expression, a type or a tag reference,
+  /// resolved to \p D: the declarations a header's text refers to.
+  virtual void recordDeclarationUse(const NamedDecl *D, SourceLocation Loc) {}
 };
 
 }

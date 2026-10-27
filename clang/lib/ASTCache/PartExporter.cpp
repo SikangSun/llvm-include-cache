@@ -47,6 +47,7 @@
 #include "llvm/Support/xxhash.h"
 #include <array>
 #include <chrono>
+#include <optional>
 #include <unistd.h>
 #include <map>
 #include "llvm/ADT/StringSet.h"
@@ -178,6 +179,20 @@ public:
                    !((Sections && llvm::StringRef(Sections) == "1") ||
                      PiecesAsked);
     PiecesMode = !LinkMode && !NoSubmodules && PiecesAsked;
+    const char *ClaimVar = std::getenv("CLANG_HEADER_CACHE_CLAIM");
+    ClaimByDeps = ClaimVar && llvm::StringRef(ClaimVar).starts_with("deps");
+    if (ClaimByDeps)
+      Tracker.OnDeclarationUse = [this](const NamedDecl *D,
+                                        SourceLocation L) {
+        declarationUsed(D, L);
+      };
+    const char *Probe = std::getenv("CLANG_HEADER_CACHE_COUNTER_PROBE");
+    CounterProbe = Probe && llvm::StringRef(Probe) == "1";
+    const char *CounterVar = std::getenv("CLANG_HEADER_CACHE_COUNTER");
+    CounterMode = CounterVar && llvm::StringRef(CounterVar) == "1";
+    if (CounterProbe)
+      CI.getPreprocessor().setTokenWatcher(
+          [this](const Token &T) { counterToken(T); });
 
     std::lock_guard<std::mutex> L(RegistryLock);
     registry()[&CI] = this;
@@ -191,6 +206,13 @@ public:
   void exportNext(FileEntryRef File, llvm::StringRef StoredAs) override {
     Expected = &File.getFileEntry();
     ExpectedStored = StoredAs.str();
+    ExpectedCutoff.reset();
+  }
+
+  void exportIfSlow(FileEntryRef File, uint64_t CutoffMicros) override {
+    Expected = &File.getFileEntry();
+    ExpectedStored.clear();
+    ExpectedCutoff = CutoffMicros;
   }
 
   void served(serialization::ModuleFile *Fold, const MetadataView *Deps,
@@ -327,7 +349,29 @@ public:
     SeenBefore = std::move(Seen);
   }
 
+  void writeOnlyIfClaimed(
+      std::function<bool(llvm::StringRef, llvm::StringRef)> Claim,
+      std::function<void(llvm::StringRef, llvm::StringRef)> Release,
+      std::function<void(const PushRequest &)> Compare) override {
+    ClaimFn = std::move(Claim);
+    ReleaseFn = std::move(Release);
+    CompareFn = std::move(Compare);
+  }
+
+  void whenDeclined(std::function<void(llvm::StringRef)> F) override {
+    DeclinedFn = std::move(F);
+  }
+
+  void whenFinished(std::function<void()> F) override {
+    FinishedFn = std::move(F);
+  }
+
   bool writing() const override {
+    return llvm::any_of(
+        Open, [](const Part &P) { return P.Decline.empty() && !P.FirstRead; });
+  }
+
+  bool recording() const override {
     return llvm::any_of(Open, [](const Part &P) { return P.Decline.empty(); });
   }
 
@@ -379,6 +423,8 @@ public:
       Expected = nullptr;
       std::string StoredAs = std::move(ExpectedStored);
       ExpectedStored.clear();
+      std::optional<uint64_t> Cutoff = ExpectedCutoff;
+      ExpectedCutoff.reset();
       if (!FE)
         return;
       // A header inside one being exported can be held as a submodule of
@@ -403,6 +449,13 @@ public:
       if (ByPath)
         ExpectedPath.clear();
       begin(FID, *FE, StoredAs);
+      if (Cutoff && !ByPath) {
+        Part &P = Open.back();
+        P.FirstRead = true;
+        P.CutoffMicros = *Cutoff;
+        P.Started = std::chrono::steady_clock::now();
+        ++Counts.FirstReads;
+      }
       return;
     }
     if (Reason != ExitFile)
@@ -455,6 +508,37 @@ public:
     }
   }
 
+  /// CLANG_HEADER_CACHE_CLAIM=deps: \p D, named at \p L, is one of the
+  /// outside declarations of each open part whose text \p L is in.
+  void declarationUsed(const NamedDecl *D, SourceLocation L) {
+    if (Open.empty() || L.isInvalid() ||
+        !D->getDeclContext()->getRedeclContext()->isFileContext())
+      return;
+    SourceLocation::UIntTy At = SM.getExpansionLoc(L).getRawEncoding();
+    for (Part &P : Open)
+      if (P.contains(At) && (D->isFromASTFile() || !inPart(P, D->getLocation())))
+        P.UsedOutside.insert(D);
+  }
+
+  /// CLANG_HEADER_CACHE_COUNTER_PROBE: a number reaching the parser that a
+  /// __COUNTER__ expansion produced, directly or through macro arguments, is
+  /// used as a value: renaming cannot stand in for it. One pasted into a
+  /// name or made a string arrives as an identifier or a string literal.
+  void counterToken(const Token &T) {
+    if (Open.empty() || CounterNames.empty() || !T.is(tok::numeric_constant))
+      return;
+    for (SourceLocation L = T.getLocation(); L.isMacroID();
+         L = SM.getImmediateSpellingLoc(L)) {
+      const SrcMgr::ExpansionInfo &X =
+          SM.getSLocEntry(SM.getFileID(L)).getExpansion();
+      if (CounterNames.contains(X.getExpansionLocStart().getRawEncoding())) {
+        for (Part &P : Open)
+          P.CounterSemantic = true;
+        return;
+      }
+    }
+  }
+
   void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                     SourceRange, const MacroArgs *) override {
     if (Open.empty())
@@ -465,9 +549,20 @@ public:
     llvm::StringRef Name = MacroNameTok.getIdentifierInfo()->getName();
     if (!isTranslationUnitVaryingBuiltin(Name))
       return;
-    for (Part &P : Open)
-      if (P.Decline.empty())
+    bool Counter = Name == "__COUNTER__";
+    // CLANG_HEADER_CACHE_COUNTER_PROBE: the copy is written, to be measured
+    // and never served (DECISIONS.md 2.7). An #if reads the value; where
+    // else it lands is seen as it reaches the parser (counterToken).
+    bool InIf = Counter && CounterProbe &&
+                CI.getPreprocessor().isParsingIfOrElifDirective();
+    if (Counter && CounterProbe)
+      CounterNames.insert(MacroNameTok.getLocation().getRawEncoding());
+    for (Part &P : Open) {
+      P.CounterUses += Counter;
+      P.CounterSemantic |= InIf;
+      if (P.Decline.empty() && !(Counter && (CounterProbe || CounterMode)))
         P.Decline = "expands " + Name.str();
+    }
   }
 
   //===--------------------------------------------------------------------===//
@@ -517,6 +612,8 @@ public:
 
   void translationUnitFinished() {
     writeReady();
+    if (FinishedFn)
+      FinishedFn();
     if (const char *Dir = std::getenv("CLANG_HEADER_CACHE_DDG"))
       dumpGraph(Dir);
   }
@@ -732,6 +829,24 @@ private:
     /// After the header ended: whether the latest diagnostic was the
     /// header's, so that its notes are too.
     bool TakingNotes = false;
+    /// CLANG_HEADER_CACHE_FIRST_READ: a header no compile had listed, written
+    /// only if reading it took CutoffMicros or more, from Started.
+    bool FirstRead = false;
+    uint64_t CutoffMicros = 0;
+    std::chrono::steady_clock::time_point Started;
+    /// CLANG_HEADER_CACHE_CLAIM: the module name this compile claimed, to
+    /// give back if the part is declined after all.
+    std::string Claimed;
+    /// __COUNTER__ where the header began, and how often the header
+    /// expanded it.
+    uint32_t CounterAtBegin = 0;
+    unsigned CounterUses = 0;
+    /// CLANG_HEADER_CACHE_CLAIM=deps: the file-scope declarations made before
+    /// the header that its text named, as Sema resolved them.
+    llvm::SetVector<const NamedDecl *> UsedOutside;
+    /// CLANG_HEADER_CACHE_COUNTER_PROBE: one of the values reached the
+    /// parser as a number, or an #if read it.
+    bool CounterSemantic = false;
 
     /// A header still open holds everything made since it began.
     bool contains(SourceLocation::UIntTy Offset) const {
@@ -970,6 +1085,7 @@ private:
     P.Begin = SM.getSLocEntry(FID).getOffset();
     P.DeclsAfter = LastTopLevel;
     P.ModulesAtBegin = modulesLoaded();
+    P.CounterAtBegin = CI.getPreprocessor().getCounterValue();
     hold(P, FE);
     if (!CI.hasSema()) {
       P.Decline = "no Sema when the header was entered";
@@ -1001,8 +1117,28 @@ private:
 
   void end() {
     Part P = Open.pop_back_val();
+    // A first read faster than the cutoff would not have listed the header;
+    // the compiles after it parse it rather than ask.
+    if (P.FirstRead && P.Decline.empty() &&
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - P.Started)
+                .count() < static_cast<int64_t>(P.CutoffMicros)) {
+      P.Decline = "a first read, faster than the ask cutoff";
+      ++Counts.FirstReadsFast;
+    }
     P.End = SM.getNextLocalOffset();
     P.ModulesAtEnd = modulesLoaded();
+    // CLANG_HEADER_CACHE_COUNTER: how far the header moved the counter,
+    // copies served inside it (CLANG_HEADER_CACHE_FOLD_SERVED) included.
+    if (CounterMode)
+      P.CounterUses =
+          CI.getPreprocessor().getCounterValue() - P.CounterAtBegin;
+    if (P.CounterUses)
+      Counts.Counters.push_back(
+          P.Stored + " from " + std::to_string(P.CounterAtBegin) + ", " +
+          std::to_string(P.CounterUses) + " uses" +
+          (P.CounterSemantic ? ", a value used as a number or by an #if"
+                             : ""));
     P.SLocEnd = SM.local_sloc_entry_size();
     Preprocessor &PP = CI.getPreprocessor();
     llvm::DenseSet<const IdentifierInfo *> Unchanged;
@@ -1429,9 +1565,43 @@ private:
            inLinked(P, SM.getExpansionLoc(L).getRawEncoding());
   }
 
+  /// CLANG_HEADER_CACHE_CLAIM=deps: what a claim is for -- the copy's name,
+  /// which covers what the header read while parsing but not the outside
+  /// declarations, and those its text named, by name and fingerprint.
+  std::string claimKey(const Part &P, llvm::StringRef Name) {
+    auto Before = [&](const Decl *D) {
+      return !inPart(P, D->getLocation()) && !madeAfter(P, D);
+    };
+    std::vector<std::string> Keys;
+    llvm::DenseSet<std::pair<unsigned, const IdentifierInfo *>> Seen;
+    for (const NamedDecl *ND : P.UsedOutside) {
+      DeclarationDependency::Space In = nameSpaceOf(*ND);
+      if (!ND->getIdentifier() ||
+          !Seen.insert({unsigned(In), ND->getIdentifier()}).second)
+        continue;
+      const Decl *AtEntry = ND->getMostRecentDecl();
+      while (AtEntry && !Before(AtEntry))
+        AtEntry = AtEntry->getPreviousDecl();
+      std::optional<std::string> F = declarationFingerprint(
+          AtEntry ? *cast<NamedDecl>(AtEntry) : *ND, Before);
+      Keys.push_back(std::to_string(unsigned(In)) + ":" + ND->getName().str() +
+                     "=" + (F ? *F : std::string("?")));
+    }
+    llvm::sort(Keys);
+    std::string All;
+    for (const std::string &K : Keys)
+      (All += K) += '\0';
+    return Name.str() + "/" +
+           llvm::utohexstr(llvm::xxh3_64bits(All), /*LowerCase=*/true, 16);
+  }
+
   void decline(const Part &P, const llvm::Twine &Why) {
     ++Counts.Declined;
     Counts.Declines.push_back(P.Stored + ": " + Why.str());
+    if (!P.Claimed.empty() && ReleaseFn)
+      ReleaseFn(P.Stored, P.Claimed);
+    if (DeclinedFn)
+      DeclinedFn(P.Stored);
   }
 
   void write(Part &P) {
@@ -1533,6 +1703,23 @@ private:
       ++Counts.HeldBack;
       return;
     }
+    // Another compile claimed or stored a copy of this name: unless asked to
+    // check it, Clang's writer does not run for it here.
+    bool Refused = false;
+    if (ClaimFn) {
+      std::string Key = ClaimByDeps ? claimKey(P, Name) : Name;
+      if (ClaimFn(P.Stored, Key)) {
+        P.Claimed = Key;
+      } else {
+        ++Counts.ClaimRefused;
+        if (!CompareFn) {
+          if (DeclinedFn)
+            DeclinedFn(P.Stored);
+          return;
+        }
+        Refused = true;
+      }
+    }
     Preprocessor &PP = CI.getPreprocessor();
     ModuleMap &MM = PP.getHeaderSearchInfo().getModuleMap();
     if (MM.findModule(Name))
@@ -1610,6 +1797,11 @@ private:
       for (size_t K = 0; K != Deps.Diagnostics.size(); ++K)
         Deps.Diagnostics[K].Cond = condAt(P, P.Diagnostics[K].Loc);
     Deps.WarningState = P.WarningState;
+    // Where the header did not expand it, its value says nothing about the
+    // copy, and would only set apart copies that are the same.
+    Deps.CounterStart = P.CounterUses ? P.CounterAtBegin : 0;
+    Deps.CounterUses = P.CounterUses;
+    Deps.CounterSemantic = P.CounterSemantic;
     Deps.WarningPragmas = P.WarningPragmas;
 
     PushRequest R;
@@ -1617,7 +1809,15 @@ private:
     R.ModuleName = Name;
     R.Deps = std::move(Deps);
     R.Data.assign(W.Buffer.begin(), W.Buffer.end());
+    // CLANG_HEADER_CACHE_CLAIM=check: a refused copy is compared with the
+    // stored one of its name, not sent.
+    if (Refused) {
+      CompareFn(R);
+      return;
+    }
     ++Counts.Exported;
+    if (P.FirstRead)
+      ++Counts.FirstReadsWritten;
     std::string Line = P.Stored + ": " + std::to_string(W.Buffer.size()) +
                        " bytes in " + std::to_string(W.Micros) + " us, " +
                        std::to_string(W.ByName) + " by name";
@@ -3331,6 +3531,8 @@ private:
   /// Set by exportNext for the file about to be entered.
   const FileEntry *Expected = nullptr;
   std::string ExpectedStored;
+  /// Set by exportIfSlow: the expected header is a first read.
+  std::optional<uint64_t> ExpectedCutoff;
   std::string ExpectedPath;
   /// Parts whose header is open, innermost last, and parts whose header has
   /// ended, waiting for the next finished declaration.
@@ -3352,6 +3554,17 @@ private:
   /// with a section for each header its lines include, everything below
   /// folded in; a compile that needs another version of a section adds one.
   bool PiecesMode = false;
+  /// CLANG_HEADER_CACHE_COUNTER_PROBE: a header that expands __COUNTER__
+  /// is written, with what its values were used for, and never served;
+  /// where each expansion was, for telling its values among the tokens.
+  bool CounterProbe = false;
+  /// CLANG_HEADER_CACHE_CLAIM=deps or depscheck: a claim covers the outside
+  /// declarations the header's text named, not only the copy's name.
+  bool ClaimByDeps = false;
+  /// CLANG_HEADER_CACHE_COUNTER=1: a header that expands __COUNTER__ is
+  /// written, its copy depending on the counter's value where it began.
+  bool CounterMode = false;
+  llvm::DenseSet<SourceLocation::UIntTy> CounterNames;
   /// CLANG_HEADER_CACHE_PIECES: the headers begun as bases.
   llvm::DenseSet<FileID> PiecesBases;
   llvm::DenseMap<FileID, std::string> CanonicalOf;
@@ -3362,6 +3575,11 @@ private:
   /// While a hit's diagnostics are printed again.
   bool Replaying = false;
   std::function<bool(llvm::StringRef, llvm::StringRef)> SeenBefore;
+  std::function<bool(llvm::StringRef, llvm::StringRef)> ClaimFn;
+  std::function<void(llvm::StringRef, llvm::StringRef)> ReleaseFn;
+  std::function<void(const PushRequest &)> CompareFn;
+  std::function<void(llvm::StringRef)> DeclinedFn;
+  std::function<void()> FinishedFn;
   llvm::DenseSet<FileID> Tracked;
   bool ObserverSet = false;
   /// See memoryBuffers.

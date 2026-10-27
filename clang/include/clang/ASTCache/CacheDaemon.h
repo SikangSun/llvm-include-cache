@@ -37,6 +37,8 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -87,7 +89,16 @@ public:
   /// message that could not be understood. An unreadable message closes the
   /// connection rather than being guessed at.
   std::optional<llvm::SmallVector<char, 0>>
-  handleMessage(llvm::StringRef Body);
+  handleMessage(llvm::StringRef Body) {
+    return handleMessage(Body, /*Conn=*/0);
+  }
+  /// The same, for the connection numbered \p Conn (run() numbers them from
+  /// 1); a compile's writing notices and claims end when it closes.
+  std::optional<llvm::SmallVector<char, 0>>
+  handleMessage(llvm::StringRef Body, uint64_t Conn);
+  /// Connection \p Conn closed: what it was writing, and what it claimed,
+  /// is given up.
+  void connectionClosed(uint64_t Conn);
 
   /// Accepts connections until \p stop is called, handing each to its own
   /// thread. Removes the socket file on the way out.
@@ -118,6 +129,14 @@ public:
     /// CLANG_HEADER_CACHE_SECOND_MISS: copies asked about for the first time,
     /// and again.
     uint64_t SeenFirst = 0, SeenAgain = 0;
+    /// CLANG_HEADER_CACHE_WAIT: lookups held for a copy being written; of
+    /// them, those a new copy ended, those the time limit ended, and lookups
+    /// not held because the header's copies seldom serve its requests.
+    uint64_t Waits = 0, WaitsServed = 0, WaitsTimedOut = 0, WaitsGated = 0;
+    uint64_t WaitMicros = 0;
+    /// CLANG_HEADER_CACHE_CLAIM: claims granted, and refused because another
+    /// compile claimed or pushed that copy.
+    uint64_t ClaimsGranted = 0, ClaimsRefused = 0;
   };
   Stats stats() const;
 
@@ -148,8 +167,14 @@ private:
     std::vector<SearchOutcome> Searches;
   };
 
-  llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req);
-  llvm::SmallVector<char, 0> handlePush(const ReceivedPush &Req);
+  llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req,
+                                          uint64_t Conn);
+  llvm::SmallVector<char, 0> handlePush(const ReceivedPush &Req,
+                                        uint64_t Conn);
+  llvm::SmallVector<char, 0> handleNotice(const WritingNotice &Notice,
+                                          uint64_t Conn);
+  llvm::SmallVector<char, 0> handleClaim(const ClaimRequest &Req,
+                                         uint64_t Conn);
   llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
   llvm::SmallVector<char, 0> handleHello();
 
@@ -171,6 +196,47 @@ private:
   llvm::StringMap<unsigned> LookupsOf;
   /// Each copy a compile was about to write, by header and module name.
   llvm::StringSet<> SeenOnce;
+
+  /// CLANG_HEADER_CACHE_WAIT: per header, the compiles writing a copy of it
+  /// (WritingNotice), by connection and client, and the lookups waiting for
+  /// one. An entry stays once made, so a waiting lookup can hold on to it.
+  struct Writer {
+    uint64_t Conn = 0, ClientId = 0;
+    /// When its notice arrived: about when it began parsing the header.
+    std::chrono::steady_clock::time_point Since;
+  };
+  struct Writers {
+    std::vector<Writer> List;
+    std::condition_variable Arrived;
+  };
+  llvm::StringMap<std::unique_ptr<Writers>> WritersOf;
+  /// Holds \p Req's reply, while another compile writes a copy of its
+  /// header, until a new copy is stored or the writers stop: at most until
+  /// the earliest writer has had twice the header's parse time, enough to
+  /// parse it and write the copy. Not once the waits for this header mostly
+  /// ended in copies the waiting compile could not use. Mutex held.
+  bool waitForWriterLocked(std::unique_lock<std::mutex> &Lock,
+                           const LookupRequest &Req, uint64_t Conn);
+  /// Per header, the waits that ended in a new copy and whether the waiting
+  /// compile then used it (learned from its next message's Used): the gate.
+  struct WaitHistory {
+    unsigned Fit = 0, Missed = 0;
+  };
+  llvm::StringMap<WaitHistory> WaitsOf;
+  /// Per connection, the header it last waited for and the copies that
+  /// arrived meanwhile, until its next message says whether it used one.
+  llvm::DenseMap<uint64_t, std::pair<std::string, std::vector<uint64_t>>>
+      WaitedFor;
+  /// Settles WaitedFor[\p Conn] with the copies \p Used. Mutex held.
+  void settleWaitLocked(uint64_t Conn, const std::vector<uint64_t> &Used);
+  /// Ends \p Conn's writing of \p Filename, or all of its writing if
+  /// \p Filename is empty, and wakes the lookups waiting on it. Mutex held.
+  void endWritingLocked(uint64_t Conn, llvm::StringRef Filename);
+  /// CLANG_HEADER_CACHE_CLAIM: each copy claimed and not yet pushed, by
+  /// module name, with the connection that claimed it; and the module names
+  /// pushed.
+  llvm::StringMap<uint64_t> Claimed;
+  llvm::StringSet<> PushedNames;
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
   bool listLocked(llvm::StringRef Path);

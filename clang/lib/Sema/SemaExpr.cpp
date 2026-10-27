@@ -48,6 +48,7 @@
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
+#include "clang/Sema/NameClassificationObserver.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
@@ -228,6 +229,8 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
                              ObjCInterfaceDecl *ClassReceiver,
                              bool SkipTrailingRequiresClause) {
   SourceLocation Loc = Locs.front();
+  if (NameClassObserver)
+    NameClassObserver->recordDeclarationUse(D, Loc);
   if (getLangOpts().CPlusPlus && isa<FunctionDecl>(D)) {
     // If there were any diagnostics suppressed by template argument deduction,
     // emit them now.

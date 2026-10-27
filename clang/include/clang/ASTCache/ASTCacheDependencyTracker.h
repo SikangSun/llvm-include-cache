@@ -235,6 +235,13 @@ public:
   void recordDeductionGuideNameQuery(const IdentifierInfo *Name,
                                       bool IsDeductionGuide) override;
 
+  /// Passed on to OnDeclarationUse (CLANG_HEADER_CACHE_CLAIM=deps).
+  void recordDeclarationUse(const NamedDecl *D, SourceLocation Loc) override {
+    if (OnDeclarationUse)
+      OnDeclarationUse(D, Loc);
+  }
+  std::function<void(const NamedDecl *, SourceLocation)> OnDeclarationUse;
+
   /// Closes every frame still open, emitting a record for each as if it had
   /// been exited. The header being populated is the main file of its own
   /// sub-compile, so it never receives an ExitFile and its frame would

@@ -84,6 +84,8 @@ void clang::ast_cache::encodeLookupRequest(const LookupRequest &Req,
   frame(Out, MessageKind::LookupRequest, [&](ByteWriter &W) {
     W.str(Req.Filename);
     writeLearned(W, Req.Build, Req.Learned, Req.Used);
+    W.u64(Req.ClientId);
+    W.u8(Req.Wait ? 1 : 0);
   });
 }
 
@@ -110,6 +112,7 @@ void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
       W.str(V.Section);
       Entries(V.Entries);
     }
+    W.u8(Resp.Waited ? 1 : 0);
   });
 }
 
@@ -172,6 +175,34 @@ void clang::ast_cache::encodeSeenReply(bool Seen,
         [&](ByteWriter &W) { W.u8(Seen ? 1 : 0); });
 }
 
+void clang::ast_cache::encodeWritingNotice(const WritingNotice &Notice,
+                                           llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::WritingNotice, [&](ByteWriter &W) {
+    W.str(Notice.Filename);
+    W.u64(Notice.ClientId);
+    W.u8(Notice.Ended ? 1 : 0);
+  });
+}
+
+void clang::ast_cache::encodeNoticeAck(llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::NoticeAck, [](ByteWriter &) {});
+}
+
+void clang::ast_cache::encodeClaimRequest(const ClaimRequest &Req,
+                                          llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::ClaimRequest, [&](ByteWriter &W) {
+    W.str(Req.Filename);
+    W.str(Req.ModuleName);
+    W.u8(Req.Release ? 1 : 0);
+  });
+}
+
+void clang::ast_cache::encodeClaimReply(bool Granted,
+                                        llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::ClaimReply,
+        [&](ByteWriter &W) { W.u8(Granted ? 1 : 0); });
+}
+
 //===----------------------------------------------------------------------===//
 // Decoding
 //===----------------------------------------------------------------------===//
@@ -201,6 +232,14 @@ clang::ast_cache::peekMessageKind(llvm::StringRef Body) {
     return MessageKind::SeenRequest;
   case static_cast<uint8_t>(MessageKind::SeenReply):
     return MessageKind::SeenReply;
+  case static_cast<uint8_t>(MessageKind::WritingNotice):
+    return MessageKind::WritingNotice;
+  case static_cast<uint8_t>(MessageKind::NoticeAck):
+    return MessageKind::NoticeAck;
+  case static_cast<uint8_t>(MessageKind::ClaimRequest):
+    return MessageKind::ClaimRequest;
+  case static_cast<uint8_t>(MessageKind::ClaimReply):
+    return MessageKind::ClaimReply;
   default:
     return std::nullopt;
   }
@@ -213,8 +252,13 @@ clang::ast_cache::decodeLookupRequest(llvm::StringRef Body) {
     return std::nullopt;
   LookupRequest Req;
   Req.Filename = R.str().str();
-  if (!readLearned(R, Req.Build, Req.Learned, Req.Used) || !R.atEnd())
+  if (!readLearned(R, Req.Build, Req.Learned, Req.Used))
     return std::nullopt;
+  Req.ClientId = R.u64();
+  uint8_t Wait = R.u8();
+  if (!R.ok() || !R.atEnd() || Wait > 1)
+    return std::nullopt;
+  Req.Wait = Wait == 1;
   return Req;
 }
 
@@ -249,8 +293,10 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
     Entries(V.Entries);
     Resp.Versions.push_back(std::move(V));
   }
-  if (!R.atEnd())
+  uint8_t Waited = R.u8();
+  if (!R.ok() || !R.atEnd() || Waited > 1)
     return std::nullopt;
+  Resp.Waited = Waited == 1;
   return Resp;
 }
 
@@ -313,6 +359,47 @@ clang::ast_cache::decodeSeenRequest(llvm::StringRef Body) {
   if (!R.ok() || !R.atEnd() || Req.Filename.empty() || Req.ModuleName.empty())
     return std::nullopt;
   return Req;
+}
+
+std::optional<WritingNotice>
+clang::ast_cache::decodeWritingNotice(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::WritingNotice))
+    return std::nullopt;
+  WritingNotice Notice;
+  Notice.Filename = R.str().str();
+  Notice.ClientId = R.u64();
+  uint8_t Ended = R.u8();
+  if (!R.ok() || !R.atEnd() || Notice.Filename.empty() || Ended > 1)
+    return std::nullopt;
+  Notice.Ended = Ended == 1;
+  return Notice;
+}
+
+std::optional<ClaimRequest>
+clang::ast_cache::decodeClaimRequest(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::ClaimRequest))
+    return std::nullopt;
+  ClaimRequest Req;
+  Req.Filename = R.str().str();
+  Req.ModuleName = R.str().str();
+  uint8_t Release = R.u8();
+  if (!R.ok() || !R.atEnd() || Req.Filename.empty() ||
+      Req.ModuleName.empty() || Release > 1)
+    return std::nullopt;
+  Req.Release = Release == 1;
+  return Req;
+}
+
+std::optional<bool> clang::ast_cache::decodeClaimReply(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::ClaimReply))
+    return std::nullopt;
+  uint8_t Granted = R.u8();
+  if (!R.ok() || !R.atEnd() || Granted > 1)
+    return std::nullopt;
+  return Granted == 1;
 }
 
 std::optional<bool> clang::ast_cache::decodeSeenReply(llvm::StringRef Body) {

@@ -65,9 +65,19 @@ public:
     /// CLANG_HEADER_CACHE_SECOND_MISS: parts not written, the first time
     /// their copy would have been.
     unsigned HeldBack = 0;
+    /// CLANG_HEADER_CACHE_FIRST_READ: headers recorded at their first read;
+    /// of them, the ones written, and the ones read faster than the cutoff.
+    unsigned FirstReads = 0, FirstReadsWritten = 0, FirstReadsFast = 0;
+    /// CLANG_HEADER_CACHE_CLAIM: copies not written because another compile
+    /// claimed or stored them.
+    unsigned ClaimRefused = 0;
     std::vector<std::string> Copies;
     /// "<header>: <why>", one per declined part.
     std::vector<std::string> Declines;
+    /// "<header> from <value>, <n> uses", one per part that expanded
+    /// __COUNTER__: its value where the header began, and how often the
+    /// header expanded it (DECISIONS.md 2.7).
+    std::vector<std::string> Counters;
     /// "<header>: <bytes> bytes in <us> us, <n> by name", one per exported
     /// part.
     std::vector<std::string> Exports;
@@ -98,6 +108,13 @@ public:
   /// given, is the name the daemon stores it under instead of its path: a
   /// version of a section of another header's copy (CLANG_HEADER_CACHE_PIECES).
   virtual void exportNext(FileEntryRef File, llvm::StringRef StoredAs = {}) = 0;
+
+  /// The compile is about to enter \p File, a header no compile has listed
+  /// yet (CLANG_HEADER_CACHE_FIRST_READ): record it as exportNext does, and
+  /// write its copy only if reading it took at least \p CutoffMicros, the
+  /// time that lists a header. The headers inside it are asked for as
+  /// usual; one served inside it declines it, as it does any part.
+  virtual void exportIfSlow(FileEntryRef File, uint64_t CutoffMicros) = 0;
 
   /// A saved copy stood in for an #include. A header open now is not
   /// exported: its part would hold the import, not the declarations. The
@@ -132,6 +149,22 @@ public:
   virtual void
   writeOnlyIfSeen(std::function<bool(llvm::StringRef, llvm::StringRef)> Seen) = 0;
 
+  /// CLANG_HEADER_CACHE_CLAIM: before Clang's writer runs, \p Claim (header,
+  /// module name) says whether this compile may write the copy; a claimed
+  /// copy then declined is given back with \p Release. With \p Check, a
+  /// refused copy is written anyway and handed to \p Compare instead of
+  /// being sent.
+  virtual void
+  writeOnlyIfClaimed(std::function<bool(llvm::StringRef, llvm::StringRef)> Claim,
+                     std::function<void(llvm::StringRef, llvm::StringRef)> Release,
+                     std::function<void(const PushRequest &)> Compare) = 0;
+
+  /// Called with the stored name of each header whose copy is declined.
+  virtual void whenDeclined(std::function<void(llvm::StringRef)> F) = 0;
+
+  /// Called once the compile's last copy is written.
+  virtual void whenFinished(std::function<void()> F) = 0;
+
   /// While \p On, Clang's diagnostics are a hit's, printed again: not the
   /// open headers' to hold.
   virtual void replaying(bool On) = 0;
@@ -139,8 +172,13 @@ public:
   /// Whether a header this compile is exporting is open: one that missed,
   /// was entered, and has not been declined. Its part is a folded copy -- it
   /// holds every header inside it -- so the headers inside must be read as
-  /// text, not served.
+  /// text, not served. A first read (exportIfSlow) does not count: the
+  /// headers inside it are asked for.
   virtual bool writing() const = 0;
+
+  /// Whether a header this compile is exporting is open and not declined, a
+  /// first read included: a header inside it belongs to its copy.
+  virtual bool recording() const = 0;
 
   /// Export the header whose absolute path is \p Path the first time it is
   /// entered, whatever the cache says. For CLANG_HEADER_CACHE_EXPORT.

@@ -19,7 +19,9 @@
 #include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/Support/FileSystem.h"
 #include "gtest/gtest.h"
+#include <chrono>
 #include <string>
+#include <thread>
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -279,6 +281,131 @@ protected:
   std::string TestDir, RegionPath;
   std::unique_ptr<CacheDaemon> Daemon;
 };
+
+/// CLANG_HEADER_CACHE_WAIT and _CLAIM: messages as they arrive on numbered
+/// connections, the way run() hands them over.
+class ConcurrencyTest : public DaemonTest {
+protected:
+  LookupResponse lookupFrom(uint64_t Conn, llvm::StringRef Name,
+                            uint64_t Client, bool Wait,
+                            std::vector<uint64_t> Used = {}) {
+    LookupRequest Req{Name.str(), 0, {}, std::move(Used)};
+    Req.ClientId = Client;
+    Req.Wait = Wait;
+    llvm::SmallVector<char, 0> Msg;
+    encodeLookupRequest(Req, Msg);
+    auto Reply = Daemon->handleMessage(body(Msg), Conn);
+    EXPECT_TRUE(Reply.has_value());
+    auto Resp = Reply ? decodeLookupResponse(body(*Reply)) : std::nullopt;
+    EXPECT_TRUE(Resp.has_value());
+    return Resp.value_or(LookupResponse{});
+  }
+  void notice(uint64_t Conn, llvm::StringRef Name, uint64_t Client,
+              bool Ended = false) {
+    llvm::SmallVector<char, 0> Msg;
+    encodeWritingNotice({Name.str(), Client, Ended}, Msg);
+    auto Reply = Daemon->handleMessage(body(Msg), Conn);
+    ASSERT_TRUE(Reply.has_value());
+    EXPECT_EQ(peekMessageKind(body(*Reply)), MessageKind::NoticeAck);
+  }
+  bool claim(uint64_t Conn, llvm::StringRef Name, llvm::StringRef Module,
+             bool Release = false) {
+    llvm::SmallVector<char, 0> Msg;
+    encodeClaimRequest({Name.str(), Module.str(), Release}, Msg);
+    auto Reply = Daemon->handleMessage(body(Msg), Conn);
+    EXPECT_TRUE(Reply.has_value());
+    return Reply && decodeClaimReply(body(*Reply)).value_or(false);
+  }
+  void pushFrom(uint64_t Conn, llvm::StringRef Name, llvm::StringRef Module,
+                llvm::StringRef Data = "BYTES") {
+    llvm::SmallVector<char, 0> Msg;
+    PushRequest P;
+    P.Filename = Name.str();
+    P.ModuleName = Module.str();
+    P.Deps = makeRecord("M", true);
+    P.Data = Data.str();
+    encodePushRequest(P, Msg);
+    auto Reply = Daemon->handleMessage(body(Msg), Conn);
+    ASSERT_TRUE(Reply.has_value());
+  }
+  /// A wait's time limit runs from the header's parse time: long here, so
+  /// only the events a test sends end a wait.
+  void timeHeader(llvm::StringRef Name) { report({{Name.str(), 2000000}}); }
+};
+
+TEST_F(ConcurrencyTest, AClaimIsGrantedOnceUntilGivenBack) {
+  // A claim still held when its compile ends is for a copy the compile
+  // wrote (one declined is given back), and stays: claims by the whole
+  // dependency list are not the module names pushes mark.
+  EXPECT_TRUE(claim(1, "h.h", "__hcp_a"));
+  EXPECT_FALSE(claim(2, "h.h", "__hcp_a")) << "claimed by connection 1";
+  EXPECT_TRUE(claim(2, "h.h", "__hcp_b")) << "another copy of the header";
+  claim(1, "h.h", "__hcp_a", /*Release=*/true);
+  EXPECT_TRUE(claim(3, "h.h", "__hcp_a")) << "given back";
+  Daemon->connectionClosed(3);
+  EXPECT_FALSE(claim(4, "h.h", "__hcp_a")) << "written by connection 3";
+  pushFrom(5, "h.h", "__hcp_c");
+  EXPECT_FALSE(claim(6, "h.h", "__hcp_c")) << "stored";
+  EXPECT_EQ(Daemon->stats().ClaimsRefused, 3u);
+}
+
+TEST_F(ConcurrencyTest, AWaitingLookupIsServedByTheCopyBeingWritten) {
+  timeHeader("h.h");
+  notice(1, "h.h", /*Client=*/1);
+  LookupResponse Got;
+  std::thread Waiter([&] { Got = lookupFrom(2, "h.h", /*Client=*/2, true); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  pushFrom(1, "h.h", "__hcp_a");
+  Waiter.join();
+  EXPECT_TRUE(Got.Waited);
+  EXPECT_EQ(Got.Entries.size(), 1u) << "the copy that arrived";
+  EXPECT_EQ(Daemon->stats().WaitsServed, 1u);
+}
+
+TEST_F(ConcurrencyTest, AWaitEndsWhenTheWriterGivesUpOrCloses) {
+  timeHeader("h.h");
+  for (bool Close : {false, true}) {
+    notice(1, "h.h", /*Client=*/1);
+    LookupResponse Got;
+    std::thread Waiter([&] { Got = lookupFrom(2, "h.h", 2, true); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (Close)
+      Daemon->connectionClosed(1);
+    else
+      notice(1, "h.h", 1, /*Ended=*/true);
+    Waiter.join();
+    EXPECT_TRUE(Got.Waited);
+    EXPECT_TRUE(Got.Entries.empty());
+  }
+  EXPECT_EQ(Daemon->stats().WaitsTimedOut, 0u);
+}
+
+TEST_F(ConcurrencyTest, ACompileDoesNotWaitForItself) {
+  timeHeader("h.h");
+  notice(1, "h.h", /*Client=*/7);
+  EXPECT_FALSE(lookupFrom(2, "h.h", /*Client=*/7, true).Waited);
+  EXPECT_FALSE(lookupFrom(3, "h.h", /*Client=*/8, false).Waited)
+      << "a lookup that does not ask to wait";
+}
+
+TEST_F(ConcurrencyTest, TheGateStopsWaitsWhoseCopiesDoNotServe) {
+  // Three waits each end in a copy the waiting compile's next message does
+  // not list as used: the fourth lookup is not held.
+  timeHeader("h.h");
+  for (uint64_t I = 0; I != 3; ++I) {
+    notice(10 + I, "h.h", 100 + I);
+    LookupResponse Got;
+    std::thread Waiter([&] { Got = lookupFrom(20 + I, "h.h", 200 + I, true); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    pushFrom(10 + I, "h.h", "__hcp_" + std::to_string(I), "B" + std::to_string(I));
+    Waiter.join();
+    ASSERT_TRUE(Got.Waited);
+    lookupFrom(20 + I, "other.h", 200 + I, false, /*Used=*/{});
+  }
+  notice(30, "h.h", 300);
+  EXPECT_FALSE(lookupFrom(31, "h.h", 301, true).Waited);
+  EXPECT_EQ(Daemon->stats().WaitsGated, 1u);
+}
 
 TEST_F(DaemonTest, UnknownHeaderIsACleanMiss) {
   // An empty result, not an error: nothing has been stored under that name.

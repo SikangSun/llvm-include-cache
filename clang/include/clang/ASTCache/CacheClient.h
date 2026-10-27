@@ -34,9 +34,13 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace llvm {
@@ -68,6 +72,7 @@ enum class MismatchReason {
   WarningState,
   MacroStack,
   GuardWithoutHeader,
+  Counter,
 };
 
 llvm::StringRef describe(MismatchReason R);
@@ -283,10 +288,41 @@ public:
   /// this one. True if the daemon cannot say, so that the copy is written.
   bool seenBefore(llvm::StringRef Filename, llvm::StringRef ModuleName);
 
-  /// Stores a newly produced entry. Blocks until the daemon acknowledges, so
-  /// a caller that does not want to wait should run this off the critical
-  /// path.
+  /// Stores a newly produced entry. Blocks until the daemon acknowledges,
+  /// unless CLANG_HEADER_CACHE_SEND_THREAD: then the encoded copy goes to a
+  /// thread of the compile's own, which sends it on a connection of its
+  /// own, and the compile goes on.
   bool push(const PushRequest &Req);
+
+  /// CLANG_HEADER_CACHE_WAIT: tells the daemon, from the sending thread and
+  /// without waiting, that this compile missed \p Filename and is writing
+  /// its copy; with \p Ended, that it stopped without one.
+  void noteWriting(llvm::StringRef Filename, bool Ended);
+
+  /// CLANG_HEADER_CACHE_CLAIM: asks to be the compile that writes the copy
+  /// of \p Filename named \p ModuleName; false if another compile claimed
+  /// or stored it. True if the daemon cannot say, so that the copy is
+  /// written. With \p Release, gives the claim up.
+  bool claim(llvm::StringRef Filename, llvm::StringRef ModuleName,
+             bool Release = false);
+
+  /// Waits until every copy given to the sending thread is sent, and ends
+  /// the thread. A compile calls it before it exits.
+  void finishSending();
+
+  /// CLANG_HEADER_CACHE_CLAIM=check: compares \p R, a copy whose claim was
+  /// refused, with the stored copy of the same name, and counts whether the
+  /// two are identical.
+  void compareStored(const PushRequest &R);
+
+  /// Which of the concurrency switches this compile runs with.
+  bool sendThread() const { return SendThread; }
+  bool waitMode() const { return WaitMode; }
+  /// "1" claims; "check" claims, and where refused writes the copy anyway,
+  /// unsent, to compare with the stored one of the same name.
+  llvm::StringRef claimMode() const { return ClaimMode; }
+  /// Whether the latest lookup's reply was held for a copy being written.
+  bool lastWaited() const { return LastWaited; }
 
   /// Whether \p Path is on the daemon's ask-list, the headers some compile
   /// found slow enough to be worth a saved copy (DECISIONS.md 2.14). Read
@@ -310,7 +346,7 @@ public:
     /// Copies fetched by name for a link, and how many the daemon held.
     unsigned Fetches = 0, Fetched = 0;
     unsigned CandidatesRejected = 0;
-    unsigned RejectedFor[13] = {};
+    unsigned RejectedFor[14] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
     /// is not".
@@ -326,6 +362,14 @@ public:
     /// Candidates checked, and the check's time step by step.
     unsigned CandidatesChecked = 0;
     CheckCost Check;
+    /// CLANG_HEADER_CACHE_WAIT: lookups the daemon held, and how many of
+    /// them ended in a hit.
+    unsigned Waited = 0, WaitedHits = 0;
+    /// CLANG_HEADER_CACHE_CLAIM: claims refused; with "check", of the copies
+    /// refused, those identical to the stored copy of the same name, those
+    /// that differ, and those whose namesake was not stored yet.
+    unsigned ClaimsRefused = 0, ClaimSame = 0, ClaimDiffers = 0,
+             ClaimNotStored = 0;
   };
   const Stats &stats() const { return Counters; }
 
@@ -333,6 +377,11 @@ public:
   /// and why the first rejected one was rejected (None if none was).
   unsigned lastCandidates() const { return LastCandidates; }
   MismatchReason lastRejection() const { return LastRejection; }
+  /// CLANG_HEADER_CACHE_COUNTER_PROBE: of the latest lookup's copies whose
+  /// header expanded __COUNTER__ and which fit otherwise, the one needing
+  /// least: 2 begun at the same value, 1 differing but renamable (its values
+  /// landed only in names and strings), 0 neither; -1 for none.
+  int lastCounterFit() const { return LastCounterFit; }
   /// Which submodules of the latest lookup's match load (REPORT.md T17),
   /// and their names.
   const std::vector<bool> &lastSubmodules() const { return LastSubmodules; }
@@ -383,6 +432,23 @@ private:
   std::unique_ptr<llvm::raw_socket_stream> Conn;
   SharedRegion Region;
   Stats Counters;
+  std::string SocketPath;
+  /// Tells this compile's writing apart from other compiles' at the daemon.
+  uint64_t ClientId = 0;
+  bool SendThread = false, WaitMode = false, LastWaited = false;
+  std::string ClaimMode;
+  /// CLANG_HEADER_CACHE_COUNTER=1: a copy whose header expanded __COUNTER__
+  /// is served where the counter starts at the value it started at.
+  bool CounterMode = false;
+  /// The sending thread: messages it sends in order on a connection of its
+  /// own, so that they never interleave with the compile's lookups.
+  void sendLoop();
+  void enqueue(llvm::SmallVector<char, 0> Msg);
+  std::thread Sender;
+  std::mutex QueueLock;
+  std::condition_variable QueueReady;
+  std::deque<llvm::SmallVector<char, 0>> Queue;
+  bool Finishing = false;
   bool LogRejections = false;
   bool LogChecks = false;
   bool PartialMode = false;
@@ -401,6 +467,7 @@ private:
   llvm::StringMap<std::string> ServedNames;
   unsigned LastCandidates = 0;
   MismatchReason LastRejection = MismatchReason::None;
+  int LastCounterFit = -1;
   std::vector<bool> LastSubmodules;
   std::vector<std::string> LastSubmoduleNames, LastSubmodulePaths;
   std::optional<MetadataView> LastMetadata;

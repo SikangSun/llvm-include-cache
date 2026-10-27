@@ -477,6 +477,14 @@ struct HeaderDependencySet {
   /// there, hashed (warningState). A hit requires the same.
   uint64_t WarningState = 0;
 
+  /// CLANG_HEADER_CACHE_COUNTER_PROBE (DECISIONS.md 2.7): __COUNTER__ where
+  /// the header began, how often the header expanded it, and whether one of
+  /// its values reached the parser as a number or was read by an #if, rather
+  /// than only landing in names and strings. A copy whose header expanded it
+  /// is never served; a check notes what it would have needed.
+  uint32_t CounterStart = 0, CounterUses = 0;
+  bool CounterSemantic = false;
+
   /// The diagnostics the header's text printed, in order.
   std::vector<SavedDiagnostic> Diagnostics;
 

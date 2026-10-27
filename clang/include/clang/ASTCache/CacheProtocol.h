@@ -65,6 +65,10 @@ enum class MessageKind : uint8_t {
   HelloReply = 8,
   SeenRequest = 9,
   SeenReply = 10,
+  WritingNotice = 11,
+  NoticeAck = 12,
+  ClaimRequest = 13,
+  ClaimReply = 14,
 };
 
 /// What a copy's #include searches found in one build, under one search key
@@ -110,6 +114,11 @@ struct LookupRequest {
   /// message: the daemon offers the most recently used first (REPORT.md
   /// I15).
   std::vector<uint64_t> Used;
+  /// CLANG_HEADER_CACHE_WAIT: the compile asking, and whether it would rather
+  /// wait for a copy another compile is writing (WritingNotice) than parse
+  /// the header itself. A compile never waits for its own.
+  uint64_t ClientId = 0;
+  bool Wait = false;
 };
 
 struct LookupResponse {
@@ -124,6 +133,8 @@ struct LookupResponse {
     std::vector<CacheEntryRef> Entries;
   };
   std::vector<SectionVersions> Versions;
+  /// The daemon held the reply for a copy another compile was writing.
+  bool Waited = false;
 };
 
 struct PushRequest {
@@ -188,6 +199,27 @@ struct SeenRequest {
   std::string Filename, ModuleName;
 };
 
+/// CLANG_HEADER_CACHE_WAIT: sent, without waiting, when a compile has missed
+/// \p Filename and is writing its copy; with \p Ended, when it stopped
+/// without one (the copy was declined). A push of a copy of the header, or
+/// the connection closing, ends it too. Compiles that ask for the header
+/// meanwhile may wait for the copy instead of parsing the header.
+struct WritingNotice {
+  std::string Filename;
+  uint64_t ClientId = 0;
+  bool Ended = false;
+};
+
+/// CLANG_HEADER_CACHE_CLAIM: a compile about to write the copy of
+/// \p Filename named \p ModuleName asks to be the one that writes it; with
+/// \p Release, it gives a claim up (the copy was declined). The name is
+/// hashed from the copy's metadata before Clang's writer runs, so two
+/// copies with one name can still differ in what the writer adds.
+struct ClaimRequest {
+  std::string Filename, ModuleName;
+  bool Release = false;
+};
+
 /// Largest message accepted, in bytes. A parsed header is the big payload
 /// here and runs to a few megabytes; the cap exists so a corrupt length
 /// prefix fails immediately instead of trying to allocate whatever 32 bits
@@ -214,6 +246,12 @@ void encodeHelloReply(const HelloReply &Reply,
 void encodeSeenRequest(const SeenRequest &Req,
                        llvm::SmallVectorImpl<char> &Out);
 void encodeSeenReply(bool Seen, llvm::SmallVectorImpl<char> &Out);
+void encodeWritingNotice(const WritingNotice &Notice,
+                         llvm::SmallVectorImpl<char> &Out);
+void encodeNoticeAck(llvm::SmallVectorImpl<char> &Out);
+void encodeClaimRequest(const ClaimRequest &Req,
+                        llvm::SmallVectorImpl<char> &Out);
+void encodeClaimReply(bool Granted, llvm::SmallVectorImpl<char> &Out);
 
 //===----------------------------------------------------------------------===//
 // Decoding. \p Body is one message with the length prefix already stripped;
@@ -232,6 +270,9 @@ std::optional<TimingReport> decodeTimingReport(llvm::StringRef Body);
 std::optional<HelloReply> decodeHelloReply(llvm::StringRef Body);
 std::optional<SeenRequest> decodeSeenRequest(llvm::StringRef Body);
 std::optional<bool> decodeSeenReply(llvm::StringRef Body);
+std::optional<WritingNotice> decodeWritingNotice(llvm::StringRef Body);
+std::optional<ClaimRequest> decodeClaimRequest(llvm::StringRef Body);
+std::optional<bool> decodeClaimReply(llvm::StringRef Body);
 
 //===----------------------------------------------------------------------===//
 // Framed transport over a connected socket.

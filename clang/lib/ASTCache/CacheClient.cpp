@@ -24,6 +24,7 @@
 #include "llvm/Support/raw_socket_stream.h"
 #include <algorithm>
 #include <chrono>
+#include <unistd.h>
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -57,6 +58,9 @@ llvm::StringRef clang::ast_cache::describe(MismatchReason R) {
     return "a definition the header's #pragma pop_macro takes differs";
   case MismatchReason::GuardWithoutHeader:
     return "a header's guard is defined, but the header was never read";
+  case MismatchReason::Counter:
+    return "its header expanded __COUNTER__, which starts at another value "
+           "here (or, measuring, is never served)";
   }
   return "unknown";
 }
@@ -943,11 +947,129 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
   std::unique_ptr<CacheClient> C(new CacheClient());
   C->Conn = std::move(*S);
   C->Region = std::move(*R);
+  C->SocketPath = SocketPath.str();
+  // Unique among the compiles one daemon serves at once: the process, and
+  // the client within it (tests run several in one process).
+  uint64_t Seed[3] = {static_cast<uint64_t>(::getpid()),
+                      reinterpret_cast<uintptr_t>(C.get()),
+                      static_cast<uint64_t>(
+                          Start.time_since_epoch().count())};
+  C->ClientId = llvm::xxh3_64bits(llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Seed), sizeof(Seed)));
+  auto On = [](const char *Name) {
+    const char *V = std::getenv(Name);
+    return V && llvm::StringRef(V) == "1";
+  };
+  C->WaitMode = On("CLANG_HEADER_CACHE_WAIT");
+  C->SendThread = C->WaitMode || On("CLANG_HEADER_CACHE_SEND_THREAD");
+  if (const char *V = std::getenv("CLANG_HEADER_CACHE_CLAIM");
+      V && (llvm::StringRef(V) == "1" || llvm::StringRef(V) == "check" ||
+            llvm::StringRef(V) == "deps" || llvm::StringRef(V) == "depscheck"))
+    C->ClaimMode = V;
+  if (const char *V = std::getenv("CLANG_HEADER_CACHE_COUNTER"))
+    C->CounterMode = llvm::StringRef(V) == "1";
   C->Counters.ConnectMicros = microsSince(Start);
   return C;
 }
 
-CacheClient::~CacheClient() = default;
+CacheClient::~CacheClient() { finishSending(); }
+
+void CacheClient::enqueue(llvm::SmallVector<char, 0> Msg) {
+  {
+    std::lock_guard<std::mutex> L(QueueLock);
+    if (!Sender.joinable())
+      Sender = std::thread([this] { sendLoop(); });
+    Queue.push_back(std::move(Msg));
+  }
+  QueueReady.notify_one();
+}
+
+void CacheClient::sendLoop() {
+  llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> S =
+      llvm::raw_socket_stream::createConnectedUnix(SocketPath);
+  if (!S)
+    llvm::consumeError(S.takeError());
+  for (;;) {
+    llvm::SmallVector<char, 0> Msg;
+    {
+      std::unique_lock<std::mutex> L(QueueLock);
+      QueueReady.wait(L, [&] { return Finishing || !Queue.empty(); });
+      if (Queue.empty())
+        return;
+      Msg = std::move(Queue.front());
+      Queue.pop_front();
+    }
+    // A failed send loses the copy, never the compile: the next compile
+    // that misses the header writes it.
+    if (S && *S && sendMessage(**S, Msg))
+      (void)receiveMessage(**S);
+  }
+}
+
+void CacheClient::finishSending() {
+  if (!Sender.joinable())
+    return;
+  {
+    std::lock_guard<std::mutex> L(QueueLock);
+    Finishing = true;
+  }
+  QueueReady.notify_one();
+  Sender.join();
+  Finishing = false;
+}
+
+void CacheClient::compareStored(const PushRequest &R) {
+  llvm::SmallVector<char, 0> Msg;
+  LookupRequest Req{R.Filename, Build, {}, {}};
+  Req.ClientId = ClientId;
+  encodeLookupRequest(Req, Msg);
+  std::optional<std::string> Reply;
+  if (sendMessage(*Conn, Msg))
+    Reply = receiveMessage(*Conn);
+  std::optional<LookupResponse> Resp =
+      Reply ? decodeLookupResponse(*Reply) : std::nullopt;
+  llvm::SmallVector<char, 0> Mine;
+  encodeMetadata(R.Deps, R.ModuleName, Mine);
+  // The same as any stored copy of the name: claims by the whole
+  // dependency list (CLANG_HEADER_CACHE_CLAIM=deps) leave several.
+  bool Stored = false;
+  if (Resp)
+    for (const CacheEntryRef &E : Resp->Entries) {
+      llvm::StringRef Bytes = Region.read(E.MetadataOffset, E.MetadataLength);
+      std::optional<MetadataView> V = MetadataView::open(Bytes);
+      if (!V || V->moduleName() != R.ModuleName)
+        continue;
+      Stored = true;
+      if (Bytes == llvm::StringRef(Mine.data(), Mine.size())) {
+        ++Counters.ClaimSame;
+        return;
+      }
+    }
+  ++(Stored ? Counters.ClaimDiffers : Counters.ClaimNotStored);
+}
+
+void CacheClient::noteWriting(llvm::StringRef Filename, bool Ended) {
+  if (!WaitMode)
+    return;
+  llvm::SmallVector<char, 0> Msg;
+  encodeWritingNotice({Filename.str(), ClientId, Ended}, Msg);
+  enqueue(std::move(Msg));
+}
+
+bool CacheClient::claim(llvm::StringRef Filename, llvm::StringRef ModuleName,
+                        bool Release) {
+  llvm::SmallVector<char, 0> Msg;
+  encodeClaimRequest({Filename.str(), ModuleName.str(), Release}, Msg);
+  auto Asked = std::chrono::steady_clock::now();
+  std::optional<std::string> Reply;
+  if (sendMessage(*Conn, Msg))
+    Reply = receiveMessage(*Conn);
+  Counters.DaemonMicros += microsSince(Asked);
+  std::optional<bool> Granted = Reply ? decodeClaimReply(*Reply) : std::nullopt;
+  if (Granted && !*Granted && !Release)
+    ++Counters.ClaimsRefused;
+  return !Granted || *Granted;
+}
 
 llvm::StringRef CacheClient::lookup(
     llvm::StringRef Filename, Preprocessor &PP, Sema *S, MetadataView *Matched,
@@ -957,6 +1079,8 @@ llvm::StringRef CacheClient::lookup(
   ++Counters.Lookups;
   LastPartial.clear();
   LastPieces.clear();
+  LastWaited = false;
+  LastCounterFit = -1;
 
   // CLANG_HEADER_CACHE_PIECES: asked again after its plan's sections were
   // read, the header has the copy the plan chose, checked once more: the
@@ -980,8 +1104,11 @@ llvm::StringRef CacheClient::lookup(
     PlannedVersions.erase(Cached);
   } else {
     llvm::SmallVector<char, 0> Msg;
-    encodeLookupRequest(
-        {Filename.str(), Build, std::move(Learned), std::move(Used)}, Msg);
+    LookupRequest Req{Filename.str(), Build, std::move(Learned),
+                      std::move(Used)};
+    Req.ClientId = ClientId;
+    Req.Wait = WaitMode;
+    encodeLookupRequest(Req, Msg);
     Learned.clear();
     Used.clear();
     auto Asked = std::chrono::steady_clock::now();
@@ -998,6 +1125,9 @@ llvm::StringRef CacheClient::lookup(
     std::optional<LookupResponse> Resp = decodeLookupResponse(*Reply);
     if (!Resp)
       return {};
+    LastWaited = Resp->Waited;
+    if (LastWaited)
+      ++Counters.Waited;
     Entries = std::move(Resp->Entries);
     Versions = std::move(Resp->Versions);
   }
@@ -1204,6 +1334,25 @@ llvm::StringRef CacheClient::lookup(
         Learned.push_back({Filename.str(), E.MetadataOffset, O});
     }
     Counters.CheckMicros += microsSince(Checking);
+    // CLANG_HEADER_CACHE_COUNTER_PROBE: a copy whose header expanded
+    // __COUNTER__ is not served, its values being the writing compile's
+    // (DECISIONS.md 2.7). Where it fits otherwise, what it would have needed
+    // is noted: the counter where the header begins at the value it began
+    // at where the copy was written, or, its values having landed only in
+    // names and strings, renaming them.
+    // CLANG_HEADER_CACHE_COUNTER=1: the copy holds the values the header's
+    // __COUNTER__ expansions had, which they have again only where the
+    // counter starts where it did (DECISIONS.md 2.7).
+    if (Why == MismatchReason::None && Deps->counterUses() && CounterMode) {
+      if (PP.getCounterValue() != Deps->counterStart())
+        Why = MismatchReason::Counter;
+    } else if (Why == MismatchReason::None && Deps->counterUses()) {
+      Why = MismatchReason::Counter;
+      LastCounterFit = std::max(LastCounterFit,
+                                PP.getCounterValue() == Deps->counterStart() ? 2
+                                : Deps->counterSemantic()                    ? 0
+                                                                             : 1);
+    }
     if (Why != MismatchReason::None) {
       if (LastRejection == MismatchReason::None)
         LastRejection = Why;
@@ -1230,6 +1379,8 @@ llvm::StringRef CacheClient::lookup(
     if (Use && !Use(Bytes, Deps->moduleName()))
       continue;
     ++Counters.Hits;
+    if (LastWaited)
+      ++Counters.WaitedHits;
     Used.push_back(E.MetadataOffset);
     // Each file the copy holds has, in this compile, the name its check
     // found it by.
@@ -1381,6 +1532,10 @@ bool CacheClient::reportTimings(const TimingReport &Report) {
 bool CacheClient::push(const PushRequest &Req) {
   llvm::SmallVector<char, 0> Msg;
   encodePushRequest(Req, Msg);
+  if (SendThread) {
+    enqueue(std::move(Msg));
+    return true;
+  }
   if (!sendMessage(*Conn, Msg))
     return false;
   return receiveMessage(*Conn).has_value();
