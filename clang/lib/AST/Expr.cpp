@@ -1355,17 +1355,21 @@ StringLiteral::getLocationOfByte(unsigned ByteNo, const SourceManager &SM,
     // expanded through.
     SourceLocation StrTokSpellingLoc = SM.getSpellingLoc(StrTokLoc);
 
-    // Re-lex the token to get its length and original spelling.
-    FileIDAndOffset LocInfo = SM.getDecomposedLoc(StrTokSpellingLoc);
-    bool Invalid = false;
-    StringRef Buffer = SM.getBufferData(LocInfo.first, &Invalid);
-    if (Invalid) {
+    // Without the token's text, the best place is the token.
+    auto TokenOnly = [&] {
       if (StartTokenByteOffset != nullptr)
         *StartTokenByteOffset = StringOffset;
       if (StartToken != nullptr)
         *StartToken = TokNo;
       return StrTokSpellingLoc;
-    }
+    };
+
+    // Re-lex the token to get its length and original spelling.
+    FileIDAndOffset LocInfo = SM.getDecomposedLoc(StrTokSpellingLoc);
+    bool Invalid = false;
+    StringRef Buffer = SM.getBufferData(LocInfo.first, &Invalid);
+    if (Invalid)
+      return TokenOnly();
 
     const char *StrData = Buffer.data()+LocInfo.second;
 
@@ -1374,6 +1378,12 @@ StringLiteral::getLocationOfByte(unsigned ByteNo, const SourceManager &SM,
                    Buffer.begin(), StrData, Buffer.end());
     Token TheTok;
     TheLexer.LexFromRawLexer(TheTok);
+
+    // A header cache copy keeps, for a token spelled in a macro it dropped,
+    // the place the macro was used (ASTWriter::getAdjustedLocation): the
+    // token there is the macro's name, not this string.
+    if (!tok::isStringLiteral(TheTok.getKind()))
+      return TokenOnly();
 
     // Use the StringLiteralParser to compute the length of the string in bytes.
     StringLiteralParser SLP(TheTok, SM, Features, Target);
@@ -1392,6 +1402,11 @@ StringLiteral::getLocationOfByte(unsigned ByteNo, const SourceManager &SM,
         *StartToken = TokNo;
       return Lexer::AdvanceToTokenCharacter(StrTokLoc, Offset, SM, Features);
     }
+
+    // A string there, written as the macro's argument, can be shorter than
+    // this one; past the last token there is none to move to.
+    if (TokNo + 1 == getNumConcatenated())
+      return TokenOnly();
 
     // Move to the next string token.
     StringOffset += TokNumBytes;

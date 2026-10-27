@@ -1339,6 +1339,55 @@ TEST_F(ExportTest, AHeaderEndingInAFunctionIsSavedWithItsBody) {
   EXPECT_FALSE(reads(Y, Last)) << "last.h's part was not served";
 }
 
+TEST_F(ExportTest, AnAsmStringFromAnOutsideMacroIsReadFromItsCopy) {
+  // atomic.h's asm string starts with LOCK_PREFIX, a macro of prefix.h. Its
+  // copy drops that macro's expansion and keeps, for the string's first
+  // token, the place LOCK_PREFIX is used. Code generation finds where each
+  // line of an asm string begins by reading its tokens again from the
+  // source (StringLiteral::getLocationOfByte); there it finds LOCK_PREFIX,
+  // and read it as a string: the kernel's full build crashed in 12 of its
+  // first 63 compiles.
+  std::string Prefix = write("prefix.h", "#ifndef PREFIX_H\n#define PREFIX_H\n"
+                                         "#define LOCK_PREFIX \"lock; \"\n"
+                                         "#endif\n");
+  std::string Atomic =
+      write("atomic.h", "#ifndef ATOMIC_H\n#define ATOMIC_H\n"
+                        "static inline void atomic_inc(int *p) {\n"
+                        "  __asm__ volatile(LOCK_PREFIX \"incl %0\\n\\t\"\n"
+                        "                   \"nop\" : \"+m\"(*p));\n"
+                        "}\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Prefix +
+                                         "\"\n#include \"" + Atomic +
+                                         "\"\nvoid f(int *p) { atomic_inc(p); }\n");
+  EXPECT_TRUE(reads(Main, Atomic)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Atomic)) << "nothing is stored yet";
+  std::string Asm;
+  unsigned Lines = 0;
+  AtEnd = [&](ASTContext &Ctx) {
+    const SourceManager &SM = Ctx.getSourceManager();
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("atomic_inc")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        if (auto *Body = dyn_cast_or_null<CompoundStmt>(F->getBody()))
+          for (Stmt *S : Body->body())
+            if (auto *A = dyn_cast<GCCAsmStmt>(S)) {
+              Asm = A->generateAsmString(Ctx);
+              auto *Str = cast<StringLiteral>(A->getAsmStringExpr());
+              unsigned Tok = 0, Offset = 0;
+              for (unsigned I = 0; I != Str->getLength(); ++I)
+                if (Str->getString()[I] == '\n' &&
+                    Str->getLocationOfByte(I + 1, SM, Ctx.getLangOpts(),
+                                           Ctx.getTargetInfo(), &Tok, &Offset)
+                        .isValid())
+                  ++Lines;
+            }
+  };
+  EXPECT_FALSE(reads(Main, Atomic)) << "atomic.h's part was not served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Asm, "lock; incl $0\n\tnop");
+  EXPECT_EQ(Lines, 1u);
+}
+
 TEST_F(ExportTest, APartServesACompileInAnotherDirectory) {
   // one/first.c writes shared.h's part; two/second.c, compiled from a
   // directory with no first.c in it, is served the part and lays out the
