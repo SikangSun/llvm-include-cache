@@ -502,6 +502,17 @@ public:
       return nullptr;
     }
 
+    // A copy is written only where no pragma is in force beyond those its
+    // metadata carries (findNonDefaultPragmaState). Under another, the
+    // header's text would give its declarations what the copy's lack: the
+    // kernel's startup code is compiled under #pragma GCC visibility
+    // push(hidden), and a symbol a copy left visible is no constant for an
+    // asm "i" operand under -fPIC.
+    if (findNonDefaultPragmaState(CI.getSema())) {
+      NextReason = "under-a-pragma";
+      return nullptr;
+    }
+
     // Loading a module file sets __COUNTER__ to the value its producer ended
     // with, which counts the uses in the context the copy was built after.
     // The saved header itself used none -- the producer declines one that

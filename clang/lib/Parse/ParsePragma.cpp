@@ -709,8 +709,11 @@ void Parser::HandlePragmaVisibility() {
   assert(Tok.is(tok::annot_pragma_vis));
   const IdentifierInfo *VisType =
     static_cast<IdentifierInfo *>(Tok.getAnnotationValue());
-  SourceLocation VisLoc = ConsumeAnnotationToken();
-  Actions.ActOnPragmaVisibility(VisType, VisLoc);
+  // Consume the token after processing the pragma, as for #pragma pack: an
+  // #include right after it is entered while the next token is read, and the
+  // header cache asks there whether the pragma is in force.
+  Actions.ActOnPragmaVisibility(VisType, Tok.getLocation());
+  ConsumeAnnotationToken();
 }
 
 void Parser::HandlePragmaPack() {
@@ -1866,9 +1869,11 @@ void Parser::HandlePragmaAttribute() {
          "Expected #pragma attribute annotation token");
   SourceLocation PragmaLoc = Tok.getLocation();
   auto *Info = static_cast<PragmaAttributeInfo *>(Tok.getAnnotationValue());
+  // Each action is taken before the token after the pragma is read, as for
+  // #pragma visibility.
   if (Info->Action == PragmaAttributeInfo::Pop) {
-    ConsumeAnnotationToken();
     Actions.ActOnPragmaAttributePop(PragmaLoc, Info->Namespace);
+    ConsumeAnnotationToken();
     return;
   }
   // Parse the actual attribute with its arguments.
@@ -1877,8 +1882,8 @@ void Parser::HandlePragmaAttribute() {
          "Unexpected #pragma attribute command");
 
   if (Info->Action == PragmaAttributeInfo::Push && Info->Tokens.empty()) {
-    ConsumeAnnotationToken();
     Actions.ActOnPragmaAttributeEmptyPush(PragmaLoc, Info->Namespace);
+    ConsumeAnnotationToken();
     return;
   }
 
@@ -2034,9 +2039,6 @@ void Parser::HandlePragmaAttribute() {
     return;
   }
 
-  // Consume the eof terminator token.
-  ConsumeToken();
-
   // Handle a mixed push/attribute by desurging to a push, then an attribute.
   if (Info->Action == PragmaAttributeInfo::Push)
     Actions.ActOnPragmaAttributeEmptyPush(PragmaLoc, Info->Namespace);
@@ -2045,6 +2047,9 @@ void Parser::HandlePragmaAttribute() {
     Actions.ActOnPragmaAttributeAttribute(Attribute, PragmaLoc,
                                           SubjectMatchRules);
   }
+
+  // Consume the eof terminator token.
+  ConsumeToken();
 }
 
 // #pragma GCC visibility comes in two variants:

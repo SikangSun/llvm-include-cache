@@ -463,6 +463,24 @@ TEST_F(HitTest, AFileBesideTheHeaderIsCheckedUnderTheNameTheHeaderGivesIt) {
   EXPECT_TRUE(Read) << "a copy holding another name for inner.h was served";
 }
 
+TEST_F(HitTest, AHeaderIsNotServedUnderAVisibilityPragma) {
+  // sections.h's copy was written where no visibility pragma was in force,
+  // so its _end has default visibility. Read under push(hidden), its text
+  // makes _end hidden: the kernel's startup code needs that for _end's
+  // address to be an asm "i" operand under -fPIC.
+  std::string Sections = write("sections.h", "#ifndef SECTIONS_H\n"
+                                             "#define SECTIONS_H\n"
+                                             "extern char _end[];\n#endif\n");
+  std::string Plain = write("plain.c", "#include \"" + Sections + "\"\n");
+  std::string Hidden =
+      write("hidden.c", "#pragma GCC visibility push(hidden)\n#include \"" +
+                            Sections + "\"\n");
+  store(Sections);
+  EXPECT_FALSE(reads(Plain, Sections)) << "sections.h's copy was not served";
+  EXPECT_TRUE(reads(Hidden, Sections))
+      << "sections.h's copy was served under push(hidden)";
+}
+
 TEST_F(HitTest, AHeaderIsServedOnlyWhereItsIncludesFindTheSameFiles) {
   // h.h includes <cfg.h>, and the include path decides which cfg.h: qemu's
   // kvm.h and "cpu.h" under -I../target/arm or -I../target/i386. Nothing in
