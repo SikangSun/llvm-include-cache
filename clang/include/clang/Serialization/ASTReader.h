@@ -2759,6 +2759,14 @@ public:
   /// Loads comments ranges.
   void ReadComments() override;
 
+  /// The name to look an input file of \p F up by. A part keeps each name
+  /// as the compile that wrote it opened the file, which may be relative to
+  /// that compile's directory, and the absolute name beside it: a compile in
+  /// another directory looks the file up by the absolute name, unless the
+  /// opened name finds the same file from its directory too.
+  StringRef getInputFileLookupName(serialization::ModuleFile &F,
+                                   const serialization::InputFileInfo &FI);
+
   /// Visit all the input file infos of the given module file.
   void visitInputFileInfos(
       serialization::ModuleFile &MF, bool IncludeSystem,

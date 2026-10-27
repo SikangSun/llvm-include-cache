@@ -213,6 +213,7 @@ private:
   std::function<bool(const MacroDirective *)> PartMacros;
   std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
   std::function<bool(FileEntryRef)> PartKeepsHeaderInfo;
+  std::function<bool(const IdentifierInfo *)> PartPoisons;
 
   /// See setPartScope.
   bool PartScoped = false;
@@ -1055,6 +1056,20 @@ public:
     PartKeepsHeaderInfo = std::move(KeepsHeaderInfo);
   }
   bool isWritingPart() const { return bool(PartDecls); }
+
+  /// Which identifiers the part's own header poisoned (#pragma GCC poison).
+  /// A part writes only those as poisoned: one poisoned before the header
+  /// stays poisoned in the writing compile, and a compile loading the part
+  /// may not have poisoned it (qemu's common code poisons TARGET_* names,
+  /// its per-target code does not).
+  void setPartPoisons(std::function<bool(const IdentifierInfo *)> Poisons) {
+    PartPoisons = std::move(Poisons);
+  }
+  /// Whether \p II is written as poisoned.
+  bool writesPoisoned(const IdentifierInfo *II) const {
+    return II->isPoisoned() &&
+           (!isWritingPart() || (PartPoisons && PartPoisons(II)));
+  }
 
   /// The top-level declarations of copies served inside the part, which it
   /// holds as its own, in order, before its own (CLANG_HEADER_CACHE_

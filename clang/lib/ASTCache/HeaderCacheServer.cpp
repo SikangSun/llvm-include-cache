@@ -289,7 +289,11 @@ public:
                     bool LogServed, WarningPragmaTracker &Pragmas)
       : CI(CI), Client(std::move(Client)), LogServed(LogServed),
         Pragmas(Pragmas),
-        WarningFlags(warningFlagsHash(CI.getDiagnosticOpts())) {
+        WarningFlags(warningFlagsHash(CI.getDiagnosticOpts())),
+        NamesMatter(CI.getCodeGenOpts().getDebugInfo() !=
+                        llvm::codegenoptions::NoDebugInfo ||
+                    // Measurement: names compared as before.
+                    std::getenv("CLANG_HEADER_CACHE_STRICT_NAMES")) {
     // For measuring what skipping saves: CLANG_HEADER_CACHE_REPLAY_ALL=1
     // replays every effect, as before it (REPORT.md I8).
     const char *All = std::getenv("CLANG_HEADER_CACHE_REPLAY_ALL");
@@ -524,7 +528,7 @@ public:
     Module *Target = nullptr;
     IncludeSite Site{File, CurDir, IncludeLoc,
                      warningState(WarningFlags, &Pragmas, IncludeLoc),
-                     searchContext(File, CurDir)};
+                     searchContext(File, CurDir), NamesMatter};
     bool AnyFits = false;
     size_t HitBytes = 0;
     uint64_t HitLoadMicros = 0;
@@ -1450,7 +1454,7 @@ private:
             if (IFI.Overridden || IFI.Transient || IFI.ModuleMap)
               return;
             llvm::SmallString<256> Name(
-                IFI.UnresolvedImportedFilenameAsRequested);
+                Reader.getInputFileLookupName(MF, IFI));
             if (!MF.BaseDirectory.empty())
               llvm::sys::path::make_absolute(MF.BaseDirectory, Name);
             L->visitInputFile(Name, IsSystem, /*IsOverridden=*/false,
@@ -1484,6 +1488,8 @@ private:
   /// (warningFlagsHash).
   WarningPragmaTracker &Pragmas;
   uint64_t WarningFlags;
+  /// IncludeSite::NamesMatter: the compile writes debug information.
+  bool NamesMatter;
   unsigned DiagnosticsReplayed = 0;
   /// Hashes of every name a loaded copy's macro effects touched.
   llvm::DenseSet<uint64_t> TouchedByCopies;
@@ -1755,7 +1761,7 @@ private:
     uint32_t Counter = PP.getCounterValue();
     IncludeSite Site{File, CurDir, IncludeLoc,
                      warningState(WarningFlags, &Pragmas, IncludeLoc),
-                     searchContext(File, CurDir)};
+                     searchContext(File, CurDir), NamesMatter};
     bool Fits = false;
     auto Asked = std::chrono::steady_clock::now();
     Client->lookup(

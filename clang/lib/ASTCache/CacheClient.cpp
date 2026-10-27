@@ -556,7 +556,12 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // the text each __FILE__ produced, which is the name the producer's compile
   // opened the file by. What each #include found, by its index, for the
   // #includes and __FILE__s inside it.
-  bool CheckNames = !Deps.headerName().empty();
+  // The names themselves matter only where something repeats them: debug
+  // information, or warnings the copy stored. postgres opens one header as
+  // ../../src/include/x.h or ../../../src/include/x.h by the directory it
+  // compiles in; without -g either copy serves (__FILE__ is compared apart).
+  bool CheckNames = !Deps.headerName().empty() &&
+                    (!Site || Site->NamesMatter || !Deps.diagnostics().empty());
   std::vector<std::pair<OptionalFileEntryRef, ConstSearchDirIterator>> Opened(
       Deps.includes().size(), {std::nullopt, nullptr});
   auto Written = [&](const IncludeView &D) {

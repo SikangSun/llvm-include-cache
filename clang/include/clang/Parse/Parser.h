@@ -1106,9 +1106,13 @@ private:
 
   //===--------------------------------------------------------------------===//
   // Declaration-boundary query, for the header-cache splice decision.
+  /// A directive the preprocessor meets while lexing ahead for the parser,
+  /// or while it may backtrack, comes after tokens the parser has not
+  /// consumed: in `enum {` followed by an #include, the counts are those of
+  /// before the '{'.
   bool isAtDeclarationBoundary() const override {
     return ParenCount == 0 && BracketCount == 0 && BraceCount == 0 &&
-           !InDeclGroup;
+           !InDeclGroup && !PP.isPeekingAhead() && !PP.isBacktrackEnabled();
   }
 
   ///@}

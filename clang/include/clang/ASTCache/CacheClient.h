@@ -86,6 +86,9 @@ struct IncludeSite {
   /// present: the compile's include path and where this one found the
   /// header (REPORT.md I9). See searchContext in HeaderCacheServer.cpp.
   uint64_t SearchContext = 0;
+  /// Whether the names this compile opens files by matter beyond __FILE__,
+  /// which is compared apart: debug information repeats them.
+  bool NamesMatter = true;
 };
 
 /// The outcome of a candidate's #include searches as earlier compiles of the

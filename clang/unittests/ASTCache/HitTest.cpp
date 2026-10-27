@@ -2318,10 +2318,11 @@ TEST_F(ExportTest, APartIsNotServedWhereAnOutsideStructDiffers) {
   EXPECT_TRUE(reads(B, Use)) << "a part carrying another struct pt was served";
 }
 
-TEST_F(ExportTest, APartIsNotServedUnderAnotherName) {
-  // A part holds use.h under the name its compile opened it by, which
-  // __FILE__ and debug information repeat. A compile that names use.h
-  // otherwise reads it.
+TEST_F(ExportTest, APartIsNotServedUnderAnotherNameWithDebugInfo) {
+  // A part holds use.h under the name its compile opened it by, which debug
+  // information repeats (__FILE__ is compared apart). A compile with -g that
+  // names use.h otherwise reads it.
+  ExtraArgs = {"-g"};
   std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
                                    "int used(void);\n#endif\n");
   write("rel.c", "#include \"use.h\"\nint f(void) { return used(); }\n");
@@ -2652,6 +2653,64 @@ TEST_F(ExportTest, SearchesFoundInABuildAreNotTakenUnderAnotherIncludePath) {
   EXPECT_TRUE(reads(Main, H)) << "a/inner.h's copy was served under -Ib";
 }
 
+TEST_F(ExportTest, AHeaderOpenedByAnotherPathIsServedWithoutDebugInfo) {
+  // A compile one directory down opens the same header by another relative
+  // path, as postgres's ../../src/include and ../../../src/include do. Only
+  // debug information repeats that name (__FILE__ is compared apart), so
+  // without -g the copy serves; with -g it does not.
+  llvm::SmallString<256> Sub(Dir);
+  llvm::sys::path::append(Sub, "sub");
+  ASSERT_FALSE(llvm::sys::fs::create_directory(Sub));
+  write("h.h", "#ifndef H_H\n#define H_H\nint h(void);\n#endif\n");
+  write("a.c", "#include \"h.h\"\nint f(void) { return h(); }\n");
+  write("sub/b.c", "#include \"../h.h\"\nint g(void) { return h(); }\n");
+  auto ReadsH = [&](const char *Main) {
+    std::set<std::string> Entered;
+    EXPECT_TRUE(compile(Main, Entered, /*WorkingDir=*/Dir)) << Main;
+    return llvm::any_of(Entered, [](const std::string &E) {
+      return llvm::StringRef(E).ends_with("h.h");
+    });
+  };
+  EXPECT_TRUE(ReadsH("a.c")) << "nothing is listed yet";
+  EXPECT_TRUE(ReadsH("a.c")) << "nothing is stored yet";
+  EXPECT_FALSE(ReadsH("a.c")) << "the copy does not serve its own name";
+  EXPECT_FALSE(ReadsH("sub/b.c")) << "another name, no -g: should serve";
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(ReadsH("sub/b.c")) << "with -g the name must match";
+}
+
+TEST_F(ExportTest, ACopyWrittenInOneDirectoryFindsItsFilesFromAnother) {
+  // The copy names inner.h "../inc/inner.h", as the compile in a/ opened
+  // it; from a/deep/ that name finds nothing, and the reader stopped at
+  // "could not find file" (postgres's ../../src/include/pg_config.h). It
+  // finds the file by the absolute name stored beside the opened one. The
+  // reader looks a file up when its text is needed: expanding I needs it.
+  llvm::SmallString<256> A(Dir), Deep(Dir), Inc(Dir);
+  llvm::sys::path::append(A, "a");
+  llvm::sys::path::append(Deep, "a", "deep");
+  llvm::sys::path::append(Inc, "inc");
+  ASSERT_FALSE(llvm::sys::fs::create_directories(Deep));
+  ASSERT_FALSE(llvm::sys::fs::create_directory(Inc));
+  write("inc/inner.h", "#ifndef INNER_H\n#define INNER_H\n#define I 1\n"
+                       "#endif\n");
+  write("inc/h.h", "#ifndef H_H\n#define H_H\n#include \"inner.h\"\n"
+                   "int h(void);\n#endif\n");
+  write("a/x.c", "#include \"../inc/h.h\"\nint f(void) { return h(); }\n");
+  write("a/deep/y.c", "#include \"../../inc/h.h\"\n"
+                      "int g(void) { return h() + I; }\n");
+  auto ReadsH = [&](const char *Main, llvm::StringRef WorkingDir) {
+    std::set<std::string> Entered;
+    EXPECT_TRUE(compile(Main, Entered, WorkingDir.str())) << Main;
+    return llvm::any_of(Entered, [](const std::string &E) {
+      return llvm::StringRef(E).ends_with("h.h");
+    });
+  };
+  EXPECT_TRUE(ReadsH("x.c", A)) << "nothing is listed yet";
+  EXPECT_TRUE(ReadsH("x.c", A)) << "nothing is stored yet";
+  EXPECT_FALSE(ReadsH("x.c", A)) << "the copy does not serve its own name";
+  EXPECT_FALSE(ReadsH("y.c", Deep)) << "from another depth: should serve";
+}
+
 TEST_F(ExportTest, AHeaderUsingAnUnnameableOutsideDeclarationIsNotWritten) {
   // main.c declares _clar with a struct type that has no name, then
   // includes use.h, whose inline function uses it. A copy of use.h can
@@ -2699,6 +2758,63 @@ TEST_F(ExportTest, AHeaderDefiningAFunctionTheFileDeclaredIsNotWritten) {
   EXPECT_TRUE(Entered.count(Gen)) << "gen.h was served";
   EXPECT_TRUE(Entered.count(Ext)) << "ext.h was served";
   EXPECT_FALSE(Entered.count(Stub)) << "stub.h was not served";
+}
+
+TEST_F(ExportTest, AHeaderUsingAFunctionOfTheFileIsNotWritten) {
+  // qemu's fpu/softfloat.c defines static functions that only the
+  // softfloat-parts.c.inc it includes calls. Loading the header's copy
+  // would not mark them used, and -Wunused-function would report them.
+  ExtraArgs = {"-Werror=unused-function"};
+  std::string Inc = write("parts.inc",
+                          "static int twice(int x) { return helper(x) * 2; }\n");
+  std::string Main =
+      write("main.c", "static int helper(int x) { return x + 1; }\n#include \"" +
+                          Inc + "\"\nint f(int x) { return twice(x); }\n");
+  EXPECT_TRUE(reads(Main, Inc)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Inc)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(Main, Inc)) << "parts.inc was not written";
+  EXPECT_EQ(Daemon->stats().Entries, 0u);
+}
+
+TEST_F(ExportTest, AHeaderIncludedInsideAnEnumIsNotServedThere) {
+  // The kernel's arch/x86/events/perf_event.h and qemu's linux-user/syscall.c
+  // include an X-macro header inside an enum body. The parser looks ahead
+  // past the '{' before consuming it, and the #include is met then, while
+  // the brace counts still read as between declarations.
+  std::string Flags = write("flags.h", "FLAG(A, 1)\nFLAG(B, 2)\n");
+  std::string Top = write("top.c", "#define FLAG(n, v) int flag_##n = v;\n"
+                                   "#include \"" + Flags + "\"\n");
+  std::string Enum = write("enum.c", "#define FLAG(n, v) EV_##n = v,\n"
+                                     "enum {\n#include \"" + Flags +
+                                         "\"\n};\nint e = EV_B;\n");
+  EXPECT_TRUE(reads(Top, Flags)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Top, Flags)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Top, Flags)) << "flags.h's copy was not served";
+  EXPECT_TRUE(reads(Enum, Flags)) << "flags.h was served inside the enum";
+}
+
+TEST_F(ExportTest, APoisoningIsCarriedOnlyByTheHeaderThatDidIt) {
+  // qemu's common code poisons the TARGET_* names its per-target code tests
+  // (exec/poison.h, by way of qemu/osdep.h). lib.h's copy, written by a
+  // compile that poisoned TARGET_X before it, must not poison it where
+  // target.c loads it. poison.h's own #pragma GCC poison is its effect: its
+  // copy poisons OWN.
+  std::string Lib = write("lib.h", "#ifndef LIB_H\n#define LIB_H\n"
+                                   "int lib(void);\n#endif\n");
+  std::string Poison = write("poison.h", "#ifndef POISON_H\n#define POISON_H\n"
+                                         "#pragma GCC poison OWN\n#endif\n");
+  std::string Common =
+      write("common.c", "#pragma GCC poison TARGET_X\n#include \"" + Lib +
+                            "\"\n#include \"" + Poison + "\"\n");
+  std::string Target =
+      write("target.c", "#include \"" + Lib + "\"\nint TARGET_X;\n");
+  std::string Uses = write("uses.c", "#include \"" + Poison + "\"\nint OWN;\n");
+  EXPECT_TRUE(reads(Common, Lib)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Common, Lib)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Target, Lib)) << "lib.h's copy was served";
+  std::set<std::string> Entered;
+  EXPECT_FALSE(compile(Uses, Entered)) << "OWN is poisoned";
+  EXPECT_FALSE(Entered.count(Poison)) << "poison.h's copy was served";
 }
 
 TEST_F(ExportTest, AFileChangedIsCaughtByTheNextBuild) {

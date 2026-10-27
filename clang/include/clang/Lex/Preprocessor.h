@@ -1874,6 +1874,10 @@ public:
   /// caching of tokens is on.
   bool isBacktrackEnabled() const { return !BacktrackPositions.empty(); }
 
+  /// True while tokens are lexed for the parser's look-ahead (PeekAhead): a
+  /// directive met then is past tokens the parser has not consumed.
+  bool isPeekingAhead() const { return PeekingAhead; }
+
   /// True if EnableBacktrackAtThisPos() was called and
   /// caching of unannotated tokens is on.
   bool isUnannotatedBacktrackEnabled() const {
@@ -2405,7 +2409,21 @@ public:
 private:
   llvm::DenseMap<IdentifierInfo*,unsigned> PoisonReasons;
 
+  /// Each identifier a #pragma GCC poison named, already poisoned or not,
+  /// and where.
+  SmallVector<std::pair<IdentifierInfo *, SourceLocation>, 0> PragmaPoisons;
+
+  /// See isPeekingAhead.
+  bool PeekingAhead = false;
+
 public:
+  /// The identifiers #pragma GCC poison named, in order: a header cache part
+  /// carries the poisoning its own header did, not one done before it.
+  ArrayRef<std::pair<IdentifierInfo *, SourceLocation>>
+  getPragmaPoisons() const {
+    return PragmaPoisons;
+  }
+
   /// Specifies the reason for poisoning an identifier.
   ///
   /// If that identifier is accessed while poisoned, then this reason will be

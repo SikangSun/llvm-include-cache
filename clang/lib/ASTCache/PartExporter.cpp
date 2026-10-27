@@ -1578,6 +1578,14 @@ private:
     // its own _clar made every later use of the name ambiguous.
     if (ByName && !W.Failure.empty())
       return decline(P, "cannot refer by name to " + W.Failure);
+    // A function or variable of the compile's own that the header uses is
+    // marked used where the header is parsed, but not where its copy is
+    // loaded, and -Wunused-function reports it there. qemu's fpu/softfloat.c
+    // defines frac64_neg() and the like, which only the
+    // softfloat-parts.c.inc it includes calls.
+    if (!W.Unused.empty())
+      return decline(P, "it uses " + W.Unused +
+                            ", which loading its copy would leave unused");
     Deps.Declarations = std::move(W.Declarations);
     auto TakeName = [&](size_t K, std::string Name) {
       std::vector<std::string> &Names = Deps.Links[P.LinkOrder[K]].Names;
@@ -3022,6 +3030,9 @@ private:
     std::vector<std::pair<size_t, std::string>> LinkNames;
     /// Non-empty: an outside declaration that could not be named, and why.
     std::string Failure;
+    /// Non-empty: an outside function or variable the compile reports if
+    /// unused (reportedIfUnused), which the part uses.
+    std::string Unused;
     /// The part's diagnostics, located in its own encoding; or, if one
     /// cannot be, why.
     std::vector<SavedDiagnostic> Diagnostics;
@@ -3110,6 +3121,26 @@ private:
           "it printed a diagnostic in a file it does not hold";
   }
 
+  /// Whether \p D, a function or variable this compile declared, is
+  /// reported at its end if nothing uses it: Sema's
+  /// ShouldWarnIfUnusedFileScopedDecl for C, without its "not used yet",
+  /// since a use before the header may not be there where the copy is
+  /// served.
+  bool reportedIfUnused(const DeclaratorDecl &D) const {
+    if (D.isFromASTFile() || D.isInvalidDecl() || D.hasAttr<UnusedAttr>() ||
+        D.isExternallyVisible())
+      return false;
+    ASTContext &Ctx = CI.getASTContext();
+    bool InMain = SM.isInMainFile(SM.getExpansionLoc(D.getLocation()));
+    if (const auto *FD = dyn_cast<FunctionDecl>(&D))
+      return (InMain || !FD->isInlined()) &&
+             !(FD->doesThisDeclarationHaveABody() &&
+               Ctx.DeclMustBeEmitted(FD));
+    if (const auto *VD = dyn_cast<VarDecl>(&D))
+      return VD->isFileVarDecl() && InMain && !Ctx.DeclMustBeEmitted(VD);
+    return false;
+  }
+
   /// Writes \p P's part as module \p M, referring to outside declarations
   /// by name if \p Named, and by deep copy otherwise.
   Written writePart(const Part &P, Module *M, bool Named) {
@@ -3150,6 +3181,14 @@ private:
           return P.contains(Offset) || inFolded(P, Offset);
         },
         [&](FileEntryRef F) { return P.Files.contains(&F.getFileEntry()); });
+    llvm::DenseSet<const IdentifierInfo *> Poisons;
+    for (auto [II, Loc] : CI.getPreprocessor().getPragmaPoisons()) {
+      SourceLocation::UIntTy At = SM.getExpansionLoc(Loc).getRawEncoding();
+      if (P.contains(At) && !inLinked(P, At))
+        Poisons.insert(II);
+    }
+    Writer.setPartPoisons(
+        [&](const IdentifierInfo *II) { return Poisons.contains(II); });
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
     if (!P.OwnerOf.empty())
@@ -3260,6 +3299,9 @@ private:
         if (W.Failure.empty() && !Require(*ND))
           W.Failure = std::string(ND->getDeclKindName()) + " '" +
                       ND->getNameAsString() + "': it has no fingerprint";
+        if (const auto *DD = dyn_cast<DeclaratorDecl>(ND);
+            W.Unused.empty() && DD && reportedIfUnused(*DD))
+          W.Unused = ND->getNameAsString();
       }
       return W;
     }

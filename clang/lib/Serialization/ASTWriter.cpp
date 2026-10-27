@@ -1956,10 +1956,14 @@ void ASTWriter::WriteInputFiles(SourceManager &SourceMgr) {
       // A part keeps each name as the compile opened the file, "./ae.h"
       // rather than the absolute path: a compile that loads the part names
       // the file by it in __FILE__, diagnostics and debug information, as a
-      // compile that read the file would.
+      // compile that read the file would. A relative name has the absolute
+      // name beside it, for a compile in another directory
+      // (ASTReader::getInputFileLookupName).
       if (!PartDecls) {
         PreparePathForOutput(NameAsRequested);
         PreparePathForOutput(Name);
+      } else if (llvm::sys::path::is_relative(NameAsRequested)) {
+        cleanPathForOutput(PP->getFileManager(), Name);
       }
 
       if (Name == NameAsRequested)
@@ -3919,7 +3923,7 @@ static NamedDecl *getDeclForLocalLookup(const LangOptions &LangOpts,
 namespace {
 
 bool IsInterestingIdentifier(const IdentifierInfo *II, uint64_t MacroOffset,
-                             bool IsModule, bool IsCPlusPlus) {
+                             bool IsModule, bool IsCPlusPlus, bool Poisoned) {
   bool NeedDecls = !IsModule || !IsCPlusPlus;
 
   bool IsInteresting =
@@ -3929,7 +3933,7 @@ bool IsInterestingIdentifier(const IdentifierInfo *II, uint64_t MacroOffset,
   if (MacroOffset ||
       (II->hasMacroDefinition() &&
        II->hasFETokenInfoChangedSinceDeserialization()) ||
-      II->isPoisoned() || (!IsModule && IsInteresting) ||
+      Poisoned || (!IsModule && IsInteresting) ||
       II->hasRevertedTokenIDToIdentifier() ||
       (NeedDecls && II->getFETokenInfo()))
     return true;
@@ -3941,7 +3945,8 @@ bool IsInterestingNonMacroIdentifier(const IdentifierInfo *II,
                                      ASTWriter &Writer) {
   bool IsModule = Writer.isWritingModule();
   bool IsCPlusPlus = Writer.getLangOpts().CPlusPlus;
-  return IsInterestingIdentifier(II, /*MacroOffset=*/0, IsModule, IsCPlusPlus);
+  return IsInterestingIdentifier(II, /*MacroOffset=*/0, IsModule, IsCPlusPlus,
+                                 Writer.writesPoisoned(II));
 }
 
 class ASTIdentifierTableTrait {
@@ -3958,7 +3963,8 @@ class ASTIdentifierTableTrait {
   /// to check that.
   bool isInterestingIdentifier(const IdentifierInfo *II, uint64_t MacroOffset) {
     return IsInterestingIdentifier(II, MacroOffset, IsModule,
-                                   Writer.getLangOpts().CPlusPlus);
+                                   Writer.getLangOpts().CPlusPlus,
+                                   Writer.writesPoisoned(II));
   }
 
 public:
@@ -4081,7 +4087,7 @@ public:
                                II->hasFETokenInfoChangedSinceDeserialization());
     Bits = (Bits << 1) | unsigned(HasMacroDefinition);
     Bits = (Bits << 1) | unsigned(II->isExtensionToken());
-    Bits = (Bits << 1) | unsigned(II->isPoisoned());
+    Bits = (Bits << 1) | unsigned(Writer.writesPoisoned(II));
     Bits = (Bits << 1) | unsigned(II->hasRevertedTokenIDToIdentifier());
     Bits = (Bits << 1) | unsigned(II->isCPlusPlusOperatorKeyword());
     LE.write<uint16_t>(Bits);
@@ -6271,7 +6277,7 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
   // their IDs as those are written.
   SmallVector<const IdentifierInfo *, 128> IIs;
   for (const auto &ID : PP->getIdentifierTable())
-    if ((!PartDecls || ID.second->isPoisoned()) &&
+    if ((!PartDecls || writesPoisoned(ID.second)) &&
         IsInterestingNonMacroIdentifier(ID.second, *this))
       IIs.push_back(ID.second);
   // Sort the identifiers lexicographically before getting the references so

@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Lex/Preprocessor.h"
+#include "llvm/Support/SaveAndRestore.h"
 using namespace clang;
 
 std::pair<Preprocessor::CachedTokensTy::size_type, bool>
@@ -135,6 +136,7 @@ void Preprocessor::EnterCachingLexModeUnchecked() {
 const Token &Preprocessor::PeekAhead(unsigned N) {
   assert(CachedLexPos + N > CachedTokens.size() && "Confused caching.");
   ExitCachingLexMode();
+  llvm::SaveAndRestore Peeking(PeekingAhead, true);
   for (size_t C = CachedLexPos + N - CachedTokens.size(); C > 0; --C) {
     CachedTokens.push_back(Token());
     Lex(CachedTokens.back());

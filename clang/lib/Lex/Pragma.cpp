@@ -460,6 +460,7 @@ void Preprocessor::HandlePragmaPoison() {
     // Look up the identifier info for the token.  We disabled identifier lookup
     // by saying we're skipping contents, so we need to do this manually.
     IdentifierInfo *II = LookUpIdentifierInfo(Tok);
+    PragmaPoisons.push_back({II, Tok.getLocation()});
 
     // Already poisoned.
     if (II->isPoisoned()) continue;

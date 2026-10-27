@@ -2829,7 +2829,7 @@ InputFile ASTReader::getInputFile(ModuleFile &F, unsigned ID, bool Complain) {
   bool Overridden = FI.Overridden;
   bool Transient = FI.Transient;
   auto Filename =
-      ResolveImportedPath(PathBuf, FI.UnresolvedImportedFilenameAsRequested, F);
+      ResolveImportedPath(PathBuf, getInputFileLookupName(F, FI), F);
   uint64_t StoredContentHash = FI.ContentHash;
 
   // For standard C++ modules, we don't need to check the inputs.
@@ -10526,6 +10526,20 @@ void ASTReader::ReadComments() {
       }
     }
   }
+}
+
+StringRef ASTReader::getInputFileLookupName(ModuleFile &F,
+                                            const InputFileInfo &FI) {
+  StringRef Opened = FI.UnresolvedImportedFilenameAsRequested;
+  StringRef Absolute = FI.UnresolvedImportedFilename;
+  if (!F.BaseDirectory.empty() || !llvm::sys::path::is_relative(Opened) ||
+      !llvm::sys::path::is_absolute(Absolute))
+    return Opened;
+  auto Real = FileMgr.getOptionalFileRef(Absolute, /*OpenFile=*/false);
+  if (!Real)
+    return Opened;
+  auto Here = FileMgr.getOptionalFileRef(Opened, /*OpenFile=*/false);
+  return Here && *Here == *Real ? Opened : Absolute;
 }
 
 void ASTReader::visitInputFileInfos(
