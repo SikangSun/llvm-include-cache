@@ -859,7 +859,8 @@ void ASTCacheDependencyTracker::declarationSite(const NamedDecl *D,
   for (Frame &F : Stack)
     // Only an outside declaration used in the header's own text.
     if (!F.P && F.Closure.contains(UseFID) && !F.holds(DeclFID) &&
-        F.SeenDeclarationUse.insert(D->getCanonicalDecl()).second)
+        F.SeenDeclarationUse.insert(cast<NamedDecl>(D->getCanonicalDecl()))
+            .second)
       site(F, 'd', "decl", D->getName(), DeclFID);
 }
 
