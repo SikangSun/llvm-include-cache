@@ -170,6 +170,17 @@ std::optional<IncludeView> redoLookups(
 
 } // namespace
 
+/// CLANG_HEADER_CACHE_LOG_COMPLETE=2, for measurement: with \p Definedness,
+/// every element that differs is listed, of every kind, with the live state
+/// it was compared against, and the check goes on past it.
+static bool everyFailure() {
+  static const bool Every = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_LOG_COMPLETE");
+    return V && llvm::StringRef(V) == "2";
+  }();
+  return Every;
+}
+
 MismatchReason clang::ast_cache::matchesLiveState(
     const MetadataView &Deps, Preprocessor &PP, Sema *S, std::string *Detail,
     const IncludeSite *Site, CheckCost *Cost, std::vector<NamedDecl *> *Found,
@@ -200,6 +211,27 @@ MismatchReason clang::ast_cache::matchesLiveState(
                    "the warning flags or pragmas differ");
 
   IdentifierTable &Idents = PP.getIdentifierTable();
+
+  // CLANG_HEADER_CACHE_LOG_COMPLETE=2: each difference as
+  // "<kind>:<name>:<state>:<file>:<line> of the live definition, or ->".
+  const bool Every = Definedness && everyFailure();
+  auto LiveAt = [&](SourceLocation L) -> std::string {
+    if (L.isInvalid())
+      return "-";
+    SourceManager &SM = PP.getSourceManager();
+    PresumedLoc PL = SM.getPresumedLoc(SM.getExpansionLoc(L));
+    if (PL.isInvalid())
+      return "-";
+    return std::string(PL.getFilename()) + ":" + std::to_string(PL.getLine());
+  };
+  auto MacroAt = [&](const MacroInfo *MI) {
+    return MI ? LiveAt(MI->getDefinitionLoc()) : std::string("-");
+  };
+  auto Differs = [&](char Kind, llvm::StringRef Name, llvm::StringRef State,
+                     const std::string &At) {
+    Definedness->push_back(std::string(1, Kind) + ":" + Name.str() + ":" +
+                           State.str() + ":" + At);
+  };
 
   // Charges the time from one step's start to the next step's start, or to
   // the return.
@@ -342,6 +374,14 @@ MismatchReason clang::ast_cache::matchesLiveState(
             (D.WasDefined ? " was defined, is not" : " was not defined, is");
         if (InSection(D.Cond, MismatchReason::Conditional, What))
           continue;
+        if (Every) {
+          Differs('c', D.MacroName, D.WasDefined ? "-" : "+",
+                  D.WasDefined ? std::string("-")
+                               : MacroAt(PP.getMacroDefinition(
+                                               Fresh(D.MacroName))
+                                             .getMacroInfo()));
+          continue;
+        }
         if (Definedness) {
           Definedness->push_back(D.MacroName.str() +
                                  (D.WasDefined ? "-" : "+"));
@@ -379,6 +419,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
         if (InSection(D.Cond, MismatchReason::Syntactic,
                       D.Name + " expands differently"))
           continue;
+        if (Every) {
+          Differs('e', D.Name, MI ? "different" : "absent", MacroAt(MI));
+          continue;
+        }
         return Because(MismatchReason::Syntactic,
                        D.Name + " expands differently");
       }
@@ -430,6 +474,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
         if (InSection(D.Cond, MismatchReason::Inclusion,
                       D.HeaderPath + " was already included, is not"))
           continue;
+        if (Every) {
+          Differs('i', D.HeaderPath, "notincluded", "-");
+          continue;
+        }
         return Because(MismatchReason::Inclusion,
                        D.HeaderPath + " was already included, is not");
       }
@@ -449,6 +497,11 @@ MismatchReason clang::ast_cache::matchesLiveState(
         if (InSection(N.Cond, MismatchReason::Syntactic,
                       N.Name + " was not a macro, is"))
           continue;
+        if (Every) {
+          Differs('n', N.Name, "defined",
+                  MacroAt(PP.getMacroDefinition(Fresh(N.Name)).getMacroInfo()));
+          continue;
+        }
         return Because(MismatchReason::Syntactic,
                        N.Name + " was not a macro, is");
       }
@@ -473,6 +526,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
                                                    : " was not a type, is");
         if (InSection(D.Cond, MismatchReason::Symbol, What))
           continue;
+        if (Every) {
+          Differs('y', D.Name, WasType ? "nottype" : "type", "-");
+          continue;
+        }
         return Because(MismatchReason::Symbol, What);
       }
       // "Still a type" is not enough: two translation units can both answer
@@ -482,6 +539,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
                            ", is " + LiveType;
         if (InSection(D.Cond, MismatchReason::Symbol, What))
           continue;
+        if (Every) {
+          Differs('y', D.Name, "othertype", "-");
+          continue;
+        }
         return Because(MismatchReason::Symbol, What);
       }
     }
@@ -802,6 +863,13 @@ MismatchReason clang::ast_cache::matchesLiveState(
             Found->push_back(nullptr);
           continue;
         }
+        if (Every) {
+          Differs('d', D.Name, Live ? "different" : "absent",
+                  Live ? LiveAt(Live->getLocation()) : std::string("-"));
+          if (Found)
+            Found->push_back(nullptr);
+          continue;
+        }
         return Because(MismatchReason::Declaration, What);
       }
       if (Found)
@@ -875,9 +943,13 @@ MismatchReason clang::ast_cache::matchesLiveState(
     Lap.next(CheckCost::TypeNamesAndPragmas);
     if (Result R = Symbols(Slice(Deps.symbol(), MetadataView::Symbol, G)))
       return *R;
-    if (G == 0 && capturePragmaState(*S) != Deps.entry())
-      return Because(MismatchReason::PragmaState,
-                     "#pragma pack or float state");
+    if (G == 0 && capturePragmaState(*S) != Deps.entry()) {
+      if (Every)
+        Differs('p', "pragma", "different", "-");
+      else
+        return Because(MismatchReason::PragmaState,
+                       "#pragma pack or float state");
+    }
     // Within a compile files and the include path do not change: a check
     // made again after the sections it needed were read (StateOnly) leaves
     // them out.
@@ -900,7 +972,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
   }
 
   if (Definedness && !Definedness->empty())
-    return Because(MismatchReason::Conditional, "only definedness tests differ");
+    return Because(MismatchReason::Conditional,
+                   Every ? "each difference is listed"
+                         : "only definedness tests differ");
   return MismatchReason::None;
 }
 
@@ -1191,7 +1265,7 @@ llvm::StringRef CacheClient::lookup(
   // differs (measurement: what else each copy differs in).
   static const bool CompleteChecks = [] {
     const char *V = std::getenv("CLANG_HEADER_CACHE_LOG_COMPLETE");
-    return V && llvm::StringRef(V) == "1";
+    return V && (llvm::StringRef(V) == "1" || llvm::StringRef(V) == "2");
   }();
   std::vector<NamedDecl *> Found;
   std::vector<bool> CandidateLoaded;
@@ -1306,6 +1380,10 @@ llvm::StringRef CacheClient::lookup(
       for (unsigned I = 0; I != std::size(Sizes); ++I)
         OS << (I ? "," : "") << Now.Read[I] - Prev.Read[I] << "/" << Sizes[I];
       OS << " bytes=" << E.MetadataLength << " module=" << Deps->moduleName();
+      // The live __COUNTER__, and the copy's start and uses.
+      if (Deps->counterUses())
+        OS << " counter=" << PP.getCounterValue() << "/" << Deps->counterStart()
+           << "/" << Deps->counterUses();
       // Every definedness test that differs outside a failing section, +
       // for "was not defined, is" and - for "was defined, is not", and the
       // first other difference, 0 for none (REPORT.md T15). A copy that

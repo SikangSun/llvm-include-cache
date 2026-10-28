@@ -43,6 +43,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include <array>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -237,6 +238,8 @@ public:
 
   /// Passed on to OnDeclarationUse (CLANG_HEADER_CACHE_CLAIM=deps).
   void recordDeclarationUse(const NamedDecl *D, SourceLocation Loc) override {
+    if (DumpSites)
+      declarationSite(D, Loc);
     if (OnDeclarationUse)
       OnDeclarationUse(D, Loc);
   }
@@ -437,6 +440,23 @@ public:
   /// its record's #includes and __FILE__s, in order.
   struct Sites {
     std::vector<FileID> Includes, FileNames;
+    /// CLANG_HEADER_CACHE_DUMP_DEPS, for measurement: where the header's
+    /// text read each state its record holds, how it used it, and each
+    /// #include it reached, in the order they happened (Seq).
+    struct Read {
+      /// 'c' conditional, 's' syntactic, 'y' symbol, 'i' inclusion, 'd' an
+      /// outside declaration, 'n' an #include or __has_include.
+      char Kind;
+      /// "test", "guard", "value", "expand", "plain", "type", "decl",
+      /// "once", "fold", "include".
+      const char *Use;
+      std::string Name;
+      SourceLocation Loc;
+      uint64_t Seq;
+      /// The file whose directive or declaration gave the state read.
+      FileID Origin;
+    };
+    std::vector<Read> Reads;
   };
   const Sites *sitesFor(FileID FID) const {
     for (size_t I = 0; I != CompletedFIDs.size(); ++I)
@@ -518,6 +538,8 @@ private:
     /// enclosing it has seen too, since both were open at the time.
     llvm::DenseSet<const IdentifierInfo *> SeenSyntactic;
     llvm::DenseSet<const IdentifierInfo *> SeenSymbol;
+    /// CLANG_HEADER_CACHE_DUMP_DEPS: outside declarations already used.
+    llvm::DenseSet<const NamedDecl *> SeenDeclarationUse;
     /// Per name, the #pragma push_macro made in this frame and not popped.
     llvm::DenseMap<const IdentifierInfo *, unsigned> MacroPushes;
     llvm::DenseSet<const FileEntry *> SeenSkipped;
@@ -608,6 +630,19 @@ private:
   /// For measureIndependence: \p F read a state that \p Origin set, \p What
   /// naming the read.
   void noteRead(Frame &F, FileID Origin, const llvm::Twine &What);
+
+  /// CLANG_HEADER_CACHE_DUMP_DEPS: \p F's text read \p Name at SiteLoc.
+  void site(Frame &F, char Kind, const char *Use, llvm::StringRef Name,
+            FileID Origin);
+  /// The first use in each open frame of an outside declaration.
+  void declarationSite(const NamedDecl *D, SourceLocation Loc);
+  const bool DumpSites = std::getenv("CLANG_HEADER_CACHE_DUMP_DEPS");
+  /// Where the read being recorded is, and, for a conditional, how it was
+  /// used; set by each callback before it records.
+  SourceLocation SiteLoc;
+  const char *SiteUse = "test";
+  /// In foldServed: what a served copy read, as read at its #include.
+  bool Folding = false;
 
   /// Records the text of a __FILE__ (or, with \p LastComponentOnly,
   /// __FILE_NAME__) whose name token is at \p Loc.

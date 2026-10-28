@@ -9,6 +9,7 @@
 #include "clang/ASTCache/ASTCacheDependencyTracker.h"
 #include "clang/ASTCache/DependencySerialization.h"
 #include "clang/ASTCache/MacroTokens.h"
+#include "clang/AST/Decl.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/HeaderSearch.h"
@@ -239,6 +240,15 @@ void ASTCacheDependencyTracker::recordLookup(SourceLocation Loc,
       }
       Dep.Includer = It->second;
     }
+    if (DumpSites) {
+      SiteLoc = Loc;
+      site(F, 'n',
+           K == IncludeDependency::Kind::Include ||
+                   K == IncludeDependency::Kind::IncludeNext
+               ? "include"
+               : "has_include",
+           FoundPath.empty() ? Spelled : StringRef(FoundPath), FileID());
+    }
     F.Deps.Includes.push_back(std::move(Dep));
     F.At.Includes.push_back(Where);
     PendingEntries.push_back({I, int32_t(F.Deps.Includes.size() - 1)});
@@ -312,6 +322,8 @@ void ASTCacheDependencyTracker::FileSkipped(
       if (GuardOrigin.isValid() && F.holds(GuardOrigin))
         continue;
       noteRead(F, GuardOrigin, "skips " + SkippedFile.getName());
+      SiteLoc = FilenameTok.getLocation();
+      site(F, 'c', "guard", Guard->getName(), GuardOrigin);
       ConditionalDependency Dep;
       Dep.MacroName = Guard->getName().str();
       Dep.WasDefined = true;
@@ -331,6 +343,9 @@ void ASTCacheDependencyTracker::FileSkipped(
     Dep.Why = HS.hasFileBeenImported(SkippedFile)
                   ? InclusionDependency::Reason::Import
                   : InclusionDependency::Reason::PragmaOnce;
+    SiteLoc = FilenameTok.getLocation();
+    site(F, 'i', "once", Dep.HeaderPath,
+         FirstEntered.lookup(&SkippedFile.getFileEntry()));
     F.Deps.Inclusion.push_back(std::move(Dep));
   }
 }
@@ -340,6 +355,7 @@ void ASTCacheDependencyTracker::recordConditional(const Token &MacroNameTok,
   const IdentifierInfo *II = MacroNameTok.getIdentifierInfo();
   if (!II)
     return;
+  SiteLoc = MacroNameTok.getLocation();
   recordConditional(II, static_cast<bool>(MD), stateOrigin(II, MD));
 }
 
@@ -370,6 +386,7 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
     if (Origin.isValid() && F.holds(Origin))
       continue;
     noteRead(F, Origin, "tests " + II->getName());
+    site(F, 'c', SiteUse, II->getName(), Origin);
     ConditionalDependency Dep;
     Dep.MacroName = II->getName().str();
     Dep.WasDefined = WasDefined;
@@ -378,8 +395,10 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
 }
 
 void ASTCacheDependencyTracker::recordHeldTests() {
-  for (const HeldTest &T : Held)
+  for (const HeldTest &T : Held) {
+    SiteLoc = T.Loc;
     recordConditional(T.II, T.WasDefined, T.Origin);
+  }
   Held.clear();
 }
 
@@ -421,8 +440,10 @@ void ASTCacheDependencyTracker::Defined(const Token &MacroNameTok,
 void ASTCacheDependencyTracker::DefinedOperatorsNeeded(
     bool Known, ArrayRef<SourceLocation> Needed) {
   for (const HeldTest &T : Held)
-    if (!Known || llvm::is_contained(Needed, T.Loc))
+    if (!Known || llvm::is_contained(Needed, T.Loc)) {
+      SiteLoc = T.Loc;
       recordConditional(T.II, T.WasDefined, T.Origin);
+    }
   Held.clear();
 }
 
@@ -456,7 +477,9 @@ void ASTCacheDependencyTracker::UndefinedIdentifierInDirective(
   // The directive's outcome depended on this identifier having no definition,
   // which is the same fact an #ifdef records -- reuse the same path, with the
   // MacroDefinition absent standing for "was not defined".
+  SiteUse = "value";
   recordConditional(IdentifierTok, MacroDefinition());
+  SiteUse = "test";
 }
 
 void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
@@ -495,6 +518,7 @@ void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
   // module load left out of date, so do that here first, or the macro state
   // read below could be stale.
   PP.refreshIdentifier(*II);
+  SiteLoc = Identifier.getLocation();
   recordSyntactic(II, PP.getMacroDefinition(II).getMacroInfo());
 }
 
@@ -512,7 +536,7 @@ void ASTCacheDependencyTracker::PragmaPushMacro(SourceLocation,
   }
 }
 
-void ASTCacheDependencyTracker::PragmaPopMacro(SourceLocation,
+void ASTCacheDependencyTracker::PragmaPopMacro(SourceLocation Loc,
                                                const IdentifierInfo *II,
                                                const MacroInfo *) {
   // The frames the pop takes from below are the innermost ones: an inner
@@ -544,6 +568,7 @@ void ASTCacheDependencyTracker::PragmaPopMacro(SourceLocation,
   // definition their push saved.
   if (TookFromBelow) {
     PP.refreshIdentifier(*II);
+    SiteLoc = Loc;
     recordSyntactic(II, PP.getMacroDefinition(II).getMacroInfo());
   }
 }
@@ -564,6 +589,7 @@ void ASTCacheDependencyTracker::MacroExpands(const Token &MacroNameTok,
     else if (II->isStr("__has_include"))
       NextHasIncludeIsNext = false;
   }
+  SiteLoc = MacroNameTok.getLocation();
   recordSyntactic(II, MI);
 }
 
@@ -665,6 +691,14 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
       continue;
     noteRead(F, ReadOrigin,
              (MI ? "expands " : "reads as plain text ") + II->getName());
+    if (DumpSites)
+      site(F, 's',
+           Folding                         ? "fold"
+           : PP.isParsingIfOrElifDirective() ? "value"
+           : MI                              ? "expand"
+                                             : "plain",
+           II->getName(),
+           MI ? DefFID : stateOrigin(II, MacroDefinition()));
 
     SyntacticDependency Dep;
     Dep.Name = II->getName().str();
@@ -745,6 +779,8 @@ void ASTCacheDependencyTracker::recordSymbol(
     if (!F.SeenSymbol.insert(Name).second)
       continue;
     noteRead(F, ResolvedFID, "names " + Name->getName());
+    SiteLoc = Ctx.QueryLoc;
+    site(F, 'y', Folding ? "fold" : "type", Name->getName(), ResolvedFID);
 
     SymbolDependency Dep;
     Dep.Name = Name->getName().str();
@@ -804,6 +840,27 @@ void ASTCacheDependencyTracker::noteRead(Frame &F, FileID Origin,
     return;
   if (!F.ReadFrom.count(Origin))
     F.ReadFrom[Origin] = What.str();
+}
+
+void ASTCacheDependencyTracker::site(Frame &F, char Kind, const char *Use,
+                                     llvm::StringRef Name, FileID Origin) {
+  if (DumpSites)
+    F.At.Reads.push_back({Kind, Use, Name.str(), SiteLoc, ++Clock, Origin});
+}
+
+void ASTCacheDependencyTracker::declarationSite(const NamedDecl *D,
+                                                SourceLocation Loc) {
+  if (Stack.empty() || !D || Loc.isInvalid() || !D->getIdentifier())
+    return;
+  SourceManager &SM = PP.getSourceManager();
+  FileID UseFID = SM.getFileID(SM.getExpansionLoc(Loc));
+  FileID DeclFID = SM.getFileID(SM.getExpansionLoc(D->getLocation()));
+  SiteLoc = Loc;
+  for (Frame &F : Stack)
+    // Only an outside declaration used in the header's own text.
+    if (!F.P && F.Closure.contains(UseFID) && !F.holds(DeclFID) &&
+        F.SeenDeclarationUse.insert(D->getCanonicalDecl()).second)
+      site(F, 'd', "decl", D->getName(), DeclFID);
 }
 
 void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
@@ -923,6 +980,9 @@ void ASTCacheDependencyTracker::foldServed(
 
   // What the copy's text tested, expanded and named, as if read here: each
   // frame depends on what of it a state outside the frame decides.
+  Folding = true;
+  SiteUse = "fold";
+  SiteLoc = Loc;
   for (const ConditionalView &C : Deps.conditional()) {
     const IdentifierInfo *II = PP.getIdentifierInfo(C.MacroName);
     recordConditional(II, C.WasDefined,
@@ -942,6 +1002,8 @@ void ASTCacheDependencyTracker::foldServed(
     Ctx.ResolvedTypeName = S.ResolvedTypeName;
     recordSymbol(PP.getIdentifierInfo(S.Name), S.Classification, Ctx);
   }
+  Folding = false;
+  SiteUse = "test";
 
   for (size_t I = 0; I != Stack.size(); ++I) {
     Frame &F = Stack[I];

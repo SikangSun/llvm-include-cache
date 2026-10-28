@@ -3143,7 +3143,7 @@ private:
 
   void dump(const Part &P, const PushRequest &R,
             const std::vector<std::string> &Sizes) {
-    dumpDependencies(R);
+    dumpDependencies(P, R);
     const char *Dir = dumpDir();
     if (!Dir)
       return;
@@ -3171,7 +3171,7 @@ private:
   /// CLANG_HEADER_CACHE_DUMP_DEPS=<dir>, for measurement: each copy's
   /// metadata as the check reads it, one element per line, to <dir>/<module
   /// name>.deps.
-  void dumpDependencies(const PushRequest &R) {
+  void dumpDependencies(const Part &P, const PushRequest &R) {
     static const char *Dir = std::getenv("CLANG_HEADER_CACHE_DUMP_DEPS");
     if (!Dir)
       return;
@@ -3211,6 +3211,36 @@ private:
     for (const auto &E : D.Declarations)
       OS << "decl\t" << unsigned(E.In) << "\t" << E.Name << "\t"
          << llvm::xxh3_64bits(E.Fingerprint) << "\n";
+    OS << "counter\t" << D.CounterStart << "\t" << D.CounterUses << "\t"
+       << D.CounterSemantic << "\n";
+    for (const auto &E : D.LeftOut)
+      OS << "leftout\t" << E.Guard << "\t" << E.Path << "\t" << E.Spelled
+         << "\n";
+    // Where the header's text read each state, how it used it, and each
+    // #include it reached, in the order they happened: "site <seq> <kind>
+    // <use> <name> <file>:<line> <file the state came from>".
+    const ASTCacheDependencyTracker::Sites *At = Tracker.sitesFor(P.FID);
+    if (!At)
+      return;
+    // Files by canonical path, as the #include sites name what they found.
+    auto From = [&](FileID F) -> std::string {
+      if (F.isInvalid())
+        return "-";
+      if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(F))
+        return CI.getFileManager().getCanonicalName(*FE).str();
+      return SM.getBufferName(SM.getLocForStartOfFile(F)).str();
+    };
+    auto Where = [&](SourceLocation L) -> std::string {
+      if (L.isInvalid())
+        return "-";
+      SourceLocation E = SM.getExpansionLoc(L);
+      return From(SM.getFileID(E)) + ":" +
+             std::to_string(SM.getExpansionLineNumber(E));
+    };
+    OS << "canonical\t" << From(P.FID) << "\n";
+    for (const auto &S : At->Reads)
+      OS << "site\t" << S.Seq << "\t" << S.Kind << "\t" << S.Use << "\t"
+         << S.Name << "\t" << Where(S.Loc) << "\t" << From(S.Origin) << "\n";
   }
 
   struct Written {
