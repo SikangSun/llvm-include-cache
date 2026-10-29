@@ -3216,6 +3216,11 @@ private:
     for (const auto &E : D.LeftOut)
       OS << "leftout\t" << E.Guard << "\t" << E.Path << "\t" << E.Spelled
          << "\n";
+    // Sections (CLANG_HEADER_CACHE_SECTIONS, PIECES): the submodule holding
+    // each, -1 for the copy's module.
+    for (const auto &E : D.Submodules)
+      OS << "submodule\t" << E.Name << "\t" << E.Parent << "\t" << E.Guard
+         << "\t" << E.Path << "\n";
     // Where the header's text read each state, how it used it, and each
     // #include it reached, in the order they happened: "site <seq> <kind>
     // <use> <name> <file>:<line> <file the state came from>".
