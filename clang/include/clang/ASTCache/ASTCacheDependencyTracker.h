@@ -540,6 +540,8 @@ private:
     llvm::DenseSet<const IdentifierInfo *> SeenSymbol;
     /// CLANG_HEADER_CACHE_DUMP_DEPS: outside declarations already used.
     llvm::DenseSet<const NamedDecl *> SeenDeclarationUse;
+    /// CLANG_HEADER_CACHE_DUMP_DEPS, in a base: the kinds and names read.
+    llvm::StringSet<> SiteNames;
     /// Per name, the #pragma push_macro made in this frame and not popped.
     llvm::DenseMap<const IdentifierInfo *, unsigned> MacroPushes;
     llvm::DenseSet<const FileEntry *> SeenSkipped;

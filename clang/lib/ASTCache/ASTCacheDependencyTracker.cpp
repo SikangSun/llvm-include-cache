@@ -308,6 +308,14 @@ void ASTCacheDependencyTracker::FileSkipped(
 
   for (Frame &F : Stack) {
     if (F.P) {
+      if (DumpSites) {
+        SiteLoc = FilenameTok.getLocation();
+        if (Guard)
+          site(F, 'c', "guard", Guard->getName(), GuardOrigin);
+        else
+          site(F, 'i', "once", SkippedFile.getName(),
+               FirstEntered.lookup(&SkippedFile.getFileEntry()));
+      }
       piecesSkip(F, SkippedFile, FilenameTok, Guard, GuardOrigin);
       continue;
     }
@@ -375,6 +383,7 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
   }
   for (Frame &F : Stack) {
     if (F.P) {
+      site(F, 'c', SiteUse, II->getName(), Origin);
       piecesConditional(F, II, WasDefined, Origin);
       continue;
     }
@@ -682,6 +691,13 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
 
   for (Frame &F : Stack) {
     if (F.P) {
+      if (DumpSites)
+        site(F, 's',
+             Folding                         ? "fold"
+             : PP.isParsingIfOrElifDirective() ? "value"
+             : MI                              ? "expand"
+                                               : "plain",
+             II->getName(), MI ? DefFID : stateOrigin(II, MacroDefinition()));
       piecesSyntactic(F, II, MI, DefFID, Sequence, Built);
       continue;
     }
@@ -768,6 +784,8 @@ void ASTCacheDependencyTracker::recordSymbol(
     if (!F.Closure.contains(QueryFID))
       continue;
     if (F.P) {
+      SiteLoc = Ctx.QueryLoc;
+      site(F, 'y', Folding ? "fold" : "type", Name->getName(), ResolvedFID);
       piecesSymbol(F, Name, Classification, QueryFID, ResolvedFID,
                    HaveResolved, Ctx.ResolvedTypeName);
       continue;
@@ -844,8 +862,11 @@ void ASTCacheDependencyTracker::noteRead(Frame &F, FileID Origin,
 
 void ASTCacheDependencyTracker::site(Frame &F, char Kind, const char *Use,
                                      llvm::StringRef Name, FileID Origin) {
-  if (DumpSites)
-    F.At.Reads.push_back({Kind, Use, Name.str(), SiteLoc, ++Clock, Origin});
+  if (!DumpSites)
+    return;
+  if (F.P && Kind != 'n' && !F.SiteNames.insert((Twine(Kind) + Name).str()).second)
+    return;
+  F.At.Reads.push_back({Kind, Use, Name.str(), SiteLoc, ++Clock, Origin});
 }
 
 void ASTCacheDependencyTracker::declarationSite(const NamedDecl *D,
@@ -858,7 +879,7 @@ void ASTCacheDependencyTracker::declarationSite(const NamedDecl *D,
   SiteLoc = Loc;
   for (Frame &F : Stack)
     // Only an outside declaration used in the header's own text.
-    if (!F.P && F.Closure.contains(UseFID) && !F.holds(DeclFID) &&
+    if (F.Closure.contains(UseFID) && !F.holds(DeclFID) &&
         F.SeenDeclarationUse.insert(cast<NamedDecl>(D->getCanonicalDecl()))
             .second)
       site(F, 'd', "decl", D->getName(), DeclFID);
