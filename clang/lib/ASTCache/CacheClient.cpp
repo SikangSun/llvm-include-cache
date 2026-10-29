@@ -206,15 +206,18 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // The copy holds the warnings its header printed under its compile's
   // flags and pragmas; under others it prints others (REPORT.md Q34). One
   // integer, so first (I15).
-  if (Site && Site->WarningState != Deps.warningState())
-    return Because(MismatchReason::WarningState,
-                   "the warning flags or pragmas differ");
-
-  IdentifierTable &Idents = PP.getIdentifierTable();
-
   // CLANG_HEADER_CACHE_LOG_COMPLETE=2: each difference as
   // "<kind>:<name>:<state>:<file>:<line> of the live definition, or ->".
+  // Different warning state is listed too ("w"), and the check goes on.
   const bool Every = Definedness && everyFailure();
+  if (Site && Site->WarningState != Deps.warningState()) {
+    if (!Every)
+      return Because(MismatchReason::WarningState,
+                     "the warning flags or pragmas differ");
+    Definedness->push_back("w:warnings:differs:-");
+  }
+
+  IdentifierTable &Idents = PP.getIdentifierTable();
   auto LiveAt = [&](SourceLocation L) -> std::string {
     if (L.isInvalid())
       return "-";
