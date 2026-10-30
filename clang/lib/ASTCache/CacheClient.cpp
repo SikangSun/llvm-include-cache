@@ -240,9 +240,12 @@ MismatchReason clang::ast_cache::matchesLiveState(
     const std::vector<bool> *Plugged, SectionFailures *Sections,
     std::vector<std::string> *Definedness, bool StateOnly,
     const std::vector<std::pair<const NamedDecl *, const Decl *>> *Prior,
-    std::vector<std::string> *Others, unsigned *Tolerated) {
+    std::vector<std::string> *Others, unsigned *Tolerated,
+    const CheckPolicy *Policy) {
   if (Tolerated)
     *Tolerated = 0;
+  CheckPolicy Everything;
+  const CheckPolicy &P = Policy ? *Policy : Everything;
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -261,7 +264,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // The copy holds the warnings its header printed under its compile's
   // flags and pragmas; under others it prints others (REPORT.md Q34). One
   // integer, so first (I15).
-  if (Site && Site->WarningState != Deps.warningState())
+  if (Site && P.WarningState && Site->WarningState != Deps.warningState())
     return Because(MismatchReason::WarningState,
                    "the warning flags or pragmas differ");
 
@@ -337,6 +340,23 @@ MismatchReason clang::ast_cache::matchesLiveState(
     if (!F || !llvm::StringRef(*F).ends_with(" defined pending"))
       (*Memo->Prints)[{Live, What}] = {Latest, Complete, F};
     return F;
+  };
+
+  // PPH's three-way rule (CheckPolicy::After): a name that was not a macro
+  // where the image was made, and is one here, passes if here it is the
+  // macro the header leaves.
+  auto EndsAs = [&](llvm::StringRef Name) {
+    if (!P.After)
+      return false;
+    auto It = P.After->find(Name);
+    if (It == P.After->end())
+      return false;
+    const MacroInfo *MI = PP.getMacroDefinition(Fresh(Name)).getMacroInfo();
+    if (!MI)
+      return false;
+    std::optional<std::string> Live =
+        serializeMacroTokens(*MI, PP.getSourceManager(), PP.getLangOpts());
+    return Live && *Live == It->second;
   };
 
   // Which submodules load (REPORT.md T17): each whose header the compile
@@ -487,7 +507,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
       // A name never made a macro is not one, without looking it up (I14).
       bool Defined =
           PP.mayBeMacro(D.MacroName) && PP.isMacroDefined(Fresh(D.MacroName));
-      if (Defined != D.WasDefined) {
+      if (Defined != D.WasDefined && !(Defined && EndsAs(D.MacroName))) {
         std::string What =
             D.MacroName.str() +
             (D.WasDefined ? " was defined, is not" : " was not defined, is");
@@ -619,7 +639,7 @@ MismatchReason clang::ast_cache::matchesLiveState(
         continue;
       if (Cost)
         ++Cost->Read[MetadataView::NotAMacro];
-      if (IsMacro(N.Name)) {
+      if (IsMacro(N.Name) && !EndsAs(N.Name)) {
         if (InSection(N.Cond, MismatchReason::Syntactic,
                       N.Name + " was not a macro, is"))
           continue;
@@ -1068,16 +1088,17 @@ MismatchReason clang::ast_cache::matchesLiveState(
             NotMacros(Slice(Deps.notAMacro(), MetadataView::NotAMacro, G)))
       return *R;
     Lap.next(CheckCost::TypeNamesAndPragmas);
-    if (Result R = Symbols(Slice(Deps.symbol(), MetadataView::Symbol, G)))
-      return *R;
-    if (G == 0 && capturePragmaState(*S) != Deps.entry())
+    if (P.Symbols)
+      if (Result R = Symbols(Slice(Deps.symbol(), MetadataView::Symbol, G)))
+        return *R;
+    if (G == 0 && P.PragmaState && capturePragmaState(*S) != Deps.entry())
       return Because(MismatchReason::PragmaState,
                      "#pragma pack or float state");
     // Within a compile files and the include path do not change: a check
     // made again after the sections it needed were read (StateOnly) leaves
     // them out.
     if (!StateOnly) {
-      if (G == 0) {
+      if (G == 0 && P.FileStamps) {
         Lap.next(CheckCost::FileStamps);
         if (Result R = Files())
           return *R;
@@ -1392,6 +1413,11 @@ llvm::StringRef CacheClient::lookup(
     // daemon with its timing report.
     ++Counters.IndexReads;
     Entries = indexedEntries(Filename);
+  } else if (isDirectory()) {
+    // Nothing to send what this compile learned to.
+    Learned.clear();
+    Used.clear();
+    Entries = readImages(Filename);
   } else {
     llvm::SmallVector<char, 0> Msg;
     LookupRequest Req{Filename.str(), Build, std::move(Learned),
@@ -1513,7 +1539,7 @@ llvm::StringRef CacheClient::lookup(
     // addresses nothing written, there is nothing to check the candidate
     // against, and it is not used.
     std::optional<MetadataView> Deps = MetadataView::open(
-        Region.read(E.MetadataOffset, E.MetadataLength));
+        bytesAt(E.MetadataOffset, E.MetadataLength));
     if (!Deps)
       continue;
     std::string Detail;
@@ -1555,6 +1581,15 @@ llvm::StringRef CacheClient::lookup(
     if (MayPlan)
       for (const LeftOutView &L : Deps->leftOut())
         Plugged.push_back(!Read(L));
+    // A pre-parsed header's image is checked as PPH checked one, with its
+    // own "after" values (CheckPolicy).
+    CheckPolicy Policy;
+    if (isDirectory()) {
+      auto It = AfterOf.find(E.MetadataOffset);
+      Policy.After = It == AfterOf.end() ? nullptr : &It->second;
+      Policy.Symbols = Policy.PragmaState = Policy.WarningState =
+          Policy.FileStamps = PPHSafe;
+    }
     {
       llvm::TimeTraceScope Scope("HeaderCache Check");
       Found.clear();
@@ -1571,7 +1606,8 @@ llvm::StringRef CacheClient::lookup(
                              Recheck ? &PlannedDecls : nullptr,
                              LogChecks && CompleteOthers ? &AllOthers
                                                          : nullptr,
-                             GuardPlus ? &HeldAgain : nullptr);
+                             GuardPlus ? &HeldAgain : nullptr,
+                             isDirectory() ? &Policy : nullptr);
     }
     MismatchReason Rest = Why;
     if (MayPlan && Why == MismatchReason::None) {
@@ -1696,7 +1732,7 @@ llvm::StringRef CacheClient::lookup(
         Counters.Rejections.push_back(Filename.str() + ": " + Detail);
       continue;
     }
-    llvm::StringRef Bytes = Region.read(E.Offset, E.Length);
+    llvm::StringRef Bytes = bytesAt(E.Offset, E.Length);
     if (Bytes.empty())
       continue; // an offset that does not address written data
     // Before Use loads the candidate: loading may read the part's
@@ -1765,7 +1801,7 @@ llvm::StringRef CacheClient::lookup(
     return {};
   for (const CacheEntryRef &E : Entries) {
     std::optional<MetadataView> Deps = MetadataView::open(
-        Region.read(E.MetadataOffset, E.MetadataLength));
+        bytesAt(E.MetadataOffset, E.MetadataLength));
     if (!Deps || Deps->leftOut().empty())
       continue;
     std::vector<bool> Plugged;
@@ -1908,6 +1944,23 @@ llvm::StringRef CacheClient::fetch(llvm::StringRef Filename,
           return Bytes;
     return {};
   }
+  // Pre-parsed headers: the images stored under the header's name.
+  if (isDirectory()) {
+    for (const CacheEntryRef &E : readImages(Filename))
+      if (E.MetadataHash == Hash) {
+        std::optional<MetadataView> Deps = MetadataView::open(
+            bytesAt(E.MetadataOffset, E.MetadataLength));
+        if (!Deps || Deps->moduleName() != ModuleName)
+          continue;
+        llvm::StringRef Bytes = bytesAt(E.Offset, E.Length);
+        if (Bytes.empty())
+          continue;
+        ++Counters.Fetched;
+        Meta = Deps;
+        return Bytes;
+      }
+    return {};
+  }
   llvm::SmallVector<char, 0> Msg;
   encodeLookupRequest(
       {Filename.str(), Build, std::move(Learned), std::move(Used)}, Msg);
@@ -1934,6 +1987,9 @@ llvm::StringRef CacheClient::fetch(llvm::StringRef Filename,
 
 bool CacheClient::seenBefore(llvm::StringRef Filename,
                              llvm::StringRef ModuleName) {
+  // A directory remembers nothing about earlier compiles but their images.
+  if (isDirectory())
+    return true;
   llvm::SmallVector<char, 0> Msg;
   encodeSeenRequest({Filename.str(), ModuleName.str()}, Msg);
   auto Asked = std::chrono::steady_clock::now();
@@ -1946,6 +2002,10 @@ bool CacheClient::seenBefore(llvm::StringRef Filename,
 }
 
 bool CacheClient::isListed(llvm::StringRef Path) {
+  // With a directory, the headers that have images are the map (PPH's
+  // -fpph-map): asked about are those, and the one being generated.
+  if (isDirectory())
+    return Path == GenTarget || hasImages(Path);
   uint64_t Version = 0;
   llvm::StringRef List = Region.askList(&Version);
   if (Version != AskListVersion) {
@@ -1962,6 +2022,9 @@ bool CacheClient::isListed(llvm::StringRef Path) {
 }
 
 bool CacheClient::reportTimings(const TimingReport &Report) {
+  // Images are chosen before the build, not by what compiles report.
+  if (isDirectory())
+    return true;
   auto Start = std::chrono::steady_clock::now();
   llvm::SmallVector<char, 0> Msg;
   TimingReport WithSearches = Report;
@@ -1979,6 +2042,8 @@ bool CacheClient::reportTimings(const TimingReport &Report) {
 }
 
 bool CacheClient::push(const PushRequest &Req) {
+  if (isDirectory())
+    return writeImage(Req);
   llvm::SmallVector<char, 0> Msg;
   encodePushRequest(Req, Msg);
   if (SendThread) {

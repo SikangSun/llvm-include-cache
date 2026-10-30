@@ -35,8 +35,11 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include <condition_variable>
 #include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -213,6 +216,26 @@ struct SectionFailures {
   std::string Detail;
 };
 
+/// How a candidate is checked (PPH_PLAN.md section 6). The cache checks
+/// everything the header's parse read from outside it. A pre-parsed header
+/// is checked as GCC's PPH checked one: the macro meaning of the names the
+/// header used, under PPH's three-way rule, and none of what PPH never
+/// looked at.
+struct CheckPolicy {
+  /// The macros the header leaves defined, by name, with their tokens as
+  /// serializeMacroTokens writes them: PPH's "after" values. With it, a name
+  /// that was not a macro, or not defined, where the image was made, and is
+  /// one here, passes if its definition here is the one the header leaves --
+  /// how PPH let through the already-defined guard of a header the image
+  /// carries as text (GCC libcpp/symtab.c, cpp_lt_verify_1).
+  const llvm::StringMap<std::string> *After = nullptr;
+  /// Checks PPH did not make.
+  bool Symbols = true;
+  bool PragmaState = true;
+  bool WarningState = true;
+  bool FileStamps = true;
+};
+
 /// \p Sections, when non-null, checks a copy whose headers are sections
 /// (CLANG_HEADER_CACHE_PIECES) in the same pass for its base: what only a
 /// section's files read failing marks that section in \p Sections, and the
@@ -259,7 +282,8 @@ MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                                             const Decl *>>
                                     *Prior = nullptr,
                                 std::vector<std::string> *Others = nullptr,
-                                unsigned *Tolerated = nullptr);
+                                unsigned *Tolerated = nullptr,
+                                const CheckPolicy *Policy = nullptr);
 
 class CacheClient {
 public:
@@ -279,6 +303,42 @@ public:
   /// is ordinary: a build with no daemon running.
   static bool sendBuildHint(llvm::StringRef SocketPath,
                             llvm::StringRef Output);
+  /// Pre-parsed headers (PPH_PLAN.md): images in the directory \p Dir, one
+  /// file each, instead of a daemon. A lookup reads the images stored under
+  /// the header's name; a push writes one, through a temporary file renamed
+  /// into place, so compiles running in parallel never read half an image.
+  /// Nothing about a build is shared beyond the images themselves.
+  static std::unique_ptr<CacheClient> openDirectory(llvm::StringRef Dir);
+  bool isDirectory() const { return !ImageDir.empty(); }
+
+  /// The header whose image a generating compile writes (CLANG_PPH_GEN): it
+  /// is listed though it has no image, any image it has is not offered, and
+  /// it is the only header such a compile may write. Every other header the
+  /// compile reads has an image already, which it links, or is read as text
+  /// into the one being written.
+  void generating(llvm::StringRef Path) { GenTarget = Path.str(); }
+  /// Whether a compile may write \p Path's copy: always with a daemon; only
+  /// the header being generated with a directory.
+  bool mayWrite(llvm::StringRef Path) const {
+    return !isDirectory() || Path == GenTarget;
+  }
+  /// The header being generated may not have an image under PPH's rules (no
+  /// include guard, an #include_next, never entered): none is written. The
+  /// first reason is kept and printed.
+  void refuseImage(llvm::StringRef Why);
+  /// Gives, for a record being written as an image, the macros the header
+  /// leaves defined among the names the record lists, with their tokens: the
+  /// image's CheckPolicy::After. Taken from the generating compile's live
+  /// macro table, which is the header's own end state, since the header is
+  /// all that compile reads.
+  void endState(std::function<llvm::StringMap<std::string>(
+                    const HeaderDependencySet &)>
+                    F) {
+    EndState = std::move(F);
+  }
+  /// Pre-parsed headers: also make the checks PPH did not (CheckPolicy), the
+  /// "pph-safe" policy of PPH_PLAN.md D3.
+  void pphSafe(bool On) { PPHSafe = On; }
 
   ~CacheClient();
 
@@ -629,6 +689,30 @@ private:
   llvm::DenseSet<const FileEntry *> OpenSeen;
   unsigned OpenSeenUpTo = 0;
   std::vector<LearnedSearch> Learned;
+
+  /// openDirectory: where the images are, and the header being generated.
+  std::string ImageDir, GenTarget;
+  /// The images read so far, kept for the compile's lifetime (the reader
+  /// holds their bytes), and where each starts in the offsets lookups hand
+  /// out in place of the region's. Offset 0 stays unused, as in the region.
+  std::vector<std::unique_ptr<llvm::MemoryBuffer>> Images;
+  std::vector<uint64_t> ImageStarts;
+  uint64_t ImagesEnd = 8;
+  /// By header name: its images, and whether it has any.
+  llvm::StringMap<std::vector<CacheEntryRef>> ImagesOf;
+  llvm::StringMap<bool> HasImages;
+  /// Each image's "after" values, by where its metadata is.
+  std::map<uint64_t, llvm::StringMap<std::string>> AfterOf;
+  std::string Refused;
+  std::function<llvm::StringMap<std::string>(const HeaderDependencySet &)>
+      EndState;
+  bool PPHSafe = false;
+
+  /// The bytes at \p Offset: the region's, or an image's with a directory.
+  llvm::StringRef bytesAt(uint64_t Offset, uint64_t Length) const;
+  std::vector<CacheEntryRef> readImages(llvm::StringRef Filename);
+  bool hasImages(llvm::StringRef Filename);
+  bool writeImage(const PushRequest &Req);
 };
 
 } // namespace ast_cache

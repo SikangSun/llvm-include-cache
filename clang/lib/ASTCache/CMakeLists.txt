@@ -6,12 +6,14 @@ add_clang_library(clangASTCache
   ASTCacheDependencyTracker.cpp
   ASTCacheProducer.cpp
   CacheClient.cpp
+  CacheClientDirectory.cpp
   CacheDaemon.cpp
   CacheProtocol.cpp
   DeclFingerprint.cpp
   DependencySerialization.cpp
   HeaderCacheServer.cpp
   MacroTokens.cpp
+  PPHGeneration.cpp
   PartExporter.cpp
   PragmaStateCheck.cpp
   SharedRegion.cpp

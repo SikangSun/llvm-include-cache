@@ -12,6 +12,7 @@
 #include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/DeclFingerprint.h"
+#include "clang/ASTCache/PPHGeneration.h"
 #include "clang/ASTCache/PartExporter.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
 #include "clang/Basic/FileManager.h"
@@ -901,8 +902,11 @@ public:
                          ? "rejected:" + describe(Client->lastRejection()).str()
                          : std::string("load-refused");
       // A miss where a copy could have stood in: save this header's part of
-      // this compile for the next one (DECISIONS.md 2.17).
-      if (Exporter && !(PopulateOnly && AnyFits) &&
+      // this compile for the next one (DECISIONS.md 2.17). A compile
+      // generating a pre-parsed header writes that header's image and no
+      // other: a header with an image that does not fit here is read as text
+      // into it, as GCC's PPH embedded unmapped headers (PPH_PLAN.md P11).
+      if (Exporter && !(PopulateOnly && AnyFits) && Client->mayWrite(Path) &&
           (!MergeTarget ||
            (&File.getFileEntry() == MergeTarget && !MergeExporting))) {
         MergeExporting = MergeTarget != nullptr;
@@ -3766,6 +3770,33 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
       !Header.empty() && CI.hasPreprocessor()) {
     CI.getPreprocessor().setHeaderCacheHook(
         std::make_unique<LoadExperiment>(CI, Header, In));
+    return;
+  }
+
+  // Pre-parsed headers (PPH_PLAN.md): images in a directory, each made by a
+  // compile that generates one header's (CLANG_PPH_GEN), instead of a
+  // daemon. A header's image links the images of the headers it includes, as
+  // GCC's PPH images referred to theirs, so linked copies are on; the server
+  // and the exporter each read that from the environment.
+  if (const char *Dir = std::getenv("CLANG_PPH_DIR"); Dir && *Dir) {
+    ::setenv("CLANG_HEADER_CACHE_LINK", "1", /*overwrite=*/1);
+    std::unique_ptr<CacheClient> Client = CacheClient::openDirectory(Dir);
+    const char *Gen = std::getenv("CLANG_PPH_GEN");
+    bool Generating = Gen && *Gen;
+    if (Generating) {
+      std::string Target = absolutePath(CI.getFileManager(), Gen);
+      Client->generating(Target);
+      installPPHGenerationRules(CI, *Client, Target);
+    }
+    // "safe" adds the checks PPH did not make (PPH_PLAN.md D3).
+    const char *Policy = std::getenv("CLANG_PPH_POLICY");
+    Client->pphSafe(Policy && llvm::StringRef(Policy) == "safe");
+    const char *Stats = std::getenv("CLANG_HEADER_CACHE_STATS");
+    llvm::StringRef Level = Stats ? Stats : "";
+    Client->logRejections(Level == "2" || Level == "3");
+    Client->logChecks(Level == "3");
+    installHeaderCacheHook(CI, std::move(Client), !Level.empty(), "",
+                           Generating ? ExportMode::Misses : ExportMode::None);
     return;
   }
 
