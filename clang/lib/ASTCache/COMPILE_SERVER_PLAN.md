@@ -406,3 +406,50 @@ server still did.
 - Fragment times come from runs with the plugin loaded, about 1% slow inside
   the span; that favors Bothner.
 - D3-D5 add his dependency sets, which can only lower his numbers.
+
+**D3-D4, the record plugin, done 2026-10-30.** Record mode now gives each
+fragment instance everything D5's simulator needs:
+
+- **Processing order.**
+- **Pragma state** (`#pragma pack` and floating point) at its start.
+- **Macro list.** Every identifier that reached the macro-expansion decision
+  in it, with its state: not a macro, or a hash of its definition. This is
+  the paper's "obvious solution" (p.30) plus expands-to. It comes from the
+  cache's `ExpansionCandidateObserver`, whose slot is empty in a compile
+  without the cache, and the cache's `serializeMacroTokens`.
+- **Uses.** The fragments whose declarations its names resolved to, as GCC
+  resolved them: to an entity's first declaration, which later ones merged
+  into (p.27-28, p.31). They come from an AST walk after the parse:
+  references, type names, and each redeclaration's earlier declaration.
+  Builtins count as present from the start.
+- **Flags.** It uses a main-file declaration, so it is never reusable (ours,
+  from p.27); it declares a tag in a parameter list (§7.2: Clang moves such a
+  tag into the function's context).
+- **The oracle.** A hash of its tokens, its pragma state, and the oracles of
+  every fragment holding an earlier declaration of an entity it used. Two
+  instances with the same oracle parse to the same declarations.
+- **For §8.2.** Every `#define` and `#undef` of the compile, in order.
+
+**Checks.**
+
+- `tests/record.py`:
+  - every earlier case;
+  - p.27's `h1.h`: `extern word flags;` has the same tokens, but uses the
+    other `word` fragment and has another oracle;
+  - an `__asm__` label or a `weak` attribute on an earlier declaration: same
+    tokens, uses the earlier declaration's fragment, another oracle;
+  - `#pragma pack(1)`: same tokens, other pragma state, other oracle;
+  - §7.2 flagged;
+  - `#define int size_t` flagged as using the main file.
+- **Determinism.** All 187 redis compiles recorded twice agree in every field
+  of all 161,403 fragment instances.
+- **Fragment counts** still equal FragCount's on every compile.
+
+**On redis:**
+
+- 0.88 uses per fragment;
+- 12.7 names per macro list;
+- one fragment uses a main-file declaration;
+- no tag is declared in a parameter list.
+
+A recording takes 35 s, serial.

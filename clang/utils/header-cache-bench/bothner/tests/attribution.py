@@ -52,7 +52,7 @@ frags = t["frags"]
 ok = True
 def check(cond, what):
     global ok
-    ok &= cond
+    ok = ok and bool(cond)
     print(("ok   " if cond else "FAIL ") + what)
 
 counted = c["sys"]["frag2"] + c["proj"]["frag2"]

@@ -46,6 +46,8 @@
 // compile's configuration, as the header cache tells configurations apart.
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/DeclGroup.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/ASTCache/MacroTokens.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
@@ -54,6 +56,10 @@
 #include "clang/Frontend/FrontendPluginRegistry.h"
 #include "clang/Lex/DeclBoundaryObserver.h"
 #include "clang/Lex/DirectoryLookup.h"
+#include "clang/Lex/ExpansionCandidateObserver.h"
+#include "clang/Lex/MacroInfo.h"
+#include "clang/Sema/Sema.h"
+#include "llvm/ADT/SetVector.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -66,10 +72,13 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 #include <x86intrin.h>
@@ -83,7 +92,9 @@ uint64_t warningFlagsHash(const DiagnosticOptions &Opts);
 
 namespace {
 
-enum EvKind : uint8_t { E_TOK, E_DECL, E_DIR };
+// E_MAC (record mode only): an identifier reached the macro-expansion
+// decision.
+enum EvKind : uint8_t { E_TOK, E_DECL, E_DIR, E_MAC };
 enum Dir : uint8_t {
   D_define, D_undef, D_if, D_ifdef, D_ifndef, D_elif, D_elifdef, D_elifndef,
   D_else, D_endif, D_include, D_pragma, D_ident, D_skip, D_enter, D_exit, D_N
@@ -129,6 +140,13 @@ uint64_t tokenHash(const Token &T, Preprocessor &PP) {
   return H;
 }
 
+uint64_t fnv(StringRef S, uint64_t H = FNVBasis) {
+  for (char C : S)
+    H = (H ^ (unsigned char)C) * FNVPrime;
+  return H;
+}
+uint64_t mix(uint64_t H, uint64_t V) { return (H ^ V) * FNVPrime ^ (V >> 29); }
+
 struct State {
   std::vector<Ev> Events;
   uint64_t T0 = 0, T1 = 0;
@@ -140,20 +158,32 @@ struct State {
   llvm::DenseSet<SourceLocation::UIntTy> Cond;
   uint64_t Tokens = 0;
   bool InRun = false; // the last event recorded was a token
-  // Record mode (BOTHNER_TRACE_RECORD): every token is an event, with its
-  // hash in TokHash, and each event notes the parser's nesting. Its times
-  // mean nothing.
-  bool Record = false;
-  std::vector<uint64_t> TokHash;
-  Preprocessor *PP = nullptr;
   uint64_t Config = 0;
+
+  // Record mode (BOTHNER_TRACE_RECORD). Every token is an event, every
+  // identifier that reaches the macro-expansion decision too (E_MAC), and
+  // each event notes the parser's nesting. Aux, beside Events:
+  //   E_TOK  {token hash, 0}
+  //   E_MAC  {name id, macro state: 0 for no macro, else its definition's hash}
+  //   E_DIR  {name id for #define and #undef, else 0; pragma state}
+  // Its times mean nothing.
+  bool Record = false;
+  std::vector<std::pair<uint64_t, uint64_t>> Aux;
+  CompilerInstance *CI = nullptr;
+  Preprocessor *PP = nullptr;
+  llvm::DenseMap<const IdentifierInfo *, unsigned> NameId;
+  std::vector<StringRef> Names;
+  llvm::DenseMap<const MacroInfo *, uint64_t> MacroHash;
+  std::vector<DeclGroupRef> Groups; // top-level declarations, for the uses
+  std::unique_ptr<ExpansionCandidateObserver> Candidates;
+
   State() { Events.reserve(1 << 16); }
   void add(EvKind K, SourceLocation L, Dir D = D_N) {
     bool B = true;
     if (Record) {
       if (DeclBoundaryObserver *O = PP->getDeclBoundaryObserver())
         B = O->isAtDeclarationBoundary();
-      TokHash.push_back(0);
+      Aux.push_back({0, K == E_DIR ? pragmaState() : 0});
     }
     Events.push_back({__rdtsc(), L.getRawEncoding(), K, D, B});
     InRun = K == E_TOK;
@@ -162,11 +192,58 @@ struct State {
     ++Tokens;
     if (Record) {
       add(E_TOK, T.getLocation());
-      TokHash.back() = tokenHash(T, *PP);
+      Aux.back().first = tokenHash(T, *PP);
     } else if (!InRun) {
       add(E_TOK, T.getLocation());
     }
   }
+  unsigned name(const IdentifierInfo *II) {
+    auto [It, New] = NameId.insert({II, Names.size()});
+    if (New)
+      Names.push_back(II->getName());
+    return It->second;
+  }
+  // The state a fragment's macro checks compare (the paper's "obvious
+  // solution", p.30, with our expands-to): not a macro, or a macro with this
+  // definition.
+  uint64_t macroState(const IdentifierInfo *II) {
+    const MacroInfo *MI = PP->getMacroDefinition(II).getMacroInfo();
+    if (!MI)
+      return 0;
+    auto [It, New] = MacroHash.insert({MI, 0});
+    if (New) {
+      std::optional<std::string> Body = clang::ast_cache::serializeMacroTokens(
+          *MI, PP->getSourceManager(), PP->getLangOpts());
+      uint64_t H = fnv(Body ? StringRef(*Body) : StringRef("\x01unreadable"));
+      H = mix(H, MI->isFunctionLike() ? 1 + MI->getNumParams() : 0);
+      It->second = H | 1;
+    }
+    return It->second;
+  }
+  void macroCandidate(const Token &T) {
+    const IdentifierInfo *II = T.getIdentifierInfo();
+    if (!II)
+      return;
+    add(E_MAC, T.getLocation());
+    Aux.back() = {name(II), macroState(II)};
+  }
+  // #pragma pack and the floating-point pragmas, which change what a
+  // declaration means without changing its tokens.
+  uint64_t pragmaState() {
+    if (!CI->hasSema())
+      return 0;
+    Sema &S = CI->getSema();
+    return mix(mix(FNVBasis, Sema::AlignPackInfo::getRawEncoding(S.AlignPackStack.CurrentValue)),
+               S.CurFPFeatures.getAsOpaqueInt());
+  }
+};
+
+class MacroCandidates : public ExpansionCandidateObserver {
+  State &S;
+
+public:
+  MacroCandidates(State &S) : S(S) {}
+  void expansionCandidate(const Token &T) override { S.macroCandidate(T); }
 };
 
 class CB : public PPCallbacks {
@@ -210,9 +287,15 @@ public:
   void Elifndef(SourceLocation L, SourceRange, SourceLocation) override { cond(L, D_elifndef); }
   void Else(SourceLocation L, SourceLocation) override { cond(L, D_else); }
   void Endif(SourceLocation L, SourceLocation) override { cond(L, D_endif); }
-  void MacroDefined(const Token &T, const MacroDirective *) override { dir(T.getLocation(), D_define); }
+  void MacroDefined(const Token &T, const MacroDirective *) override {
+    dir(T.getLocation(), D_define);
+    if (S.Record)
+      S.Aux.back().first = S.name(T.getIdentifierInfo());
+  }
   void MacroUndefined(const Token &T, const MacroDefinition &, const MacroDirective *) override {
     dir(T.getLocation(), D_undef);
+    if (S.Record)
+      S.Aux.back().first = S.name(T.getIdentifierInfo());
   }
   void InclusionDirective(SourceLocation HashLoc, const Token &, StringRef, bool,
                           CharSourceRange, OptionalFileEntryRef, StringRef,
@@ -231,6 +314,45 @@ public:
 struct Frag {
   unsigned Entry, Start, End, NTok, Start3;
   uint64_t Ticks = 0, Edge = 0;
+};
+
+// What record mode finds about a fragment instance (see HandleTranslationUnit).
+struct Rec {
+  uint64_t Hash = FNVBasis, Pragma = 0, Oracle = 0;
+  int8_t Before = -1, After = -1;
+  size_t Order = SIZE_MAX;
+  std::map<unsigned, uint64_t> Ids; // name id -> macro state, first sighting
+  llvm::SmallSetVector<int, 8> Uses, Deps;
+  bool UsesMain = false, DepsMain = false, Param = false;
+};
+
+// Every name a declaration's parse resolved to a declaration: references,
+// types written by name, and the earlier declaration a redeclaration merges
+// with. Member and designator names are left out, as Bothner leaves them out.
+class UseVisitor : public RecursiveASTVisitor<UseVisitor> {
+public:
+  std::function<void(SourceLocation, const Decl *)> Ref;
+  bool VisitDeclRefExpr(DeclRefExpr *E) {
+    Ref(E->getLocation(), E->getDecl());
+    return true;
+  }
+  bool VisitTypedefTypeLoc(TypedefTypeLoc TL) {
+    Ref(TL.getBeginLoc(), TL.getDecl());
+    return true;
+  }
+  bool VisitRecordTypeLoc(RecordTypeLoc TL) {
+    Ref(TL.getBeginLoc(), TL.getDecl());
+    return true;
+  }
+  bool VisitEnumTypeLoc(EnumTypeLoc TL) {
+    Ref(TL.getBeginLoc(), TL.getDecl());
+    return true;
+  }
+  bool VisitDecl(Decl *D) {
+    if (Decl *P = D->getPreviousDecl())
+      Ref(D->getLocation(), P);
+    return true;
+  }
 };
 
 // Owners of time other than fragments.
@@ -367,6 +489,8 @@ public:
     if (!G.isNull())
       L = (*G.begin())->getBeginLoc();
     S.add(E_DECL, L);
+    if (S.Record)
+      S.Groups.push_back(G);
     return true;
   }
 
@@ -387,6 +511,7 @@ public:
       bool Sys;
     };
     std::vector<EntryOut> Entries;
+    std::vector<FileID> EntryFID;
     for (auto &[FID, Kind] : S.Entries) {
       if (FID == Main)
         continue;
@@ -398,6 +523,7 @@ public:
       Range[FID] = {First, unsigned(Frags.size())};
       StringRef RP = FE->getFileEntry().tryGetRealPathName();
       Entries.push_back({FE->getName().str(), RP.str(), SrcMgr::isSystem(Kind)});
+      EntryFID.push_back(FID);
     }
 
     auto fileOf = [&](SourceLocation::UIntTy Raw) {
@@ -406,9 +532,10 @@ public:
         return FileID();
       return SM.getFileID(SM.getExpansionLoc(L));
     };
-    // The owner of a token or declaration at Raw.
+    // The owner of a token or declaration at Raw. Count: a header location in
+    // no fragment is a token that should have been in one.
     unsigned Loose = 0;
-    auto ownerOf = [&](SourceLocation::UIntTy Raw, int Default) -> int {
+    auto ownerOf = [&](SourceLocation::UIntTy Raw, int Default, bool Count = true) -> int {
       SourceLocation L = SourceLocation::getFromRawEncoding(Raw);
       if (L.isInvalid())
         return Default;
@@ -422,7 +549,7 @@ public:
       auto P = std::upper_bound(Frags.begin() + B, Frags.begin() + E, Off,
                                 [](unsigned O, const Frag &F) { return O < F.Start; });
       if (P == Frags.begin() + B || Off > (P - 1)->End) {
-        ++Loose;
+        Loose += Count;
         return O_LOOSE;
       }
       return int(P - 1 - Frags.begin());
@@ -486,6 +613,8 @@ public:
       Prev = S.Events[0].T;
     }
     for (const Ev &E : S.Events) {
+      if (E.Kind == E_MAC)
+        continue;
       uint64_t T = E.T - Prev;
       Prev = E.T;
       ++Counts[E.Kind];
@@ -528,34 +657,128 @@ public:
         Parser = false;
         break;
       }
+      case E_MAC: // skipped above
+        break;
       }
     }
     add(Parser ? O_END : LastDir, S.T1 - Prev);
 
-    // Record mode: each fragment's token hash, and whether the parser was
-    // between declarations at the directive event before its first token and
-    // at the one after its last (Bothner's currently_nested, p.33).
-    std::vector<uint64_t> FragHash(Frags.size(), FNVBasis);
-    std::vector<int8_t> Before(Frags.size(), -1), After(Frags.size(), -1);
+    // Record mode, per fragment instance:
+    //   Hash    the tokens the parser received;
+    //   Before, After  whether the parser was between declarations at the
+    //           directive event before its first token and the one after its
+    //           last (Bothner's currently_nested, p.33);
+    //   Order   the event number of its first token: the order fragments
+    //           were processed in;
+    //   Pragma  #pragma pack and floating-point state at its start;
+    //   Ids     each identifier that reached the macro-expansion decision in
+    //           it, with its macro state (the macro checks, p.30);
+    //   Uses    the fragments whose declarations its names resolved to, as
+    //           GCC resolved them: to an entity's first declaration, which
+    //           its later declarations were merged into (p.27-28, p.31);
+    //   Deps    the fragments holding any earlier declaration of those
+    //           entities: what the oracle hashes;
+    //   flags   it used a main-file declaration (never reusable, p.27); the
+    //           oracle depends on one; it declares a tag in a parameter list
+    //           (p.28-29);
+    //   Oracle  everything its parse depends on, hashed: tokens, pragma
+    //           state, and the oracles of its Deps. Two instances with the
+    //           same oracle parse to the same declarations.
+    std::vector<Rec> R(Frags.size());
+    std::vector<std::array<uint64_t, 3>> Defs; // event number, name id, defined
     if (S.Record) {
       bool Last = true;
+      uint64_t LastPragma = 0;
       int Cur = -1;
       for (size_t I = 0; I < S.Events.size(); ++I) {
         const Ev &E = S.Events[I];
         if (E.Kind == E_DIR) {
           Last = E.Boundary;
-          if (Cur >= 0 && After[Cur] < 0)
-            After[Cur] = E.Boundary;
+          LastPragma = S.Aux[I].second;
+          if (Cur >= 0 && R[Cur].After < 0)
+            R[Cur].After = E.Boundary;
           Cur = -1;
+          if (E.D == D_define || E.D == D_undef)
+            Defs.push_back({I, S.Aux[I].first, E.D == D_define});
         } else if (E.Kind == E_TOK) {
           int O = ownerOf(E.Loc, O_LOOSE);
           if (O < 0)
             continue;
-          if (Before[O] < 0)
-            Before[O] = Last;
-          FragHash[O] = (FragHash[O] ^ S.TokHash[I]) * FNVPrime;
+          Rec &F = R[O];
+          if (F.Order == SIZE_MAX) {
+            F.Order = I;
+            F.Before = Last;
+            F.Pragma = LastPragma;
+          }
+          F.Hash = (F.Hash ^ S.Aux[I].first) * FNVPrime;
           Cur = O;
+        } else if (E.Kind == E_MAC) {
+          int O = ownerOf(E.Loc, O_LOOSE, /*Count=*/false);
+          if (O >= 0)
+            R[O].Ids.insert({unsigned(S.Aux[I].first), S.Aux[I].second});
         }
+      }
+
+      // Uses and Deps, from the declarations each fragment made.
+      auto declOwner = [&](const Decl *D) {
+        return ownerOf(SM.getExpansionLoc(D->getLocation()).getRawEncoding(), O_PRE,
+                       /*Count=*/false);
+      };
+      auto startOf = [&](int F) {
+        return SM.getComposedLoc(EntryFID[Frags[F].Entry], Frags[F].Start);
+      };
+      UseVisitor V;
+      V.Ref = [&](SourceLocation At, const Decl *D) {
+        int U = ownerOf(SM.getExpansionLoc(At).getRawEncoding(), O_PRE, false);
+        if (U < 0 || !D)
+          return;
+        const Decl *First = D->getCanonicalDecl();
+        if (First->isImplicit())
+          return; // a builtin: there from the start, as GCC's were (p.23)
+        int O = declOwner(First);
+        if (O >= 0 && O != U && R[O].Order < R[U].Order)
+          R[U].Uses.insert(O);
+        else if (O == O_MAIN && SM.isBeforeInTranslationUnit(First->getLocation(), startOf(U)))
+          R[U].UsesMain = true;
+        for (const Decl *Q : D->redecls()) {
+          if (Q->isImplicit())
+            continue;
+          int OQ = declOwner(Q);
+          if (OQ >= 0 && OQ != U && R[OQ].Order < R[U].Order)
+            R[U].Deps.insert(OQ);
+          else if (OQ == O_MAIN && SM.isBeforeInTranslationUnit(Q->getLocation(), startOf(U)))
+            R[U].DepsMain = true;
+        }
+        // p.28-29: a tag first declared in a parameter list, which C moves
+        // into the function (Sema::ActOnFunctionDeclarator).
+        if (auto *TD = dyn_cast<TagDecl>(D))
+          if (auto *FD = dyn_cast<FunctionDecl>(TD->getDeclContext()))
+            if (!FD->doesThisDeclarationHaveABody() ||
+                SM.isBeforeInTranslationUnit(TD->getLocation(), FD->getBody()->getBeginLoc()))
+              R[U].Param = true;
+      };
+      for (DeclGroupRef G : S.Groups)
+        for (Decl *D : G)
+          V.TraverseDecl(D);
+
+      // Oracles, in processing order: each one's Deps come before it.
+      std::vector<unsigned> ByOrder(Frags.size());
+      std::iota(ByOrder.begin(), ByOrder.end(), 0);
+      std::sort(ByOrder.begin(), ByOrder.end(),
+                [&](unsigned A, unsigned B) { return R[A].Order < R[B].Order; });
+      uint64_t MainHash = fnv(SM.getBufferData(Main));
+      for (unsigned I : ByOrder) {
+        Rec &F = R[I];
+        uint64_t H = mix(mix(FNVBasis, F.Hash), F.Pragma);
+        std::vector<uint64_t> D;
+        for (int Q : F.Deps)
+          D.push_back(R[Q].Oracle);
+        std::sort(D.begin(), D.end());
+        for (uint64_t X : D)
+          H = mix(H, X);
+        if (F.DepsMain)
+          H = mix(H, MainHash);
+        F.Oracle = H | 1;
       }
     }
 
@@ -593,18 +816,44 @@ public:
       OS << (I ? "," : "") << "[" << jstr(Entries[I].Name) << ","
          << jstr(Entries[I].Real) << "," << Entries[I].Sys << "]";
     // [entry, start, end, tokens, option-3 start, ns, edge ns]; in record
-    // mode also the token hash and the nesting before and after (1: between
-    // declarations, 0: inside one, -1: no event).
+    // mode also [token hash, nesting before, nesting after (1: between
+    // declarations, 0: inside one, -1: no event), order, pragma state, oracle,
+    // flags (1: uses the main file, 2: its oracle does, 4: a tag in a
+    // parameter list), uses, [[name id, macro state (low 32 bits; 0: not a
+    // macro)], ...]].
+    auto hex = [](uint64_t V) { return llvm::format_hex_no_prefix(V, 16); };
     OS << "],\"frags\":[";
     for (size_t I = 0; I < Frags.size(); ++I) {
       const Frag &F = Frags[I];
       OS << (I ? "," : "") << "[" << F.Entry << "," << F.Start << "," << F.End
          << "," << F.NTok << "," << F.Start3 << "," << ns(F.Ticks) << ","
          << ns(F.Edge);
-      if (S.Record)
-        OS << ",\"" << llvm::format_hex_no_prefix(FragHash[I], 16) << "\","
-           << int(Before[I]) << "," << int(After[I]);
+      if (S.Record) {
+        const Rec &X = R[I];
+        OS << ",\"" << hex(X.Hash) << "\"," << int(X.Before) << "," << int(X.After)
+           << "," << X.Order << ",\"" << hex(X.Pragma) << "\",\"" << hex(X.Oracle)
+           << "\"," << (X.UsesMain | X.DepsMain << 1 | X.Param << 2) << ",[";
+        for (size_t K = 0; K < X.Uses.size(); ++K)
+          OS << (K ? "," : "") << X.Uses[K];
+        OS << "],[";
+        bool First = true;
+        for (auto [Id, St] : X.Ids) {
+          OS << (First ? "" : ",") << "[" << Id << "," << uint32_t(St) << "]";
+          First = false;
+        }
+        OS << "]";
+      }
       OS << "]";
+    }
+    if (S.Record) {
+      OS << "],\"names\":[";
+      for (size_t I = 0; I < S.Names.size(); ++I)
+        OS << (I ? "," : "") << jstr(S.Names[I]);
+      // Every #define and #undef: [event number, name id, 1 if #define].
+      OS << "],\"defs\":[";
+      for (size_t I = 0; I < Defs.size(); ++I)
+        OS << (I ? "," : "") << "[" << Defs[I][0] << "," << Defs[I][1] << ","
+           << Defs[I][2] << "]";
     }
     OS << "]}\n";
   }
@@ -673,6 +922,12 @@ protected:
     S->PP = &PP;
     S->Record = getenv("BOTHNER_TRACE_RECORD") != nullptr;
     S->Config = configuration(CI);
+    S->CI = &CI;
+    if (S->Record) {
+      // The slot the header cache uses; empty in a compile without it.
+      S->Candidates = std::make_unique<MacroCandidates>(*S);
+      PP.setExpansionCandidateObserver(*S->Candidates);
+    }
     if (!Off.contains("tokens"))
       PP.setTokenWatcher([Raw](const Token &T) { Raw->token(T); });
     return std::make_unique<Consumer>(CI, S);
