@@ -38,18 +38,33 @@
 // recorded, so that the recording's overhead can be measured, but nothing is
 // computed or written. $BOTHNER_TRACE_EVENTS also writes one line per event:
 // kind, file and offset, the owner charged, and the ticks it got.
+//
+// With $BOTHNER_TRACE_RECORD set, the run records what the model's decisions
+// need instead of times: every token, so that each fragment gets a hash of the
+// tokens the parser received, and at each directive event whether the parser
+// was between declarations. Its times mean nothing. Every run also writes the
+// compile's configuration, as the header cache tells configurations apart.
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/DeclGroup.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Lex/DeclBoundaryObserver.h"
+#include "clang/Lex/DirectoryLookup.h"
+#include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -60,6 +75,11 @@
 #include <x86intrin.h>
 
 using namespace clang;
+
+// In clang/lib/ASTCache (PragmaStateCheck.h), which the clang binary exports.
+namespace clang::ast_cache {
+uint64_t warningFlagsHash(const DiagnosticOptions &Opts);
+}
 
 namespace {
 
@@ -78,7 +98,36 @@ struct Ev {
   SourceLocation::UIntTy Loc;
   EvKind Kind;
   Dir D;
+  bool Boundary; // record mode: the parser was between declarations
 };
+
+const uint64_t FNVBasis = 1469598103934665603ull, FNVPrime = 1099511628211ull;
+
+// What the parser received: the token's kind and, for an identifier or a
+// literal, its text. Equal for two compiles exactly when they hand the parser
+// the same token, so a fragment's hash covers every macro's effect on it.
+uint64_t tokenHash(const Token &T, Preprocessor &PP) {
+  uint64_t H = FNVBasis;
+  auto Mix = [&](const char *P, size_t N) {
+    for (size_t I = 0; I < N; ++I)
+      H = (H ^ (unsigned char)P[I]) * FNVPrime;
+  };
+  uint16_t K = T.getKind();
+  Mix(reinterpret_cast<const char *>(&K), sizeof(K));
+  if (T.isAnnotation())
+    return H;
+  if (IdentifierInfo *II = T.getIdentifierInfo()) {
+    Mix(II->getNameStart(), II->getLength());
+  } else if (T.isLiteral()) {
+    if (const char *P = T.getLiteralData()) {
+      Mix(P, T.getLength());
+    } else {
+      std::string S = PP.getSpelling(T);
+      Mix(S.data(), S.size());
+    }
+  }
+  return H;
+}
 
 struct State {
   std::vector<Ev> Events;
@@ -91,15 +140,32 @@ struct State {
   llvm::DenseSet<SourceLocation::UIntTy> Cond;
   uint64_t Tokens = 0;
   bool InRun = false; // the last event recorded was a token
+  // Record mode (BOTHNER_TRACE_RECORD): every token is an event, with its
+  // hash in TokHash, and each event notes the parser's nesting. Its times
+  // mean nothing.
+  bool Record = false;
+  std::vector<uint64_t> TokHash;
+  Preprocessor *PP = nullptr;
+  uint64_t Config = 0;
   State() { Events.reserve(1 << 16); }
   void add(EvKind K, SourceLocation L, Dir D = D_N) {
-    Events.push_back({__rdtsc(), L.getRawEncoding(), K, D});
+    bool B = true;
+    if (Record) {
+      if (DeclBoundaryObserver *O = PP->getDeclBoundaryObserver())
+        B = O->isAtDeclarationBoundary();
+      TokHash.push_back(0);
+    }
+    Events.push_back({__rdtsc(), L.getRawEncoding(), K, D, B});
     InRun = K == E_TOK;
   }
-  void token(SourceLocation L) {
+  void token(const Token &T) {
     ++Tokens;
-    if (!InRun)
-      add(E_TOK, L);
+    if (Record) {
+      add(E_TOK, T.getLocation());
+      TokHash.back() = tokenHash(T, *PP);
+    } else if (!InRun) {
+      add(E_TOK, T.getLocation());
+    }
   }
 };
 
@@ -466,6 +532,33 @@ public:
     }
     add(Parser ? O_END : LastDir, S.T1 - Prev);
 
+    // Record mode: each fragment's token hash, and whether the parser was
+    // between declarations at the directive event before its first token and
+    // at the one after its last (Bothner's currently_nested, p.33).
+    std::vector<uint64_t> FragHash(Frags.size(), FNVBasis);
+    std::vector<int8_t> Before(Frags.size(), -1), After(Frags.size(), -1);
+    if (S.Record) {
+      bool Last = true;
+      int Cur = -1;
+      for (size_t I = 0; I < S.Events.size(); ++I) {
+        const Ev &E = S.Events[I];
+        if (E.Kind == E_DIR) {
+          Last = E.Boundary;
+          if (Cur >= 0 && After[Cur] < 0)
+            After[Cur] = E.Boundary;
+          Cur = -1;
+        } else if (E.Kind == E_TOK) {
+          int O = ownerOf(E.Loc, O_LOOSE);
+          if (O < 0)
+            continue;
+          if (Before[O] < 0)
+            Before[O] = Last;
+          FragHash[O] = (FragHash[O] ^ S.TokHash[I]) * FNVPrime;
+          Cur = O;
+        }
+      }
+    }
+
     double Ns = 1e9 * std::chrono::duration<double>(S.C1 - S.C0).count() /
                 double(S.T1 - S.T0); // nanoseconds per tick
     auto ns = [&](uint64_t T) { return (unsigned long long)(T * Ns + 0.5); };
@@ -479,7 +572,9 @@ public:
       llvm::errs() << "bothner-trace: cannot write " << Out << "\n";
       return;
     }
-    OS << "{\"ghz\":" << 1.0 / Ns << ",\"span_ns\":" << ns(S.T1 - S.T0)
+    OS << "{\"config\":\"" << llvm::format_hex_no_prefix(S.Config, 16)
+       << "\",\"record\":" << S.Record << ",\"ghz\":" << 1.0 / Ns
+       << ",\"span_ns\":" << ns(S.T1 - S.T0)
        << ",\"frag_ns\":" << ns(FragTicks) << ",\"own_ns\":{";
     for (int K = 0; K < O_N; ++K)
       OS << (K ? "," : "") << "\"" << OwnerName[K] << "\":" << ns(Own[K]);
@@ -497,17 +592,69 @@ public:
     for (size_t I = 0; I < Entries.size(); ++I)
       OS << (I ? "," : "") << "[" << jstr(Entries[I].Name) << ","
          << jstr(Entries[I].Real) << "," << Entries[I].Sys << "]";
-    // [entry, start, end, tokens, option-3 start, ns, edge ns]
+    // [entry, start, end, tokens, option-3 start, ns, edge ns]; in record
+    // mode also the token hash and the nesting before and after (1: between
+    // declarations, 0: inside one, -1: no event).
     OS << "],\"frags\":[";
     for (size_t I = 0; I < Frags.size(); ++I) {
       const Frag &F = Frags[I];
       OS << (I ? "," : "") << "[" << F.Entry << "," << F.Start << "," << F.End
          << "," << F.NTok << "," << F.Start3 << "," << ns(F.Ticks) << ","
-         << ns(F.Edge) << "]";
+         << ns(F.Edge);
+      if (S.Record)
+        OS << ",\"" << llvm::format_hex_no_prefix(FragHash[I], 16) << "\","
+           << int(Before[I]) << "," << int(After[I]);
+      OS << "]";
     }
     OS << "]}\n";
   }
 };
+
+// The compile's configuration, as the header cache tells configurations apart
+// (the user's "flag checking device", instead of assuming one flag set per
+// server): Clang's module hash (language, target, -D/-U, code generation,
+// header-search options), the compile-wide part of the cache's searchContext
+// (HeaderCacheServer.cpp: working directory, sysroot, overlays, every search
+// directory and its kind), and the cache's warningFlagsHash.
+uint64_t configuration(CompilerInstance &CI) {
+  std::string K = CI.getInvocation().getModuleHash();
+  K += '\0';
+  auto Num = [&](uint64_t V) {
+    K.append(reinterpret_cast<const char *>(&V), sizeof(V));
+  };
+  auto Str = [&](StringRef V) {
+    K += V;
+    K += '\0';
+  };
+  Str(CI.getFileManager().getFileSystemOpts().WorkingDir);
+  if (llvm::ErrorOr<std::string> CWD =
+          CI.getFileManager().getVirtualFileSystem().getCurrentWorkingDirectory())
+    Str(*CWD);
+  HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+  const HeaderSearchOptions &O = HS.getHeaderSearchOpts();
+  Str(O.Sysroot);
+  for (const std::string &F : O.VFSOverlayFiles)
+    Str(F);
+  Num(CI.getLangOpts().MSVCCompat);
+  unsigned Index = 0, Angled = 0, System = 0;
+  for (const DirectoryLookup &D : HS.search_dir_range()) {
+    if (HS.angled_dir_begin() != HS.search_dir_end() &&
+        &D == &*HS.angled_dir_begin())
+      Angled = Index;
+    if (HS.system_dir_begin() != HS.search_dir_end() &&
+        &D == &*HS.system_dir_begin())
+      System = Index;
+    Num(D.getLookupType());
+    Num(D.getDirCharacteristic());
+    Str(D.getName());
+    ++Index;
+  }
+  Num(Angled);
+  Num(System);
+  Num(Index);
+  Num(clang::ast_cache::warningFlagsHash(CI.getDiagnosticOpts()));
+  return llvm::xxh3_64bits(K);
+}
 
 class Action : public PluginASTAction {
 protected:
@@ -523,8 +670,11 @@ protected:
     if (!Off.contains("callbacks"))
       PP.addPPCallbacks(std::make_unique<CB>(S, CI.getSourceManager()));
     State *Raw = S.get();
+    S->PP = &PP;
+    S->Record = getenv("BOTHNER_TRACE_RECORD") != nullptr;
+    S->Config = configuration(CI);
     if (!Off.contains("tokens"))
-      PP.setTokenWatcher([Raw](const Token &T) { Raw->token(T.getLocation()); });
+      PP.setTokenWatcher([Raw](const Token &T) { Raw->token(T); });
     return std::make_unique<Consumer>(CI, S);
   }
   bool ParseArgs(const CompilerInstance &,

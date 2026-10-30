@@ -9,8 +9,10 @@ run cut short starts again where it was.
 Checks, per compile: the parts add up to the span; no token is outside every
 fragment; the fragments are as many as fragcount/expected_per_compile.csv
 says (FragCount on the same compiles).
+With RECORD=1 each compile runs once in the plugin's record mode instead
+(token hashes and nesting for the simulator; its times mean nothing).
 usage: trace_run.py <outdir> [first index] [count]
-env: REPS (default 3), CORE (default 3), LOGS, BIN
+env: REPS (default 3), CORE (default 3), RECORD, LOGS, BIN
 """
 import csv, json, os, statistics, subprocess, sys, time
 
@@ -19,8 +21,10 @@ sys.path.insert(0, HERE)
 from compiles import ENV, commands, front_end
 
 TRACE = os.path.join(HERE, "BothnerTrace.so")
-REPS = int(os.environ.get("REPS", "3"))
+RECORD = os.environ.get("RECORD") == "1"
+REPS = 1 if RECORD else int(os.environ.get("REPS", "3"))
 CORE = os.environ.get("CORE", "3")
+MODE = {"BOTHNER_TRACE_RECORD": "1"} if RECORD else {}
 out = os.path.abspath(sys.argv[1])
 first = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 count = int(sys.argv[3]) if len(sys.argv) > 3 else None
@@ -40,7 +44,7 @@ for i in todo:
     runs, walls, rc, err = [], [], 0, ""
     for _ in range(REPS):
         s = time.perf_counter()
-        r = subprocess.run(argv, cwd=cwd, env=dict(ENV, BOTHNER_TRACE_OUT=tmp), capture_output=True, text=True)
+        r = subprocess.run(argv, cwd=cwd, env=dict(ENV, BOTHNER_TRACE_OUT=tmp, **MODE), capture_output=True, text=True)
         walls.append(time.perf_counter() - s)
         rc, err = r.returncode, r.stderr[-2000:]
         if r.returncode or not os.path.exists(tmp):

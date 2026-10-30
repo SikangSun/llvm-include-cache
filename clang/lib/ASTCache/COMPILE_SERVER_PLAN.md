@@ -350,3 +350,59 @@ Decided 2026-10-30:
 
 The last column is a ceiling, before Bothner's rule rejects anything. D2's
 simulator finds how much of it his rule keeps.
+
+**D2, the go/no-go, done 2026-10-30: go.** The cache beats Bothner's bound
+by a wide margin. Even reusing every fragment at no cost only ties it.
+
+- **`BothnerTrace` record mode.** For each fragment it records a hash of the
+  tokens the parser received, which captures every macro's effect on the
+  fragment. It also records whether the parser was between declarations
+  before and after the fragment, and the compile's configuration, built the
+  way the cache's own check builds it. `tests/record.py` checks the paper's
+  cases: `BUFSIZ` changed, `#define int size_t`, the enum with `#define`
+  lines inside, `__FILE__` under another name.
+- **`simulate.py` v0.** The first build fills the server, then the
+  recompilation is scored.
+  - One version is kept per location, and a fragment inside a declaration is
+    never reused.
+  - Under R1, a location already processed in this compile is parsed again.
+  - A reused fragment's tokens must match the stored version's.
+  - There are no dependency sets yet, which can only add reuse.
+  - `tests/simulate.py` checks the decisions against a build worked out by
+    hand.
+- **`recompile.py`.** A fresh daemon; a first build through the cache, not
+  timed; then each compile again under a new build ID. Plain clang, plain
+  clang with the modules flags, and the cache are interleaved, best of 3.
+  The front end only, with sources read in place.
+- **Credit for a persistent process.** Bothner's server skips initializing the
+  compiler, but his driver still runs for every request (p.22-24). Measured
+  with redis's flags: a one-line file takes 8.3-8.4 ms; the driver alone
+  (`-###`) 6.6-6.8 ms. So compiler start-up is 1.6-1.7 ms, credited as
+  1.65 ms per compile.
+
+**Recompilation decisions.** 52.6% of fragment instances reused; 38.2%
+nested; 7.6% repeats within a compile; 1.6% changed. The reused instances
+hold 78.4% of the time in fragments.
+
+| redis, recompilation | All 187 compiles | redis-server (125) |
+|---|---|---|
+| Plain clang | 15.38 s | 13.32 s |
+| Header cache (979 hits of 983 lookups) | 5.41 s: 2.84x (2.46x geometric mean per compile) | 4.13 s: 3.23x (3.05x) |
+| Bothner bound, R1 v0, compiler start-up credited | 7.55 s: 2.04x (1.83x) | 6.13 s: 2.17x (2.05x) |
+| The same, without the credit | 7.86 s: 1.96x (1.72x) | 6.34 s: 2.10x (1.95x) |
+| Every fragment reused, compiler start-up credited | 5.48 s: 2.81x (2.39x) | 4.37 s: 3.05x (2.73x) |
+
+**The most generous credit.** Crediting the whole process start, which
+Bothner's design did not save, puts the bound at 2.27x and the ceiling at
+3.26x. Only that last row beats the cache, and it is unreachable twice over:
+the rule rejects 47% of fragment instances, and the credit counts work his
+server still did.
+
+**Caveats.**
+
+- This recompilation is the same compiles again with nothing edited, which
+  is the best case for both systems.
+- Sources were read in place, not from DRAM.
+- Fragment times come from runs with the plugin loaded, about 1% slow inside
+  the span; that favors Bothner.
+- D3-D5 add his dependency sets, which can only lower his numbers.
