@@ -32,6 +32,7 @@
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileEntry.h"
+#include "llvm/ADT/DenseSet.h"
 #include <functional>
 #include <string>
 #include <vector>
@@ -41,6 +42,7 @@ namespace serialization {
 class ModuleFile;
 }
 class CompilerInstance;
+class IdentifierInfo;
 
 namespace ast_cache {
 class MetadataView;
@@ -129,6 +131,27 @@ public:
          llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve =
              nullptr) = 0;
 
+  /// CLANG_HEADER_CACHE_MERGE: \p MF, a link of the copy served at
+  /// \p Loc and loaded with it, is folded into the headers open as the
+  /// served copy is (served). Its metadata \p Deps gives its files and
+  /// macros; what it reads, the served copy's metadata holds.
+  virtual void foldLink(serialization::ModuleFile *MF, const MetadataView &Deps,
+                        SourceLocation Loc) = 0;
+
+  /// CLANG_HEADER_CACHE_MERGE: the hit at \p Loc loaded a link, or skipped
+  /// it, because its include guard \p Guard was not defined there, or was
+  /// (\p WasDefined): the headers open read that.
+  virtual void linkGuardTested(SourceLocation Loc, llvm::StringRef Guard,
+                               bool WasDefined) = 0;
+
+  /// CLANG_HEADER_CACHE_MERGE, in a process forked from the compile to
+  /// merge one tree: the parts open are dropped unwritten, copies served
+  /// later are folded, not linked, and \p Done is called with each part's
+  /// stored name, and the module name it was sent under (empty if it was
+  /// not), once it is written or declined.
+  virtual void
+  mergeOnly(std::function<void(llvm::StringRef, llvm::StringRef)> Done) = 0;
+
   /// CLANG_HEADER_CACHE_LINK: the copy of the header at \p Path, module
   /// \p Module and file \p MF, stood in for an #include at \p Loc inside
   /// the headers open, whose copies link it instead of holding it. \p Guard
@@ -141,7 +164,8 @@ public:
          serialization::ModuleFile *MF, const MetadataView &Deps,
          SourceLocation Loc,
          llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
-         unsigned FirstModule, uint64_t Hash) = 0;
+         unsigned FirstModule, uint64_t Hash,
+         llvm::ArrayRef<serialization::ModuleFile *> Used) = 0;
 
   /// CLANG_HEADER_CACHE_SECOND_MISS: a part is written only if \p Seen
   /// says a compile was about to write the same copy (header, module name)
@@ -164,6 +188,13 @@ public:
 
   /// Called once the compile's last copy is written.
   virtual void whenFinished(std::function<void()> F) = 0;
+
+  /// The set of names the compile made from __COUNTER__ values, which the
+  /// exporter adds its text's to and reads for masked hashes
+  /// (declarationFingerprint): the client's, which adds the names of each
+  /// copy it loads.
+  virtual void
+  shareCounterNames(llvm::DenseSet<const IdentifierInfo *> &Names) = 0;
 
   /// While \p On, Clang's diagnostics are a hit's, printed again: not the
   /// open headers' to hold.

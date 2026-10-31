@@ -138,6 +138,11 @@ public:
     ParsingPreprocessorDirective = f;
   }
 
+  /// Whether the lexer is lexing a preprocessor directive.
+  bool isParsingPreprocessorDirective() const {
+    return ParsingPreprocessorDirective;
+  }
+
   /// Return true if this lexer is in raw mode or not.
   bool isLexingRawMode() const { return LexingRawMode; }
 

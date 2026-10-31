@@ -30,6 +30,7 @@
 #include "clang/Basic/FileEntry.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -119,6 +120,23 @@ struct SearchMemo {
   llvm::function_ref<std::optional<llvm::StringRef>(llvm::StringRef)> NameOf;
   /// The key FilesFound is kept under, beside the search keys.
   static constexpr uint64_t FilesKey = 0x46494c45534f4b31ULL;
+  /// The fingerprint of each live declaration the compile's checks have
+  /// computed, with the latest redeclaration it covered and whether the
+  /// struct, union or enum it describes was complete: one computed again
+  /// only where either changed. Every copy of a header names much the same
+  /// outside declarations, and each copy is checked against them. Kept
+  /// apart by what is in them: 1, a struct's layout (LayoutPart); 2, a
+  /// function's masked hash.
+  struct Print {
+    const Decl *Latest = nullptr;
+    bool Complete = false;
+    std::optional<std::string> Fingerprint;
+  };
+  llvm::DenseMap<std::pair<const NamedDecl *, unsigned>, Print> *Prints =
+      nullptr;
+  /// The names the compile made from __COUNTER__ values, by its own text
+  /// or in the copies it loaded (declarationFingerprint).
+  const llvm::DenseSet<const IdentifierInfo *> *CounterNames = nullptr;
 };
 
 /// Whether the metadata \p Deps still holds in this compile, read in place.
@@ -213,6 +231,18 @@ struct SectionFailures {
 /// check found for each of the copy's declarations, with the declaration's
 /// latest redeclaration then: one the same name still finds, with no
 /// redeclaration since, is as it was.
+///
+/// \p Others, when non-null with \p Definedness, for measurement: every
+/// expansion, plain-text name, type name and outside declaration that
+/// differs is added to it too, as "E", "N", "Y" or "D" and its index in its
+/// list, and the check goes on; the result is still the first of them.
+///
+/// \p Tolerated, when non-null (CLANG_HEADER_CACHE_GUARD_PLUS=1): a test
+/// that finds read a header the copy holds (HeldHeader) -- its guard
+/// defined, or its #pragma once file read -- does not fail the check where
+/// the compile read the header as the copy holds it and nothing the header
+/// read changed since. It receives how many such headers the copy holds a
+/// second time.
 MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                 Sema *S, std::string *Detail = nullptr,
                                 const IncludeSite *Site = nullptr,
@@ -227,7 +257,9 @@ MismatchReason matchesLiveState(const MetadataView &Deps, Preprocessor &PP,
                                 bool StateOnly = false,
                                 const std::vector<std::pair<const NamedDecl *,
                                                             const Decl *>>
-                                    *Prior = nullptr);
+                                    *Prior = nullptr,
+                                std::vector<std::string> *Others = nullptr,
+                                unsigned *Tolerated = nullptr);
 
 class CacheClient {
 public:
@@ -276,10 +308,10 @@ public:
                          const IncludeSite *Site = nullptr,
                          PiecesStep Step = PiecesStep::Plan);
 
-  /// The stored copy of \p Filename whose module is \p ModuleName, and its
-  /// metadata in \p Meta, with no check: a copy that links it
-  /// (CLANG_HEADER_CACHE_LINK) was checked for both. Empty if the daemon
-  /// holds none.
+  /// The stored copy of \p Filename whose module is \p ModuleName and whose
+  /// metadata hashes to \p Hash, and its metadata in \p Meta, with no
+  /// check: a copy that links it (CLANG_HEADER_CACHE_LINK) was checked for
+  /// both. Empty if the daemon holds none.
   llvm::StringRef fetch(llvm::StringRef Filename, llvm::StringRef ModuleName,
                         uint64_t Hash, std::optional<MetadataView> &Meta);
 
@@ -345,7 +377,16 @@ public:
     unsigned BaseFits = 0;
     /// Copies fetched by name for a link, and how many the daemon held.
     unsigned Fetches = 0, Fetched = 0;
+    /// Lookups and fetches answered from the region's index, with no
+    /// request to the daemon.
+    unsigned IndexReads = 0;
     unsigned CandidatesRejected = 0;
+    /// Hits on a copy whose __COUNTER__ began elsewhere, served by
+    /// CLANG_HEADER_CACHE_COUNTER=names or =any.
+    unsigned OtherStartHits = 0;
+    /// CLANG_HEADER_CACHE_GUARD_PLUS=1: hits on a copy holding headers the
+    /// compile read already, and how many such headers they held.
+    unsigned GuardPlusHits = 0, HeldAgain = 0;
     unsigned RejectedFor[14] = {};
     /// With logRejections on: the header and what failed, one per rejected
     /// candidate, such as "/usr/include/stdio.h: __need_size_t was defined,
@@ -382,6 +423,12 @@ public:
   /// least: 2 begun at the same value, 1 differing but renamable (its values
   /// landed only in names and strings), 0 neither; -1 for none.
   int lastCounterFit() const { return LastCounterFit; }
+
+  /// The names this compile made from __COUNTER__ values: its own text's,
+  /// which the exporter adds, and those each copy it loads lists.
+  llvm::DenseSet<const IdentifierInfo *> &counterNames() {
+    return CounterNames;
+  }
   /// Which submodules of the latest lookup's match load (REPORT.md T17),
   /// and their names.
   const std::vector<bool> &lastSubmodules() const { return LastSubmodules; }
@@ -406,6 +453,41 @@ public:
   /// The latest lookup's match's metadata, read in place.
   const std::optional<MetadataView> &lastMetadata() const {
     return LastMetadata;
+  }
+  /// The latest lookup's match's record in the region's index, or null if
+  /// the daemon's reply gave it.
+  const IndexedCopy *lastRecord() const { return Region.copyAt(LastRecord); }
+  uint64_t lastRecordOffset() const { return LastRecord; }
+  /// CLANG_HEADER_CACHE_GUARD_PLUS=1: how many headers the latest lookup's
+  /// match holds that the compile read already.
+  unsigned lastHeldAgain() const { return LastHeldAgain; }
+
+  /// CLANG_HEADER_CACHE_MERGE: the hit being loaded loads the combination
+  /// \p Combo of copies (MergeRecord::Combo); the timing report says so.
+  void noteCombo(uint64_t Combo) { LastCombo = Combo; }
+  /// CLANG_HEADER_CACHE_MERGE=auto: the latest hit, if it loaded links,
+  /// took \p Instructions from its lookup to the end of its replay.
+  void noteHitInstructions(uint64_t Instructions) {
+    if (LastHitCombo && !Combos.empty())
+      Combos.back().Instructions = Instructions;
+    LastHitCombo = false;
+  }
+  /// The record of the combination \p Combo of \p Copy; null for none.
+  const MergeRecord *comboOf(const IndexedCopy &Copy, uint64_t Combo) const {
+    return Region.comboOf(Copy, Combo);
+  }
+
+  /// CLANG_HEADER_CACHE_MERGE: in a process forked from the compile, a
+  /// connection of its own, every message sent on it and waited for. The
+  /// compile's connection and sending thread are left alone; this process
+  /// must end with _exit. False if the daemon cannot be reached.
+  bool reconnectAfterFork();
+
+  /// CLANG_HEADER_CACHE_COUNTER=unique or =ahead: a hit moves the counter
+  /// past the values its copy holds.
+  bool counterAhead() const {
+    return CounterOtherStart == OtherStart::Unique ||
+           CounterOtherStart == OtherStart::Ahead;
   }
 
   /// The declaration each outside declaration of the latest lookup's match
@@ -438,8 +520,20 @@ private:
   bool SendThread = false, WaitMode = false, LastWaited = false;
   std::string ClaimMode;
   /// CLANG_HEADER_CACHE_COUNTER=1: a copy whose header expanded __COUNTER__
-  /// is served where the counter starts at the value it started at.
+  /// is served where the counter starts at the value it started at. =unique
+  /// also serves one whose values only set names apart where the counter
+  /// has not yet reached that value, the counter then moving past the
+  /// copy's values, so that none repeats (the user's rule, 2026-10-27).
   bool CounterMode = false;
+  /// For measuring only, a copy served wherever the counter starts, keeping
+  /// the values it was written with: =names, one whose values landed only in
+  /// names and strings; =any, every one, as a module is; =ahead, every one
+  /// where the counter has not yet reached the value it began at, the
+  /// counter then moving past the copy's values, so that none repeats (sound
+  /// where each value only has to differ from the others, as the kernel's
+  /// and qemu's do).
+  enum class OtherStart { Never, Unique, Names, Ahead, Any } CounterOtherStart =
+      OtherStart::Never;
   /// The sending thread: messages it sends in order on a connection of its
   /// own, so that they never interleave with the compile's lookups.
   void sendLoop();
@@ -471,6 +565,14 @@ private:
   std::vector<bool> LastSubmodules;
   std::vector<std::string> LastSubmoduleNames, LastSubmodulePaths;
   std::optional<MetadataView> LastMetadata;
+  uint64_t LastRecord = 0, LastCombo = 0;
+  unsigned LastHeldAgain = 0;
+  /// CLANG_HEADER_CACHE_GUARD_PLUS=1 (matchesLiveState's Tolerated).
+  bool GuardPlus = false;
+  /// For the timing report: each hit's copy and combination (noteCombo),
+  /// and its instructions (noteHitInstructions).
+  std::vector<TimingReport::ComboHit> Combos;
+  bool LastHitCombo = false;
   std::vector<NamedDecl *> MatchedDecls;
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;
@@ -480,8 +582,33 @@ private:
   /// daemon.
   uint64_t Build = 0;
   llvm::DenseMap<std::pair<uint64_t, uint64_t>, uint8_t> Outcomes;
+  /// Live declarations' fingerprints, for every check (SearchMemo::Prints).
+  llvm::DenseMap<std::pair<const NamedDecl *, unsigned>, SearchMemo::Print>
+      Prints;
+  /// See SearchMemo::CounterNames.
+  llvm::DenseSet<const IdentifierInfo *> CounterNames;
   /// The copies used since the last message, by metadata offset.
   std::vector<uint64_t> Used;
+
+  /// Copies are found in the region's index, with no request to the
+  /// daemon (CLANG_HEADER_CACHE_REGION_INDEX=0 asks instead). Not with
+  /// CLANG_HEADER_CACHE_WAIT, whose reply waits for a copy being written,
+  /// nor with CLANG_HEADER_CACHE_PIECES, whose reply holds the versions of
+  /// the copies' sections.
+  bool RegionIndex = true;
+  /// Per header, the records of its copies the index listed so far, the
+  /// oldest first, and the newest of them.
+  struct IndexedCopies {
+    uint64_t Newest = 0;
+    std::vector<const IndexedCopy *> Copies;
+  };
+  llvm::StringMap<IndexedCopies> Indexed;
+  /// The records of \p Filename's copies, with those stored since the
+  /// last call added.
+  IndexedCopies &indexedCopies(llvm::StringRef Filename);
+  /// The copies of \p Filename in the index, as the daemon's reply to a
+  /// lookup gives them: the most recently used first.
+  std::vector<CacheEntryRef> indexedEntries(llvm::StringRef Filename);
 
   /// The files this compile has entered, by file name, as far as
   /// OpenSeenUpTo of the source manager's offsets; for SearchMemo::FindOpen.

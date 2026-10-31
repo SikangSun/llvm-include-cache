@@ -98,6 +98,10 @@ class CGDebugInfo {
   /// Cache of previously constructed Types.
   llvm::DenseMap<const void *, llvm::TrackingMDRef> TypeCache;
 
+  /// C records described by a declaration alone, their definition not yet
+  /// known, where a module could bring it (completeImportedRecords).
+  llvm::SmallVector<const RecordDecl *, 8> RecordsDeclaredOnly;
+
   /// Cache that maps VLA types to size expressions for that type,
   /// represented by instantiated Metadata nodes.
   llvm::SmallDenseMap<QualType, llvm::Metadata *> SizeExprCache;
@@ -620,6 +624,12 @@ public:
 
   void completeType(const EnumDecl *ED);
   void completeType(const RecordDecl *RD);
+  /// Completes each C record described by a declaration alone whose
+  /// definition an imported module now holds, as parsing the definition
+  /// would have. A module's definitions reach code generation only when
+  /// needed: a header cache copy of qemu's memory.h left struct
+  /// AddressSpace, declared before it and used, without its members.
+  void completeImportedRecords();
   void completeRequiredType(const RecordDecl *RD);
   void completeClassData(const RecordDecl *RD);
   void completeClass(const RecordDecl *RD);

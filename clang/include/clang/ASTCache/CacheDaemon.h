@@ -75,6 +75,9 @@ struct CacheDaemonOptions {
   /// 0.14 s faster.
   bool DropCostly = false;
   uint64_t LaterCostMicros = DefaultLaterCostMicros;
+  /// Measurement: when set, the ask-list is exactly these headers from the
+  /// start, and no timing changes it, so that runs compare on one list.
+  std::optional<std::vector<std::string>> FixedAskList;
 };
 
 class CacheDaemon {
@@ -84,6 +87,9 @@ public:
   static llvm::Expected<std::unique_ptr<CacheDaemon>>
   create(llvm::StringRef RegionPath = DefaultRegionPath,
          uint64_t RegionSize = DefaultRegionSize, Options Opts = Options());
+
+  /// The headers on the ask-list now, in the order they were listed.
+  std::vector<std::string> askList() const;
 
   /// Handles one message body and returns the reply, or std::nullopt for a
   /// message that could not be understood. An unreadable message closes the
@@ -114,6 +120,7 @@ public:
     uint64_t Hits = 0;      // lookups that returned at least one entry
     uint64_t Pushes = 0;
     uint64_t Duplicates = 0; // pushes discarded as already stored
+    uint64_t Dropped = 0;    // pushes the full region had no room for
     uint64_t BytesStored = 0;
     /// BytesStored by kind: the parts' module files and their metadata.
     uint64_t PartBytes = 0, MetadataBytes = 0;
@@ -137,6 +144,8 @@ public:
     /// CLANG_HEADER_CACHE_CLAIM: claims granted, and refused because another
     /// compile claimed or pushed that copy.
     uint64_t ClaimsGranted = 0, ClaimsRefused = 0;
+    /// CLANG_HEADER_CACHE_MERGE: merges granted, and merged copies stored.
+    uint64_t MergesClaimed = 0, MergesStored = 0;
   };
   Stats stats() const;
 
@@ -165,6 +174,8 @@ private:
     /// one per search key (REPORT.md I9). Another build starts afresh.
     uint64_t SearchBuild = 0;
     std::vector<SearchOutcome> Searches;
+    /// Its record in the region's index (SharedRegion::indexCopy).
+    uint64_t Record = 0;
   };
 
   llvm::SmallVector<char, 0> handleLookup(const LookupRequest &Req,
@@ -186,6 +197,9 @@ private:
   /// received: copies are offered most recently used first (REPORT.md I15).
   llvm::DenseMap<uint64_t, uint64_t> LastUsed;
   uint64_t UseClock = 0;
+  /// Each copy's record in the region's index, by metadata offset: a use
+  /// stamps it there, for the compiles that read the index.
+  llvm::DenseMap<uint64_t, uint64_t> RecordOf;
   /// For dumpEntries, per copy by metadata offset.
   struct Usage {
     uint64_t PushedAt = 0;
@@ -236,6 +250,9 @@ private:
   /// module name, with the connection that claimed it; and the module names
   /// pushed.
   llvm::StringMap<uint64_t> Claimed;
+  /// CLANG_HEADER_CACHE_MERGE: by connection, the record of the
+  /// combination that compile merges; the copy it pushes is the merged one.
+  llvm::DenseMap<uint64_t, uint64_t> MergeOf;
   llvm::StringSet<> PushedNames;
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.

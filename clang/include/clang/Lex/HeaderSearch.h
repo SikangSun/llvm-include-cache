@@ -154,6 +154,11 @@ public:
   /// \c External bit set. If the file entry is not known, return a
   /// default-constructed \c HeaderFileInfo.
   virtual HeaderFileInfo GetHeaderFileInfo(FileEntryRef FE) = 0;
+
+  /// A number that changes whenever GetHeaderFileInfo can answer otherwise
+  /// for a file it had nothing for: when the source learns new header file
+  /// information. 0 if the source cannot say, so that it is asked each time.
+  virtual unsigned getHeaderFileInfoGeneration() const { return 0; }
 };
 
 /// This structure is used to record entries in our framework cache.
@@ -285,6 +290,15 @@ class HeaderSearch {
   /// All of the preprocessor-specific data about files that are
   /// included, indexed by the FileEntry's UID.
   mutable std::vector<HeaderFileInfo> FileInfo;
+
+  /// By the FileEntry's UID, the external source's generation when it last
+  /// had nothing for the file: it is not asked again until that changes.
+  /// With many AST files loaded, each question visits all of them.
+  mutable std::vector<unsigned> ExternalHadNothingAt;
+
+  /// Whether to ask the external source about the file with \p UID, which
+  /// it has not resolved.
+  bool shouldAskExternal(unsigned UID) const;
 
   /// Keeps track of each lookup performed by LookupFile.
   struct LookupFileCacheInfo {
@@ -844,6 +858,12 @@ public:
   /// Return the HeaderFileInfo structure for the specified FileEntry, in
   /// preparation for updating it in some way.
   HeaderFileInfo &getFileInfo(FileEntryRef FE);
+
+  /// Marks \p FE included in this compilation, as
+  /// getFileInfo(FE).IsLocallyIncluded = true does, without asking the
+  /// external source what it knows of the file now: the next getFileInfo or
+  /// getExistingFileInfo of it does, and merges the same.
+  void markLocallyIncluded(FileEntryRef FE);
 
   /// Return the HeaderFileInfo structure for the specified FileEntry, if it has
   /// ever been filled in (either locally or externally).

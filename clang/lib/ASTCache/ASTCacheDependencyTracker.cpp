@@ -12,6 +12,7 @@
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/STLExtras.h"
@@ -21,6 +22,43 @@ using namespace clang::ast_cache;
 
 ASTCacheDependencyTracker::ASTCacheDependencyTracker(Preprocessor &PP)
     : PP(PP) {}
+
+static const bool DumpingSites = std::getenv("CLANG_HEADER_CACHE_DUMP_DEPS");
+
+std::string ASTCacheDependencyTracker::site() const {
+  if (!DumpingSites)
+    return "";
+  std::string Out = SiteKind;
+  if (SiteLoc.isInvalid())
+    return Out + "|?";
+  SourceManager &SM = PP.getSourceManager();
+  auto At = [&](SourceLocation L) {
+    FileID F = SM.getFileID(L);
+    OptionalFileEntryRef FE = SM.getFileEntryRefForID(F);
+    return (FE ? FE->getName().str() : std::string("<buffer>")) + ":" +
+           std::to_string(SM.getSpellingLineNumber(L));
+  };
+  SourceLocation E = SM.getExpansionLoc(SiteLoc);
+  Out += "|" + At(E);
+  if (SiteLoc.isMacroID())
+    Out += "|via " +
+           Lexer::getImmediateMacroName(SiteLoc, SM, PP.getLangOpts()).str() +
+           "@" + At(SM.getSpellingLoc(SiteLoc));
+  Out += "|";
+  // The files holding it, innermost first, up to the main file.
+  for (FileID F = SM.getFileID(E); F.isValid();) {
+    OptionalFileEntryRef FE = SM.getFileEntryRefForID(F);
+    if (!FE)
+      break;
+    Out += FE->getName().str() + ">";
+    SourceLocation Inc = SM.getIncludeLoc(F);
+    if (Inc.isInvalid())
+      break;
+    F = SM.getFileID(Inc);
+  }
+  // In the order the compile recorded them.
+  return Out + "|#" + std::to_string(++SiteSeq);
+}
 
 void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
                                              FileChangeReason Reason,
@@ -93,6 +131,24 @@ void ASTCacheDependencyTracker::FileChanged(SourceLocation Loc,
   if (!OpenFiles.empty() && Files[OpenFiles.back()].FID == PrevFID) {
     Files[OpenFiles.back()].Exit = ++Clock;
     OpenFiles.pop_back();
+  }
+
+  // A #pragma once file with no guard, read inside the headers open: each
+  // holds it, so a hit needs it not read before, as a guard's #ifndef
+  // would (InclusionDependency::WasRead).
+  if (OptionalFileEntryRef Left = SM.getFileEntryRefForID(PrevFID)) {
+    HeaderSearch &HS = PP.getHeaderSearchInfo();
+    HeaderFileInfo &Info = HS.getFileInfo(*Left);
+    if (Info.isPragmaOnce && !Info.getControllingMacro(HS.getExternalLookup()))
+      for (Frame &F : Stack) {
+        if (F.P || F.FID == PrevFID ||
+            !F.SeenSkipped.insert(&Left->getFileEntry()).second)
+          continue;
+        InclusionDependency Dep;
+        Dep.HeaderPath = Left->getName().str();
+        Dep.WasRead = false;
+        F.Deps.Inclusion.push_back(std::move(Dep));
+      }
   }
 
   // PrevFID names the file just left. Only close a frame that matches it --
@@ -315,6 +371,11 @@ void ASTCacheDependencyTracker::FileSkipped(
       ConditionalDependency Dep;
       Dep.MacroName = Guard->getName().str();
       Dep.WasDefined = true;
+      if (DumpingSites) {
+        SiteLoc = FilenameTok.getLocation();
+        SiteKind = "guard";
+        Dep.Site = site();
+      }
       F.Deps.Conditional.push_back(std::move(Dep));
       continue;
     }
@@ -373,13 +434,17 @@ void ASTCacheDependencyTracker::recordConditional(const IdentifierInfo *II,
     ConditionalDependency Dep;
     Dep.MacroName = II->getName().str();
     Dep.WasDefined = WasDefined;
+    Dep.Site = site();
     F.Deps.Conditional.push_back(std::move(Dep));
   }
 }
 
 void ASTCacheDependencyTracker::recordHeldTests() {
-  for (const HeldTest &T : Held)
+  for (const HeldTest &T : Held) {
+    SiteLoc = T.Loc;
+    SiteKind = "defined";
     recordConditional(T.II, T.WasDefined, T.Origin);
+  }
   Held.clear();
 }
 
@@ -397,12 +462,16 @@ FileID ASTCacheDependencyTracker::stateOrigin(const IdentifierInfo *II,
 void ASTCacheDependencyTracker::Ifdef(SourceLocation Loc,
                                        const Token &MacroNameTok,
                                        const MacroDefinition &MD) {
+  SiteLoc = MacroNameTok.getLocation();
+  SiteKind = "ifdef";
   recordConditional(MacroNameTok, MD);
 }
 
 void ASTCacheDependencyTracker::Ifndef(SourceLocation Loc,
                                         const Token &MacroNameTok,
                                         const MacroDefinition &MD) {
+  SiteLoc = MacroNameTok.getLocation();
+  SiteKind = "ifndef";
   recordConditional(MacroNameTok, MD);
 }
 
@@ -421,8 +490,11 @@ void ASTCacheDependencyTracker::Defined(const Token &MacroNameTok,
 void ASTCacheDependencyTracker::DefinedOperatorsNeeded(
     bool Known, ArrayRef<SourceLocation> Needed) {
   for (const HeldTest &T : Held)
-    if (!Known || llvm::is_contained(Needed, T.Loc))
+    if (!Known || llvm::is_contained(Needed, T.Loc)) {
+      SiteLoc = T.Loc;
+      SiteKind = "defined";
       recordConditional(T.II, T.WasDefined, T.Origin);
+    }
   Held.clear();
 }
 
@@ -442,12 +514,16 @@ void ASTCacheDependencyTracker::Elif(SourceLocation Loc,
 void ASTCacheDependencyTracker::Elifdef(SourceLocation Loc,
                                          const Token &MacroNameTok,
                                          const MacroDefinition &MD) {
+  SiteLoc = MacroNameTok.getLocation();
+  SiteKind = "elifdef";
   recordConditional(MacroNameTok, MD);
 }
 
 void ASTCacheDependencyTracker::Elifndef(SourceLocation Loc,
                                           const Token &MacroNameTok,
                                           const MacroDefinition &MD) {
+  SiteLoc = MacroNameTok.getLocation();
+  SiteKind = "elifndef";
   recordConditional(MacroNameTok, MD);
 }
 
@@ -456,6 +532,8 @@ void ASTCacheDependencyTracker::UndefinedIdentifierInDirective(
   // The directive's outcome depended on this identifier having no definition,
   // which is the same fact an #ifdef records -- reuse the same path, with the
   // MacroDefinition absent standing for "was not defined".
+  SiteLoc = IdentifierTok.getLocation();
+  SiteKind = "if-value";
   recordConditional(IdentifierTok, MacroDefinition());
 }
 
@@ -495,6 +573,13 @@ void ASTCacheDependencyTracker::expansionCandidate(const Token &Identifier) {
   // module load left out of date, so do that here first, or the macro state
   // read below could be stale.
   PP.refreshIdentifier(*II);
+  SiteLoc = Identifier.getLocation();
+  SiteKind = !DumpingSites                     ? ""
+             : PP.isParsingIfOrElifDirective() ? "if"
+             : PP.getCurrentFileLexer() &&
+                     PP.getCurrentFileLexer()->isParsingPreprocessorDirective()
+                 ? "directive"
+                 : "text";
   recordSyntactic(II, PP.getMacroDefinition(II).getMacroInfo());
 }
 
@@ -564,6 +649,13 @@ void ASTCacheDependencyTracker::MacroExpands(const Token &MacroNameTok,
     else if (II->isStr("__has_include"))
       NextHasIncludeIsNext = false;
   }
+  SiteLoc = MacroNameTok.getLocation();
+  SiteKind = !DumpingSites                     ? ""
+             : PP.isParsingIfOrElifDirective() ? "if"
+             : PP.getCurrentFileLexer() &&
+                     PP.getCurrentFileLexer()->isParsingPreprocessorDirective()
+                 ? "directive"
+                 : "text";
   recordSyntactic(II, MI);
 }
 
@@ -668,6 +760,7 @@ void ASTCacheDependencyTracker::recordSyntactic(const IdentifierInfo *II,
 
     SyntacticDependency Dep;
     Dep.Name = II->getName().str();
+    Dep.Site = site();
     if (MI) {
       if (!Built) {
         // Shared with the client's match check -- see MacroTokens.h for why
@@ -744,12 +837,31 @@ void ASTCacheDependencyTracker::recordSymbol(
       continue;
     if (!F.SeenSymbol.insert(Name).second)
       continue;
+    static const bool DebugLink = getenv("DEBUG_LINK");
+    if (DebugLink) {
+      OptionalFileEntryRef FE =
+          ResolvedFID.isValid() ? SM.getFileEntryRefForID(ResolvedFID)
+                                : std::nullopt;
+      llvm::errs() << "OUTSIDE-SYMBOL " << Name->getName() << " in frame "
+                   << F.Path << (Folding ? " (served)" : "") << " resolved "
+                   << (HaveResolved ? static_cast<int>(ResolvedFID.getHashValue())
+                                    : 0)
+                   << " " << (FE ? FE->getName() : "?") << " folded:";
+      for (auto [First, N] : F.Folded)
+        llvm::errs() << " [" << First << "," << First + int(N) << ")";
+      llvm::errs() << "\n";
+    }
     noteRead(F, ResolvedFID, "names " + Name->getName());
 
     SymbolDependency Dep;
     Dep.Name = Name->getName().str();
     Dep.Classification = Classification;
     Dep.ResolvedTypeName = Ctx.ResolvedTypeName.str();
+    if (DumpingSites) {
+      SiteLoc = Ctx.QueryLoc;
+      SiteKind = Folding ? "served" : "symbol";
+      Dep.Site = site();
+    }
     F.Deps.Symbol.push_back(std::move(Dep));
   }
 }
@@ -821,7 +933,9 @@ void ASTCacheDependencyTracker::MacroDefined(const Token &MacroNameTok,
       if (L.isValid())
         Replaced = PP.getSourceManager().getFileID(L);
     }
-    F->Changes.push_back({MacroNameTok.getIdentifierInfo(), Replaced, ++Clock});
+    const MacroInfo *MI = MD->getMacroInfo();
+    F->Changes.push_back({MacroNameTok.getIdentifierInfo(), Replaced, ++Clock,
+                          true, MI ? MI->getDefinitionLoc() : SourceLocation()});
   }
   if (!Measuring || Stack.empty() || !MD)
     return;
@@ -857,7 +971,8 @@ void ASTCacheDependencyTracker::MacroUndefined(const Token &MacroNameTok,
     FileID Replaced;
     if (const MacroInfo *MI = MD.getMacroInfo())
       Replaced = PP.getSourceManager().getFileID(MI->getDefinitionLoc());
-    F->Changes.push_back({MacroNameTok.getIdentifierInfo(), Replaced, ++Clock});
+    F->Changes.push_back(
+        {MacroNameTok.getIdentifierInfo(), Replaced, ++Clock, false});
   }
   if (!Measuring || Stack.empty())
     return;
@@ -907,9 +1022,20 @@ void ASTCacheDependencyTracker::foldServed(
     llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve, bool Linked) {
   SourceManager &SM = PP.getSourceManager();
   FileID Where = SM.getFileID(SM.getExpansionLoc(Loc));
+  for (size_t I : OpenFiles)
+    Files[I].Served = true;
   bool Unfoldable = !Deps.submodules().empty() ||
                     (!Linked && !Deps.warningPragmas().empty()) ||
                     !Deps.macroStacks().empty();
+  // The files the copy holds were read inside each header open here: a
+  // later #pragma once skip of one is no state from outside it. CPython's
+  // pycore_mimalloc.h, served inside _remote_debugging.h, holds
+  // mimalloc/types.h, which mimalloc/internal.h includes again.
+  llvm::SmallVector<const FileEntry *, 32> Held;
+  for (const FileStampView &FS : Deps.files())
+    if (OptionalFileEntryRef FE =
+            PP.getFileManager().getOptionalFileRef(FS.Path))
+      Held.push_back(&FE->getFileEntry());
   for (Frame &F : Stack) {
     if (!F.Closure.contains(Where))
       continue;
@@ -923,6 +1049,9 @@ void ASTCacheDependencyTracker::foldServed(
 
   // What the copy's text tested, expanded and named, as if read here: each
   // frame depends on what of it a state outside the frame decides.
+  SiteLoc = Loc;
+  SiteKind = "served";
+  Folding = true;
   for (const ConditionalView &C : Deps.conditional()) {
     const IdentifierInfo *II = PP.getIdentifierInfo(C.MacroName);
     recordConditional(II, C.WasDefined,
@@ -942,24 +1071,30 @@ void ASTCacheDependencyTracker::foldServed(
     Ctx.ResolvedTypeName = S.ResolvedTypeName;
     recordSymbol(PP.getIdentifierInfo(S.Name), S.Classification, Ctx);
   }
+  Folding = false;
 
   for (size_t I = 0; I != Stack.size(); ++I) {
     Frame &F = Stack[I];
     if (!F.Closure.contains(Where))
       continue;
-    // A #pragma once skip of a file the frame read stays inside it.
+    // A #pragma once skip of a file the frame read stays inside it; so does
+    // a file the copy read that the frame read before it.
     for (const InclusionView &V : Deps.inclusion()) {
       OptionalFileEntryRef FE =
           PP.getFileManager().getOptionalFileRef(V.HeaderPath);
       if (FE && F.ClosureFiles.contains(&FE->getFileEntry()))
         continue;
+      if (FE && !F.SeenSkipped.insert(&FE->getFileEntry()).second)
+        continue;
       InclusionDependency D;
       D.HeaderPath = V.HeaderPath.str();
       D.Why = V.Why;
+      D.WasRead = V.WasRead;
       F.Deps.Inclusion.push_back(std::move(D));
       if (F.P)
         F.P->Rec.Origins[3].push_back(FileID());
     }
+    F.ClosureFiles.insert(Held.begin(), Held.end());
     // The copy's #include searches and __FILE__s, numbered after the
     // frame's own: the copy's header is the file the frame's pending
     // #include found.
@@ -992,6 +1127,27 @@ void ASTCacheDependencyTracker::foldServed(
       F.At.FileNames.push_back(Where);
     }
   }
+}
+
+void ASTCacheDependencyTracker::guardTested(SourceLocation Loc,
+                                            llvm::StringRef Guard,
+                                            bool WasDefined) {
+  IdentifierInfo *II = PP.getIdentifierInfo(Guard);
+  SiteLoc = Loc;
+  SiteKind = "link guard";
+  recordConditional(II, WasDefined,
+                    stateOrigin(II, PP.getMacroDefinition(II)));
+}
+
+void ASTCacheDependencyTracker::foldModule(SourceLocation Loc, int FirstID,
+                                           unsigned NumIDs) {
+  SourceManager &SM = PP.getSourceManager();
+  FileID Where = SM.getFileID(SM.getExpansionLoc(Loc));
+  for (size_t I : OpenFiles)
+    Files[I].Served = true;
+  for (Frame &F : Stack)
+    if (F.Closure.contains(Where))
+      F.Folded.push_back({FirstID, NumIDs});
 }
 
 //===----------------------------------------------------------------------===//

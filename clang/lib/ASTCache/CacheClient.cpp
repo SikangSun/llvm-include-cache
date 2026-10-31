@@ -18,6 +18,7 @@
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTReader.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/Support/raw_ostream.h"
@@ -168,6 +169,68 @@ std::optional<IncludeView> redoLookups(
   return std::nullopt;
 }
 
+/// guard+ tolerance (HeldHeader): whether the compile read \p H as the copy
+/// holds it, and left it so. Its guard was defined by its own text, or by
+/// a copy holding it; a #pragma once header without one was entered. Each
+/// macro it set or removed is as it left it: undefined, or defined at the
+/// same place in the same file. Nothing it read from outside the copy
+/// changed after it was read: no name has a directive later.
+bool heldAsRead(const HeldView &H, Preprocessor &PP) {
+  SourceManager &SM = PP.getSourceManager();
+  FileManager &FM = PP.getFileManager();
+  OptionalFileEntryRef FE = FM.getOptionalFileRef(H.Path);
+  if (!FE)
+    return false;
+  auto FileOf = [&](SourceLocation L) -> const FileEntry * {
+    if (L.isInvalid())
+      return nullptr;
+    OptionalFileEntryRef F = SM.getFileEntryRefForID(SM.getFileID(L));
+    return F ? &F->getFileEntry() : nullptr;
+  };
+  SourceLocation At;
+  if (!H.Guard.empty()) {
+    const auto *Def = dyn_cast_or_null<DefMacroDirective>(
+        PP.getLocalMacroDirectiveHistory(PP.getIdentifierInfo(H.Guard)));
+    if (!Def || !Def->getInfo() ||
+        FileOf(SM.getFileLoc(Def->getInfo()->getDefinitionLoc())) !=
+            &FE->getFileEntry())
+      return false;
+    At = Def->getLocation();
+  } else {
+    FileID F = SM.translateFile(*FE);
+    if (F.isInvalid())
+      return false;
+    At = SM.getLocForStartOfFile(F);
+  }
+  if (At.isInvalid())
+    return false;
+  for (llvm::StringRef N : H.Reads)
+    if (const MacroDirective *MD =
+            PP.getLocalMacroDirectiveHistory(PP.getIdentifierInfo(N)))
+      if (MD->getLocation().isInvalid() ||
+          SM.isBeforeInTranslationUnit(At, MD->getLocation()))
+        return false;
+  for (const HeldView::Macro &M : H.Macros) {
+    IdentifierInfo *II = PP.getIdentifierInfo(M.Name);
+    PP.refreshIdentifier(*II);
+    MacroDefinition Def = PP.getMacroDefinition(II);
+    if (!M.Defined) {
+      if (Def)
+        return false;
+      continue;
+    }
+    const MacroInfo *MI = Def.getMacroInfo();
+    if (!MI)
+      return false;
+    SourceLocation L = SM.getFileLoc(MI->getDefinitionLoc());
+    OptionalFileEntryRef Want = FM.getOptionalFileRef(H.Files[M.File]);
+    if (!Want || FileOf(L) != &Want->getFileEntry() ||
+        SM.getFileOffset(L) != M.Offset)
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 MismatchReason clang::ast_cache::matchesLiveState(
@@ -176,7 +239,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
     SearchMemo *Memo, bool SkipConditionals, std::vector<bool> *LoadedOut,
     const std::vector<bool> *Plugged, SectionFailures *Sections,
     std::vector<std::string> *Definedness, bool StateOnly,
-    const std::vector<std::pair<const NamedDecl *, const Decl *>> *Prior) {
+    const std::vector<std::pair<const NamedDecl *, const Decl *>> *Prior,
+    std::vector<std::string> *Others, unsigned *Tolerated) {
+  if (Tolerated)
+    *Tolerated = 0;
   // Names what failed, for a caller that reports it.
   auto Because = [&](MismatchReason R, const llvm::Twine &What) {
     if (Detail)
@@ -232,6 +298,45 @@ MismatchReason clang::ast_cache::matchesLiveState(
     IdentifierInfo *II = PP.getIdentifierInfo(Name);
     PP.refreshIdentifier(*II);
     return II;
+  };
+
+  // A live declaration's fingerprint, from the compile's memo where nothing
+  // it covers has changed since: no later redeclaration, and the struct,
+  // union or enum it describes no more complete. A function whose body the
+  // parser has not attached yet is never kept. A struct's layout is in it
+  // only where the carried fingerprint has one: computing the layout of a
+  // struct as large as cpython's _PyRuntimeState takes 36 ms. So is a
+  // function's masked hash, which may read the function's body.
+  // CLANG_HEADER_CACHE_NO_LAYOUT_CHECK (measurement only, unsafe): a
+  // carried fingerprint is compared without its struct layout.
+  static const bool NoLayoutCheck =
+      std::getenv("CLANG_HEADER_CACHE_NO_LAYOUT_CHECK");
+  auto Carry = [&](llvm::StringRef C) {
+    return NoLayoutCheck ? C.take_front(C.find(" layout ")) : C;
+  };
+  auto LivePrint = [&](NamedDecl *Live,
+                       llvm::StringRef Carried) -> std::optional<std::string> {
+    bool WithLayout = hasLayout(Carried);
+    LayoutPart Layout = WithLayout ? LayoutPart::Always : LayoutPart::Never;
+    const llvm::DenseSet<const IdentifierInfo *> *Masked =
+        Memo && Carried.contains(" masked ") ? Memo->CounterNames : nullptr;
+    unsigned What = (WithLayout ? 1 : 0) | (Masked ? 2 : 0);
+    if (!Memo || !Memo->Prints)
+      return declarationFingerprint(*Live, nullptr, Layout, Masked);
+    const TagDecl *Tag = dyn_cast<TagDecl>(Live);
+    if (auto *TD = dyn_cast<TypedefNameDecl>(Live))
+      Tag = TD->getUnderlyingType()->getAsTagDecl();
+    const Decl *Latest = Live->getMostRecentDecl();
+    bool Complete = Tag && Tag->getDefinition();
+    auto It = Memo->Prints->find({Live, What});
+    if (It != Memo->Prints->end() && It->second.Latest == Latest &&
+        It->second.Complete == Complete)
+      return It->second.Fingerprint;
+    std::optional<std::string> F =
+        declarationFingerprint(*Live, nullptr, Layout, Masked);
+    if (!F || !llvm::StringRef(*F).ends_with(" defined pending"))
+      (*Memo->Prints)[{Live, What}] = {Latest, Complete, F};
+    return F;
   };
 
   // Which submodules load (REPORT.md T17): each whose header the compile
@@ -297,11 +402,57 @@ MismatchReason clang::ast_cache::matchesLiveState(
     }
     return true;
   };
+  // With Others: each other difference is noted, the first kept for the
+  // result.
+  std::optional<std::pair<MismatchReason, std::string>> FirstOther;
+  // Where a live macro or declaration was written, for the note.
+  auto WhereIs = [&](SourceLocation L) -> std::string {
+    if (L.isInvalid())
+      return "";
+    PresumedLoc PL = PP.getSourceManager().getPresumedLoc(
+        PP.getSourceManager().getFileLoc(L));
+    return PL.isValid() ? std::string("@") + PL.getFilename() + ":" +
+                              std::to_string(PL.getLine())
+                        : "";
+  };
+  auto Note = [&](char Kind, size_t Index, MismatchReason R,
+                  const std::string &What, const std::string &Live = "") {
+    if (!Others)
+      return false;
+    Others->push_back(Kind + std::to_string(Index) + Live);
+    if (!FirstOther)
+      FirstOther.emplace(R, What);
+    return true;
+  };
   auto AnySectionFails = [&] {
     return Sections && llvm::is_contained(Sections->Failing, true);
   };
   if (LoadedOut)
     *LoadedOut = Loaded;
+
+  // guard+ tolerance (HeldHeader): the headers the copy holds that the
+  // tests found read, by their place in the metadata, and the first such
+  // test, which fails the check if one of them is not as the copy holds it.
+  // Not with sections, nor where __COUNTER__ gave the copy's text values.
+  llvm::SmallVector<uint32_t, 4> HeldAgain;
+  std::optional<std::pair<MismatchReason, std::string>> FirstHeld;
+  auto Hold = [&](MismatchReason R, const std::string &What,
+                  llvm::function_ref<bool(const HeldView &)> Is) {
+    if (!Tolerated || Sections || Definedness || Deps.counterUses())
+      return false;
+    uint32_t K = 0;
+    for (const HeldView &H : Deps.held()) {
+      if (Is(H)) {
+        if (!llvm::is_contained(HeldAgain, K))
+          HeldAgain.push_back(K);
+        if (!FirstHeld)
+          FirstHeld.emplace(R, What);
+        return true;
+      }
+      ++K;
+    }
+    return false;
+  };
 
   // CLANG_HEADER_CACHE_PIECES: a grouped copy (HeaderDependencySet::Grouped)
   // is read group by group -- the base's first, then the group of each
@@ -347,6 +498,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
                                  (D.WasDefined ? "-" : "+"));
           continue;
         }
+        if (!D.WasDefined &&
+            Hold(MismatchReason::Conditional, What,
+                 [&](const HeldView &H) { return H.Guard == D.MacroName; }))
+          continue;
         return Because(MismatchReason::Conditional, What);
       }
     }
@@ -362,7 +517,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
   };
 
   auto Expansions = [&](MetadataSection<ExpandsToView> Sec) -> Result {
+    size_t Index = 0;
     for (const ExpandsToView &D : Sec) {
+      ++Index;
       if (!Apply(D.Cond))
         continue;
       if (Cost)
@@ -378,6 +535,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
       if (!Live || *Live != D.TokenSequence) {
         if (InSection(D.Cond, MismatchReason::Syntactic,
                       D.Name + " expands differently"))
+          continue;
+        if (Note('E', Index - 1, MismatchReason::Syntactic,
+                 D.Name.str() + " expands differently",
+                 MI ? "x" + WhereIs(MI->getDefinitionLoc()) : "u"))
           continue;
         return Because(MismatchReason::Syntactic,
                        D.Name + " expands differently");
@@ -416,8 +577,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
     return std::nullopt;
   };
 
-  // An #include the recorded compile skipped must also be skippable here,
-  // which means the same file must already have been read.
+  // An #include the recorded compile skipped must also be skipped here,
+  // as Clang decides it (HeaderSearch::ShouldEnterIncludeFile): the file was
+  // read before and ran #pragma once, or was #imported. A #pragma once file
+  // the copy read must not be (InclusionDependency::WasRead).
   auto Inclusions = [&](MetadataSection<InclusionView> Sec) -> Result {
     for (const InclusionView &D : Sec) {
       if (!Apply(D.Cond))
@@ -425,13 +588,22 @@ MismatchReason clang::ast_cache::matchesLiveState(
       if (Cost)
         ++Cost->Read[MetadataView::Inclusion];
       OptionalFileEntryRef FE = FM.getOptionalFileRef(D.HeaderPath);
-      if (!FE ||
-          (!HS.hasFileBeenImported(*FE) && !HS.getFileInfo(*FE).isImport)) {
-        if (InSection(D.Cond, MismatchReason::Inclusion,
-                      D.HeaderPath + " was already included, is not"))
+      const HeaderFileInfo *Info = FE ? &HS.getFileInfo(*FE) : nullptr;
+      bool Read = Info && (Info->isPragmaOnce || Info->isImport);
+      if (Read != D.WasRead) {
+        std::string What =
+            D.HeaderPath.str() + (D.WasRead ? " was already included, is not"
+                                            : " was not read, is");
+        if (InSection(D.Cond, MismatchReason::Inclusion, What))
           continue;
-        return Because(MismatchReason::Inclusion,
-                       D.HeaderPath + " was already included, is not");
+        if (!D.WasRead &&
+            Hold(MismatchReason::Inclusion, What, [&](const HeldView &H) {
+              OptionalFileEntryRef Held = FM.getOptionalFileRef(H.Path);
+              return H.Guard.empty() && Held &&
+                     &Held->getFileEntry() == &FE->getFileEntry();
+            }))
+          continue;
+        return Because(MismatchReason::Inclusion, What);
       }
     }
     return std::nullopt;
@@ -440,7 +612,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
   // Several hundred names for a system header, so after the short lists.
   auto NotMacros = [&](MetadataSection<NameView> Sec) -> Result {
     llvm::TimeTraceScope NamesScope("HeaderCache Check NotAMacro");
+    size_t Index = 0;
     for (const NameView &N : Sec) {
+      ++Index;
       if (!Apply(N.Cond))
         continue;
       if (Cost)
@@ -448,6 +622,12 @@ MismatchReason clang::ast_cache::matchesLiveState(
       if (IsMacro(N.Name)) {
         if (InSection(N.Cond, MismatchReason::Syntactic,
                       N.Name + " was not a macro, is"))
+          continue;
+        if (Note('N', Index - 1, MismatchReason::Syntactic,
+                 N.Name.str() + " was not a macro, is",
+                 "x" + WhereIs(PP.getMacroDefinition(Fresh(N.Name))
+                                   .getMacroInfo()
+                                   ->getDefinitionLoc())))
           continue;
         return Because(MismatchReason::Syntactic,
                        N.Name + " was not a macro, is");
@@ -458,7 +638,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
 
   // Symbol dependencies last: the only ones that cost a name lookup.
   auto Symbols = [&](MetadataSection<SymbolView> Sec) -> Result {
+    size_t Index = 0;
     for (const SymbolView &D : Sec) {
+      ++Index;
       if (!Apply(D.Cond))
         continue;
       if (Cost)
@@ -473,6 +655,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
                                                    : " was not a type, is");
         if (InSection(D.Cond, MismatchReason::Symbol, What))
           continue;
+        if (Note('Y', Index - 1, MismatchReason::Symbol, What,
+                 IsType ? "x" : "u"))
+          continue;
         return Because(MismatchReason::Symbol, What);
       }
       // "Still a type" is not enough: two translation units can both answer
@@ -481,6 +666,9 @@ MismatchReason clang::ast_cache::matchesLiveState(
         std::string What = D.Name.str() + " was " + D.ResolvedTypeName.str() +
                            ", is " + LiveType;
         if (InSection(D.Cond, MismatchReason::Symbol, What))
+          continue;
+        if (Note('Y', Index - 1, MismatchReason::Symbol, What,
+                 IsType ? "x" : "u"))
           continue;
         return Because(MismatchReason::Symbol, What);
       }
@@ -793,11 +981,13 @@ MismatchReason clang::ast_cache::matchesLiveState(
       }
       std::optional<std::string> F;
       if (Live)
-        F = declarationFingerprint(*Live);
-      if (!F || !fingerprintSatisfies(D.Fingerprint, *F)) {
+        F = LivePrint(Live, Carry(D.Fingerprint));
+      if (!F || !fingerprintSatisfies(Carry(D.Fingerprint), *F)) {
         std::string What = D.Name.str() + " was " + D.Fingerprint.str() +
                            ", is " + (F ? *F : std::string("not declared"));
-        if (InSection(D.Cond, MismatchReason::Declaration, What)) {
+        if (InSection(D.Cond, MismatchReason::Declaration, What) ||
+            Note('D', Index, MismatchReason::Declaration, What,
+                 Live ? "x" + WhereIs(Live->getLocation()) : "u")) {
           if (Found)
             Found->push_back(nullptr);
           continue;
@@ -899,8 +1089,40 @@ MismatchReason clang::ast_cache::matchesLiveState(
       return *R;
   }
 
+  // CLANG_HEADER_CACHE_SECTIONS=2: what the copy's lines take from a
+  // submodule this compile skips is the compile's own declaration of the
+  // name, which must be the one they were parsed against.
+  static const bool NoProvidedCheck =
+      std::getenv("CLANG_HEADER_CACHE_NO_PROVIDED_CHECK");
+  for (const ProvidedView &D : Deps.provided()) {
+    if (NoProvidedCheck)
+      break;
+    size_t K = D.Cond - 1;
+    if (!D.Cond || D.Fingerprint.empty() || K >= Loaded.size() || Loaded[K])
+      continue;
+    NamedDecl *Live = ASTReader::lookupAtFileScope(
+        *S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
+        /*CreateBuiltin=*/true);
+    std::optional<std::string> F;
+    if (Live)
+      F = LivePrint(Live, Carry(D.Fingerprint));
+    if (!F || !fingerprintSatisfies(Carry(D.Fingerprint), *F))
+      return Because(MismatchReason::Declaration,
+                     D.Name + " from a skipped section was " + D.Fingerprint +
+                         ", is " + (F ? *F : std::string("not declared")));
+  }
+
+  if (FirstOther)
+    return Because(FirstOther->first, FirstOther->second);
   if (Definedness && !Definedness->empty())
     return Because(MismatchReason::Conditional, "only definedness tests differ");
+  if (!HeldAgain.empty()) {
+    uint32_t K = 0;
+    for (const HeldView &H : Deps.held())
+      if (llvm::is_contained(HeldAgain, K++) && !heldAsRead(H, PP))
+        return Because(FirstHeld->first, FirstHeld->second);
+    *Tolerated = HeldAgain.size();
+  }
   return MismatchReason::None;
 }
 
@@ -961,13 +1183,25 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
     return V && llvm::StringRef(V) == "1";
   };
   C->WaitMode = On("CLANG_HEADER_CACHE_WAIT");
+  if (const char *V = std::getenv("CLANG_HEADER_CACHE_REGION_INDEX"))
+    C->RegionIndex = llvm::StringRef(V) != "0";
   C->SendThread = C->WaitMode || On("CLANG_HEADER_CACHE_SEND_THREAD");
   if (const char *V = std::getenv("CLANG_HEADER_CACHE_CLAIM");
       V && (llvm::StringRef(V) == "1" || llvm::StringRef(V) == "check" ||
             llvm::StringRef(V) == "deps" || llvm::StringRef(V) == "depscheck"))
     C->ClaimMode = V;
-  if (const char *V = std::getenv("CLANG_HEADER_CACHE_COUNTER"))
-    C->CounterMode = llvm::StringRef(V) == "1";
+  if (const char *V = std::getenv("CLANG_HEADER_CACHE_COUNTER")) {
+    llvm::StringRef S(V);
+    C->CounterMode = S == "1" || S == "unique" || S == "names" ||
+                     S == "ahead" || S == "any";
+    C->CounterOtherStart = S == "unique"  ? OtherStart::Unique
+                           : S == "any"   ? OtherStart::Any
+                           : S == "names" ? OtherStart::Names
+                           : S == "ahead" ? OtherStart::Ahead
+                                          : OtherStart::Never;
+  }
+  if (const char *V = std::getenv("CLANG_HEADER_CACHE_GUARD_PLUS"))
+    C->GuardPlus = llvm::StringRef(V) == "1";
   C->Counters.ConnectMicros = microsSince(Start);
   return C;
 }
@@ -1056,6 +1290,26 @@ void CacheClient::noteWriting(llvm::StringRef Filename, bool Ended) {
   enqueue(std::move(Msg));
 }
 
+bool CacheClient::reconnectAfterFork() {
+  llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> S =
+      llvm::raw_socket_stream::createConnectedUnix(SocketPath);
+  if (!S) {
+    llvm::consumeError(S.takeError());
+    return false;
+  }
+  // The compile's connection stays open for the compile: closing it here
+  // could end it there too.
+  (void)Conn.release();
+  Conn = std::move(*S);
+  SendThread = false;
+  WaitMode = false;
+  // What the compile used and learned is the compile's to report.
+  Used.clear();
+  Learned.clear();
+  Combos.clear();
+  return true;
+}
+
 bool CacheClient::claim(llvm::StringRef Filename, llvm::StringRef ModuleName,
                         bool Release) {
   llvm::SmallVector<char, 0> Msg;
@@ -1102,6 +1356,12 @@ llvm::StringRef CacheClient::lookup(
     // copy.
     Entries = std::move(Cached->second);
     PlannedVersions.erase(Cached);
+  } else if (RegionIndex && !WaitMode && !PiecesMode &&
+             !Filename.starts_with("*")) {
+    // What this compile used and what its searches found go to the
+    // daemon with its timing report.
+    ++Counters.IndexReads;
+    Entries = indexedEntries(Filename);
   } else {
     llvm::SmallVector<char, 0> Msg;
     LookupRequest Req{Filename.str(), Build, std::move(Learned),
@@ -1138,6 +1398,7 @@ llvm::StringRef CacheClient::lookup(
 
   LastCandidates = Entries.size();
   LastRejection = MismatchReason::None;
+  LastHeldAgain = 0;
   MatchedDecls.clear();
   // A file the compile has entered, by the canonical path a copy names it
   // by. Found by file name first, so that only a file named the same has its
@@ -1191,10 +1452,32 @@ llvm::StringRef CacheClient::lookup(
   // differs (measurement: what else each copy differs in).
   static const bool CompleteChecks = [] {
     const char *V = std::getenv("CLANG_HEADER_CACHE_LOG_COMPLETE");
-    return V && llvm::StringRef(V) == "1";
+    return V && (llvm::StringRef(V) == "1" || llvm::StringRef(V) == "2");
+  }();
+  // =2 also notes every other difference of each copy (" more=").
+  static const bool CompleteOthers = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_LOG_COMPLETE");
+    return V && llvm::StringRef(V) == "2";
   }();
   std::vector<NamedDecl *> Found;
   std::vector<bool> CandidateLoaded;
+  // CLANG_HEADER_CACHE_COUNTER=unique or =ahead: a copy written where the counter
+  // stood where it stands now is tried first, then those written further
+  // on, nearest first, so that a hit moves the counter as little as it can.
+  if (counterAhead()) {
+    uint32_t Now = PP.getCounterValue();
+    auto Order = [&](const CacheEntryRef &E) -> std::pair<int, uint32_t> {
+      std::optional<MetadataView> D = MetadataView::open(
+          Region.read(E.MetadataOffset, E.MetadataLength));
+      if (!D || !D->counterUses() || D->counterStart() == Now)
+        return {0, 0};
+      return {D->counterStart() > Now ? 1 : 2, D->counterStart()};
+    };
+    llvm::stable_sort(Entries,
+                      [&](const CacheEntryRef &A, const CacheEntryRef &B) {
+                        return Order(A) < Order(B);
+                      });
+  }
   for (const CacheEntryRef &E : Entries) {
     // The metadata is read where the daemon stored it. If the offset
     // addresses nothing written, there is nothing to check the candidate
@@ -1218,7 +1501,8 @@ llvm::StringRef CacheClient::lookup(
           return O.Outcome;
       return std::nullopt;
     };
-    SearchMemo Memo{Recall, {}, std::nullopt, FindOpen, NameOf};
+    SearchMemo Memo{Recall, {},      std::nullopt, FindOpen,
+                    NameOf, &Prints, &CounterNames};
     CheckCost Prev = Counters.Check;
     // CLANG_HEADER_CACHE_PIECES: a copy with sections or left-out headers is
     // checked once for both, whether it fits whole and else whether its
@@ -1236,7 +1520,8 @@ llvm::StringRef CacheClient::lookup(
           }));
     std::vector<bool> Plugged;
     SectionFailures Sections;
-    std::vector<std::string> AllFails;
+    std::vector<std::string> AllFails, AllOthers;
+    unsigned HeldAgain = 0;
     if (MayPlan)
       for (const LeftOutView &L : Deps->leftOut())
         Plugged.push_back(!Read(L));
@@ -1253,7 +1538,10 @@ llvm::StringRef CacheClient::lookup(
                              MayPlan ? &Sections : nullptr,
                              LogChecks && CompleteChecks ? &AllFails : nullptr,
                              /*StateOnly=*/Recheck,
-                             Recheck ? &PlannedDecls : nullptr);
+                             Recheck ? &PlannedDecls : nullptr,
+                             LogChecks && CompleteOthers ? &AllOthers
+                                                         : nullptr,
+                             GuardPlus ? &HeldAgain : nullptr);
     }
     MismatchReason Rest = Why;
     if (MayPlan && Why == MismatchReason::None) {
@@ -1313,6 +1601,11 @@ llvm::StringRef CacheClient::lookup(
       OS << " fails=";
       for (size_t I = 0; I != AllFails.size(); ++I)
         OS << (I ? "," : "") << AllFails[I];
+      if (CompleteOthers) {
+        OS << " more=";
+        for (size_t I = 0; I != AllOthers.size(); ++I)
+          OS << (I ? "," : "") << AllOthers[I];
+      }
       OS << " rest="
          << static_cast<unsigned>(Rest == MismatchReason::Conditional &&
                                           !AllFails.empty()
@@ -1344,7 +1637,18 @@ llvm::StringRef CacheClient::lookup(
     // __COUNTER__ expansions had, which they have again only where the
     // counter starts where it did (DECISIONS.md 2.7).
     if (Why == MismatchReason::None && Deps->counterUses() && CounterMode) {
-      if (PP.getCounterValue() != Deps->counterStart())
+      if (PP.getCounterValue() == Deps->counterStart())
+        ;
+      else if (CounterOtherStart == OtherStart::Any ||
+               (CounterOtherStart == OtherStart::Names &&
+                !Deps->counterSemantic()) ||
+               (CounterOtherStart == OtherStart::Ahead &&
+                PP.getCounterValue() < Deps->counterStart()) ||
+               (CounterOtherStart == OtherStart::Unique &&
+                !Deps->counterSemantic() &&
+                PP.getCounterValue() < Deps->counterStart()))
+        ++Counters.OtherStartHits;
+      else
         Why = MismatchReason::Counter;
     } else if (Why == MismatchReason::None && Deps->counterUses()) {
       Why = MismatchReason::Counter;
@@ -1370,6 +1674,9 @@ llvm::StringRef CacheClient::lookup(
     MatchedDecls = Found;
     LastSubmodules = CandidateLoaded;
     LastMetadata = Deps;
+    LastRecord = E.Record;
+    LastCombo = 0;
+    LastHeldAgain = HeldAgain;
     LastSubmoduleNames.clear();
     LastSubmodulePaths.clear();
     for (const SubmoduleView &M : Deps->submodules()) {
@@ -1379,9 +1686,16 @@ llvm::StringRef CacheClient::lookup(
     if (Use && !Use(Bytes, Deps->moduleName()))
       continue;
     ++Counters.Hits;
+    if (HeldAgain) {
+      ++Counters.GuardPlusHits;
+      Counters.HeldAgain += HeldAgain;
+    }
     if (LastWaited)
       ++Counters.WaitedHits;
     Used.push_back(E.MetadataOffset);
+    LastHitCombo = LastCombo != 0;
+    if (LastCombo)
+      Combos.push_back({E.MetadataOffset, LastCombo, 0});
     // Each file the copy holds has, in this compile, the name its check
     // found it by.
     if (PiecesMode && !Deps->headerName().empty())
@@ -1451,10 +1765,119 @@ llvm::StringRef CacheClient::lookup(
   return {};
 }
 
+CacheClient::IndexedCopies &
+CacheClient::indexedCopies(llvm::StringRef Filename) {
+  IndexedCopies &K = Indexed[Filename];
+  uint64_t Newest = Region.newestCopy(Filename);
+  if (Newest != K.Newest) {
+    // Each record names the one stored before it: the walk stops at the
+    // newest one listed before.
+    size_t Old = K.Copies.size();
+    for (uint64_t At = Newest; At && At != K.Newest;) {
+      const IndexedCopy *C = Region.copyAt(At);
+      if (!C)
+        break;
+      K.Copies.push_back(C);
+      At = C->Next;
+    }
+    std::reverse(K.Copies.begin() + Old, K.Copies.end());
+    K.Newest = Newest;
+  }
+  return K;
+}
+
+std::vector<CacheEntryRef>
+CacheClient::indexedEntries(llvm::StringRef Filename) {
+  IndexedCopies &K = indexedCopies(Filename);
+  std::vector<std::pair<uint64_t, const IndexedCopy *>> Order;
+  Order.reserve(K.Copies.size());
+  for (const IndexedCopy *C : K.Copies)
+    Order.push_back({C->Stamp.load(std::memory_order_relaxed), C});
+  // Copies used equally recently, or never, stay in the order they were
+  // stored, as in the daemon's reply.
+  std::stable_sort(Order.begin(), Order.end(),
+                   [](const auto &A, const auto &B) { return A.first > B.first; });
+  // CLANG_HEADER_CACHE_MERGE: the copies merged from the hits that started
+  // from a copy are checked just before it, which fits wherever they do.
+  llvm::SmallDenseMap<const IndexedCopy *,
+                      llvm::SmallVector<const IndexedCopy *, 2>, 4>
+      MergedOf;
+  llvm::SmallPtrSet<const IndexedCopy *, 4> Merged;
+  for (const IndexedCopy *C : K.Copies)
+    for (const MergeRecord *M =
+             Region.mergeAt(C->Merge.load(std::memory_order_acquire));
+         M; M = Region.mergeAt(M->Next))
+      if (uint64_t To = M->Merged.load(std::memory_order_acquire); To > 1)
+        if (const IndexedCopy *T = Region.copyAt(To);
+            T && llvm::is_contained(K.Copies, T)) {
+          MergedOf[C].push_back(T);
+          Merged.insert(T);
+        }
+  if (!MergedOf.empty()) {
+    std::vector<std::pair<uint64_t, const IndexedCopy *>> Placed;
+    Placed.reserve(Order.size());
+    for (const auto &[Stamp, C] : Order) {
+      if (Merged.contains(C))
+        continue;
+      if (auto It = MergedOf.find(C); It != MergedOf.end())
+        for (const IndexedCopy *M : It->second)
+          Placed.push_back({Stamp, M});
+      Placed.push_back({Stamp, C});
+    }
+    Order = std::move(Placed);
+  }
+  std::vector<CacheEntryRef> Out;
+  Out.reserve(Order.size());
+  for (const auto &[Stamp, C] : Order) {
+    CacheEntryRef &E = Out.emplace_back();
+    E.Record = Region.offsetOf(C);
+    E.MetadataOffset = C->MetadataOffset;
+    E.MetadataLength = C->MetadataLength;
+    E.Offset = C->Offset;
+    E.Length = C->Length;
+    E.MetadataHash = C->MetadataHash;
+    if (!Build)
+      continue;
+    // What its searches found earlier in this build (REPORT.md I9).
+    if (uint64_t At = C->Searches.load(std::memory_order_acquire))
+      if (std::optional<StoredSearches> F = Region.searchesAt(At);
+          F && F->Build == Build)
+        for (size_t I = 0; I + 1 < F->Pairs.size(); I += 2)
+          E.Searches.push_back(
+              {F->Pairs[I], static_cast<uint8_t>(F->Pairs[I + 1])});
+  }
+  return Out;
+}
+
 llvm::StringRef CacheClient::fetch(llvm::StringRef Filename,
                                    llvm::StringRef ModuleName, uint64_t Hash,
                                    std::optional<MetadataView> &Meta) {
   ++Counters.Fetches;
+  auto Take = [&](uint64_t MetadataOffset, uint64_t MetadataLength,
+                  uint64_t Offset, uint64_t Length) -> llvm::StringRef {
+    std::optional<MetadataView> Deps =
+        MetadataView::open(Region.read(MetadataOffset, MetadataLength));
+    if (!Deps || Deps->moduleName() != ModuleName)
+      return {};
+    llvm::StringRef Bytes = Region.read(Offset, Length);
+    if (Bytes.empty())
+      return {};
+    ++Counters.Fetched;
+    Meta = Deps;
+    return Bytes;
+  };
+  if (RegionIndex && !WaitMode) {
+    ++Counters.IndexReads;
+    IndexedCopies &K = indexedCopies(Filename);
+    for (auto It = K.Copies.rbegin(), E = K.Copies.rend(); It != E; ++It)
+      if ((*It)->MetadataHash == Hash)
+        if (llvm::StringRef Bytes =
+                Take((*It)->MetadataOffset, (*It)->MetadataLength,
+                     (*It)->Offset, (*It)->Length);
+            !Bytes.empty())
+          return Bytes;
+    return {};
+  }
   llvm::SmallVector<char, 0> Msg;
   encodeLookupRequest(
       {Filename.str(), Build, std::move(Learned), std::move(Used)}, Msg);
@@ -1470,18 +1893,12 @@ llvm::StringRef CacheClient::fetch(llvm::StringRef Filename,
   std::optional<LookupResponse> Resp = decodeLookupResponse(*Reply);
   if (!Resp)
     return {};
-  for (const CacheEntryRef &E : Resp->Entries) {
-    std::optional<MetadataView> Deps = MetadataView::open(
-        Region.read(E.MetadataOffset, E.MetadataLength));
-    if (!Deps || Deps->moduleName() != ModuleName)
-      continue;
-    llvm::StringRef Bytes = Region.read(E.Offset, E.Length);
-    if (Bytes.empty() || llvm::xxh3_64bits(Bytes) != Hash)
-      continue;
-    ++Counters.Fetched;
-    Meta = Deps;
-    return Bytes;
-  }
+  for (const CacheEntryRef &E : Resp->Entries)
+    if (E.MetadataHash == Hash)
+      if (llvm::StringRef Bytes =
+              Take(E.MetadataOffset, E.MetadataLength, E.Offset, E.Length);
+          !Bytes.empty())
+        return Bytes;
   return {};
 }
 
@@ -1521,8 +1938,10 @@ bool CacheClient::reportTimings(const TimingReport &Report) {
   WithSearches.Build = Build;
   WithSearches.Learned = std::move(Learned);
   WithSearches.Used = std::move(Used);
+  WithSearches.Combos = std::move(Combos);
   Learned.clear();
   Used.clear();
+  Combos.clear();
   encodeTimingReport(WithSearches, Msg);
   bool Sent = sendMessage(*Conn, Msg) && receiveMessage(*Conn).has_value();
   Counters.ReportMicros += microsSince(Start);

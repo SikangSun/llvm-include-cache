@@ -99,6 +99,7 @@ void clang::ast_cache::encodeLookupResponse(const LookupResponse &Resp,
         W.u64(E.MetadataLength);
         W.u64(E.Offset);
         W.u64(E.Length);
+        W.u64(E.MetadataHash);
         W.u32(static_cast<uint32_t>(E.Searches.size()));
         for (const SearchOutcome &O : E.Searches) {
           W.u64(O.Key);
@@ -120,9 +121,13 @@ void clang::ast_cache::encodePushRequest(const PushRequest &Req,
                                          llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::PushRequest, [&](ByteWriter &W) {
     W.str(Req.Filename);
-    llvm::SmallVector<char, 0> Metadata;
-    encodeMetadata(Req.Deps, Req.ModuleName, Metadata);
-    W.str(llvm::StringRef(Metadata.data(), Metadata.size()));
+    if (!Req.Metadata.empty()) {
+      W.str(Req.Metadata);
+    } else {
+      llvm::SmallVector<char, 0> Metadata;
+      encodeMetadata(Req.Deps, Req.ModuleName, Metadata);
+      W.str(llvm::StringRef(Metadata.data(), Metadata.size()));
+    }
     W.str(Req.Data);
   });
 }
@@ -142,6 +147,12 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
       }
     }
     writeLearned(W, Report.Build, Report.Learned, Report.Used);
+    W.u32(static_cast<uint32_t>(Report.Combos.size()));
+    for (const TimingReport::ComboHit &C : Report.Combos) {
+      W.u64(C.Copy);
+      W.u64(C.Combo);
+      W.u64(C.Instructions);
+    }
   });
 }
 
@@ -277,6 +288,7 @@ clang::ast_cache::decodeLookupResponse(llvm::StringRef Body) {
       E.MetadataLength = R.u64();
       E.Offset = R.u64();
       E.Length = R.u64();
+      E.MetadataHash = R.u64();
       for (uint32_t J = 0, M = R.count(); J < M && R.ok(); ++J) {
         SearchOutcome O;
         O.Key = R.u64();
@@ -329,8 +341,16 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
       L->push_back(std::move(H));
     }
   }
-  if (!readLearned(R, Report.Build, Report.Learned, Report.Used) || !R.ok() ||
-      !R.atEnd())
+  if (!readLearned(R, Report.Build, Report.Learned, Report.Used))
+    return std::nullopt;
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    TimingReport::ComboHit C;
+    C.Copy = R.u64();
+    C.Combo = R.u64();
+    C.Instructions = R.u64();
+    Report.Combos.push_back(C);
+  }
+  if (!R.ok() || !R.atEnd())
     return std::nullopt;
   return Report;
 }

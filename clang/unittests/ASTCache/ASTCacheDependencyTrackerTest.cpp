@@ -614,13 +614,17 @@ TEST_F(ASTCacheDependencyTrackerTest,
        AOnceFileReadTwiceInsideAHeaderIsNoDependency) {
   // parent.h reads once.h and then includes it again. The skip is parent.h's
   // own doing; recording "once.h was already included" would reject parent.h
-  // wherever once.h had not been read before it.
+  // wherever once.h had not been read before it. parent.h's copy holds
+  // once.h, so it needs once.h not read before it (WasRead), as a guard's
+  // #ifndef would.
   addFile("/once.h", "#pragma once\nint once_v;\n");
   addFile("/parent.h", "#include \"once.h\"\n#include \"once.h\"\nint p;\n");
   auto Recs = run("#include \"parent.h\"\n");
   const HeaderDependencySet *D = find(Recs, "parent.h");
   ASSERT_NE(D, nullptr);
-  EXPECT_TRUE(D->Inclusion.empty());
+  ASSERT_EQ(D->Inclusion.size(), 1u);
+  EXPECT_EQ(D->Inclusion[0].HeaderPath, "/once.h");
+  EXPECT_FALSE(D->Inclusion[0].WasRead);
 }
 
 TEST_F(ASTCacheDependencyTrackerTest, AFileMacroInTheHeaderRecordsItsText) {

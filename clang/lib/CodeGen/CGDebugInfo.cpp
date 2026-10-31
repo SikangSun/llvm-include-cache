@@ -3006,6 +3006,17 @@ void CGDebugInfo::completeType(const RecordDecl *RD) {
     completeRequiredType(RD);
 }
 
+void CGDebugInfo::completeImportedRecords() {
+  SmallVector<const RecordDecl *, 8> Pending;
+  Pending.swap(RecordsDeclaredOnly);
+  for (const RecordDecl *RD : Pending) {
+    if (const RecordDecl *Def = RD->getDefinition())
+      completeType(Def);
+    else
+      RecordsDeclaredOnly.push_back(RD);
+  }
+}
+
 /// Return true if the class or any of its methods are marked dllimport.
 static bool isClassOrMethodDLLImport(const CXXRecordDecl *RD) {
   if (RD->hasAttr<DLLImportAttr>())
@@ -3227,8 +3238,11 @@ CGDebugInfo::CreateTypeDefinition(const RecordType *Ty) {
   llvm::DICompositeType *FwdDecl = getOrCreateLimitedType(Ty);
 
   const RecordDecl *D = RD->getDefinition();
-  if (!D || !D->isCompleteDefinition())
+  if (!D || !D->isCompleteDefinition()) {
+    if (!CGM.getLangOpts().CPlusPlus && CGM.getContext().getExternalSource())
+      RecordsDeclaredOnly.push_back(RD);
     return {FwdDecl, nullptr};
+  }
 
   if (const auto *CXXDecl = dyn_cast<CXXRecordDecl>(RD))
     CollectContainingType(CXXDecl, FwdDecl);

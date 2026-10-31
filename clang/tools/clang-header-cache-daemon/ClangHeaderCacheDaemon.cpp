@@ -19,6 +19,7 @@
 #include "clang/ASTCache/SharedRegion.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
 #include <csignal>
@@ -70,6 +71,18 @@ static cl::opt<unsigned long long>
                        "microseconds"),
               cl::init(DefaultLaterCostMicros), cl::cat(Category));
 
+static cl::opt<std::string> AskListLoad(
+    "ask-list-load",
+    cl::desc("Measurement: the ask-list is exactly the headers in this file, "
+             "one path per line, and timings do not change it"),
+    cl::init(""), cl::cat(Category));
+
+static cl::opt<std::string>
+    AskListSave("ask-list-save",
+                cl::desc("Measurement: write the ask-list to this file on "
+                         "exit, one path per line"),
+                cl::init(""), cl::cat(Category));
+
 static CacheDaemon *TheDaemon = nullptr;
 
 /// Signal handling exists for one reason: the socket file has to come off
@@ -93,6 +106,20 @@ int main(int argc, char **argv) {
   Opts.ListStored = ListStored;
   Opts.DropCostly = DropCostly;
   Opts.LaterCostMicros = LaterCost;
+  if (!AskListLoad.empty()) {
+    ErrorOr<std::unique_ptr<MemoryBuffer>> List =
+        MemoryBuffer::getFile(AskListLoad);
+    if (!List) {
+      errs() << "clang-header-cache-daemon: cannot read " << AskListLoad
+             << "\n";
+      return 1;
+    }
+    SmallVector<StringRef, 0> Lines;
+    (*List)->getBuffer().split(Lines, '\n', -1, /*KeepEmpty=*/false);
+    Opts.FixedAskList.emplace();
+    for (StringRef L : Lines)
+      Opts.FixedAskList->push_back(L.str());
+  }
   Expected<std::unique_ptr<CacheDaemon>> D =
       CacheDaemon::create(RegionPath, RegionSize, Opts);
   if (!D) {
@@ -114,6 +141,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (!AskListSave.empty()) {
+    std::error_code EC;
+    raw_fd_ostream OS(AskListSave, EC);
+    if (!EC)
+      for (const std::string &P : (*D)->askList())
+        OS << P << "\n";
+  }
+
   // For measuring: every copy stored and how it was used.
   if (const char *Dump = std::getenv("CLANG_HEADER_CACHE_DAEMON_DUMP")) {
     std::error_code EC;
@@ -124,7 +159,8 @@ int main(int argc, char **argv) {
   if (Verbose) {
     CacheDaemon::Stats S = (*D)->stats();
     outs() << "lookups " << S.Lookups << " (" << S.Hits << " with entries)\n"
-           << "pushes  " << S.Pushes << " (" << S.Duplicates << " duplicate)\n"
+           << "pushes  " << S.Pushes << " (" << S.Duplicates << " duplicate, "
+           << S.Dropped << " dropped, the region full)\n"
            << "stored  " << S.Entries << " entries for " << S.Headers
            << " headers, " << (S.BytesStored / 1024)
            << " KiB: " << (S.PartBytes / 1024) << " KiB of parts, "
@@ -140,7 +176,8 @@ int main(int argc, char **argv) {
            << " by the time limit, " << (S.WaitMicros / 1000) << " ms), "
            << S.WaitsGated << " lookups the gate did not hold; claims "
            << S.ClaimsGranted << " granted, " << S.ClaimsRefused
-           << " refused\n";
+           << " refused; merges " << S.MergesClaimed << " started, "
+           << S.MergesStored << " stored\n";
   }
   return 0;
 }

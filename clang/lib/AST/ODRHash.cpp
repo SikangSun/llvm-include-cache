@@ -27,6 +27,10 @@ void ODRHash::AddStmt(const Stmt *S) {
 
 void ODRHash::AddIdentifierInfo(const IdentifierInfo *II) {
   assert(II && "Expecting non-null pointer.");
+  if (Masked && Masked(II)) {
+    ID.AddString("<masked>");
+    return;
+  }
   ID.AddString(II->getName());
 }
 

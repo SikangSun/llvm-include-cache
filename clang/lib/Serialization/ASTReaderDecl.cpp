@@ -2854,6 +2854,12 @@ RedeclarableResult ASTDeclReader::VisitRedeclarable(Redeclarable<T> *D) {
   }
 
   auto *FirstDecl = cast_or_null<T>(Reader.GetDecl(FirstDeclID));
+  // A header cache part names the declaration before D by name, and
+  // reading that one can read another part's redeclaration, which names D
+  // in turn: stdlib.h's and sys/types.h's size_t, units of one hit. D is
+  // then the first: linking it to the other would make a cycle.
+  if (FirstDecl && FirstDecl != D && FirstDecl->getCanonicalDecl() == D)
+    FirstDecl = static_cast<T *>(D);
   if (FirstDecl != D) {
     // We delay loading of the redeclaration chain to avoid deeply nested calls.
     // We temporarily set the first (canonical) declaration as the previous one
@@ -3632,6 +3638,30 @@ void mergeInheritableAttributes(ASTReader &Reader, Decl *D, Decl *Previous) {
     NewAttr->setInherited(true);
     D->addAttr(NewAttr);
   }
+
+  // In C, a declaration inherits each inheritable attribute of the one
+  // before it that it lacks, as Sema::mergeDeclAttributes gives one it
+  // parses; one of its own is kept, as Sema keeps it after diagnosing a
+  // conflict. The kernel's net/transp_v6.h declares pingv6_init() again
+  // after net/ping.h's `int __init pingv6_init(void)`, cold and in
+  // .init.text; a header cache copy of transp_v6.h, written where ping.h was
+  // not included, made af_inet6.c call a function it did not know was cold.
+  if (Context.getLangOpts().CPlusPlus || !Previous->hasAttrs())
+    return;
+  for (const auto *A : Previous->specific_attrs<InheritableAttr>()) {
+    if (isa<MSInheritanceAttr, AvailabilityAttr>(A))
+      continue;
+    const auto *Ann = dyn_cast<AnnotateAttr>(A);
+    if (llvm::any_of(D->attrs(), [&](const Attr *Own) {
+          return Own->getKind() == A->getKind() &&
+                 (!Ann || cast<AnnotateAttr>(Own)->getAnnotation() ==
+                              Ann->getAnnotation());
+        }))
+      continue;
+    NewAttr = cast<InheritableAttr>(A->clone(Context));
+    NewAttr->setInherited(true);
+    D->addAttr(NewAttr);
+  }
 }
 } // namespace
 
@@ -3876,6 +3906,19 @@ void ASTDeclReader::attachPreviousDecl(ASTReader &Reader, Decl *D,
 
 template<typename DeclT>
 void ASTDeclReader::attachLatestDeclImpl(Redeclarable<DeclT> *D, Decl *Latest) {
+  static const bool DebugChains = getenv("CLANG_HEADER_CACHE_DEBUG_CHAINS");
+  if (DebugChains && !D->RedeclLink.isFirst()) {
+    Decl *DD = static_cast<DeclT *>(D);
+    llvm::errs() << "CHAIN setLatest on a non-first "
+                 << DD->getDeclKindName() << " "
+                 << (isa<NamedDecl>(DD) ? cast<NamedDecl>(DD)->getName()
+                                        : StringRef("?"))
+                 << " first-is-self="
+                 << (static_cast<Decl *>(D->getFirstDecl()) == DD)
+                 << " id=" << DD->getGlobalID().getRawValue()
+                 << " latest-id=" << Latest->getGlobalID().getRawValue()
+                 << "\n";
+  }
   D->RedeclLink.setLatest(cast<DeclT>(Latest));
 }
 
@@ -3883,8 +3926,20 @@ void ASTDeclReader::attachLatestDeclImpl(...) {
   llvm_unreachable("attachLatestDecl on non-redeclarable declaration");
 }
 
+/// The first declaration of \p D's chain as it is now. A declaration
+/// records its chain's first one when it is read, and a merge can then put
+/// that one after another chain's first: a header cache link's
+/// redeclaration of a typedef its parent declared, both read in one reader
+/// call, where the parent's typedef then merges with the compile's own.
+static Decl *currentFirstDecl(Decl *D) {
+  for (Decl *C = D->getCanonicalDecl(); C != D; C = D->getCanonicalDecl())
+    D = C;
+  return D;
+}
+
 void ASTDeclReader::attachLatestDecl(Decl *D, Decl *Latest) {
   assert(D && Latest);
+  D = currentFirstDecl(D);
 
   switch (D->getKind()) {
 #define ABSTRACT_DECL(TYPE)
@@ -3920,17 +3975,33 @@ void ASTReader::markIncompleteDeclChain(Decl *D) {
 /// The declaration a DECL_NAME_REFERENCE record of \p F names in this
 /// compile, or null.
 static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
-                                       ASTRecordReader &Record) {
+                                       ASTRecordReader &Record,
+                                       std::string *Missing = nullptr) {
   auto Kind = Decl::Kind(Record.readInt());
   auto How = NameReferenceKind(Record.readInt());
   Decl *Parent = Record.readDecl();
   NamedDecl *Found = nullptr;
+  // What was not found, for the error a caller reports.
+  auto Note = [&](const Twine &What) {
+    if (Missing)
+      *Missing = (What + " (kind " + Twine(unsigned(Kind)) + ")").str();
+  };
   switch (How) {
   case NameReferenceKind::Named: {
     bool Tag = Record.readInt();
     IdentifierInfo *II = Record.readIdentifier();
     if (!II)
       return nullptr;
+    Note(Twine(Tag ? "tag " : "") + II->getName() +
+         (Parent ? Twine(" in ") +
+                       (isa<NamedDecl>(Parent)
+                            ? cast<NamedDecl>(Parent)->getName()
+                            : StringRef("?")) +
+                       (isa<RecordDecl>(Parent) &&
+                                !cast<RecordDecl>(Parent)->getDefinition()
+                            ? " (no definition)"
+                            : "")
+                 : Twine()));
     if (!Parent) {
       Found = Reader.getPinnedNameReference(F, *II, Tag);
       if (!Found)
@@ -3945,6 +4016,17 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
       if (!Found && getenv("DEBUG_LINK"))
         llvm::errs() << "NAMEREF missing " << (Tag ? "tag " : "") << II->getName()
                      << " in " << F.ModuleName << "\n";
+      static const bool DebugChains =
+          getenv("CLANG_HEADER_CACHE_DEBUG_CHAINS");
+      if (DebugChains && Found) {
+        const ModuleFile *Owner = Found->isFromASTFile()
+                                      ? Reader.getOwningModuleFile(Found)
+                                      : nullptr;
+        llvm::errs() << "NAMEREF " << II->getName() << " from " << F.ModuleName
+                     << " (" << F.Index << ") -> "
+                     << (Owner ? Owner->ModuleName : StringRef("text")) << " ("
+                     << (Owner ? int(Owner->Index) : -1) << ")\n";
+      }
       break;
     }
     auto *RD = dyn_cast<RecordDecl>(Parent);
@@ -3955,12 +4037,29 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
         Found = Member;
         break;
       }
+    // A definition read in the middle of this read can lack its lookup
+    // table still: its members, read in order, hold the one named. CPython's
+    // PyModuleObject, an unnamed struct, and its md_state.
+    if (!Found)
+      for (Decl *Member : RD->decls())
+        if (auto *ND = dyn_cast<NamedDecl>(Member);
+            ND && ND->getKind() == Kind && ND->getIdentifier() == II) {
+          Found = ND;
+          break;
+        }
     break;
   }
   case NameReferenceKind::TagOfTypedef:
     if (auto *TD = dyn_cast_or_null<TypedefNameDecl>(Parent))
       Found = TD->getUnderlyingType()->getAsTagDecl();
     break;
+  case NameReferenceKind::Parameter: {
+    unsigned Index = Record.readInt();
+    if (auto *Fn = dyn_cast_or_null<FunctionDecl>(Parent))
+      if (Index < Fn->getNumParams())
+        Found = Fn->getParamDecl(Index);
+    break;
+  }
   case NameReferenceKind::Unnamed: {
     unsigned Index = Record.readInt();
     auto *RD = dyn_cast_or_null<RecordDecl>(Parent);
@@ -4098,11 +4197,13 @@ Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
     // A declaration from outside a header cache part. The loading compile
     // checked, before it loaded the part, that the name finds a declaration
     // with the same fingerprint, so a failure here is a bug.
-    NamedDecl *Found = resolveNameReference(*this, *Loc.F, Record);
+    std::string Missing;
+    NamedDecl *Found = resolveNameReference(*this, *Loc.F, Record, &Missing);
     if (!Found)
       llvm::report_fatal_error(
           Twine("header cache part ") + Loc.F->ModuleName +
-          ": a declaration it refers to by name is not in this compile");
+          ": a declaration it refers to by name is not in this compile: " +
+          Missing);
     LoadedDecl(translateGlobalDeclIDToIndex(ID), Found);
     return Found;
   }
@@ -4493,10 +4594,36 @@ void ASTReader::PassInterestingDeclsToConsumer() {
       GetDecl(ID);
   EagerlyDeserializedDecls.clear();
 
-  auto ConsumingPotentialInterestingDecls = [this]() {
+  // Since we load the variable's initializers lazily, it'd be problematic
+  // if the initializers dependent on each other. So here we try to load the
+  // initializers of static variables to make sure they are passed to code
+  // generator by order. If we read anything interesting, we would consume
+  // that before emitting the current declaration. In C, the same is done for
+  // a variable the code generator must emit, which it emits as it is passed,
+  // reading its initializer then: the static variables it names, read with
+  // it, would be passed after it, last first, as the statement stream keeps
+  // them, where a parse passes them before it. Their definitions would follow
+  // in the object in that order (qemu's xtensa-modules.c.inc, from a header
+  // cache copy).
+  bool InC = !getContext().getLangOpts().CPlusPlus;
+  auto LoadInitializer = [this, InC](Decl *D) {
+    if (auto *VD = dyn_cast<VarDecl>(D);
+        VD && VD->isFileVarDecl() &&
+        (!VD->isExternallyVisible() ||
+         (InC && getContext().DeclMustBeEmitted(VD))))
+      VD->getInit();
+  };
+  auto ConsumingPotentialInterestingDecls = [this, InC, &LoadInitializer]() {
     while (!PotentiallyInterestingDecls.empty()) {
       Decl *D = PotentiallyInterestingDecls.front();
       PotentiallyInterestingDecls.pop_front();
+      size_t Queued = PotentiallyInterestingDecls.size();
+      if (InC)
+        LoadInitializer(D);
+      if (PotentiallyInterestingDecls.size() != Queued) {
+        PotentiallyInterestingDecls.push_back(D);
+        continue;
+      }
       if (isConsumerInterestedIn(D))
         PassInterestingDeclToConsumer(D);
     }
@@ -4508,14 +4635,7 @@ void ASTReader::PassInterestingDeclsToConsumer() {
   while (!MaybeInterestingDecls.empty()) {
     Decl *D = MaybeInterestingDecls.front();
     MaybeInterestingDecls.pop_front();
-    // Since we load the variable's initializers lazily, it'd be problematic
-    // if the initializers dependent on each other. So here we try to load the
-    // initializers of static variables to make sure they are passed to code
-    // generator by order. If we read anything interesting, we would consume
-    // that before emitting the current declaration.
-    if (auto *VD = dyn_cast<VarDecl>(D);
-        VD && VD->isFileVarDecl() && !VD->isExternallyVisible())
-      VD->getInit();
+    LoadInitializer(D);
     ConsumingPotentialInterestingDecls();
     if (isConsumerInterestedIn(D))
       PassInterestingDeclToConsumer(D);
@@ -4661,7 +4781,7 @@ void ASTReader::loadDeclUpdateRecords(PendingUpdateRecord &Record) {
 
 void ASTReader::loadPendingDeclChain(Decl *FirstLocal, uint64_t LocalOffset) {
   // Attach FirstLocal to the end of the decl chain.
-  Decl *CanonDecl = FirstLocal->getCanonicalDecl();
+  Decl *CanonDecl = currentFirstDecl(FirstLocal);
   if (FirstLocal != CanonDecl) {
     Decl *PrevMostRecent = ASTDeclReader::getMostRecentDecl(CanonDecl);
     ASTDeclReader::attachPreviousDecl(

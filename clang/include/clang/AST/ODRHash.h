@@ -21,6 +21,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace clang {
@@ -49,8 +50,19 @@ class ODRHash {
 
   llvm::FoldingSetNodeID ID;
 
+  // See setMaskedIdentifiers.
+  llvm::function_ref<bool(const IdentifierInfo *)> Masked;
+
 public:
   ODRHash() {}
+
+  // Hash each identifier \p IsMasked accepts as one placeholder. A
+  // declaration name still gets its own index, so two masked names stay
+  // apart.
+  void setMaskedIdentifiers(
+      llvm::function_ref<bool(const IdentifierInfo *)> IsMasked) {
+    Masked = IsMasked;
+  }
 
   // Use this for ODR checking classes between modules.  This method compares
   // more information than the AddDecl class.

@@ -1788,6 +1788,7 @@ void Preprocessor::ExpandBuiltinMacro(Token &Tok) {
     }
     OS << CounterValue++;
     Tok.setKind(tok::numeric_constant);
+    Tok.setFlag(Token::FromCounter);
   } else if (II == Ident__has_feature) {
     EvaluateFeatureLikeBuiltinMacro(OS, Tok, II, *this, false,
       [this](Token &Tok, bool &HasLexedNextToken) -> int {

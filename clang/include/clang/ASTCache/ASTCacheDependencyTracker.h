@@ -310,6 +310,16 @@ public:
                   const MetadataView &Deps,
                   llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
                   bool Linked = false);
+  /// CLANG_HEADER_CACHE_LINK: a copy that the copy served at \p Loc links,
+  /// loaded with it, counts as inside each header open there, as foldServed
+  /// counts the served copy: a macro it defines, read by the lines after
+  /// it, is no state from outside them. Its metadata is the served copy's.
+  void foldModule(SourceLocation Loc, int FirstID, unsigned NumIDs);
+  /// CLANG_HEADER_CACHE_MERGE: a hit at \p Loc loaded or skipped one of
+  /// its links by whether the link's include guard \p Guard was defined
+  /// there, \p WasDefined: a definedness test at \p Loc, as the #include
+  /// of the link's header would have made.
+  void guardTested(SourceLocation Loc, llvm::StringRef Guard, bool WasDefined);
 
   /// REPORT.md T17: what each file read inside a header being exported read
   /// with its own text -- a definedness test, a name expanded or read as
@@ -339,8 +349,15 @@ public:
       const IdentifierInfo *II;
       FileID Replaced;
       uint64_t Seq;
+      /// A #define; false for an #undef.
+      bool Defined = true;
+      /// Where a #define's definition is.
+      SourceLocation Loc;
     };
     std::vector<Change> Changes;
+    /// A saved copy stood in for an #include while the file was open: what
+    /// the file's lines and the files below them did is not all here.
+    bool Served = false;
     /// CLANG_HEADER_CACHE_PARTIAL: each #include the file's text reached
     /// that was skipped by the header's include guard: the header, by
     /// canonical path, its guard, the file whose #define gave the guard, how
@@ -663,6 +680,17 @@ private:
     FileID Origin;
   };
   llvm::SmallVector<HeldTest, 4> Held;
+  /// CLANG_HEADER_CACHE_DUMP_DEPS, for measurement: where the dependency
+  /// being recorded was taken, and how, set by the callback that records it.
+  SourceLocation SiteLoc;
+  const char *SiteKind = "";
+  /// Inside foldServed: the dependencies are a served copy's.
+  bool Folding = false;
+  /// "<kind>|<file>:<line>|<include chain>" for SiteLoc, or empty when not
+  /// measuring. A name that came out of a macro's expansion also says which
+  /// macro and where its text was written.
+  std::string site() const;
+  mutable unsigned SiteSeq = 0;
 };
 
 } // namespace ast_cache

@@ -41,10 +41,23 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <chrono>
+#include <cerrno>
+#include <csignal>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <iterator>
 #include <optional>
+#include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#endif
 
 using namespace clang;
 
@@ -320,6 +333,13 @@ public:
        << " not at a declaration boundary, " << NotListed
        << " not on the ask-list, " << InsideWritten
        << " inside a header being written\n";
+    if (S.OtherStartHits)
+      OS << "header cache counter: " << S.OtherStartHits
+         << " copies fit whose __COUNTER__ began elsewhere\n";
+    if (S.GuardPlusHits)
+      OS << "header cache guard+: " << S.GuardPlusHits
+         << " hits on copies holding headers read already (" << S.HeldAgain
+         << " such headers)\n";
     if (PiecesMode)
       OS << "header cache pieces: " << S.BaseFits
          << " bases fit with sections needing another version (" << StandInBases
@@ -341,10 +361,18 @@ public:
       OS << "header cache links: " << LinksLoaded << " loaded, "
          << LinksSkipped << " skipped by their guard, " << LinksFailed
          << " copies not used for a link that failed, " << S.Fetches
-         << " fetched (" << S.Fetched << " found)\n";
+         << " fetched (" << S.Fetched << " found); one-call loads failed: "
+         << TreeFails[0] << " fetch, " << TreeFails[1] << " plan, "
+         << TreeFails[2] << " read, " << OtherCopySameName
+         << " other copy of a name\n";
     if (LoadsRefused)
       OS << "  refused by the module reader (built with other options?): "
          << LoadsRefused << "\n";
+    OS << "header cache index: " << S.IndexReads
+       << " lookups and fetches read the region's index\n";
+    if (MergeCount)
+      OS << "header cache merges: " << MergesForked
+         << " started in a process of their own\n";
     OS << "header cache time: " << ms(LookupMicros) << " ms in lookups ("
        << ms(S.DaemonMicros) << " waiting for the daemon, " << ms(S.CheckMicros)
        << " checking candidates, " << ms(LoadMicros) << " loading), "
@@ -450,6 +478,7 @@ public:
   /// stored copy fits, for the compiles after it to serve.
   void exportMisses(PartExporter &E, bool PopulateOnly) {
     Exporter = &E;
+    E.shareCounterNames(Client->counterNames());
     this->PopulateOnly = PopulateOnly;
   }
 
@@ -517,10 +546,20 @@ public:
       // this compile's context gets a copy only at a later build's miss.
       // Inside a header being recorded, a header is that header's.
       DeclBoundaryObserver *B = PP.getDeclBoundaryObserver();
-      if (FirstReadCutoff && Exporter && !PopulateOnly &&
+      if (FirstReadCutoff && Exporter && !PopulateOnly && !MergeTarget &&
           !Exporter->recording() && CI.hasSema() && B &&
           B->isAtDeclarationBoundary())
         Exporter->exportIfSlow(File, *FirstReadCutoff);
+      return nullptr;
+    }
+
+    // CLANG_HEADER_CACHE_LINK: a header included again from inside itself,
+    // before its guard macro is known, holds nothing past its guard test;
+    // it is read as text, never asked for or written.
+    if (LinkMode && llvm::any_of(Open, [&](const OpenFile &O) {
+          return O.Entry == &File.getFileEntry();
+        })) {
+      NextReason = "open-already";
       return nullptr;
     }
 
@@ -587,7 +626,14 @@ public:
              CheckBefore = Before.CheckMicros;
     unsigned CheckedBefore = Before.CandidatesChecked;
     auto Asked = std::chrono::steady_clock::now();
+    uint64_t InstrBefore = hitInstructions();
+    HitLinks = 0;
+    HitLinkBytes = 0;
+    HitCombo = 0;
     llvm::TimeTraceScope QueryScope("HeaderCache Query", Path);
+    HitModules.clear();
+    LiveGuardTests.clear();
+    Asking = File;
     // CLANG_HEADER_CACHE_PIECES: a version serves only whole; the header a
     // stand-in includes after its sections has the copy its plan chose.
     // Any other header the stand-in reads serves only whole.
@@ -598,23 +644,33 @@ public:
       Step = &File.getFileEntry() == AskAgain
                  ? CacheClient::PiecesStep::Again
                  : CacheClient::PiecesStep::WholeOnly;
+    std::optional<llvm::TimeTraceScope> LookupScope;
+    LookupScope.emplace("HeaderCache Lookup");
     Client->lookup(
         Path, PP, &CI.getSema(), &Deps,
         [&](llvm::StringRef Bytes, llvm::StringRef ModuleName) {
           AnyFits = true;
-          if (PopulateOnly)
+          if (PopulateOnly || ForceMiss)
             return false;
           auto Loading = std::chrono::steady_clock::now();
-          // CLANG_HEADER_CACHE_LINK: the copies it links load first.
+          // CLANG_HEADER_CACHE_LINK: the copies it links load first, or
+          // with it, in one reader call.
           if (LinkMode && Client->lastMetadata() &&
               !Client->lastMetadata()->links().empty()) {
             MetadataView Outer = *Client->lastMetadata();
-            if (!loadLinks(Outer, IncludeLoc)) {
+            if (!LinkEach) {
+              Target = loadTree(Outer, Bytes, ModuleName, IncludeLoc);
+              if (!Target) {
+                ++LinksFailed;
+                return false;
+              }
+            } else if (!loadLinks(Outer, IncludeLoc)) {
               ++LinksFailed;
               return false;
             }
           }
-          Target = load(Bytes, ModuleName, IncludeLoc);
+          if (!Target)
+            Target = load(Bytes, ModuleName, IncludeLoc);
           HitLoadMicros = micros(Loading);
           HitBytes = Bytes.size();
           LoadMicros += HitLoadMicros;
@@ -623,6 +679,9 @@ public:
           return Target != nullptr;
         },
         &Site, Step);
+    LookupScope.reset();
+    // The process forked to merge reads this header as text.
+    ForceMiss = false;
     uint64_t Took = micros(Asked);
     LookupMicros += Took;
     // Notes this query, with LogServed. Replay is the time a hit spent
@@ -643,7 +702,10 @@ public:
           " bytes=" + std::to_string(HitBytes));
     };
     // Loading set the counter to where the writing compile left it; a hit
-    // leaves it where the header would have (CLANG_HEADER_CACHE_COUNTER).
+    // leaves it where the header would have (CLANG_HEADER_CACHE_COUNTER),
+    // or, with =ahead, past the values the copy holds.
+    if (Target && Client->lastMetadata() && Client->counterAhead())
+      Counter = std::max(Counter, Client->lastMetadata()->counterStart());
     PP.setCounterValue(Counter + (Target && Client->lastMetadata()
                                       ? Client->lastMetadata()->counterUses()
                                       : 0));
@@ -753,7 +815,10 @@ public:
                          : std::string("load-refused");
       // A miss where a copy could have stood in: save this header's part of
       // this compile for the next one (DECISIONS.md 2.17).
-      if (Exporter && !(PopulateOnly && AnyFits)) {
+      if (Exporter && !(PopulateOnly && AnyFits) &&
+          (!MergeTarget ||
+           (&File.getFileEntry() == MergeTarget && !MergeExporting))) {
+        MergeExporting = MergeTarget != nullptr;
         Exporter->exportNext(File);
         // CLANG_HEADER_CACHE_WAIT: compiles asking for it meanwhile may wait
         // for this copy rather than parse the header too.
@@ -766,12 +831,23 @@ public:
     // otherwise each resolves when first read, to the name's latest
     // declaration, which may come after this #include (REPORT.md Q8).
     const LoadedCopy &Copy = LoadedTargets.find(LastModuleName)->second;
+    // The names the copy's text made from __COUNTER__ values are the
+    // compile's now, for the masked hashes of the checks after.
+    for (const NameView &N : Deps.counterNames())
+      Client->counterNames().insert(PP.getIdentifierInfo(N.Name));
 
     // A header being exported cannot hold a served one: its part would hold
     // the import, not the declarations -- unless it folds the served copy's
     // declarations in as its own (FoldServed).
-    bool Folding = Exporter && FoldServed && Exporter->writing() && Copy.MF;
-    if (LinkMode && Exporter && Exporter->writing()) {
+    // CLANG_HEADER_CACHE_GUARD_PLUS=1: a copy holding headers the compile
+    // read already is linked or folded as any other. The headers open take
+    // its dependencies, the guards of those headers among them: where the
+    // compile read one of them outside the headers open, their copies need
+    // it not read, and the copies they hold or link hold it.
+    bool Folding = Exporter && (FoldServed || MergeTarget) &&
+                   Exporter->writing() && Copy.MF;
+    if (LinkMode && !MergeTarget && Exporter && Exporter->writing()) {
+      llvm::TimeTraceScope S("HeaderCache Linked");
       Sema &Sem = CI.getSema();
       IdentifierTable &Ids = PP.getIdentifierTable();
       HeaderSearch &HS = PP.getHeaderSearchInfo();
@@ -783,19 +859,28 @@ public:
                              Sem, Ids.get(Name), /*Tag=*/false,
                              /*CreateBuiltin=*/false);
                          return D ? D->getLocation() : SourceLocation();
-                       }, ModulesBefore, llvm::xxh3_64bits(Copy.Bytes));
+                       }, ModulesBefore, llvm::xxh3_64bits(Deps.bytes()),
+                       HitModules);
     } else if (Folding) {
       Sema &Sem = CI.getSema();
       IdentifierTable &Ids = PP.getIdentifierTable();
+      // CLANG_HEADER_CACHE_MERGE: what decided which links loaded, then
+      // the copy, then each link it loaded, in load order.
+      for (const auto &[Guard, Defined] : LiveGuardTests)
+        Exporter->linkGuardTested(IncludeLoc, Guard, Defined);
       Exporter->served(Copy.MF, &Deps, IncludeLoc, [&](llvm::StringRef Name) {
         NamedDecl *D = ASTReader::lookupAtFileScope(
             Sem, Ids.get(Name), /*Tag=*/false, /*CreateBuiltin=*/false);
         return D ? D->getLocation() : SourceLocation();
       });
+      for (auto [F, M] : PendingLinks)
+        if (auto L = LoadedTargets.find(F->Module); L != LoadedTargets.end())
+          Exporter->foldLink(L->second.MF, *F->Meta, IncludeLoc);
     } else if (Exporter) {
       Exporter->served();
     }
     if (Copy.Fresh) {
+      llvm::TimeTraceScope S("HeaderCache Pin");
       llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
       IdentifierTable &Idents = PP.getIdentifierTable();
       size_t I = 0;
@@ -812,6 +897,12 @@ public:
       };
       Pin(Deps.declarations());
       reportInputFiles(*Copy.MF);
+      // Debug information names a file by the name the compile first
+      // entered it by, which a read of the header gives it here. qemu's
+      // cpu64.c, served cpu.h, includes cpu-sysregs.h.inc itself after it,
+      // by another name than cpu.h's copy holds it under.
+      if (NamesMatter)
+        noteCopyFiles(*Copy.MF);
     }
 
     // REPORT.md T17: the submodules that load, each found inside its
@@ -839,6 +930,11 @@ public:
     // first, so the directives replayed below override them rather than the
     // other way around.
     auto Replaying = std::chrono::steady_clock::now();
+    // The links' effects first, top down (loadTree), then the copy's own:
+    // the copy keeps only the macros its own lines set last (PartExporter),
+    // so outer.h's LIMIT, defined again after its link inner.h defined it,
+    // ends as outer.h's.
+    finishLinks(IncludeLoc);
     // The pushes go first: they save this compile's definitions, which the
     // copy's own would hide once visible.
     replayMacroStacks(Deps.macroStacks(), IncludeLoc);
@@ -855,8 +951,7 @@ public:
       // the copy written holds each one's definition.
       bool Was = ReplayAll;
       ReplayAll = ReplayAll || Folding;
-      replayMacroEffects(Deps.macroEffects(), *Target, IncludeLoc, Applies,
-                         OwnerOf, Subs);
+      replayMacroEffects(Deps, *Target, IncludeLoc, Applies, OwnerOf, Subs);
       ReplayAll = Was;
     }
     {
@@ -875,12 +970,25 @@ public:
     ReplayMicros += Replay;
     Timings.Hits.push_back({Path, Took + Replay});
     Log(Replay);
+    uint64_t HitInstructions = hitInstructions() - InstrBefore;
+    if (MergeAuto)
+      Client->noteHitInstructions(HitInstructions);
+    if (HitLog)
+      HitLines.push_back(
+          LastModuleName + " links=" + std::to_string(HitLinks) +
+          " combo=" + llvm::utohexstr(HitCombo) +
+          " instr=" + std::to_string(HitInstructions) +
+          " us=" + std::to_string(Took + Replay) +
+          " bytes=" + std::to_string(HitBytes) +
+          " link_bytes=" + std::to_string(HitLinkBytes));
     return Target;
   }
 
   /// A header the compile is entering. Timed until it is left, headers it
   /// includes on the way counted in, since a saved copy holds all of them.
   FileID enterInstead(FileEntryRef File, SourceLocation) override {
+    if (NamesMatter)
+      nameAsCopiesDo(File);
     if (!PendingStandIn || PendingStandIn->first != &File.getFileEntry())
       return FileID();
     FileID F = PendingStandIn->second;
@@ -937,6 +1045,13 @@ public:
   /// Tells the daemon how long this compile took to read each header, so it
   /// can list the slow ones for later compiles.
   void mainFileEnded() {
+    // The process forked to merge reports nothing: its hits are the
+    // compile's.
+    if (MergeTarget)
+      return;
+    for (const std::string &Line : HitLines)
+      llvm::errs() << "header cache hit: " << Line << "\n";
+    HitLines.clear();
     if (!Timings.Headers.empty() || !Timings.Hits.empty())
       Client->reportTimings(Timings);
     Timings.Headers.clear();
@@ -1052,9 +1167,8 @@ private:
   /// module. An effect of a submodule that does not load is the compile's
   /// own header's to have had; one of a submodule that loads has its
   /// definition in the submodule's module.
-  void replayMacroEffects(MetadataSection<MacroEffectView> Effects,
-                          Module &Target, SourceLocation Loc,
-                          llvm::ArrayRef<char> Applies = {},
+  void replayMacroEffects(const MetadataView &D, Module &Target,
+                          SourceLocation Loc, llvm::ArrayRef<char> Applies = {},
                           llvm::ArrayRef<int> OwnerOf = {},
                           llvm::ArrayRef<Module *> Subs = {}) {
     Preprocessor &PP = CI.getPreprocessor();
@@ -1062,25 +1176,31 @@ private:
     bool OnlyCopies =
         !ReplayAll &&
         CI.getASTReader()->getModuleManager().size() == CopiesLoaded;
-    for (const MacroEffectView &E : Effects) {
+    // Each name's hash is stored beside the effects, in the same order.
+    auto Hashes = D.macroEffectHashes().begin();
+    for (const MacroEffectView &E : D.macroEffects()) {
+      uint64_t Hash = (*Hashes).Hash;
+      ++Hashes;
       if (E.Cond && E.Cond < Applies.size() && !Applies[E.Cond])
         continue;
       Module *In = &Target;
       if (E.Cond && E.Cond < OwnerOf.size() && OwnerOf[E.Cond] >= 0 &&
           OwnerOf[E.Cond] < (int)Subs.size() && Subs[OwnerOf[E.Cond]])
         In = Subs[OwnerOf[E.Cond]];
-      uint64_t Hash = llvm::xxh3_64bits(E.Name);
       // A name the copy leaves a macro is one, replayed or not, for the
       // check's filter (REPORT.md I14).
       if (E.Defined)
         PP.noteMacroNameHash(Hash);
       bool Earlier = !TouchedByCopies.insert(Hash).second;
-      if (OnlyCopies && !Earlier && Idents.find(E.Name) == Idents.end()) {
+      // The identifier table hashes names the same way.
+      auto Known = Idents.find(E.Name, static_cast<uint32_t>(Hash));
+      if (OnlyCopies && !Earlier && Known == Idents.end()) {
         ++EffectsSkipped;
         continue;
       }
       ++EffectsReplayed;
-      IdentifierInfo *II = PP.getIdentifierInfo(E.Name);
+      IdentifierInfo *II = Known != Idents.end() ? Known->getValue()
+                                                 : PP.getIdentifierInfo(E.Name);
       // Loads the module's macros for this name, if the name existed before
       // the load and is now out of date.
       PP.refreshIdentifier(*II);
@@ -1260,6 +1380,7 @@ private:
   /// up also reads it from the module files loaded since the name was last
   /// read: the reader of the copy, which finds it by name, does not.
   NamedDecl *findLinkName(llvm::StringRef N) {
+    llvm::TimeTraceScope Scope("HeaderCache FindLinkName");
     Preprocessor &PP = CI.getPreprocessor();
     bool Tag = N.starts_with("t:");
     IdentifierInfo *II = PP.getIdentifierInfo(N.drop_front(2));
@@ -1330,7 +1451,6 @@ private:
   }
 
   bool loadLink(const Fetched &F, SourceLocation Loc) {
-    Preprocessor &PP = CI.getPreprocessor();
     if (guardDefined(F.Guard)) {
       if (!wasRead(F.Path))
         return false;
@@ -1359,15 +1479,35 @@ private:
     }
     if (!M)
       return false;
+    linkLoaded(F, *M, Loc);
+    return true;
+  }
+
+  /// What a hit on the header of the link \p F, loaded as \p M, does past
+  /// the load: its macros, pragmas and warnings, as the #include at \p Loc
+  /// would have left them.
+  void linkLoaded(const Fetched &F, Module &Mod, SourceLocation Loc) {
+    llvm::TimeTraceScope Scope("HeaderCache LinkLoaded");
+    Module *M = &Mod;
+    Preprocessor &PP = CI.getPreprocessor();
     serialization::ModuleFile *MF = LoadedTargets.find(F.Module)->second.MF;
     const MetadataView &D = *F.Meta;
     replayMacroStacks(D.macroStacks(), Loc);
     // As the #include's own hit does, through Sema: visible, and imported,
     // so that a definition the copy must emit is emitted here.
-    CI.getSema().BuildModuleInclude(Loc, M);
+    {
+      llvm::TimeTraceScope S("HeaderCache LinkImport");
+      CI.getSema().BuildModuleInclude(Loc, M);
+    }
     // Its macros too, which only the preprocessor shows (as for a hit).
-    PP.makeModuleVisible(M, Loc);
-    replayMacroEffects(D.macroEffects(), *M, Loc);
+    {
+      llvm::TimeTraceScope S("HeaderCache LinkMacrosVisible");
+      PP.makeModuleVisible(M, Loc);
+    }
+    {
+      llvm::TimeTraceScope S("HeaderCache LinkEffects");
+      replayMacroEffects(D, *M, Loc);
+    }
     applyPragmaDelta(CI.getSema(), D.entry(), D.exit());
     if (Exporter)
       Exporter->replaying(true);
@@ -1377,12 +1517,284 @@ private:
       Exporter->replaying(false);
     for (const WarningPragmaView &W : D.warningPragmas())
       Pragmas.apply(CI.getDiagnostics(), W.Pragma, Loc);
+    llvm::TimeTraceScope S("HeaderCache LinkMarkIncluded");
     if (OptionalFileEntryRef FE = PP.getFileManager().getOptionalFileRef(F.Path))
-      PP.markIncluded(*FE);
+      PP.markIncludedLazily(*FE);
     ++LinksLoaded;
-    return true;
   }
   unsigned LinksLoaded = 0, LinksSkipped = 0, LinksFailed = 0;
+  /// loadTree's failures: a link not fetched, a skip planLinks refused, the
+  /// reader call refused (or another copy of a name loaded).
+  unsigned TreeFails[3] = {0, 0, 0};
+
+  /// The links in \p Links that a hit loads, in text order: each before
+  /// the links it has, as the #includes are read. One whose guard is
+  /// defined, here or by the effects of a link taken before it (\p Set:
+  /// true for defined, false for undefined), is skipped with what it links
+  /// (planLinks checked that such a skip is right).
+  /// The include guards of a hit's links, found among the thousands of
+  /// macros its links set by the hashes stored with them: only a macro
+  /// whose hash is a guard's is read and compared.
+  struct GuardNames {
+    llvm::StringSet<> Names;
+    llvm::DenseSet<uint64_t> Hashes;
+    void insert(llvm::StringRef N) {
+      if (Names.insert(N).second)
+        Hashes.insert(llvm::xxh3_64bits(N));
+    }
+  };
+
+  void linksToLoad(const std::vector<Fetched> &Links,
+                   const GuardNames &Guards, llvm::StringMap<bool> &Set,
+                   std::vector<const Fetched *> &Out) {
+    for (const Fetched &F : Links) {
+      auto It = F.Guard.empty() ? Set.end() : Set.find(F.Guard);
+      bool Defined = It != Set.end() ? It->second : guardDefined(F.Guard);
+      if (MergeTarget && It == Set.end() && !F.Guard.empty())
+        LiveGuardTests.push_back({F.Guard, Defined});
+      if (Defined) {
+        static const bool DebugLink = getenv("DEBUG_LINK");
+        if (DebugLink)
+          llvm::errs() << "TREE skip " << F.Path << " " << F.Module << " on "
+                       << F.Guard << (It != Set.end() ? " (link)" : " (state)")
+                       << "\n";
+        ++LinksSkipped;
+        continue;
+      }
+      Out.push_back(&F);
+      linksToLoad(F.Links, Guards, Set, Out);
+      // Only a link's guard decides a skip: the other macros the link
+      // sets need no entry (a hit of git's sets 16,000), and only a
+      // guard's hash leads to reading the macro.
+      size_t Last = 0, I = 0;
+      for (const NameHashView &H : F.Meta->macroEffectHashes()) {
+        ++I;
+        if (Guards.Hashes.contains(H.Hash))
+          Last = I;
+      }
+      if (Last) {
+        I = 0;
+        for (const MacroEffectView &E : F.Meta->macroEffects()) {
+          if (I++ == Last)
+            break;
+          if (Guards.Names.contains(E.Name))
+            Set[E.Name] = E.Defined;
+        }
+      }
+    }
+  }
+  static void guardsOf(const std::vector<Fetched> &Links,
+                       GuardNames &Guards) {
+    for (const Fetched &F : Links) {
+      if (!F.Guard.empty())
+        Guards.insert(F.Guard);
+      guardsOf(F.Links, Guards);
+    }
+  }
+
+  /// CLANG_HEADER_CACHE_LINK: a hit on the copy \p Bytes of module
+  /// \p ModuleName, with metadata \p Deps: the copy and the copies it
+  /// links load with one reader call, one module load for the compile, top
+  /// down in text order: the copy, then each link before the links it has.
+  /// Every one is visible before any declaration is read, so a name finds
+  /// its declaration in the copy or in a link, as in the header's text:
+  /// bits/stdlib-bsearch.h's copy names the bsearch stdlib.h declared
+  /// before including it. The hit replays the copy's effects, then
+  /// finishLinks each link's, in the same order. Returns the copy's module,
+  /// or null with nothing loaded.
+  Module *loadTree(const MetadataView &Deps, llvm::StringRef Bytes,
+                   llvm::StringRef ModuleName, SourceLocation Loc) {
+    std::vector<Fetched> All;
+    std::optional<llvm::TimeTraceScope> Step;
+    Step.emplace("HeaderCache FetchLinks");
+    if (!fetchLinks(Deps, All, 0)) {
+      ++TreeFails[0];
+      return nullptr;
+    }
+    Step.emplace("HeaderCache PlanLinks");
+    llvm::StringSet<> WillLoad;
+    if (!planLinks(All, WillLoad)) {
+      ++TreeFails[1];
+      return nullptr;
+    }
+    Step.emplace("HeaderCache LoadAll");
+    std::vector<const Fetched *> Order;
+    llvm::StringMap<bool> Set;
+    {
+      llvm::TimeTraceScope S("HeaderCache LinksToLoad");
+      GuardNames Guards;
+      guardsOf(All, Guards);
+      linksToLoad(All, Guards, Set, Order);
+    }
+    // CLANG_HEADER_CACHE_MERGE: which copies the hit loads, for the timing
+    // report; the process forked here reads the header instead, and writes
+    // them as one copy.
+    HitLinks = Order.size();
+    for (const Fetched *F : Order)
+      HitLinkBytes += F->Bytes.size();
+    if (MergeCount && !Order.empty()) {
+      std::string Names = ModuleName.str();
+      for (const Fetched *F : Order)
+        (Names += '\0') += F->Module;
+      uint64_t Combo = llvm::xxh3_64bits(Names);
+      Client->noteCombo(Combo);
+      HitCombo = Combo;
+      if (!MergeTarget && forkMerge(Combo, Bytes.size() + HitLinkBytes))
+        return nullptr;
+    }
+    std::vector<std::pair<llvm::StringRef, llvm::StringRef>> Units;
+    Units.push_back({Bytes, ModuleName});
+    for (const Fetched *F : Order)
+      Units.push_back({F->Bytes, F->Module});
+    std::vector<Module *> Mods;
+    if (!loadAll(Units, Loc, Mods)) {
+      ++TreeFails[2];
+      return nullptr;
+    }
+    Step.reset();
+    static const bool DebugLink = getenv("DEBUG_LINK");
+    if (DebugLink) {
+      llvm::errs() << "TREE at " << Loc.printToString(CI.getSourceManager())
+                   << "\n";
+      for (size_t K = 0; K != Units.size(); ++K)
+        llvm::errs() << "TREE unit " << Units[K].second << " "
+                     << (K ? llvm::StringRef(Order[K - 1]->Path)
+                           : llvm::StringRef("(parent)"))
+                     << "\n";
+    }
+    Sema &S = CI.getSema();
+    for (Module *M : Mods)
+      S.makeModuleVisible(M, Loc);
+    PendingLinks.clear();
+    PendingNames.clear();
+    for (size_t K = 0; K != Order.size(); ++K)
+      PendingLinks.push_back({Order[K], Mods[K + 1]});
+    for (const Fetched *F : Order)
+      for (const std::string &N : F->Names)
+        PendingNames.push_back(N);
+    for (const Fetched &F : All)
+      for (const std::string &N : F.Names)
+        PendingNames.push_back(N);
+    // PendingLinks points into it; moving keeps the elements in place.
+    PendingTree = std::move(All);
+    LastModuleName = ModuleName.str();
+    return Mods.front();
+  }
+
+  /// The links of the hit loadTree loaded, in text order, in the tree
+  /// fetched for it, and the names the copies take from them.
+  std::vector<Fetched> PendingTree;
+  std::vector<std::pair<const Fetched *, Module *>> PendingLinks;
+  std::vector<std::string> PendingNames;
+  /// Each link of the hit at \p Loc replays its effects after the copy's,
+  /// as the #include read them; then the names the copies take from the
+  /// links are read from them.
+  void finishLinks(SourceLocation Loc) {
+    for (auto [F, M] : PendingLinks)
+      linkLoaded(*F, *M, Loc);
+    // A tag is looked up, so that its definition in a link joins the
+    // declarations the compile has of it: a member a copy names is found
+    // in the definition (git's http-push.c). Another name, only if the
+    // compile has met it, so that it cannot find an older declaration
+    // first. Any other name's first lookup reads it from the units that
+    // list it, and the reader finds it there itself (resolveNameReference);
+    // looking it up here would read every declaration of it, used or not.
+    static const bool Eager = [] {
+      const char *V = std::getenv("CLANG_HEADER_CACHE_LINK_NAMES");
+      return V && llvm::StringRef(V) == "all";
+    }();
+    IdentifierTable &Idents = CI.getPreprocessor().getIdentifierTable();
+    llvm::StringSet<> Found;
+    for (const std::string &N : PendingNames)
+      if ((Eager || llvm::StringRef(N).starts_with("t:") ||
+           Idents.find(llvm::StringRef(N).drop_front(2)) != Idents.end()) &&
+          Found.insert(N).second)
+        findLinkName(N);
+    PendingLinks.clear();
+    PendingNames.clear();
+    PendingTree.clear();
+  }
+
+  /// Loads \p Units, each a copy's bytes and module name, with one reader
+  /// call, and gives the module of each in \p Out. A copy loaded already
+  /// in this compile, or earlier in \p Units, is taken again, as load does.
+  /// False, with nothing new loaded, if the reader refuses one or another
+  /// copy of the same name is loaded (see load).
+  bool loadAll(llvm::ArrayRef<std::pair<llvm::StringRef, llvm::StringRef>> Units,
+               SourceLocation IncludeLoc, std::vector<Module *> &Out) {
+    Out.assign(Units.size(), nullptr);
+    llvm::StringMap<size_t> First;
+    std::vector<size_t> Load;
+    for (size_t K = 0; K != Units.size(); ++K) {
+      auto [Bytes, Name] = Units[K];
+      auto Known = LoadedTargets.find(Name);
+      if (Known != LoadedTargets.end()) {
+        if (Known->second.Bytes.data() != Bytes.data() &&
+            Known->second.Bytes != Bytes) {
+          ++OtherCopySameName;
+          return false;
+        }
+        Known->second.Fresh = false;
+        Out[K] = Known->second.Target;
+        HitModules.push_back(Known->second.MF);
+        continue;
+      }
+      if (First.try_emplace(Name, K).second)
+        Load.push_back(K);
+    }
+    if (!Load.empty()) {
+      if (!CI.getASTReader())
+        CI.createASTReader();
+      ASTReader &Reader = *CI.getASTReader();
+      std::optional<llvm::TimeTraceScope> Part;
+      Part.emplace("HeaderCache AddBuffers");
+      std::vector<std::string> Names;
+      for (size_t K : Load) {
+        Names.push_back("/__hc_memory/" + std::to_string(Loaded++) + ".pcm");
+        Reader.getModuleManager().addInMemoryBuffer(
+            Names.back(), llvm::MemoryBuffer::getMemBuffer(
+                              Units[K].first, Names.back(),
+                              /*RequiresNullTerminator=*/false));
+      }
+      std::vector<llvm::StringRef> Refs(Names.begin(), Names.end());
+      llvm::SmallVector<serialization::ModuleFile *, 8> MFs;
+      Part.reset();
+      // Copies start in the compile's own warning state (ASTReader).
+      Reader.setReadingHeaderCacheParts(true);
+      bool Read = Reader.ReadASTs(Refs, serialization::MK_ExplicitModule,
+                                  IncludeLoc,
+                                  ASTReader::ARR_ConfigurationMismatch,
+                                  MFs) == ASTReader::Success;
+      Reader.setReadingHeaderCacheParts(false);
+      if (!Read || MFs.size() != Load.size()) {
+        ++LoadsRefused;
+        return false;
+      }
+      Part.emplace("HeaderCache FindModules");
+      ModuleMap &MM =
+          CI.getPreprocessor().getHeaderSearchInfo().getModuleMap();
+      for (size_t I = 0; I != Load.size(); ++I) {
+        serialization::ModuleFile *MF = MFs[I];
+        Module *Top = MM.findModule(MF->ModuleName);
+        if (!Top)
+          return false;
+        MM.cacheModuleLoad(
+            *CI.getPreprocessor().getIdentifierInfo(MF->ModuleName), Top);
+        Module *Target = Top->findSubmodule(TargetSubmoduleName);
+        if (!Target)
+          Target = Top;
+        LoadedTargets[MF->ModuleName] = {Target, Units[Load[I]].first, MF,
+                                         /*Fresh=*/true};
+        ++CopiesLoaded;
+        HitModules.push_back(MF);
+        Out[Load[I]] = Target;
+      }
+    }
+    for (size_t K = 0; K != Units.size(); ++K)
+      if (!Out[K])
+        Out[K] = Out[First.lookup(Units[K].second)];
+    return true;
+  }
 
   Module *load(llvm::StringRef Bytes, llvm::StringRef ModuleName,
                SourceLocation IncludeLoc) {
@@ -1439,6 +1851,7 @@ private:
       if (Known->second.Bytes.data() == Bytes.data() ||
           Known->second.Bytes == Bytes) {
         Known->second.Fresh = false;
+        HitModules.push_back(Known->second.MF);
         return Known->second.Target;
       }
       ++OtherCopySameName;
@@ -1475,9 +1888,12 @@ private:
         }
       Reader.setPartSkip(std::move(Skip));
     }
+    // A copy starts in the compile's own warning state (ASTReader).
+    Reader.setReadingHeaderCacheParts(true);
     bool Read = Reader.ReadAST(Name, serialization::MK_ExplicitModule,
                                IncludeLoc, ASTReader::ARR_ConfigurationMismatch,
                                &MF) == ASTReader::Success;
+    Reader.setReadingHeaderCacheParts(false);
     Reader.setPartSkip(std::nullopt);
     if (!Read || !MF) {
       ++LoadsRefused;
@@ -1499,7 +1915,63 @@ private:
       Target = Top;
     LoadedTargets[MF->ModuleName] = {Target, Bytes, MF, /*Fresh=*/true};
     ++CopiesLoaded;
+    HitModules.push_back(MF);
     return Target;
+  }
+  /// The module files the hit being made loaded or took again, for the
+  /// header being written around it (PartExporter::linked).
+  std::vector<serialization::ModuleFile *> HitModules;
+
+  /// Debug information names a file by the name the compile first entered
+  /// it by. A read of a copy's header would have entered the files inside it
+  /// there, by the names the copy holds them under; the copy enters each only
+  /// when a location in it is first read, which can be after the compile has
+  /// entered the file itself, by another name: qemu's cpu64.c, served cpu.h,
+  /// includes cpu-sysregs.h.inc afterwards. The names are kept here, by file
+  /// name, for nameAsCopiesDo; nothing is looked up until then.
+  void noteCopyFiles(serialization::ModuleFile &MF) {
+    CI.getASTReader()->visitInputFileInfos(
+        MF, /*IncludeSystem=*/true,
+        [&](const serialization::InputFileInfo &IFI, bool) {
+          if (IFI.Overridden || IFI.Transient || IFI.ModuleMap)
+            return;
+          StringRef Opened = IFI.UnresolvedImportedFilenameAsRequested;
+          auto &Names = CopyFileNames[llvm::sys::path::filename(Opened)];
+          std::pair<std::string, std::string> Held{
+              Opened.str(), IFI.UnresolvedImportedFilename.str()};
+          if (!llvm::is_contained(Names, Held))
+            Names.push_back(std::move(Held));
+        });
+  }
+
+  /// \p File, about to be entered by the compile itself, is entered by the
+  /// name a loaded copy holds it under, if the compile has not entered it
+  /// yet: the name a read of the copy's header would have given it first.
+  /// A copy's name is looked up as the copy itself does
+  /// (ASTReader::getInputFileLookupName): as opened, if that finds the file
+  /// from here, and otherwise by its absolute name.
+  void nameAsCopiesDo(FileEntryRef File) {
+    if (CopyFileNames.empty() ||
+        CI.getSourceManager().hasFileInfo(&File.getFileEntry()))
+      return;
+    auto It = CopyFileNames.find(llvm::sys::path::filename(File.getName()));
+    if (It == CopyFileNames.end())
+      return;
+    FileManager &FM = CI.getFileManager();
+    for (const auto &[Opened, Absolute] : It->second)
+      for (StringRef Name : {StringRef(Opened), StringRef(Absolute)}) {
+        if (Name.empty())
+          continue;
+        OptionalFileEntryRef Held =
+            FM.getOptionalFileRef(Name, /*OpenFile=*/false);
+        if (!Held)
+          continue;
+        if (&Held->getFileEntry() != &File.getFileEntry())
+          continue;
+        if (Held->getName() != File.getName())
+          CI.getASTReader()->enterFile(*Held);
+        return;
+      }
   }
 
   /// A served copy's headers are this compile's dependencies, as if it had
@@ -1554,6 +2026,10 @@ private:
   uint64_t WarningFlags;
   /// IncludeSite::NamesMatter: the compile writes debug information.
   bool NamesMatter;
+  /// With NamesMatter: each file a loaded copy holds, by file name, as
+  /// opened by the compile that wrote the copy and as an absolute name.
+  llvm::StringMap<llvm::SmallVector<std::pair<std::string, std::string>, 1>>
+      CopyFileNames;
   unsigned DiagnosticsReplayed = 0;
   /// Hashes of every name a loaded copy's macro effects touched.
   llvm::DenseSet<uint64_t> TouchedByCopies;
@@ -1826,6 +2302,13 @@ private:
     const char *V = std::getenv("CLANG_HEADER_CACHE_LINK");
     return V && llvm::StringRef(V) == "1";
   }();
+  /// CLANG_HEADER_CACHE_LINK_LOADS=each: a hit loads each link with a
+  /// reader call of its own, as before 2026-11-01. By default a hit's links
+  /// and its copy load in one call (loadTree).
+  bool LinkEach = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_LINK_LOADS");
+    return V && llvm::StringRef(V) == "each";
+  }();
   bool MeasureNested = [] {
     const char *V = std::getenv("CLANG_HEADER_CACHE_MEASURE_NESTED");
     return V && llvm::StringRef(V) == "1";
@@ -1869,6 +2352,251 @@ private:
   /// Null unless this compile exports its misses.
   PartExporter *Exporter = nullptr;
   bool PopulateOnly = false;
+
+  /// CLANG_HEADER_CACHE_MERGE=<n>: at the n-th hit that starts from a copy
+  /// with links, the compile forks; the process forked reads the header as
+  /// text, with the copies inside it folded in, writes that one copy, and
+  /// exits. 0: never.
+  unsigned MergeCount = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE");
+    unsigned N = 0;
+    if (V && llvm::StringRef(V) == "auto")
+      return 2u;
+    return V && !llvm::StringRef(V).getAsInteger(10, N) ? N : 0u;
+  }();
+  /// CLANG_HEADER_CACHE_MERGE=auto: a combination is merged once its hits so
+  /// far pay for the merge (mergeDue), with the constants the merge study
+  /// measured (2026-10-31): a merged hit takes 0.6 of a linked hit's
+  /// instructions, a merged copy holds 0.66 of the bytes a linked hit loads,
+  /// and a merge takes 17.5 M instructions and 257 per byte of its copy.
+  /// Each is CLANG_HEADER_CACHE_MERGE_<SHARE, BYTES_SHARE, FIXED, PER_BYTE>.
+  bool MergeAuto = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE");
+    return V && llvm::StringRef(V) == "auto";
+  }();
+  static double mergeConstant(const char *Name, double Default) {
+    double D;
+    const char *V = std::getenv(Name);
+    return V && !llvm::StringRef(V).getAsDouble(D) ? D : Default;
+  }
+  double MergeShare = mergeConstant("CLANG_HEADER_CACHE_MERGE_SHARE", 0.4);
+  double MergeBytesShare =
+      mergeConstant("CLANG_HEADER_CACHE_MERGE_BYTES_SHARE", 0.66);
+  double MergeFixed = mergeConstant("CLANG_HEADER_CACHE_MERGE_FIXED", 17.5e6);
+  double MergePerByte =
+      mergeConstant("CLANG_HEADER_CACHE_MERGE_PER_BYTE", 257);
+  /// The header being asked for.
+  OptionalFileEntryRef Asking;
+  /// In the process forked to merge: the header it writes, whether its
+  /// part was begun, and the lookup that must miss.
+  const FileEntry *MergeTarget = nullptr;
+  bool MergeExporting = false, ForceMiss = false;
+  std::string MergePath;
+  /// The combinations, by copy record, this compile forked for.
+  llvm::DenseSet<std::pair<uint64_t, uint64_t>> MergeForked;
+  unsigned MergesForked = 0;
+  /// In the process forked to merge, for the latest hit: each link's guard
+  /// the state here decided on, and whether it was defined.
+  std::vector<std::pair<std::string, bool>> LiveGuardTests;
+  /// In the process forked to merge: its own instruction counter, its
+  /// start, and the compile's standard error.
+  int MergeCounter = -1, MergeErr = -1;
+  std::chrono::steady_clock::time_point MergeStart;
+  /// In the process forked to merge: the combination it merges.
+  uint64_t MergeCombo = 0;
+
+  /// CLANG_HEADER_CACHE_HIT_LOG=1: a line per hit on standard error when
+  /// the main file ends -- the copy's module, how many links it loaded and
+  /// their bytes, the combination they make, and the instructions and
+  /// microseconds from the lookup's start to the end of the replay.
+  bool HitLog = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_HIT_LOG");
+    return V && llvm::StringRef(V) == "1";
+  }();
+  std::vector<std::string> HitLines;
+  size_t HitLinks = 0;
+  uint64_t HitLinkBytes = 0, HitCombo = 0;
+  int HitCounter = -2;
+  /// The compile's own instructions so far (HitLog, MergeAuto), or 0.
+  uint64_t hitInstructions() {
+    if (!HitLog && !MergeAuto)
+      return 0;
+#ifdef __linux__
+    if (HitCounter == -2) {
+      struct perf_event_attr A;
+      std::memset(&A, 0, sizeof(A));
+      A.size = sizeof(A);
+      A.type = PERF_TYPE_HARDWARE;
+      A.config = PERF_COUNT_HW_INSTRUCTIONS;
+      HitCounter =
+          static_cast<int>(syscall(SYS_perf_event_open, &A, 0, -1, -1, 0));
+    }
+    uint64_t N = 0;
+    if (HitCounter >= 0 && read(HitCounter, &N, sizeof(N)) == sizeof(N))
+      return N;
+#endif
+    return 0;
+  }
+
+  /// Forks if hits that started from the copy the latest lookup took
+  /// loaded the combination \p Combo of copies the merge count of times,
+  /// this one included, and no compile merged it. True in the process
+  /// forked, which then must miss.
+  /// Whether the hits that loaded the combination \p M counts, this one
+  /// included, call for merging it: the merge count of them. With
+  /// CLANG_HEADER_CACHE_MERGE=auto (the user's rule, 2026-10-31), enough
+  /// that their saving pays for the merge:
+  ///   n x s >= MergeFixed + MergePerByte x merged bytes,
+  /// s being MergeShare of the mean instructions its hits took so far, and
+  /// the merged bytes MergeBytesShare of the \p TreeBytes this hit loads.
+  bool mergeDue(const MergeRecord *M, uint64_t Serves,
+                uint64_t TreeBytes) const {
+    uint64_t N = Serves + 1;
+    if (!MergeAuto)
+      return N >= MergeCount;
+    if (!M || !Serves)
+      return false;
+    double S = MergeShare *
+               double(M->Instructions.load(std::memory_order_relaxed)) /
+               double(Serves);
+    return double(N) * S >=
+           MergeFixed + MergePerByte * MergeBytesShare * double(TreeBytes);
+  }
+
+  bool forkMerge(uint64_t Combo, uint64_t TreeBytes) {
+    uint64_t At = Client->lastRecordOffset();
+    const IndexedCopy *R = Client->lastRecord();
+    if (!R || !Asking || !Exporter || PopulateOnly)
+      return false;
+    const MergeRecord *M = Client->comboOf(*R, Combo);
+    uint64_t Serves = M ? M->Serves.load(std::memory_order_relaxed) : 0;
+    if ((M && M->Merged.load(std::memory_order_acquire) != 0) ||
+        !mergeDue(M, Serves, TreeBytes) ||
+        !MergeForked.insert({At, Combo}).second)
+      return false;
+    llvm::errs().flush();
+    llvm::outs().flush();
+    pid_t Pid = fork();
+    if (Pid < 0)
+      return false;
+    if (Pid > 0) {
+      ++MergesForked;
+      mergeChildren().push_back(Pid);
+      return false;
+    }
+    startMerge(At, Combo);
+    return true;
+  }
+
+  static std::vector<pid_t> &mergeChildren() {
+    static std::vector<pid_t> Pids;
+    static bool Waits = [] {
+      const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE_WAIT");
+      if (V && llvm::StringRef(V) == "1")
+        std::atexit([] {
+          for (pid_t P : Pids)
+            while (waitpid(P, nullptr, 0) < 0 && errno == EINTR)
+              ;
+        });
+      return true;
+    }();
+    (void)Waits;
+    return Pids;
+  }
+
+  static void mergeEnded(int) { _exit(70); }
+
+  /// The process forked to merge: nothing it does may reach the compile's
+  /// output, files or connection.
+  void startMerge(uint64_t Record, uint64_t Combo) {
+    MergeCombo = Combo;
+    for (int Sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGINT,
+                    SIGTERM, SIGHUP, SIGQUIT, SIGPIPE, SIGALRM, SIGUSR1,
+                    SIGUSR2}) {
+      struct sigaction A;
+      std::memset(&A, 0, sizeof(A));
+      A.sa_handler = mergeEnded;
+      sigemptyset(&A.sa_mask);
+      sigaction(Sig, &A, nullptr);
+    }
+    llvm::remove_fatal_error_handler();
+    llvm::install_fatal_error_handler(
+        [](void *, const char *, bool) { _exit(71); });
+    unsigned Limit = 60;
+    if (const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE_TIMEOUT"))
+      (void)llvm::StringRef(V).getAsInteger(10, Limit);
+    alarm(Limit);
+    MergeErr = dup(2);
+    int Null = open("/dev/null", O_WRONLY);
+    if (Null >= 0) {
+      dup2(Null, 1);
+      dup2(Null, 2);
+      close(Null);
+    }
+    if (const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE_CPU")) {
+      unsigned Cpu = 0;
+      if (!llvm::StringRef(V).getAsInteger(10, Cpu)) {
+        cpu_set_t Set;
+        CPU_ZERO(&Set);
+        CPU_SET(Cpu, &Set);
+        sched_setaffinity(0, sizeof(Set), &Set);
+      }
+    }
+    MergeStart = std::chrono::steady_clock::now();
+#ifdef __linux__
+    struct perf_event_attr A;
+    std::memset(&A, 0, sizeof(A));
+    A.size = sizeof(A);
+    A.type = PERF_TYPE_HARDWARE;
+    A.config = PERF_COUNT_HW_INSTRUCTIONS;
+    MergeCounter = static_cast<int>(syscall(SYS_perf_event_open, &A, 0, -1, -1, 0));
+#endif
+    MergeTarget = &Asking->getFileEntry();
+    MergePath = absolutePath(CI.getFileManager(), Asking->getName());
+    ForceMiss = true;
+    if (!Client->reconnectAfterFork())
+      finishMerge("no daemon");
+    if (!Client->claim(MergePath, "merge:" + llvm::utohexstr(Record) + ":" +
+                                      llvm::utohexstr(Combo)))
+      finishMerge("refused");
+    Exporter->mergeOnly([this](llvm::StringRef Stored,
+                               llvm::StringRef Written) {
+      const PartExporter::Stats &S = Exporter->stats();
+      if (Stored.empty())
+        finishMerge("not written");
+      finishMerge(!Written.empty() ? "sent " + Written.str()
+                                   : "declined: " + (S.Declines.empty()
+                                                         ? std::string()
+                                                         : S.Declines.back()));
+    });
+  }
+
+  [[noreturn]] void finishMerge(const std::string &Result) {
+    uint64_t Instructions = 0;
+#ifdef __linux__
+    if (MergeCounter >= 0 &&
+        read(MergeCounter, &Instructions, sizeof(Instructions)) !=
+            sizeof(Instructions))
+      Instructions = 0;
+#endif
+    const PartExporter::Stats &S = Exporter->stats();
+    std::string Line = "header cache merge: " + MergePath + " " + Result +
+                       " combo=" + llvm::utohexstr(MergeCombo) +
+                       " merge_instr=" + std::to_string(Instructions) +
+                       " merge_us=" + std::to_string(micros(MergeStart)) +
+                       " export_us=" + std::to_string(S.Micros) +
+                       " writer_us=" + std::to_string(S.WriterMicros) + "\n";
+    // CLANG_HEADER_CACHE_MERGE_TRACE=<dir>, with -ftime-trace: the merging
+    // process's trace, the compile's before the fork included.
+    if (const char *Dir = std::getenv("CLANG_HEADER_CACHE_MERGE_TRACE");
+        Dir && llvm::timeTraceProfilerEnabled())
+      llvm::consumeError(llvm::timeTraceProfilerWrite(
+          std::string(Dir) + "/merge-" + std::to_string(getpid()) + ".json",
+          "merge.json"));
+    if (MergeErr >= 0)
+      (void)!write(MergeErr, Line.data(), Line.size());
+    _exit(0);
+  }
 
   struct OpenFile {
     /// Null for a buffer with no file behind it, such as the predefines.
@@ -2117,9 +2845,11 @@ public:
     uint32_t Counter = PP.getCounterValue();
     auto Start = std::chrono::steady_clock::now();
     serialization::ModuleFile *MF = nullptr;
+    Reader.setReadingHeaderCacheParts(true);
     ASTReader::ASTReadResult R =
         Reader.ReadAST(Name, serialization::MK_ExplicitModule, SourceLocation(),
                        ASTReader::ARR_None, &MF);
+    Reader.setReadingHeaderCacheParts(false);
     PP.setCounterValue(Counter);
     if (R != ASTReader::Success || !MF) {
       llvm::errs() << "header cache load: the reader refused " << In << "\n";

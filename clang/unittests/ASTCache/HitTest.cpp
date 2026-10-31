@@ -29,6 +29,7 @@
 #include "clang/ASTCache/HeaderCacheServer.h"
 #include "clang/ASTCache/SharedRegion.h"
 #include "clang/Basic/DiagnosticOptions.h"
+#include "clang/CodeGen/CodeGenAction.h"
 #include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendActions.h"
@@ -36,6 +37,11 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Options/OptionUtils.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -74,12 +80,34 @@ private:
 
 /// Records the variables a compile generating code would be told to emit
 /// that a syntax-only one never sees emitted: a module's initializers, at
-/// each import, and the tentative definitions completed at the end.
+/// each import, and the tentative definitions completed at the end. Records
+/// too, in order, the definitions handed over.
 class EmitRecorder : public ASTConsumer {
 public:
-  EmitRecorder(std::set<std::string> &Out,
+  EmitRecorder(std::set<std::string> &Out, std::vector<std::string> &Handed,
                std::function<void(ASTContext &)> AtEnd)
-      : Out(Out), AtEnd(std::move(AtEnd)) {}
+      : Out(Out), Handed(Handed), AtEnd(std::move(AtEnd)) {}
+
+  /// Like code generation, reads the initializer or body of a definition it
+  /// must emit as it is handed over.
+  bool HandleTopLevelDecl(DeclGroupRef G) override {
+    for (Decl *D : G) {
+      ASTContext &Ctx = D->getASTContext();
+      if (auto *V = dyn_cast<VarDecl>(D);
+          V && V->isFileVarDecl() &&
+          V->isThisDeclarationADefinition() == VarDecl::Definition) {
+        Handed.push_back(V->getName().str());
+        if (Ctx.DeclMustBeEmitted(V))
+          V->getInit();
+      } else if (auto *F = dyn_cast<FunctionDecl>(D);
+                 F && F->doesThisDeclarationHaveABody()) {
+        Handed.push_back(F->getName().str());
+        if (Ctx.DeclMustBeEmitted(F))
+          F->getBody();
+      }
+    }
+    return true;
+  }
 
   void HandleTranslationUnit(ASTContext &Ctx) override {
     if (AtEnd)
@@ -99,7 +127,29 @@ public:
 
 private:
   std::set<std::string> &Out;
+  std::vector<std::string> &Handed;
   std::function<void(ASTContext &)> AtEnd;
+};
+
+/// Installs the hit path and the file recorder on a compile that generates
+/// code, into a module the test keeps.
+class CachedCodeGenAction : public EmitLLVMOnlyAction {
+public:
+  CachedCodeGenAction(std::unique_ptr<CacheClient> Client,
+                      std::set<std::string> &Out, llvm::LLVMContext &Ctx)
+      : EmitLLVMOnlyAction(&Ctx), Client(std::move(Client)), Out(Out) {}
+
+  bool BeginSourceFileAction(CompilerInstance &CI) override {
+    CI.getPreprocessor().addPPCallbacks(
+        std::make_unique<EnteredFiles>(CI.getSourceManager(), Out));
+    installHeaderCacheHook(CI, std::move(Client), /*ReportStats=*/false, "",
+                           ExportMode::None);
+    return EmitLLVMOnlyAction::BeginSourceFileAction(CI);
+  }
+
+private:
+  std::unique_ptr<CacheClient> Client;
+  std::set<std::string> &Out;
 };
 
 /// Installs the hit path and the file recorder on the compile.
@@ -108,14 +158,16 @@ public:
   CachedAction(std::unique_ptr<CacheClient> Client, std::set<std::string> &Out,
                std::string JobsDir = "", bool ExportParts = false,
                std::set<std::string> *Emitted = nullptr,
+               std::vector<std::string> *Handed = nullptr,
                std::function<void(ASTContext &)> AtEnd = nullptr)
       : Client(std::move(Client)), Out(Out), JobsDir(std::move(JobsDir)),
-        ExportParts(ExportParts), Emitted(Emitted), AtEnd(std::move(AtEnd)) {}
+        ExportParts(ExportParts), Emitted(Emitted), Handed(Handed),
+        AtEnd(std::move(AtEnd)) {}
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  StringRef File) override {
-    if (Emitted)
-      return std::make_unique<EmitRecorder>(*Emitted, AtEnd);
+    if (Emitted && Handed)
+      return std::make_unique<EmitRecorder>(*Emitted, *Handed, AtEnd);
     return SyntaxOnlyAction::CreateASTConsumer(CI, File);
   }
 
@@ -134,6 +186,7 @@ private:
   std::string JobsDir;
   bool ExportParts;
   std::set<std::string> *Emitted;
+  std::vector<std::string> *Handed;
   std::function<void(ASTContext &)> AtEnd;
 };
 
@@ -239,11 +292,18 @@ protected:
     CI.createFileManager();
 
     Emitted.clear();
+    Handed.clear();
     std::unique_ptr<CacheClient> C = client();
     if (C)
       C->setBuild(Build);
+    if (GenerateCode) {
+      CachedCodeGenAction Action(std::move(C), Entered, GeneratedContext);
+      bool Ok = CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
+      Generated = Action.takeModule();
+      return Ok;
+    }
     CachedAction Action(std::move(C), Entered, RecordJobsTo, ExportParts,
-                        &Emitted, AtEnd);
+                        &Emitted, &Handed, AtEnd);
     bool Ok = CI.ExecuteAction(Action) && !Diags->hasErrorOccurred();
     Warnings = Diags->getNumWarnings();
     return Ok;
@@ -278,11 +338,17 @@ protected:
   std::vector<std::string> ExtraArgs;
   /// When set, compiles export each listed header they read (PartExporter).
   bool ExportParts = false;
+  /// When set, compiles generate code, into Generated; nothing is exported.
+  bool GenerateCode = false;
+  llvm::LLVMContext GeneratedContext;
+  std::unique_ptr<llvm::Module> Generated;
   /// When set, compiles record their jobs in this directory.
   std::string RecordJobsTo;
   /// The variables the last compile would have been told to emit, beyond
   /// what it parsed: module initializers and tentative definitions.
   std::set<std::string> Emitted;
+  /// The definitions the last compile handed over, in order.
+  std::vector<std::string> Handed;
   /// Run on each compile's AST when its translation unit ends.
   std::function<void(ASTContext &)> AtEnd;
   /// How many warnings the last compile printed.
@@ -937,8 +1003,10 @@ TEST_F(AskListTest, AStoredHeaderIsServedOnlyOnceACompileHasTimedIt) {
       << "that compile read use.h and reported it; any time meets a cutoff "
          "of zero";
 
+  // Asked about, in the region's index, and served: the compile's report
+  // gives the hit.
   EXPECT_FALSE(reads(Main, Use));
-  EXPECT_EQ(Daemon->stats().Lookups, 1u);
+  EXPECT_EQ(Daemon->stats().HitsTimed, 1u);
 }
 
 TEST_F(AskListTest, AHeaderReadFasterThanTheCutoffIsNeverAskedAbout) {
@@ -1326,6 +1394,201 @@ TEST_F(ExportTest, AServedPartEmitsItsVariableDefinitions) {
       << "the served part does not emit def_value";
   EXPECT_TRUE(Emitted.count("tent_value"))
       << "the served part does not emit tent_value";
+}
+
+TEST_F(ExportTest, AFileKeepsTheNameItWasFirstEnteredByInsideACopy) {
+  // Debug information names a file by the name the compile first entered it
+  // by. Read as text, part.inc is first entered from mid.h, as x/part.inc;
+  // main.c's own #include "./part.inc" then enters the same file. A copy of
+  // top.h enters its files only when something first reads a location in
+  // them, after main.c's #include: part.inc was named x/./part.inc. qemu's
+  // cpu64.c, served cpu.h, named cpu-sysregs.h.inc in its line table by
+  // another name than plain Clang.
+  ASSERT_FALSE(llvm::sys::fs::create_directories(Dir + "/x"));
+  write("x/part.inc", "extern int part_value;\n");
+  write("x/mid.h", "#ifndef MID_H\n#define MID_H\n#include \"part.inc\"\n"
+                   "#endif\n");
+  std::string Top = write("top.h", "#ifndef TOP_H\n#define TOP_H\n"
+                                   "#include \"x/mid.h\"\n#endif\n");
+  std::string Main = write("x/main.c", "#include \"" + Top +
+                                           "\"\n#include \"./part.inc\"\n"
+                                           "int use(void) { return part_value; }\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(Main, Top)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Top)) << "nothing is stored yet";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D : Ctx.getTranslationUnitDecl()->lookup(
+             &Ctx.Idents.get("part_value")))
+      Named = Ctx.getSourceManager()
+                  .getPresumedLoc(D->getLocation())
+                  .getFilename();
+  };
+  EXPECT_FALSE(reads(Main, Top)) << "top.h's copy was not served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Named, Dir + "/x/part.inc");
+}
+
+TEST_F(ExportTest, AServedDefinitionCompletesATypeDebugInfoDeclared) {
+  // Debug information describes a struct used before its definition by a
+  // declaration, and completes it where the definition is parsed. A copy's
+  // definitions reach code generation only when needed: qemu's
+  // op_helper.c, served memory.h in counter mode, described struct
+  // AddressSpace, declared in typedefs.h and used before, without its
+  // members.
+  std::string Fwd = write("fwd.h", "#ifndef FWD_H\n#define FWD_H\n"
+                                   "typedef struct space space;\n#endif\n");
+  std::string Def = write("def.h", "#ifndef DEF_H\n#define DEF_H\n"
+                                   "struct space { int x; enum mode { A, B } m; };"
+                                   "\n#endif\n");
+  // g keeps def.h from being entered, as the token after f, before f is
+  // handed to code generation.
+  std::string Main = write("main.c", "#include \"" + Fwd +
+                                         "\"\nint f(space *s) { return s != 0; }\n"
+                                         "int g;\n#include \"" + Def + "\"\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(Main, Def)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Def)) << "nothing is stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Def)) << "def.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::DebugInfoFinder Found;
+  Found.processModule(*Generated);
+  const llvm::DICompositeType *Space = nullptr;
+  for (const llvm::DIType *T : Found.types())
+    if (auto *C = llvm::dyn_cast<llvm::DICompositeType>(T);
+        C && C->getName() == "space" && (!Space || !C->isForwardDecl()))
+      Space = C;
+  ASSERT_TRUE(Space) << "struct space is not described";
+  EXPECT_FALSE(Space->isForwardDecl())
+      << "struct space is described without its members";
+}
+
+TEST_F(ExportTest, AServedVariableThatMustBeEmittedIsEmittedOnce) {
+  // A copy's definitions that must be emitted are its module's
+  // initializers, emitted where it is imported; read in for that, each was
+  // also handed to code generation as it was read, and emitted twice: the
+  // kernel's realmode video-vesa.c, which includes boot/video-vesa.c, listed
+  // video_vesa twice in llvm.compiler.used, with two debug descriptions.
+  std::string Def = write("cards.h", "#ifndef CARDS_H\n#define CARDS_H\n"
+                                     "static int __attribute__((used)) "
+                                     "cards = 1;\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Def + "\"\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(Main, Def)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Def)) << "nothing is stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Def)) << "cards.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::GlobalVariable *Used =
+      Generated->getGlobalVariable("llvm.compiler.used");
+  ASSERT_TRUE(Used) << "cards is not kept as used";
+  EXPECT_EQ(cast<llvm::ArrayType>(Used->getValueType())->getNumElements(), 1u)
+      << "cards is listed as used more than once";
+  llvm::GlobalVariable *Cards =
+      Generated->getGlobalVariable("cards", /*AllowInternal=*/true);
+  ASSERT_TRUE(Cards) << "cards is not emitted";
+  llvm::SmallVector<llvm::DIGlobalVariableExpression *, 2> Described;
+  Cards->getDebugInfo(Described);
+  EXPECT_EQ(Described.size(), 1u) << "cards is described more than once";
+}
+
+TEST_F(ExportTest, AServedVariableInAWritableSectionStaysWritable) {
+  // Code generation makes a variable in a section constant when the section
+  // is read-only, as Sema records each section while it checks the
+  // definitions it parses. A copy's definitions are not checked again, so
+  // their section was unknown, read as read-only: the kernel's realmode
+  // video-vesa.c, served boot/video-vesa.c, put
+  // `static __videocard video_vesa` (in .videocards) in read-only memory,
+  // and its store to video_vesa.modes was optimized away.
+  std::string Def = write("card.h",
+                          "#ifndef CARD_H\n#define CARD_H\n"
+                          "struct card { int (*probe)(void); int *modes; };\n"
+                          "static int probe(void);\n"
+                          "static struct card __attribute__((section("
+                          "\".cards\"), used)) card = { probe, 0 };\n"
+                          "static int probe(void) { card.modes = 0; return 0; }"
+                          "\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Def + "\"\n");
+  EXPECT_TRUE(reads(Main, Def)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Def)) << "nothing is stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Def)) << "card.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::GlobalVariable *Card =
+      Generated->getGlobalVariable("card", /*AllowInternal=*/true);
+  ASSERT_TRUE(Card) << "card is not emitted";
+  EXPECT_FALSE(Card->isConstant()) << "card was made read-only";
+}
+
+TEST_F(ExportTest, AServedRedeclarationInheritsTheAttributesBeforeIt) {
+  // The kernel's net/ping.h declares `int __init pingv6_init(void)`, cold
+  // and in .init.text, and net/transp_v6.h declares it again plainly. Read
+  // as text, the second declaration inherits the attributes of the first.
+  // transp.h's copy, written where ping.h was not included, has none, and
+  // the compile that read ping.h and was served transp.h called a function
+  // it no longer knew to be cold: af_inet6.c's inet6_init laid out its
+  // branches in another order than plain Clang.
+  std::string Ping = write("ping.h", "#ifndef PING_H\n#define PING_H\n"
+                                     "int __attribute__((cold, section("
+                                     "\".init.text\"))) pingv6_init(void);\n"
+                                     "#endif\n");
+  std::string Transp = write("transp.h", "#ifndef TRANSP_H\n#define TRANSP_H\n"
+                                         "int pingv6_init(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Transp + "\"\n");
+  std::string B = write("b.c", "#include \"" + Ping + "\"\n#include \"" +
+                                   Transp +
+                                   "\"\n"
+                                   "int f(void) { return pingv6_init(); }\n");
+  EXPECT_TRUE(reads(A, Transp)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Transp)) << "nothing is stored yet";
+  bool Cold = false, Section = false;
+  // Code generation takes the attributes of the declaration a call names.
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("f")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        if (auto *Body = dyn_cast_or_null<CompoundStmt>(F->getBody()))
+          if (auto *R = dyn_cast<ReturnStmt>(Body->body_front()))
+            if (auto *Call =
+                    dyn_cast<CallExpr>(R->getRetValue()->IgnoreImplicit()))
+              if (const FunctionDecl *Callee = Call->getDirectCallee()) {
+                Cold = Callee->hasAttr<ColdAttr>();
+                Section = Callee->hasAttr<SectionAttr>();
+              }
+  };
+  EXPECT_FALSE(reads(B, Transp)) << "transp.h's part was not served";
+  AtEnd = nullptr;
+  EXPECT_TRUE(Cold) << "the served declaration is not cold";
+  EXPECT_TRUE(Section) << "the served declaration has no section";
+}
+
+TEST_F(ExportTest, WhatAVariableNamesIsHandedOverBeforeIt) {
+  // tables.h defines static tables and an external table naming them, as
+  // qemu's xtensa-modules.c.inc does. Code generation emits the external
+  // table as it is handed over, then the static tables in the order its
+  // initializer names those it was handed already. From a part, the static
+  // tables were read only with that initializer and handed over after it,
+  // last first, as the statement stream keeps them: 18 of qemu's xtensa
+  // objects laid their tables out in another order than plain Clang.
+  std::string Tables = write("tables.h", "#ifndef TABLES_H\n#define TABLES_H\n"
+                                         "static int first[1] = {1};\n"
+                                         "static int second[1] = {2};\n"
+                                         "int *table[] = {first, second};\n"
+                                         "#endif\n");
+  std::string A = write("a.c", "#include \"" + Tables + "\"\n");
+  std::string B = write("b.c", "#include \"" + Tables + "\"\n");
+  EXPECT_TRUE(reads(A, Tables)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Tables)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(B, Tables)) << "tables.h's part was not served";
+  auto At = [&](llvm::StringRef Name) {
+    return llvm::find(Handed, Name) - Handed.begin();
+  };
+  EXPECT_LT(At("first"), At("table")) << "first is handed over after table";
+  EXPECT_LT(At("second"), At("table")) << "second is handed over after table";
 }
 
 TEST_F(ExportTest, AHeaderEndingInAFunctionIsSavedWithItsBody) {
@@ -1718,6 +1981,93 @@ TEST_F(ExportTest, ALinkIsSkippedWhereItsHeaderWasRead) {
   EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
 }
 
+namespace {
+/// outer.h declares find and my_t, and inner.h, included after them, defines
+/// find and uses my_t: as glibc's stdlib.h declares bsearch and its
+/// bits/stdlib-bsearch.h defines it. later.h uses both again.
+struct ParentLines {
+  std::string Inner, Outer, Later;
+  ParentLines(const std::function<std::string(llvm::StringRef,
+                                              llvm::StringRef)> &Write)
+      : Inner(Write("inner.h",
+                    "#ifndef INNER_H\n#define INNER_H\n"
+                    "extern __inline __attribute__((__gnu_inline__)) int "
+                    "find(int x) { return x + 1; }\n"
+                    "struct holder { my_t v; };\n#endif\n")),
+        Outer(Write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                               "typedef struct { int a; } my_t;\n"
+                               "extern int find(int x);\n#include \"" +
+                                   Inner +
+                                   "\"\nint after(struct holder *h);\n"
+                                   "#endif\n")),
+        Later(Write("later.h", "#ifndef LATER_H\n#define LATER_H\n"
+                               "int later(my_t *p);\n"
+                               "static inline int use_find(void) "
+                               "{ return find(2); }\n#endif\n")) {}
+};
+} // namespace
+
+TEST_F(ExportTest, ALinkNamingItsParentsEarlierLinesIsWrittenWithIt) {
+  // b.c's second compile writes outer.h's copy, and inner.h's inside it,
+  // linked. c.c is served outer.h: outer.h's copy loads first, then
+  // inner.h's, and inner.h's names find and my_t find outer.h's
+  // declarations. Then later.h's check reads both.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  ParentLines H(
+      [&](llvm::StringRef N, llvm::StringRef T) { return write(N, T); });
+  std::string B = write("b.c", "#include \"" + H.Outer + "\"\n#include \"" +
+                                   H.Later + "\"\n");
+  std::string C = write(
+      "c.c", "#include \"" + H.Outer + "\"\n#include \"" + H.Later +
+                 "\"\nint c(void) {\n  struct holder h = {{1}};\n"
+                 "  return find(h.v.a) + after(&h) + later(&h.v) + "
+                 "use_find();\n}\n");
+  EXPECT_TRUE(reads(B, H.Outer)) << "nothing is listed yet";
+  size_t Before = Daemon->stats().Entries;
+  EXPECT_TRUE(reads(B, H.Outer)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 3)
+      << "outer.h, inner.h and later.h were not all written";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(H.Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(H.Inner)) << "inner.h was opened";
+  EXPECT_FALSE(Entered.count(H.Later)) << "later.h's copy was not served";
+}
+
+TEST_F(ExportTest, AServedLinkNamingItsParentsEarlierLinesIsLoadedWithIt) {
+  // As ALinkNamingItsParentsEarlierLinesIsWrittenWithIt, with inner.h's copy
+  // written first, by a.c, whose own lines declare find and my_t: b.c is
+  // served it inside outer.h, which links it.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  ParentLines H(
+      [&](llvm::StringRef N, llvm::StringRef T) { return write(N, T); });
+  std::string A = write("a.c", "typedef struct { int a; } my_t;\n"
+                               "extern int find(int x);\n#include \"" +
+                                   H.Inner + "\"\n");
+  std::string B = write("b.c", "#include \"" + H.Outer + "\"\n#include \"" +
+                                   H.Later + "\"\n");
+  std::string C = write(
+      "c.c", "#include \"" + H.Outer + "\"\n#include \"" + H.Later +
+                 "\"\nint c(void) {\n  struct holder h = {{1}};\n"
+                 "  return find(h.v.a) + after(&h) + later(&h.v) + "
+                 "use_find();\n}\n");
+  EXPECT_TRUE(reads(A, H.Inner)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, H.Inner)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(B, H.Outer)) << "outer.h is not listed yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_FALSE(Entered.count(H.Inner)) << "inner.h was not served in b.c";
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(H.Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(H.Inner)) << "inner.h was opened";
+  EXPECT_FALSE(Entered.count(H.Later)) << "later.h's copy was not served";
+}
+
 TEST_F(ExportTest, ALinkReadingTheLinesBeforeItIsNotSkipped) {
   // inner.h tests WIDE, which outer.h defines before including it: inner.h
   // depends on outer.h's lines, so where inner.h was read first outer.h's
@@ -1785,6 +2135,381 @@ TEST_F(ExportTest, ALinkWhoseMacroTheLinesReadIsNotSkipped) {
   EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
   AtEnd = nullptr;
   EXPECT_EQ(Returns, "long");
+}
+
+TEST_F(ExportTest, APragmaOnceHeaderAServedCopyHoldsIsReadInsideTheHeader) {
+  // inner.h holds once.h, a #pragma once header. b.c writes outer.h, which
+  // is served inner.h and then includes once.h again, skipped: once.h was
+  // read inside outer.h, by inner.h's copy, so outer.h's copy does not need
+  // once.h read before it (CPython's mimalloc/types.h, inside
+  // _remote_debugging.h). c.c is served outer.h.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Once =
+      write("once.h", "#pragma once\nstruct once_s { int x; };\n");
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#include \"" +
+                                           Once +
+                                           "\"\nint inner(struct once_s *p);\n"
+                                           "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\n#include \"" + Once +
+                           "\"\nint outer(struct once_s *p);\n#endif\n");
+  std::string D = write("d.c", "#include \"" + Inner + "\"\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C =
+      write("c.c", "#include \"" + Outer +
+                       "\"\nint c(struct once_s *p) { return inner(p) + "
+                       "outer(p); }\n");
+  EXPECT_TRUE(reads(D, Inner)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(D, Inner)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(D, Inner)) << "inner.h's copy was not served";
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h is not listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h is not stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+}
+
+TEST_F(ExportTest, ACopyThatSkippedAPragmaOnceHeaderHitsWhereItWasRead) {
+  // b.c and c.c read once.h, a #pragma once header with no guard, before
+  // outer.h, which includes it again: outer.h's copy holds none of it and
+  // needs it read before. c.c read it, so the copy fits.
+  std::string Once =
+      write("once.h", "#pragma once\nstruct once_s { int x; };\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Once + "\"\nint outer(struct once_s *p);\n"
+                                  "#endif\n");
+  std::string B = write("b.c", "#include \"" + Once + "\"\n#include \"" +
+                                   Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Once + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint c(struct once_s *p) "
+                                   "{ return outer(p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+}
+
+TEST_F(ExportTest, ACopyHoldingAPragmaOnceHeaderIsNotServedWhereItWasRead) {
+  // outer.h's copy, written by b.c, holds once.h, a #pragma once header
+  // with no guard. d.c reads once.h before outer.h: the text would skip it,
+  // so the copy, which would define struct once_s and enum once_e again,
+  // must not be served.
+  std::string Once = write("once.h", "#pragma once\nstruct once_s { int x; };\n"
+                                     "enum once_e { ONCE_A, ONCE_B };\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Once + "\"\nint outer(struct once_s *p);\n"
+                                  "#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Once + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint d(struct once_s *p) "
+                                   "{ return outer(p) + ONCE_B; }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h's copy was served after "
+                                       "once.h was read";
+}
+
+TEST_F(ExportTest, AHeldHeaderReadBeforeIsTakenAgainWithGuardPlus) {
+  // CLANG_HEADER_CACHE_GUARD_PLUS=1: outer.h's copy, written by b.c, holds
+  // inner.h, which reads nothing outside it. d.c reads inner.h before
+  // outer.h: the copy still serves, and its declarations of inner.h's
+  // struct, enum, unnamed struct, function and variable are the ones d.c
+  // has.
+  setenv("CLANG_HEADER_CACHE_GUARD_PLUS", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_GUARD_PLUS"); });
+  std::string Inner = write(
+      "inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                 "struct pair { int a, b; };\n"
+                 "enum inner_e { INNER_A, INNER_B };\n"
+                 "typedef struct { int x; } anon_t;\n"
+                 "static inline int twice(int v) { return 2 * v; }\n"
+                 "extern int inner_count;\n"
+                 "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n"
+                           "anon_t outer_anon(void);\n"
+                           "int outer_arr[INNER_MAX];\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write(
+      "d.c", "#include \"" + Inner + "\"\n#include \"" + Outer +
+                 "\"\nint d(void) { struct pair p = {1, INNER_MAX};\n"
+                 "  anon_t a = outer_anon(); enum inner_e e = INNER_B;\n"
+                 "  return outer_sum(&p) + twice(a.x) + e + inner_count +\n"
+                 "         (int)(sizeof outer_arr / sizeof outer_arr[0]); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer))
+      << "outer.h's copy was not served after inner.h was read";
+
+  // Without it, the copy is not served there.
+  unsetenv("CLANG_HEADER_CACHE_GUARD_PLUS");
+  Entered.clear();
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_TRUE(Entered.count(Outer)) << "served without GUARD_PLUS";
+}
+
+TEST_F(ExportTest, AHeldHeaderReadingTheCopysLinesIsNotTakenAgain) {
+  // inner.h reads INNER_WIDE, which outer.h's lines before it define: read
+  // before outer.h, in d.c, it made num an int, and the copy's long must
+  // not be served.
+  setenv("CLANG_HEADER_CACHE_GUARD_PLUS", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_GUARD_PLUS"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#ifdef INNER_WIDE\ntypedef long num;\n"
+                                       "#else\ntypedef int num;\n#endif\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                       "#define INNER_WIDE 1\n#include \"" +
+                           Inner + "\"\nnum outer_num(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer + "\"\nint d(void) { return "
+                                           "(int)outer_num(); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::string Num;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *Dl :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("outer_num")))
+      if (auto *F = dyn_cast<FunctionDecl>(Dl))
+        Num = F->getReturnType().getCanonicalType().getAsString();
+  };
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Num, "int");
+}
+
+TEST_F(ExportTest, AHeldHeaderWhoseMacroChangedSinceIsNotTakenAgain) {
+  // d.c reads inner.h, then defines INNER_MAX again: outer.h's lines would
+  // size outer_arr by d.c's 7, where the copy's are sized by 42.
+  setenv("CLANG_HEADER_CACHE_GUARD_PLUS", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_GUARD_PLUS"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nint outer_arr[INNER_MAX];\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Inner +
+                                   "\"\n#undef INNER_MAX\n#define INNER_MAX 7\n"
+                                   "#include \"" +
+                                   Outer + "\"\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
+}
+
+TEST_F(ExportTest, AHeldHeaderReadingAMacroChangedSinceIsNotTakenAgain) {
+  // inner.h reads FEATURE, from outside outer.h. d.c read inner.h with
+  // FEATURE defined, then undefined it: outer.h's copy fits the state
+  // where outer.h is, but holds inner.h as read without FEATURE.
+  setenv("CLANG_HEADER_CACHE_GUARD_PLUS", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_GUARD_PLUS"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#ifdef FEATURE\ntypedef long num;\n"
+                                       "#else\ntypedef int num;\n#endif\n"
+                                       "#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nnum outer_num(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#define FEATURE 1\n#include \"" + Inner +
+                                   "\"\n#undef FEATURE\n#include \"" + Outer +
+                                   "\"\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(D, Outer)) << "outer.h's copy was served";
+}
+
+TEST_F(ExportTest, AHeldPragmaOnceHeaderIsTakenAgainWithGuardPlus) {
+  // As ACopyHoldingAPragmaOnceHeaderIsNotServedWhereItWasRead, with
+  // CLANG_HEADER_CACHE_GUARD_PLUS=1: once.h reads nothing outside it, so
+  // the copy serves, and its struct and enum are d.c's.
+  setenv("CLANG_HEADER_CACHE_GUARD_PLUS", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_GUARD_PLUS"); });
+  std::string Once = write("once.h", "#pragma once\nstruct once_s { int x; };\n"
+                                     "enum once_e { ONCE_A, ONCE_B };\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Once + "\"\nint outer(struct once_s *p);\n"
+                                  "#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string D = write("d.c", "#include \"" + Once + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint d(struct once_s *p) "
+                                   "{ return outer(p) + ONCE_B; }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer))
+      << "outer.h's copy was not served after once.h was read";
+}
+
+TEST_F(ExportTest, ATreeServedTwiceIsMergedIntoOneCopy) {
+  // CLANG_HEADER_CACHE_MERGE=2: c.c's second hit on outer.h's copy, which
+  // links inner.h's, forks a process that writes the two as one copy. c.c's
+  // third compile is served that copy: inner.h's struct and macro, outer.h's
+  // function. d.c reads inner.h before outer.h, where the merged copy would
+  // define struct pair again: it is served the linked copies instead.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "2", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+  });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C =
+      write("c.c", "#include \"" + Outer +
+                       "\"\nint c(void) { struct pair p = {1, INNER_MAX}; "
+                       "return outer_sum(&p); }\n");
+  std::string D = write("d.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer +
+                                   "\"\nint d(void) { struct pair p = {2, "
+                                   "INNER_MAX}; return outer_sum(&p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  size_t Before = Daemon->stats().Entries;
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_EQ(Daemon->stats().MergesClaimed, 0u) << "merged at the first hit";
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile again";
+  for (int I = 0; I < 3000 && Daemon->stats().MergesStored == 0; ++I)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ASSERT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+  EXPECT_EQ(Daemon->stats().Entries, Before + 1);
+
+  // The merged copy is the newest copy of outer.h.
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(R)) << llvm::toString(R.takeError());
+  const IndexedCopy *Merged = R->copyAt(R->newestCopy(Outer));
+  ASSERT_TRUE(Merged);
+  const IndexedCopy *Linked = R->copyAt(Merged->Next);
+  ASSERT_TRUE(Linked);
+  const MergeRecord *Combo = R->mergeAt(Linked->Merge.load());
+  ASSERT_TRUE(Combo) << "no combination of outer.h's copy was recorded";
+  EXPECT_EQ(Combo->Merged.load(), R->offsetOf(Merged));
+  EXPECT_EQ(Combo->Serves.load(), 2u);
+
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile a third time";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h was read";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was read";
+  EXPECT_EQ(Merged->Serves.load(), 1u) << "the merged copy was not served";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h was read in d.c";
+  EXPECT_EQ(Merged->Serves.load(), 1u)
+      << "the merged copy was served where inner.h was read";
+  EXPECT_EQ(Linked->Serves.load(), 3u) << "the linked copy was not served";
+}
+
+TEST_F(ExportTest, AutoMergingWaitsUntilTheHitsPayForTheMerge) {
+  // CLANG_HEADER_CACHE_MERGE=auto: outer.h's copy, which links inner.h's,
+  // is merged once n x s >= fixed + per byte x merged bytes. With a fixed
+  // cost no hits repay, c.c's hits never merge it. With no cost, the next
+  // hit does: hits so far are counted, with their instructions.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "auto", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE_FIXED", "1e18", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+    unsetenv("CLANG_HEADER_CACHE_MERGE_FIXED");
+    unsetenv("CLANG_HEADER_CACHE_MERGE_PER_BYTE");
+  });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Outer +
+                                   "\"\nint c(void) { struct pair p = {1, 2}; "
+                                   "return outer_sum(&p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  for (int I = 0; I != 3; ++I)
+    ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_EQ(Daemon->stats().MergesClaimed, 0u)
+      << "merged though no hits could repay the merge";
+
+  setenv("CLANG_HEADER_CACHE_MERGE_FIXED", "0", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE_PER_BYTE", "0", 1);
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  for (int I = 0; I < 3000 && Daemon->stats().MergesStored == 0; ++I)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(R)) << llvm::toString(R.takeError());
+  const IndexedCopy *Merged = R->copyAt(R->newestCopy(Outer));
+  ASSERT_TRUE(Merged);
+  const IndexedCopy *Linked = R->copyAt(Merged->Next);
+  ASSERT_TRUE(Linked);
+  const MergeRecord *Combo = R->mergeAt(Linked->Merge.load());
+  ASSERT_TRUE(Combo);
+  EXPECT_EQ(Combo->Serves.load(), 4u);
+}
+
+TEST_F(ExportTest, AMacroAParentSetsAfterItsLinkKeepsTheParentsValue) {
+  // inner.h defines LIMIT as 1, and outer.h, after including it, as 2. c.c
+  // is served outer.h's copy, which loads before inner.h's: LIMIT is still
+  // 2 after the #include, as in the text.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "#define LIMIT 1\nint inner(void);\n"
+                                       "#endif\n");
+  std::string Outer = write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n"
+                                       "#include \"" +
+                                           Inner +
+                                           "\"\n#undef LIMIT\n#define LIMIT 2\n"
+                                           "int outer(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Outer +
+                                   "\"\n_Static_assert(LIMIT == 2, \"LIMIT\");\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  size_t Before = Daemon->stats().Entries;
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 2)
+      << "outer.h and inner.h were not both written";
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(C, Entered)) << "LIMIT is not 2 after outer.h";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
 }
 
 TEST_F(ExportTest, OneCopyServesAHeaderWhetherOrNotItsInnerHeaderWasRead) {
@@ -2942,6 +3667,109 @@ TEST_F(ExportTest, ACopyUsingTheCounterServesWhereItStartsTheSame) {
   EXPECT_TRUE(reads(First, U)) << "nothing is stored yet";
   EXPECT_FALSE(reads(First, U)) << "u.h's copy was not served at 0";
   EXPECT_TRUE(reads(Later, U)) << "u.h's copy was served at 1";
+}
+
+TEST_F(ExportTest, AFunctionDifferingOnlyInCounterNamesStillServesACopy) {
+  // CLANG_HEADER_CACHE_COUNTER=1: f's body pastes __COUNTER__ into a name,
+  // as the kernel's BUILD_BUG_ON does, and user.h's copy calls f. Where the
+  // compile read f.h at another counter value, f differs only in that name,
+  // and the copy serves; where f's body differs otherwise, it does not.
+  setenv("CLANG_HEADER_CACHE_COUNTER", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_COUNTER"); });
+  std::string F = write("f.h", "#ifndef F_H\n#define F_H\n"
+                               "#define CAT_(a, b) a##b\n"
+                               "#define CAT(a, b) CAT_(a, b)\n"
+                               "#ifndef OFFSET\n#define OFFSET 1\n#endif\n"
+                               "static inline int f(int x) {\n"
+                               "  extern void CAT(check_, __COUNTER__)(void);\n"
+                               "  return x + OFFSET;\n}\n"
+                               "extern int f_end;\n#endif\n");
+  std::string User =
+      write("user.h", "#ifndef USER_H\n#define USER_H\n#include \"" + F +
+                          "\"\nstatic inline int g(int x) { return f(x); }\n"
+                          "#endif\n");
+  auto File = [&](const char *Name, const char *Before) {
+    return write(Name, std::string(Before) + "#include \"" + F +
+                           "\"\n#include \"" + User + "\"\n");
+  };
+  std::string First = File("first.c", "int a0 = __COUNTER__;\n");
+  std::string Later =
+      File("later.c", "int b0 = __COUNTER__;\nint b1 = __COUNTER__;\n");
+  std::string Other =
+      File("other.c", "int c0 = __COUNTER__;\n#define OFFSET 2\n");
+  EXPECT_TRUE(reads(First, User)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(First, User)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(Later, User)) << "f differs only in check_2";
+  EXPECT_TRUE(reads(Other, User)) << "f adds 2";
+}
+
+TEST_F(ExportTest, ACopyWhoseValuesOnlySetNamesApartServesBehindItsStart) {
+  // CLANG_HEADER_CACHE_COUNTER=unique (the user's rule, 2026-10-27): a copy
+  // whose counter values only set names apart serves where the counter has
+  // not reached the value it began at, and the counter then moves past the
+  // copy's values, so that none repeats. Each header is written by ahead.c,
+  // where the counter stands at 3, and asked for by behind.c, where it
+  // stands at 1; behind.c checks that the counter moved past the copy's
+  // values. A copy using a value as more than a name serves only at 3.
+  setenv("CLANG_HEADER_CACHE_COUNTER", "unique", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_COUNTER"); });
+  std::string Common = write("common.h",
+                             "#ifndef COMMON_H\n#define COMMON_H\n"
+                             "#define CAT_(a, b) a##b\n"
+                             "#define CAT(a, b) CAT_(a, b)\n"
+                             "#define STR_(x...) #x\n#define STR(x...) STR_(x)\n"
+                             "#define BREF(l) l##b\n#endif\n");
+  int K = 0;
+  // Whether a header of Body, with Uses uses of the counter, serves behind;
+  // Before comes first in both compiles.
+  auto Behind = [&](llvm::StringRef Body, unsigned Uses, bool Served,
+                    llvm::StringRef Before = "") {
+    std::string N = std::to_string(K++);
+    std::string H = write("h" + N + ".h", "#ifndef H" + N + "_H\n#define H" + N +
+                                               "_H\n#include \"" + Common +
+                                               "\"\n" + Body.str() + "\n#endif\n");
+    std::string Ahead =
+        write("ahead" + N + ".c", Before.str() +
+                                      "enum { a = __COUNTER__, b = __COUNTER__, "
+                                      "c = __COUNTER__ };\n#include \"" +
+                                      H + "\"\n");
+    std::string Behind = write(
+        "behind" + N + ".c",
+        Before.str() + "int before = __COUNTER__;\n#include \"" + H +
+            "\"\n_Static_assert(__COUNTER__ == " +
+            std::to_string((Served ? 3 : 1) + Uses) +
+            ", \"the counter is not past the header's values\");\n");
+    EXPECT_TRUE(reads(Ahead, H)) << "nothing is listed yet";
+    EXPECT_TRUE(reads(Ahead, H)) << "nothing is stored yet";
+    EXPECT_EQ(!reads(Behind, H), Served) << Body.str();
+  };
+  Behind("static int CAT(u_, __COUNTER__);\n"
+         "static int CAT(u_, __COUNTER__);\n"
+         "static inline int *u(void) { return &u_4; }\n",
+         2, true);
+  // The kernel's instrumentation_begin(): a numeric local label, and an
+  // operand the asm text never refers to.
+  Behind("#define MARK(c) __asm__ __volatile__(STR(c) \": nop\\n\\t\" "
+         "STR(.pushsection .discard.x, \"M\"; .long BREF(c) - .; .popsection) "
+         ": : \"i\" (c))\n"
+         "static inline void mark(void) { MARK(__COUNTER__); }\n",
+         1, true);
+  // An operand the asm text reads; a number; one pasted from a value; a
+  // string; a value an #if reads; a variable with external linkage; a
+  // function defined; a name naming something already.
+  Behind("static inline void mark(void) {\n"
+         "  __asm__ __volatile__(\"mov %0, %%eax\" : : \"i\" (__COUNTER__) : \"eax\");\n}\n",
+         1, false);
+  Behind("enum { e = __COUNTER__ + 4 };\n", 1, false);
+  Behind("static int arr[CAT(1, __COUNTER__)];\n", 1, false);
+  Behind("static const char *s = STR(__COUNTER__);\n", 1, false);
+  Behind("#if __COUNTER__ > 100\n#endif\n", 1, false);
+  Behind("int CAT(v_, __COUNTER__);\n", 1, false);
+  Behind("static int CAT(f_, __COUNTER__)(void) { return 0; }\n", 1, false);
+  Behind("static inline int g(void) { return CAT(n_, __COUNTER__); }\n", 1,
+         false, "enum { n_1 = 1, n_3 = 3 };\n");
 }
 
 TEST_F(ExportTest, APoisoningIsCarriedOnlyByTheHeaderThatDidIt) {

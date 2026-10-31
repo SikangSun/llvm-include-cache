@@ -1563,6 +1563,10 @@ enum class NameReferenceKind : unsigned {
   /// Nothing: the writer could not name the declaration, and the part is
   /// not used.
   Unnameable,
+  /// The position among the parameters of the parent function: a variable
+  /// length array parameter's bound names another parameter (glibc's
+  /// regexec, `regmatch_t __pmatch[__nmatch]`).
+  Parameter,
 };
 
 /// Record codes for each kind of statement or expression.

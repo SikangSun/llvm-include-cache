@@ -24,6 +24,8 @@
 #include "clang/Frontend/FrontendPluginRegistry.h"
 #include "clang/Lex/DeclBoundaryObserver.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Lex/LiteralSupport.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/ModuleMap.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -165,8 +167,15 @@ public:
         Deliver(std::move(Deliver)), ByName(ByName), Pragmas(Pragmas) {
     const char *Link = std::getenv("CLANG_HEADER_CACHE_LINK");
     LinkMode = Link && llvm::StringRef(Link) == "1";
+    const char *Loads = std::getenv("CLANG_HEADER_CACHE_LINK_LOADS");
+    LinkEach = LinkMode && Loads && llvm::StringRef(Loads) == "each";
+    const char *Takes = std::getenv("CLANG_HEADER_CACHE_LINK_TAKES_PARENTS");
+    TakeParents =
+        LinkMode && !LinkEach && !(Takes && llvm::StringRef(Takes) == "0");
     const char *Partial = std::getenv("CLANG_HEADER_CACHE_PARTIAL");
     PartialMode = !LinkMode && Partial && llvm::StringRef(Partial) == "1";
+    const char *Plus = std::getenv("CLANG_HEADER_CACHE_GUARD_PLUS");
+    GuardPlus = Plus && llvm::StringRef(Plus) == "1";
     // Guard conflicts are resolved only where asked: headers held as
     // sections a compile skips where it read them (REPORT.md T17,
     // CLANG_HEADER_CACHE_SECTIONS=1), or bases and pieces
@@ -175,9 +184,10 @@ public:
     const char *Sections = std::getenv("CLANG_HEADER_CACHE_SECTIONS");
     const char *Pieces = std::getenv("CLANG_HEADER_CACHE_PIECES");
     bool PiecesAsked = Pieces && *Pieces && llvm::StringRef(Pieces) != "0";
+    DependentSections = Sections && llvm::StringRef(Sections) == "2";
     NoSubmodules = std::getenv("CLANG_HEADER_CACHE_NO_SUBMODULES") ||
                    !((Sections && llvm::StringRef(Sections) == "1") ||
-                     PiecesAsked);
+                     DependentSections || PiecesAsked);
     PiecesMode = !LinkMode && !NoSubmodules && PiecesAsked;
     const char *ClaimVar = std::getenv("CLANG_HEADER_CACHE_CLAIM");
     ClaimByDeps = ClaimVar && llvm::StringRef(ClaimVar).starts_with("deps");
@@ -189,10 +199,21 @@ public:
     const char *Probe = std::getenv("CLANG_HEADER_CACHE_COUNTER_PROBE");
     CounterProbe = Probe && llvm::StringRef(Probe) == "1";
     const char *CounterVar = std::getenv("CLANG_HEADER_CACHE_COUNTER");
-    CounterMode = CounterVar && llvm::StringRef(CounterVar) == "1";
-    if (CounterProbe)
+    llvm::StringRef Counter = CounterVar ? CounterVar : "";
+    CounterMode = Counter == "1" || Counter == "unique" || Counter == "names" ||
+                  Counter == "ahead" || Counter == "any";
+    CounterClassify =
+        CounterProbe || Counter == "unique" || Counter == "names";
+    if (CounterMode || CounterClassify)
       CI.getPreprocessor().setTokenWatcher(
           [this](const Token &T) { counterToken(T); });
+    if (CounterClassify) {
+      CI.getPreprocessor().setCounterStringWatcher(
+          [this](const Token &T,
+                 llvm::ArrayRef<std::pair<unsigned, unsigned>> Ranges) {
+            counterString(T, Ranges);
+          });
+    }
 
     std::lock_guard<std::mutex> L(RegistryLock);
     registry()[&CI] = this;
@@ -235,8 +256,15 @@ public:
     for (Part &P : Open) {
       if (!P.Decline.empty())
         continue;
-      if (P.Folded.insert(Fold).second)
+      // A folded copy's values are the part's own.
+      P.CounterSemantic |= Deps->counterUses() && Deps->counterSemantic();
+      for (const NameView &N : Deps->counterNames())
+        P.CounterNameIds.insert(
+            CI.getPreprocessor().getIdentifierInfo(N.Name));
+      if (P.Folded.insert(Fold).second) {
+        P.FoldedOrder.push_back(Fold);
         P.FoldedEntries.insert(Entries.begin(), Entries.end());
+      }
       // The copy's files are the part's: their stamps, and their header
       // search marks for a loading compile.
       for (const FileStampView &F : Deps->files()) {
@@ -254,21 +282,64 @@ public:
                        *Deps, Resolve);
   }
 
+  void foldLink(serialization::ModuleFile *MF, const MetadataView &Deps,
+                SourceLocation Loc) override {
+    if (!MF)
+      return;
+    llvm::DenseMap<int, FileID> Entries;
+    if (llvm::any_of(Open, [&](const Part &P) {
+          return P.Decline.empty() && !P.Folded.count(MF);
+        }))
+      entriesFor(*MF, Loc, Entries);
+    for (Part &P : Open) {
+      if (!P.Decline.empty())
+        continue;
+      P.CounterSemantic |= Deps.counterUses() && Deps.counterSemantic();
+      for (const NameView &N : Deps.counterNames())
+        P.CounterNameIds.insert(
+            CI.getPreprocessor().getIdentifierInfo(N.Name));
+      if (P.Folded.insert(MF).second) {
+        P.FoldedOrder.push_back(MF);
+        P.FoldedEntries.insert(Entries.begin(), Entries.end());
+      }
+      for (const FileStampView &F : Deps.files()) {
+        P.Stamps[F.Path.str()] = {F.Path.str(), F.Size, F.ModTime};
+        if (OptionalFileEntryRef FE =
+                CI.getFileManager().getOptionalFileRef(F.Path))
+          P.Files.insert(&FE->getFileEntry());
+      }
+      for (const MacroEffectView &M : Deps.macroEffects())
+        touch(P, CI.getPreprocessor().getIdentifierInfo(M.Name));
+    }
+    Tracker.foldModule(Loc, MF->SLocEntryBaseID, MF->LocalNumSLocEntries);
+  }
+
+  void linkGuardTested(SourceLocation Loc, llvm::StringRef Guard,
+                       bool WasDefined) override {
+    if (!Open.empty())
+      Tracker.guardTested(Loc, Guard, WasDefined);
+  }
+
+  void mergeOnly(
+      std::function<void(llvm::StringRef, llvm::StringRef)> Done) override {
+    Open.clear();
+    Ready.clear();
+    LinkMode = false;
+    MergeDoneFn = std::move(Done);
+  }
+
   void linked(llvm::StringRef Path, llvm::StringRef Module,
               llvm::StringRef Guard, serialization::ModuleFile *MF,
               const MetadataView &Deps, SourceLocation Loc,
               llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
-              unsigned FirstModule, uint64_t Hash) override {
+              unsigned FirstModule, uint64_t Hash,
+              llvm::ArrayRef<serialization::ModuleFile *> Used) override {
     if (Open.empty())
       return;
     Preprocessor &PP = CI.getPreprocessor();
-    // A hit replays the links before the copy's own directives: one that
-    // changes a macro the lines before it set would be undone by them.
-    for (Part &P : Open)
-      for (const MacroEffectView &M : Deps.macroEffects())
-        if (P.Decline.empty() && P.Touched.contains(PP.getIdentifierInfo(M.Name)))
-          P.Decline = "a copy it links changes a macro its lines set before: " +
-                      M.Name.str();
+    // A macro the lines before the link set and the link sets again is the
+    // link's where its directive is the latest (takeLinks): a hit replays
+    // the links first, and the part's own effect for it is dropped.
     for (Part &P : Open) {
       if (!P.Decline.empty())
         continue;
@@ -311,7 +382,12 @@ public:
     for (const MacroEffectView &M : Deps.macroEffects())
       In.LinkSets.back().push_back(M.Name.str());
     In.LinkFroms.push_back(
-        {FirstModule, static_cast<unsigned>(modulesLoaded()), 0, 0});
+        {FirstModule, static_cast<unsigned>(modulesLoaded()), 0, 0, {}});
+    // The copies the hit took again, loaded before by another #include of
+    // the compile (an unguarded stddef.h's), are this link's too.
+    for (serialization::ModuleFile *U : Used)
+      if (U && U->Index < FirstModule)
+        In.LinkFroms.back().Mods.push_back(U->Index);
     if (getenv("DEBUG_LINK")) {
       llvm::errs() << "SERVED " << Path << " in " << In.Stored << " decls:";
       for (const DeclarationView &D : Deps.declarations())
@@ -326,10 +402,11 @@ public:
     for (const DeclarationView &D : Deps.declarations()) {
       In.LinkOutside.push_back({int(In.Links.size()) - 1,
                                 {D.In, D.Name.str(), D.Fingerprint.str()}});
-      // A link loads before the lines of the copies around it: one that
-      // names a declaration they made cannot be linked, and they hold none
-      // of its lines either.
-      if (ownLinesDeclare(In, D.In == DeclarationDependency::Space::Tag,
+      // A link that names a declaration of the lines of the copies around
+      // it cannot be linked, and they hold none of its lines either, unless
+      // TakeParents.
+      if (!TakeParents &&
+          ownLinesDeclare(In, D.In == DeclarationDependency::Space::Tag,
                           D.Name))
         for (Part &O : Open)
           if (O.Decline.empty())
@@ -337,6 +414,22 @@ public:
                         "own lines: " + D.Name.str();
     }
     ++Counts.LinksServed;
+    // The copies it links, loaded with it or taken again: a macro
+    // features.h's copy defines, linked by the copy of stdio.h served here,
+    // is set inside the headers open here, for the lines after it that
+    // read it. Folded before the copy's own reads are recorded, which can
+    // find a declaration or macro of one of them: stdio.h's copy names
+    // __off_t, which the copy of bits/types.h it links declares.
+    if (CI.getASTReader()) {
+      serialization::ModuleManager &MM = CI.getASTReader()->getModuleManager();
+      for (unsigned I = FirstModule, E = MM.size(); I < E; ++I)
+        if (&MM[I] != MF)
+          Tracker.foldModule(Loc, MM[I].SLocEntryBaseID,
+                             MM[I].LocalNumSLocEntries);
+      for (serialization::ModuleFile *U : Used)
+        if (U && U != MF && U->Index < FirstModule)
+          Tracker.foldModule(Loc, U->SLocEntryBaseID, U->LocalNumSLocEntries);
+    }
     if (MF)
       Tracker.foldServed(Loc, MF->SLocEntryBaseID, MF->LocalNumSLocEntries,
                          Deps, Resolve, /*Linked=*/true);
@@ -360,6 +453,19 @@ public:
 
   void whenDeclined(std::function<void(llvm::StringRef)> F) override {
     DeclinedFn = std::move(F);
+  }
+
+  /// The names a masked hash hashes as one: in a counter mode, those made
+  /// from counter values. CLANG_HEADER_CACHE_NO_MASK (measurement): none.
+  const llvm::DenseSet<const IdentifierInfo *> *maskedNames() const {
+    static const bool NoMask = std::getenv("CLANG_HEADER_CACHE_NO_MASK");
+    return CounterMode && !NoMask ? CounterNames : nullptr;
+  }
+
+  void shareCounterNames(
+      llvm::DenseSet<const IdentifierInfo *> &Names) override {
+    Names.insert(CounterNames->begin(), CounterNames->end());
+    CounterNames = &Names;
   }
 
   void whenFinished(std::function<void()> F) override {
@@ -476,14 +582,22 @@ public:
 
   void MacroDefined(const Token &MacroNameTok,
                     const MacroDirective *) override {
-    for (Part &P : Open)
+    for (Part &P : Open) {
       touch(P, MacroNameTok.getIdentifierInfo());
+      if (!NoSubmodules)
+        P.Touches[MacroNameTok.getIdentifierInfo()].push_back(
+            {MacroNameTok.getLocation(), true});
+    }
   }
 
   void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &,
                       const MacroDirective *) override {
-    for (Part &P : Open)
+    for (Part &P : Open) {
       touch(P, MacroNameTok.getIdentifierInfo());
+      if (!NoSubmodules)
+        P.Touches[MacroNameTok.getIdentifierInfo()].push_back(
+            {MacroNameTok.getLocation(), false});
+    }
   }
 
   void PragmaPushMacro(SourceLocation, const IdentifierInfo *II,
@@ -520,29 +634,82 @@ public:
         P.UsedOutside.insert(D);
   }
 
-  /// CLANG_HEADER_CACHE_COUNTER_PROBE: a number reaching the parser that a
-  /// __COUNTER__ expansion produced, directly or through macro arguments, is
-  /// used as a value: renaming cannot stand in for it. One pasted into a
-  /// name or made a string arrives as an identifier or a string literal.
+  /// CLANG_HEADER_CACHE_COUNTER=unique: where each token made from a
+  /// counter value (Token::FromCounter) went, as it reaches the parser. A
+  /// name sets apart what it names, unless it names something already; a
+  /// number or a string is used as a value, unless the part's asm statements
+  /// show otherwise when it is written (counterValuesOnlySetApart); anything
+  /// else is used as a value.
   void counterToken(const Token &T) {
-    if (Open.empty() || CounterNames.empty() || !T.is(tok::numeric_constant))
+    if (!T.getFlag(Token::FromCounter))
       return;
-    for (SourceLocation L = T.getLocation(); L.isMacroID();
-         L = SM.getImmediateSpellingLoc(L)) {
-      const SrcMgr::ExpansionInfo &X =
-          SM.getSLocEntry(SM.getFileID(L)).getExpansion();
-      if (CounterNames.contains(X.getExpansionLocStart().getRawEncoding())) {
-        for (Part &P : Open)
-          P.CounterSemantic = true;
-        return;
+    // Every counter mode: the names, for masked hashes.
+    if (const IdentifierInfo *II = T.getIdentifierInfo()) {
+      CounterNames->insert(II);
+      for (Part &P : Open)
+        P.CounterNameIds.insert(II);
+    }
+    if (Open.empty() || !CounterClassify)
+      return;
+    auto UsedAsValue = [&] {
+      for (Part &P : Open)
+        P.CounterSemantic = true;
+    };
+    SourceLocation::UIntTy At = T.getLocation().getRawEncoding();
+    SourceLocation::UIntTy Site =
+        SM.getExpansionLoc(T.getLocation()).getRawEncoding();
+    if (const IdentifierInfo *II = T.getIdentifierInfo()) {
+      // Its first use declares it; a name declared before, or one a copy
+      // holds, would be found by its value.
+      if (CounterNamesSeen.insert(II).second &&
+          (II->getFETokenInfo() || II->isFromAST()))
+        UsedAsValue();
+      for (Part &P : Open)
+        P.CounterIdents.insert(At);
+    } else if (T.is(tok::numeric_constant)) {
+      for (Part &P : Open) {
+        P.CounterNumbers.insert(At);
+        P.CounterSites.push_back(Site);
       }
+    } else if (T.is(tok::string_literal) &&
+               Open.back().CounterStrings.count(
+                   SM.getSpellingLoc(T.getLocation()).getRawEncoding())) {
+      for (Part &P : Open)
+        P.CounterSites.push_back(Site);
+    } else {
+      UsedAsValue();
     }
   }
+
+  /// CLANG_HEADER_CACHE_COUNTER=unique: a string a stringizing operator made
+  /// from tokens made from a counter value, by where its spelling is, with
+  /// the ranges of the spelling those tokens became. Each must be found in
+  /// an asm statement's text when the part is written.
+  void counterString(const Token &T,
+                     llvm::ArrayRef<std::pair<unsigned, unsigned>> Ranges) {
+    if (Open.empty())
+      return;
+    if (!T.is(tok::string_literal)) {
+      for (Part &P : Open)
+        P.CounterSemantic = true;
+      return;
+    }
+    SourceLocation::UIntTy Key =
+        SM.getSpellingLoc(T.getLocation()).getRawEncoding();
+    for (Part &P : Open)
+      P.CounterStrings[Key].assign(Ranges.begin(), Ranges.end());
+  }
+
 
   void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                     SourceRange, const MacroArgs *) override {
     if (Open.empty())
       return;
+    // A name made from a counter value that names a macro: what it expands
+    // to depends on the value.
+    if (MacroNameTok.getFlag(Token::FromCounter))
+      for (Part &P : Open)
+        P.CounterSemantic = true;
     const MacroInfo *MI = MD.getMacroInfo();
     if (!MI || !MI->isBuiltinMacro())
       return;
@@ -551,15 +718,14 @@ public:
       return;
     bool Counter = Name == "__COUNTER__";
     // CLANG_HEADER_CACHE_COUNTER_PROBE: the copy is written, to be measured
-    // and never served (DECISIONS.md 2.7). An #if reads the value; where
-    // else it lands is seen as it reaches the parser (counterToken).
-    bool InIf = Counter && CounterProbe &&
-                CI.getPreprocessor().isParsingIfOrElifDirective();
-    if (Counter && CounterProbe)
-      CounterNames.insert(MacroNameTok.getLocation().getRawEncoding());
+    // and never served (DECISIONS.md 2.7). A directive reads the value;
+    // where else it lands is seen as it reaches the parser (counterToken).
+    const PreprocessorLexer *L = CI.getPreprocessor().getCurrentFileLexer();
+    bool InDirective = Counter && CounterClassify && L &&
+                       L->isParsingPreprocessorDirective();
     for (Part &P : Open) {
       P.CounterUses += Counter;
-      P.CounterSemantic |= InIf;
+      P.CounterSemantic |= InDirective;
       if (P.Decline.empty() && !(Counter && (CounterProbe || CounterMode)))
         P.Decline = "expands " + Name.str();
     }
@@ -612,6 +778,9 @@ public:
 
   void translationUnitFinished() {
     writeReady();
+    // CLANG_HEADER_CACHE_MERGE: the part was never written.
+    if (MergeDoneFn)
+      MergeDoneFn({}, {});
     if (FinishedFn)
       FinishedFn();
     if (const char *Dir = std::getenv("CLANG_HEADER_CACHE_DDG"))
@@ -761,6 +930,8 @@ private:
     struct LinkFrom {
       unsigned ModLo = 0, ModHi = 0;
       SourceLocation::UIntTy RegLo = 0, RegHi = 0;
+      /// Module files loaded before the link that it took again.
+      std::vector<unsigned> Mods;
     };
     std::vector<LinkFrom> LinkFroms;
     std::vector<size_t> LinkOrder;
@@ -785,6 +956,8 @@ private:
     /// Copies served inside the header, whose declarations the part holds
     /// as its own (CLANG_HEADER_CACHE_FOLD_SERVED).
     llvm::SmallPtrSet<serialization::ModuleFile *, 4> Folded;
+    /// The same, in the order they were served.
+    std::vector<serialization::ModuleFile *> FoldedOrder;
     /// For each file entry of those copies, by its loaded ID, the entry for
     /// the same file made inside the header where the copy was served: a
     /// location in the copy is written as the same offset in it.
@@ -808,6 +981,12 @@ private:
     size_t ModulesAtBegin = 0;
     PragmaSnapshot Entry, Exit;
     llvm::SetVector<const IdentifierInfo *> Touched;
+    /// With submodules: where each #define (true) and #undef of each name
+    /// touched was, in order -- an #undef of a name that is no macro too,
+    /// for which Clang keeps no directive.
+    llvm::DenseMap<const IdentifierInfo *,
+                   llvm::SmallVector<std::pair<SourceLocation, bool>, 2>>
+        Touches;
     std::vector<MacroEffect> Effects;
     /// Each name the header's #pragma push_macro or pop_macro named.
     llvm::MapVector<const IdentifierInfo *, MacroStack> Stacks;
@@ -844,9 +1023,25 @@ private:
     /// CLANG_HEADER_CACHE_CLAIM=deps: the file-scope declarations made before
     /// the header that its text named, as Sema resolved them.
     llvm::SetVector<const NamedDecl *> UsedOutside;
-    /// CLANG_HEADER_CACHE_COUNTER_PROBE: one of the values reached the
-    /// parser as a number, or an #if read it.
+    /// CLANG_HEADER_CACHE_COUNTER_PROBE: one of the values is used as more
+    /// than something setting a name or a label apart: a directive read it,
+    /// a name made from it named something already, or a token made from it
+    /// was neither a name, a number nor a string (counterToken); and, once
+    /// the part is written, a number or a string not found in an asm
+    /// statement only setting something apart (counterValuesOnlySetApart).
     bool CounterSemantic = false;
+    /// The tokens made from counter values, by where they were: names, and
+    /// numbers; the strings, by where their spelling is, with the ranges of
+    /// it the values became; where in the header's files the numbers and
+    /// strings were.
+    llvm::DenseSet<SourceLocation::UIntTy> CounterIdents, CounterNumbers;
+    /// The names made from counter values, in the part's text or in the
+    /// copies it folded (HeaderDependencySet::CounterNames).
+    llvm::DenseSet<const IdentifierInfo *> CounterNameIds;
+    llvm::DenseMap<SourceLocation::UIntTy,
+                   llvm::SmallVector<std::pair<unsigned, unsigned>, 2>>
+        CounterStrings;
+    std::vector<SourceLocation::UIntTy> CounterSites;
 
     /// A header still open holds everything made since it began.
     bool contains(SourceLocation::UIntTy Offset) const {
@@ -866,6 +1061,176 @@ private:
     /// canonical path, and the condition of what the copy takes from each.
     std::vector<std::string> LeftOutPaths;
     std::vector<uint32_t> LeftOutCond;
+  };
+
+  /// CLANG_HEADER_CACHE_COUNTER=unique: whether every value of the counter
+  /// \p P holds only sets something apart -- with other values, none the
+  /// same as another, the program would be the same, names aside (the
+  /// user's rule, 2026-10-27). That is so for a value
+  ///   - in a name nothing else had (counterToken), other than a function
+  ///     defined (its name can be printed, by __func__) or a variable with
+  ///     external linkage defined (another compile can refer to it);
+  ///   - in an asm statement's input operand of constraint "i" or "n" that
+  ///     the asm text never refers to: the kernel's instrumentation_begin();
+  ///   - in an asm statement's text as a numeric local label, defined and
+  ///     referred to in the same text: the label instrumentation_begin()
+  ///     puts there. Such a label may be defined again elsewhere.
+  bool counterValuesOnlySetApart(const Part &P) {
+    if (P.CounterSemantic)
+      return false;
+    ASTContext &Ctx = CI.getASTContext();
+    Decl *First =
+        P.DeclsAfter
+            ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+            : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+    std::vector<const FunctionDecl *> Bodies;
+    for (Decl *D = First; D; D = D->getNextDeclInContext()) {
+      if (D->isFromASTFile() || !inPart(P, D->getLocation()))
+        continue;
+      bool Named = P.CounterIdents.contains(D->getLocation().getRawEncoding());
+      if (auto *FD = dyn_cast<FunctionDecl>(D)) {
+        if (!FD->doesThisDeclarationHaveABody())
+          continue;
+        if (Named)
+          return false;
+        Bodies.push_back(FD);
+      } else if (auto *VD = dyn_cast<VarDecl>(D)) {
+        if (Named && VD->isExternallyVisible() &&
+            VD->isThisDeclarationADefinition() != VarDecl::DeclarationOnly)
+          return false;
+      }
+    }
+    if (P.CounterNumbers.empty() && P.CounterStrings.empty())
+      return true;
+    // Only the functions holding a number or a string are looked into.
+    std::vector<SourceLocation::UIntTy> Sites = P.CounterSites;
+    llvm::sort(Sites);
+    CounterInAsm Found(P, Ctx, SM, CI.getLangOpts());
+    for (const FunctionDecl *FD : Bodies) {
+      SourceRange R = FD->getSourceRange();
+      SourceLocation::UIntTy B = SM.getExpansionLoc(R.getBegin()).getRawEncoding(),
+                             E = SM.getExpansionLoc(R.getEnd()).getRawEncoding();
+      auto It = llvm::lower_bound(Sites, B);
+      if (It != Sites.end() && *It <= E)
+        Found.TraverseStmt(FD->getBody());
+    }
+    return Found.Numbers.size() == P.CounterNumbers.size() &&
+           Found.Strings.size() == P.CounterStrings.size();
+  }
+
+  /// The counter values of a part, numbers and strings, found in asm
+  /// statements where they only set something apart (see
+  /// counterValuesOnlySetApart).
+  struct CounterInAsm : RecursiveASTVisitor<CounterInAsm> {
+    const Part &P;
+    ASTContext &Ctx;
+    const SourceManager &SM;
+    const LangOptions &LO;
+    llvm::DenseSet<SourceLocation::UIntTy> Numbers, Strings;
+    CounterInAsm(const Part &P, ASTContext &Ctx, const SourceManager &SM,
+                 const LangOptions &LO)
+        : P(P), Ctx(Ctx), SM(SM), LO(LO) {}
+
+    bool VisitGCCAsmStmt(GCCAsmStmt *S) {
+      SmallVector<GCCAsmStmt::AsmStringPiece, 8> Pieces;
+      unsigned DiagOffset;
+      if (S->AnalyzeAsmString(Pieces, Ctx, DiagOffset))
+        return true;
+      for (unsigned I = 0, N = S->getNumInputs(); I != N; ++I) {
+        auto *Lit =
+            dyn_cast<IntegerLiteral>(S->getInputExpr(I)->IgnoreParenImpCasts());
+        if (!Lit ||
+            !P.CounterNumbers.contains(Lit->getLocation().getRawEncoding()))
+          continue;
+        std::string C = S->getInputConstraint(I);
+        unsigned No = S->getNumOutputs() + I;
+        if ((C == "i" || C == "n") &&
+            llvm::none_of(Pieces, [&](const GCCAsmStmt::AsmStringPiece &Pc) {
+              return Pc.isOperand() && Pc.getOperandNo() == No;
+            }))
+          Numbers.insert(Lit->getLocation().getRawEncoding());
+      }
+      if (auto *Text = dyn_cast<StringLiteral>(S->getAsmStringExpr()))
+        labels(Text);
+      return true;
+    }
+
+    /// The pieces of \p Text stringized from counter values in which each
+    /// value is a numeric local label, defined and referred to in \p Text.
+    void labels(const StringLiteral *Text) {
+      if (!Text->isOrdinary())
+        return;
+      llvm::StringRef Str = Text->getString();
+      struct Use {
+        size_t At;
+        llvm::StringRef Digits;
+        char Kind; // ':' defined, 'b' or 'f' referred to
+      };
+      std::vector<Use> Uses;
+      std::vector<SourceLocation::UIntTy> Keys;
+      size_t PieceAt = 0;
+      for (unsigned K = 0, N = Text->getNumConcatenated(); K != N; ++K) {
+        SourceLocation Spelling = SM.getSpellingLoc(Text->getStrTokenLoc(K));
+        bool Invalid = false;
+        llvm::SmallString<64> Buffer;
+        llvm::StringRef Spelled =
+            Lexer::getSpelling(Spelling, Buffer, SM, LO, &Invalid);
+        if (Invalid || Spelled.size() < 2 || Spelled.front() != '"')
+          return;
+        Token Tok;
+        Tok.startToken();
+        Tok.setKind(tok::string_literal);
+        Tok.setLocation(Spelling);
+        Tok.setLength(Spelled.size());
+        StringLiteralParser Parsed(Tok, SM, LO, Ctx.getTargetInfo());
+        if (Parsed.hadError)
+          return;
+        auto It = P.CounterStrings.find(Spelling.getRawEncoding());
+        if (It != P.CounterStrings.end()) {
+          for (auto [Begin, End] : It->second) {
+            // A stringized piece escapes only \ and ".
+            size_t At = PieceAt;
+            for (size_t I = 1; I < Begin; ++I, ++At)
+              if (Spelled[I] == '\\' && ++I < Begin &&
+                  Spelled[I] != '\\' && Spelled[I] != '"')
+                return;
+            llvm::StringRef Word = Spelled.slice(Begin, End);
+            llvm::StringRef Digits = Word.take_while(llvm::isDigit);
+            llvm::StringRef Rest = Word.drop_front(Digits.size());
+            auto WordChar = [](char C) {
+              return llvm::isAlnum(C) || C == '_' || C == '$' || C == '.' ||
+                     C == '@';
+            };
+            auto CharAt = [&](size_t I) { return I < Str.size() ? Str[I] : 0; };
+            if (Digits.empty() || Str.substr(At, Word.size()) != Word ||
+                (At && WordChar(Str[At - 1])))
+              return;
+            size_t After = At + Word.size();
+            char Kind;
+            if (Rest.empty() && CharAt(After) == ':')
+              Kind = ':';
+            else if (Rest.empty() &&
+                     (CharAt(After) == 'b' || CharAt(After) == 'f') &&
+                     !WordChar(CharAt(After + 1)))
+              Kind = CharAt(After);
+            else if ((Rest == "b" || Rest == "f") && !WordChar(CharAt(After)))
+              Kind = Rest[0];
+            else
+              return;
+            Uses.push_back({At, Digits, Kind});
+          }
+          Keys.push_back(It->first);
+        }
+        PieceAt += Parsed.GetStringLength();
+      }
+      for (const Use &U : Uses)
+        if (U.Kind != ':' && llvm::none_of(Uses, [&](const Use &D) {
+              return D.Kind == ':' && D.Digits == U.Digits &&
+                     (U.Kind == 'b' ? D.At < U.At : D.At > U.At);
+            }))
+          return;
+      Strings.insert(Keys.begin(), Keys.end());
+    }
   };
 
   /// Puts a diagnostic into \p P, to be printed again at a hit.
@@ -1136,9 +1501,7 @@ private:
     if (P.CounterUses)
       Counts.Counters.push_back(
           P.Stored + " from " + std::to_string(P.CounterAtBegin) + ", " +
-          std::to_string(P.CounterUses) + " uses" +
-          (P.CounterSemantic ? ", a value used as a number or by an #if"
-                             : ""));
+          std::to_string(P.CounterUses) + " uses");
     P.SLocEnd = SM.local_sloc_entry_size();
     Preprocessor &PP = CI.getPreprocessor();
     llvm::DenseSet<const IdentifierInfo *> Unchanged;
@@ -1201,6 +1564,8 @@ private:
       write(P);
       if (LinkMode)
         handOver(P);
+      if (MergeDoneFn)
+        MergeDoneFn(P.Stored, P.Written);
     }
     Batch = nullptr;
     Counts.Micros += std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1232,10 +1597,10 @@ private:
     Part *Parent = P.ParentId ? findPart(P.ParentId) : nullptr;
     if (!Parent)
       return;
-    // A link loads before the lines of the copy linking it, so it cannot
-    // name a declaration they make: git's repository.h's
-    // `struct object_id;`, after hash.h's definition, inside hash.h.
-    bool TakesParents = llvm::any_of(P.WrittenDecls,
+    // A link cannot name a declaration of the lines of the copy linking it,
+    // unless TakeParents: git's repository.h's `struct object_id;`, after
+    // hash.h's definition, inside hash.h.
+    bool TakesParents = !TakeParents && llvm::any_of(P.WrittenDecls,
                                      [&](const DeclarationDependency &D) {
       return ownLinesDeclare(*Parent,
                              D.In == DeclarationDependency::Space::Tag, D.Name);
@@ -1348,6 +1713,162 @@ private:
     return true;
   }
 
+  /// CLANG_HEADER_CACHE_GUARD_PLUS=1 (HeldHeader): each guarded or #pragma
+  /// once header \p P's copy holds whose skip its check would see -- a
+  /// guard it needs undefined, a file it needs unread -- and whose text,
+  /// with the files it included, read no state the part's lines before it
+  /// set, changed none they set, and held no served copy. Not where the
+  /// part printed a diagnostic: a hit prints it again.
+  void heldHeaders(const Part &P, HeaderDependencySet &Deps) {
+    using FR = ASTCacheDependencyTracker::FileReads;
+    const FR *Root = Tracker.fileReads(P.FID);
+    if (!Root || !P.Diagnostics.empty())
+      return;
+    FileManager &FM = CI.getFileManager();
+    llvm::StringSet<> Undefined;
+    for (const ConditionalDependency &D : Deps.Conditional)
+      if (!D.WasDefined)
+        Undefined.insert(D.MacroName);
+    llvm::DenseSet<const FileEntry *> Unread;
+    for (const InclusionDependency &D : Deps.Inclusion)
+      if (!D.WasRead)
+        if (OptionalFileEntryRef FE = FM.getOptionalFileRef(D.HeaderPath))
+          Unread.insert(&FE->getFileEntry());
+    if (Undefined.empty() && Unread.empty())
+      return;
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    for (const FR &H : Tracker.allFileReads()) {
+      if (H.Enter <= Root->Enter || (Root->Exit && H.Enter > Root->Exit) ||
+          !H.Exit || H.Served ||
+          inLinked(P, SM.getSLocEntry(H.FID).getOffset()))
+        continue;
+      OptionalFileEntryRef FE = SM.getFileEntryRefForID(H.FID);
+      if (!FE)
+        continue;
+      HeaderFileInfo &Info = HS.getFileInfo(*FE);
+      const IdentifierInfo *G =
+          Info.getControllingMacro(HS.getExternalLookup());
+      if (G ? !Undefined.contains(G->getName())
+            : !(Info.isPragmaOnce && Unread.contains(&FE->getFileEntry())))
+        continue;
+      if (std::optional<HeldHeader> Held = heldHeader(P, *Root, H, *FE, G))
+        Deps.Held.push_back(std::move(*Held));
+    }
+  }
+
+  /// The header \p H inside \p P, as heldHeaders takes it, or std::nullopt
+  /// if it reads or changes what \p P's lines before it set.
+  std::optional<HeldHeader>
+  heldHeader(const Part &P, const ASTCacheDependencyTracker::FileReads &Root,
+             const ASTCacheDependencyTracker::FileReads &H, FileEntryRef FE,
+             const IdentifierInfo *Guard) {
+    using FR = ASTCacheDependencyTracker::FileReads;
+    auto Within = [&](const FR &F) {
+      return H.Enter <= F.Enter && F.Exit && F.Exit <= H.Exit;
+    };
+    // Where the state read was set: in the header (Inside), in the part's
+    // lines or files before it, or a copy served there (Before), or
+    // outside the part (Outside), the command line included.
+    enum Where { Inside, Before, Outside };
+    auto WhereIs = [&](FileID O) {
+      if (O.isInvalid())
+        return Outside;
+      if (SM.isLoadedFileID(O)) {
+        int ID = static_cast<int>(O.getHashValue());
+        for (const serialization::ModuleFile &MF :
+             CI.getASTReader()->getModuleManager())
+          if (ID >= MF.SLocEntryBaseID &&
+              ID < MF.SLocEntryBaseID + int(MF.LocalNumSLocEntries))
+            return MF.Index >= P.ModulesAtBegin ? Before : Outside;
+        return Before;
+      }
+      if (const FR *F = Tracker.fileReads(O))
+        return Within(*F) ? Inside
+               : F->Enter >= Root.Enter ? Before
+                                        : Outside;
+      return P.contains(SM.getSLocEntry(O).getOffset()) ? Before : Outside;
+    };
+    HeldHeader Out;
+    Out.Path = CI.getFileManager().getCanonicalName(FE).str();
+    if (Guard)
+      Out.Guard = Guard->getName().str();
+    llvm::StringSet<> Reads;
+    llvm::DenseMap<const IdentifierInfo *, const FR::Change *> Last;
+    for (const FR &F : Tracker.allFileReads()) {
+      if (!Within(F))
+        continue;
+      if (F.Served)
+        return std::nullopt;
+      // A file's test of its own guard, and an #include skipped by the
+      // guard of a header read before, are guards, not states it needs.
+      std::string Own = guardOf(F.FID);
+      for (const auto &E : F.Conditional) {
+        if (E.Dep.MacroName == Own)
+          continue;
+        Where W = WhereIs(E.Origin);
+        if (W == Inside)
+          continue;
+        bool Skip = E.Dep.WasDefined &&
+                    llvm::any_of(F.Skips, [&](const FR::Skip &K) {
+                      return K.Guard == E.Dep.MacroName &&
+                             K.Origin == E.Origin && K.Seq + 1 == E.Seq;
+                    });
+        if (Skip)
+          continue;
+        if (W == Before)
+          return std::nullopt;
+        Reads.insert(E.Dep.MacroName);
+      }
+      for (const auto &E : F.Syntactic) {
+        Where W = WhereIs(E.Origin);
+        if (W == Before)
+          return std::nullopt;
+        if (W == Outside)
+          Reads.insert(E.Dep.Name);
+      }
+      for (const auto &E : F.Symbol)
+        if (WhereIs(E.Origin) == Before)
+          return std::nullopt;
+      for (const FR::Change &C : F.Changes) {
+        if (C.Replaced.isValid() && WhereIs(C.Replaced) == Before)
+          return std::nullopt;
+        auto [It, New] = Last.try_emplace(C.II, &C);
+        if (!New && It->second->Seq < C.Seq)
+          It->second = &C;
+      }
+    }
+    std::vector<const FR::Change *> Left;
+    for (auto &[II, C] : Last)
+      Left.push_back(C);
+    llvm::sort(Left, [](const FR::Change *A, const FR::Change *B) {
+      return A->Seq < B->Seq;
+    });
+    for (const FR::Change *C : Left) {
+      HeldHeader::Macro M;
+      M.Name = C->II->getName().str();
+      M.Defined = C->Defined;
+      if (C->Defined) {
+        SourceLocation L = SM.getFileLoc(C->Loc);
+        OptionalFileEntryRef In =
+            L.isValid() ? SM.getFileEntryRefForID(SM.getFileID(L))
+                        : std::nullopt;
+        if (!In)
+          return std::nullopt;
+        std::string Path = CI.getFileManager().getCanonicalName(*In).str();
+        auto It = llvm::find(Out.Files, Path);
+        M.File = It - Out.Files.begin();
+        if (It == Out.Files.end())
+          Out.Files.push_back(std::move(Path));
+        M.Offset = SM.getFileOffset(L);
+      }
+      Out.Macros.push_back(std::move(M));
+    }
+    for (const auto &N : Reads)
+      Out.Reads.push_back(N.getKey().str());
+    llvm::sort(Out.Reads);
+    return Out;
+  }
+
   /// CLANG_HEADER_CACHE_LINK: the links \p P's copy carries, in the order
   /// of their #includes, and what they take from its metadata: the effects
   /// their own directives made, and the guard test of each skipped where
@@ -1356,20 +1877,24 @@ private:
     if (P.Links.empty())
       return "";
     Preprocessor &PP = CI.getPreprocessor();
+    // A served link's effects were replayed at its #include, so a directive
+    // there is the link's, as is one in a linked header's own lines.
+    llvm::DenseSet<SourceLocation::UIntTy> LinkAt;
+    for (const auto &[Loc, L] : P.Links)
+      LinkAt.insert(Loc.getRawEncoding());
     auto Linked = [&](SourceLocation L) {
-      return inLinked(P, SM.getExpansionLoc(L).getRawEncoding());
+      return LinkAt.contains(L.getRawEncoding()) ||
+             inLinked(P, SM.getExpansionLoc(L).getRawEncoding());
     };
-    // A name whose latest directive in the header is a linked header's is
-    // that header's effect, which its copy replays. The links replay first,
-    // so the part's own directive before it would win wrongly.
-    for (auto &[II, Dirs] : P.Directives) {
-      if (Dirs.empty() || !Linked(Dirs.front()))
-        continue;
-      if (!llvm::all_of(Dirs, Linked))
-        return "a header it links changes a macro its lines set before: " +
-               II->getName().str();
-      P.LinkedNames.insert(II);
-    }
+    // A name whose latest directive in the header is a link's is that
+    // link's effect, which its copy replays, though the part's own lines
+    // set it before (`#define __need_size_t` before <stddef.h>, an
+    // unguarded bits/wordsize.h read twice). The links replay first and the
+    // part's own effects after, so the part keeps only the names whose
+    // latest directive is its own.
+    for (auto &[II, Dirs] : P.Directives)
+      if (!Dirs.empty() && Linked(Dirs.front()))
+        P.LinkedNames.insert(II);
     llvm::erase_if(Deps.MacroEffects, [&](const MacroEffect &E) {
       return P.LinkedNames.contains(PP.getIdentifierInfo(E.Name));
     });
@@ -1433,7 +1958,8 @@ private:
       if (ND.isFromASTFile()) {
         const serialization::ModuleFile *MF =
             CI.getASTReader()->getOwningModuleFile(&ND);
-        if (MF && MF->Index >= F.ModLo && MF->Index < F.ModHi)
+        if (MF && ((MF->Index >= F.ModLo && MF->Index < F.ModHi) ||
+                   llvm::is_contained(F.Mods, MF->Index)))
           return K;
         continue;
       }
@@ -1504,6 +2030,8 @@ private:
     NamedDecl *D = ASTReader::lookupAtFileScope(CI.getSema(), *II, Tag,
                                                 /*CreateBuiltin=*/false);
     for (Decl *R = D; R; R = R->getPreviousDecl()) {
+      if (inWaiting(P, *R))
+        continue;
       if (R->isFromASTFile()) {
         const serialization::ModuleFile *MF =
             CI.getASTReader()->getOwningModuleFile(R);
@@ -1512,6 +2040,32 @@ private:
           return true;
       } else if (inPart(P, R->getLocation())) {
         return true;
+      }
+    }
+    return false;
+  }
+
+  /// Whether \p R is in a header inside \p P that ended and waits to be
+  /// written: it becomes a link of P's copy then, unless declined
+  /// (handOver). config.h's sys/param.h waits until the declaration after
+  /// it, past config.h's #include <fcntl.h>.
+  bool inWaiting(const Part &P, const Decl &R) const {
+    for (const Part &Q : Ready) {
+      if (Q.IncludeLoc.isInvalid() || !SM.isLocalSourceLocation(Q.IncludeLoc) ||
+          !P.contains(SM.getExpansionLoc(Q.IncludeLoc).getRawEncoding()))
+        continue;
+      if (R.isFromASTFile()) {
+        const serialization::ModuleFile *MF =
+            CI.getASTReader()->getOwningModuleFile(&R);
+        if (MF && MF->Index >= Q.ModulesAtBegin && MF->Index < Q.ModulesAtEnd)
+          return true;
+        continue;
+      }
+      SourceLocation L = R.getLocation();
+      if (L.isValid() && SM.isLocalSourceLocation(L)) {
+        SourceLocation::UIntTy At = SM.getExpansionLoc(L).getRawEncoding();
+        if (Q.Begin <= At && At < Q.End)
+          return true;
       }
     }
     return false;
@@ -1531,16 +2085,42 @@ private:
     for (Decl *R = D; R; R = R->getPreviousDecl()) {
       auto *ND = cast<NamedDecl>(R);
       int K = linkOf(P, *ND);
-      if (K >= 0 && K >= From)
+      static const bool DebugLink = getenv("DEBUG_LINK");
+      if (DebugLink) {
+        const serialization::ModuleFile *MF =
+            R->isFromASTFile() ? CI.getASTReader()->getOwningModuleFile(R)
+                               : nullptr;
+        llvm::errs() << "WHERE " << P.Stored << " " << Name << " from " << From
+                     << ": decl " << (const void *)R << " link " << K
+                     << " ast " << R->isFromASTFile() << " mod "
+                     << (MF ? MF->ModuleName : "-") << " idx "
+                     << (MF ? int(MF->Index) : -1) << " begin "
+                     << P.ModulesAtBegin << " inPart "
+                     << inPart(P, R->getLocation()) << " at "
+                     << R->getLocation().printToString(SM) << "\n";
+      }
+      // Not its own link or one after it, in text order: links are
+      // numbered as they are made, and a header written inside the part
+      // becomes a link only once written (handOver), after a link served
+      // on a later line.
+      if (K >= 0 && (K == From || !At.isValid() ||
+                     !SM.isBeforeInTranslationUnit(P.Links[K].first, At)))
         continue;
       if (K >= 0)
         return K;
       if (R->isFromASTFile()) {
         const serialization::ModuleFile *MF =
             CI.getASTReader()->getOwningModuleFile(R);
-        if (MF && MF->Index >= P.ModulesAtBegin)
-          return -2;
-        return -1;
+        if (!MF || MF->Index < P.ModulesAtBegin)
+          return -1;
+        // A copy served on the part's own lines comes before the link only
+        // if the #include that served it does: opt.h's copy served dict.h
+        // after its channel_layout.h link, and the size_t dict.h redeclared
+        // is not the one channel_layout.h's stdlib.h names.
+        if (At.isValid() && MF->ImportLoc.isValid() &&
+            !SM.isBeforeInTranslationUnit(MF->ImportLoc, At))
+          continue;
+        return -2;
       }
       if (!inPart(P, R->getLocation()))
         return -1;
@@ -1583,7 +2163,8 @@ private:
       while (AtEntry && !Before(AtEntry))
         AtEntry = AtEntry->getPreviousDecl();
       std::optional<std::string> F = declarationFingerprint(
-          AtEntry ? *cast<NamedDecl>(AtEntry) : *ND, Before);
+          AtEntry ? *cast<NamedDecl>(AtEntry) : *ND, Before,
+          LayoutPart::IfComputed, maskedNames());
       Keys.push_back(std::to_string(unsigned(In)) + ":" + ND->getName().str() +
                      "=" + (F ? *F : std::string("?")));
     }
@@ -1648,9 +2229,15 @@ private:
         if (getenv("DEBUG_LINK"))
           llvm::errs() << "OUTSIDE " << P.Stored << " " << (Tag ? "tag " : "")
                        << D.Name << " from link " << From << " -> " << K << "\n";
-        if (K == -2)
-          return decline(P, "a copy it links names a declaration of its own "
-                            "lines: " + D.Name);
+        // In the part's own lines: with TakeParents, loaded with the links
+        // in one call, the link's name finds it there, and the part's check
+        // needs nothing.
+        if (K == -2) {
+          if (!TakeParents)
+            return decline(P, "a copy it links names a declaration of its "
+                              "own lines: " + D.Name);
+          continue;
+        }
         if (K >= 0) {
           std::vector<std::string> &Names = Deps.Links[P.LinkOrder[K]].Names;
           std::string N = (Tag ? "t:" : "o:") + D.Name;
@@ -1681,6 +2268,9 @@ private:
     Counts.ComposeMicros += std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - Composing)
                                 .count();
+
+    if (GuardPlus && !PiecesMode)
+      heldHeaders(P, Deps);
 
     // The same header, metadata and compiler options give the same name in
     // any compile, which lets the daemon recognise a part it already holds.
@@ -1774,6 +2364,17 @@ private:
       return decline(P, "it uses " + W.Unused +
                             ", which loading its copy would leave unused");
     Deps.Declarations = std::move(W.Declarations);
+    // CLANG_HEADER_CACHE_DUMP_DEPS: where each was declared.
+    if (std::getenv("CLANG_HEADER_CACHE_DUMP_DEPS"))
+      for (size_t I = 0;
+           I != Deps.Declarations.size() && I != W.DeclarationLocs.size(); ++I)
+        if (SourceLocation L = W.DeclarationLocs[I]; L.isValid()) {
+          PresumedLoc PL = SM.getPresumedLoc(SM.getFileLoc(L));
+          if (PL.isValid())
+            Deps.Declarations[I].Site = std::string("declared|") +
+                                        PL.getFilename() + ":" +
+                                        std::to_string(PL.getLine());
+        }
     auto TakeName = [&](size_t K, std::string Name) {
       std::vector<std::string> &Names = Deps.Links[P.LinkOrder[K]].Names;
       if (!llvm::is_contained(Names, Name))
@@ -1801,7 +2402,16 @@ private:
     // copy, and would only set apart copies that are the same.
     Deps.CounterStart = P.CounterUses ? P.CounterAtBegin : 0;
     Deps.CounterUses = P.CounterUses;
-    Deps.CounterSemantic = P.CounterSemantic;
+    for (const IdentifierInfo *II : P.CounterNameIds)
+      Deps.CounterNames.push_back(II->getName().str());
+    llvm::sort(Deps.CounterNames);
+    Deps.CounterSemantic =
+        P.CounterUses && CounterClassify && !counterValuesOnlySetApart(P);
+    if (P.CounterUses && CounterClassify)
+      Counts.Counters.push_back(P.Stored + ": " +
+                                (Deps.CounterSemantic
+                                     ? "a value used as more than a name"
+                                     : "its values only set names apart"));
     Deps.WarningPragmas = P.WarningPragmas;
 
     PushRequest R;
@@ -1829,8 +2439,12 @@ private:
               " locations dropped (in module files or outside the part)";
     Counts.Exports.push_back(std::move(Line));
     P.Written = Name;
-    P.WrittenHash = llvm::xxh3_64bits(
-        llvm::StringRef(R.Data.data(), R.Data.size()));
+    {
+      llvm::SmallVector<char, 0> Metadata;
+      encodeMetadata(R.Deps, R.ModuleName, Metadata);
+      R.Metadata.assign(Metadata.begin(), Metadata.end());
+    }
+    P.WrittenHash = llvm::xxh3_64bits(R.Metadata);
     if (Tracker.measuringIndependence())
       measureIndependence(P, Name, W.Buffer.size());
     dump(P, R, W.Sizes);
@@ -1891,6 +2505,26 @@ private:
         D.Decl.Name = E->getName().str();
         // The submodule owning it, plus one: Conditions[K] is where it loads.
         D.Decl.Cond = K + 1;
+        // CLANG_HEADER_CACHE_SECTIONS=2: where the submodule is skipped, the
+        // compile's own declaration must be the one the copy's lines were
+        // parsed against, as the header made it -- of its redeclarations,
+        // those before the part and those inside the submodule count.
+        if (DependentSections) {
+          auto Counts = [&](const Decl *R) {
+            SourceLocation L = R->getLocation();
+            if (!inPart(P, L))
+              return !madeAfter(P, R);
+            auto It = P.SubmoduleOf.find(SM.getFileID(SM.getExpansionLoc(L)));
+            for (int S = It == P.SubmoduleOf.end() ? -1 : It->second; S >= 0;
+                 S = Deps.Submodules[S].Parent)
+              if (S == K)
+                return true;
+            return false;
+          };
+          if (std::optional<std::string> F = declarationFingerprint(
+                  *E, Counts, LayoutPart::IfComputed, maskedNames()))
+            D.Decl.Fingerprint = std::move(*F);
+        }
         Deps.Provided.push_back(std::move(D));
       }
       Deps.Provided[It->second].Uses.push_back(std::move(U));
@@ -2025,10 +2659,15 @@ private:
             if (Before(E.Origin))
               Qualifies = false;
         };
-        Reads(F.Conditional);
-        Reads(F.Syntactic);
-        Reads(F.Symbol);
-        Reads(F.Inclusion);
+        // CLANG_HEADER_CACHE_SECTIONS=2: what it reads of the copy's
+        // earlier lines is the copy's own wherever it loads, and checked
+        // where a submodule that set it is skipped.
+        if (!DependentSections) {
+          Reads(F.Conditional);
+          Reads(F.Syntactic);
+          Reads(F.Symbol);
+          Reads(F.Inclusion);
+        }
         for (const FR::Change &C : F.Changes)
           if (Before(C.Replaced))
             Qualifies = false;
@@ -2090,12 +2729,108 @@ private:
       auto J = Index.find(SM.getFileID(SM.getExpansionLoc(L)));
       return J == Index.end() ? -1 : Region[J->second];
     };
-    // A macro the header left changed belongs to the submodule of the last
-    // directive it made.
+    // CLANG_HEADER_CACHE_SECTIONS=2: a dependency applies where the
+    // innermost submodule holding every file that read it loads. Where the
+    // compile has read that header, the header's text is not read here, and
+    // what its text tested says nothing: glibc's stdio.h tests
+    // __off_t_defined, which sys/types.h, read before, defined.
+    if (DependentSections) {
+      // The innermost submodule holding both; -2 for none yet.
+      auto Common = [&](int A, int B) {
+        if (A == -2 || A == B)
+          return B;
+        llvm::SmallVector<int, 8> Up;
+        for (int R = A; R >= 0; R = Subs[R].Parent)
+          Up.push_back(R);
+        for (int R = B; R >= 0; R = Subs[R].Parent)
+          if (llvm::is_contained(Up, R))
+            return R;
+        return -1;
+      };
+      // Keyed by a 128-bit hash of what each read requires.
+      using Key = std::pair<uint64_t, uint64_t>;
+      auto KeyOf = [](char Kind, llvm::StringRef A, int B, llvm::StringRef C) {
+        llvm::SmallString<128> Bytes;
+        Bytes.push_back(Kind);
+        Bytes.append(A);
+        Bytes.push_back('\0');
+        Bytes.push_back(char(B));
+        Bytes.append(C);
+        llvm::XXH128_hash_t H = llvm::xxh3_128bits(llvm::arrayRefFromStringRef(Bytes));
+        return Key{H.low64, H.high64};
+      };
+      llvm::DenseMap<Key, int> Readers;
+      auto Note = [&](Key K, int R) {
+        auto [It, New] = Readers.try_emplace(K, -2);
+        It->second = Common(It->second, R);
+      };
+      for (size_t J = 0; J != All.size(); ++J) {
+        int R = Region[J];
+        for (const auto &E : All[J]->Conditional)
+          Note(KeyOf('c', E.Dep.MacroName, E.Dep.WasDefined, ""), R);
+        for (const auto &E : All[J]->Syntactic)
+          Note(KeyOf('s', E.Dep.Name, int(E.Dep.Required), E.Dep.TokenSequence),
+               R);
+        for (const auto &E : All[J]->Symbol)
+          Note(KeyOf('y', E.Dep.Name, int(E.Dep.Classification),
+                     E.Dep.ResolvedTypeName),
+               R);
+        for (const auto &E : All[J]->Inclusion)
+          Note(KeyOf('i', E.Dep.HeaderPath, int(E.Dep.Why), ""), R);
+      }
+      auto Tag = [&](Key K, uint32_t &Cond) {
+        auto It = Readers.find(K);
+        if (!Cond && It != Readers.end() && It->second >= 0)
+          Cond = CondOf(It->second);
+      };
+      for (ConditionalDependency &D : Deps.Conditional)
+        Tag(KeyOf('c', D.MacroName, D.WasDefined, ""), D.Cond);
+      for (SyntacticDependency &D : Deps.Syntactic)
+        Tag(KeyOf('s', D.Name, int(D.Required), D.TokenSequence), D.Cond);
+      for (SymbolDependency &D : Deps.Symbol)
+        Tag(KeyOf('y', D.Name, int(D.Classification), D.ResolvedTypeName),
+            D.Cond);
+      for (InclusionDependency &D : Deps.Inclusion)
+        Tag(KeyOf('i', D.HeaderPath, int(D.Why), ""), D.Cond);
+    }
+    // A macro the header left changed belongs to the submodule of the
+    // directives that decide what it left it as: its last #define, or each
+    // #undef after that, an #undef of a name that is no macro included --
+    // glibc's features.h opens with `#undef __USE_MISC`, which Clang keeps
+    // no directive for, and which a skipped features.h must not replay.
+    // Decided in several, it belongs to the innermost holding them all.
     Preprocessor &PP = CI.getPreprocessor();
+    auto Holding = [&](int A, int B) {
+      if (A == -2 || A == B)
+        return B;
+      llvm::SmallVector<int, 8> Up;
+      for (int R = A; R >= 0; R = Subs[R].Parent)
+        Up.push_back(R);
+      for (int R = B; R >= 0; R = Subs[R].Parent)
+        if (llvm::is_contained(Up, R))
+          return R;
+      return -1;
+    };
     for (MacroEffect &E : Deps.MacroEffects) {
-      const MacroDirective *MD =
-          PP.getLocalMacroDirectiveHistory(PP.getIdentifierInfo(E.Name));
+      IdentifierInfo *II = PP.getIdentifierInfo(E.Name);
+      auto T = P.Touches.find(II);
+      if (T != P.Touches.end() && !T->second.empty()) {
+        const auto &V = T->second;
+        size_t LastDefine = V.size();
+        for (size_t I = 0; I != V.size(); ++I)
+          if (V[I].second)
+            LastDefine = I;
+        int R = -2;
+        if (E.Defined && LastDefine != V.size())
+          R = RegionOf(V[LastDefine].first);
+        else
+          for (size_t I = LastDefine == V.size() ? 0 : LastDefine + 1;
+               I != V.size(); ++I)
+            R = Holding(R, RegionOf(V[I].first));
+        E.Cond = R < 0 ? 0 : CondOf(R);
+        continue;
+      }
+      const MacroDirective *MD = PP.getLocalMacroDirectiveHistory(II);
       while (MD && !inPart(P, MD->getLocation()))
         MD = MD->getPrevious();
       if (MD)
@@ -2160,6 +2895,20 @@ private:
           if (SeenRead.insert({D.Name, D.TokenSequence, D.Cond}).second)
             Deps.Syntactic.push_back(std::move(D));
         }
+        // CLANG_HEADER_CACHE_SECTIONS=2: a name a submodule declared that
+        // the lines outside it read as a type, or as not one: libavcodec's
+        // codec.h reads rational.h's AVRational.
+        if (DependentSections)
+          for (const auto &E : All[J]->Symbol) {
+            int K = Provider(E.Origin);
+            if (K < 0)
+              continue;
+            SymbolDependency D = E.Dep;
+            D.Cond = CondIndex(Reader, K);
+            if (SeenRead.insert({D.Name, "t:" + D.ResolvedTypeName, D.Cond})
+                    .second)
+              Deps.Symbol.push_back(std::move(D));
+          }
       }
       Counts.Crossing += SeenTest.size() + SeenRead.size();
     }
@@ -3190,16 +3939,26 @@ private:
        << D.WarningState << "\npragma\t" << D.Entry.AlignPackRaw << " "
        << D.Entry.FpPragmaRaw << "\n";
     for (const auto &E : D.Conditional)
-      OS << "cond\t" << E.MacroName << "\t" << E.WasDefined << "\n";
+      OS << "cond\t" << E.MacroName << "\t" << E.WasDefined << "\t" << E.Site
+         << "\t" << E.Cond << "\n";
     for (const auto &E : D.Syntactic)
       OS << (E.Required == SyntacticDependency::State::NotAMacro ? "notmacro\t"
                                                                  : "expands\t")
-         << E.Name << "\t" << llvm::xxh3_64bits(E.TokenSequence) << "\n";
+         << E.Name << "\t" << llvm::xxh3_64bits(E.TokenSequence) << "\t"
+         << E.Site << "\n";
     for (const auto &E : D.Inclusion)
       OS << "inclusion\t" << E.HeaderPath << "\n";
+    for (const auto &E : D.Submodules)
+      OS << "section\t" << E.Name << "\t" << E.Parent << "\t" << E.Guard
+         << "\t" << E.Path << "\n";
+    for (const auto &E : D.Conditions)
+      OS << "condition\t" << E.Owner << "\t" << E.Provider << "\n";
+    for (const auto &E : D.MacroEffects)
+      OS << "effect\t" << E.Name << "\t" << E.Defined << "\t" << E.Cond
+         << "\n";
     for (const auto &E : D.Symbol)
       OS << "symbol\t" << E.Name << "\t" << unsigned(E.Classification) << "\t"
-         << E.ResolvedTypeName << "\n";
+         << E.ResolvedTypeName << "\t" << E.Site << "\n";
     for (const auto &E : D.Files)
       OS << "file\t" << E.Path << "\t" << E.Size << "\t" << E.ModTime << "\n";
     for (const auto &E : D.Includes)
@@ -3210,7 +3969,7 @@ private:
          << E.Text << "\n";
     for (const auto &E : D.Declarations)
       OS << "decl\t" << unsigned(E.In) << "\t" << E.Name << "\t"
-         << llvm::xxh3_64bits(E.Fingerprint) << "\n";
+         << llvm::xxh3_64bits(E.Fingerprint) << "\t" << E.Site << "\n";
   }
 
   struct Written {
@@ -3351,7 +4110,7 @@ private:
     std::vector<const Decl *> FoldedDecls;
     if (!P.Folded.empty()) {
       SmallVector<Decl *, 64> Top;
-      for (serialization::ModuleFile *MF : P.Folded)
+      for (serialization::ModuleFile *MF : P.FoldedOrder)
         CI.getASTReader()->getTopLevelDecls(*MF, Top);
       for (Decl *D : Top)
         if (!isa<ImportDecl>(D))
@@ -3468,7 +4227,8 @@ private:
       while (AtEntry && !Before(AtEntry))
         AtEntry = AtEntry->getPreviousDecl();
       std::optional<std::string> F = declarationFingerprint(
-          AtEntry ? *cast<NamedDecl>(AtEntry) : ND, Before);
+          AtEntry ? *cast<NamedDecl>(AtEntry) : ND, Before,
+          LayoutPart::IfComputed, maskedNames());
       if (!F)
         return false;
       W.Declarations.push_back({In, ND.getName().str(), std::move(*F)});
@@ -3543,13 +4303,34 @@ private:
   /// CLANG_HEADER_CACHE_LINK: a copy links the copies of the headers inside
   /// it, instead of holding them.
   bool LinkMode = false;
+  /// CLANG_HEADER_CACHE_LINK_LOADS=each: a hit loads each link with a
+  /// reader call of its own, before the copy linking it. By default a
+  /// hit's links and its copy load in one call.
+  bool LinkEach = false;
+  /// A link may name a declaration of the lines around it: a hit loads the
+  /// copy and its links top down in one reader call, all visible before
+  /// any declaration is read, and the link's name finds it as in the text.
+  /// CLANG_HEADER_CACHE_LINK_TAKES_PARENTS=0 declines such a copy instead,
+  /// as with CLANG_HEADER_CACHE_LINK_LOADS=each, which loads each link
+  /// before the copy, alone.
+  bool TakeParents = false;
   /// CLANG_HEADER_CACHE_PARTIAL: a copy records the headers it left out
   /// that a compile can plug in first.
   bool PartialMode = false;
+  /// CLANG_HEADER_CACHE_GUARD_PLUS=1: a copy records the headers it holds
+  /// that a compile which read them already may take again (HeldHeader).
+  bool GuardPlus = false;
   /// No headers held as submodules: the default, unless
   /// CLANG_HEADER_CACHE_SECTIONS=1 or CLANG_HEADER_CACHE_PIECES asks for
   /// them; CLANG_HEADER_CACHE_NO_SUBMODULES forces it.
   bool NoSubmodules = true;
+  /// CLANG_HEADER_CACHE_SECTIONS=2: a header inside the copy is held as a
+  /// submodule though it reads what the copy's earlier lines set; each
+  /// dependency applies only where the innermost submodule holding every
+  /// file that read it loads, and what the copy's other lines take from a
+  /// submodule -- macros, type names, declarations with their fingerprints
+  /// -- is checked where it is skipped.
+  bool DependentSections = false;
   /// CLANG_HEADER_CACHE_PIECES: a copy is a base -- its header's own lines --
   /// with a section for each header its lines include, everything below
   /// folded in; a compile that needs another version of a section adds one.
@@ -3563,8 +4344,16 @@ private:
   bool ClaimByDeps = false;
   /// CLANG_HEADER_CACHE_COUNTER=1: a header that expands __COUNTER__ is
   /// written, its copy depending on the counter's value where it began.
+  /// names, ahead and any, for measurement, write the same copies.
   bool CounterMode = false;
-  llvm::DenseSet<SourceLocation::UIntTy> CounterNames;
+  /// CLANG_HEADER_CACHE_COUNTER_PROBE or CLANG_HEADER_CACHE_COUNTER=names:
+  /// what the counter's values were used for is noted in each copy.
+  bool CounterClassify = false;
+  /// The names made from counter values met so far (counterToken).
+  llvm::DenseSet<const IdentifierInfo *> CounterNamesSeen;
+  /// Every name the compile made from a counter value (shareCounterNames).
+  llvm::DenseSet<const IdentifierInfo *> OwnCounterNames;
+  llvm::DenseSet<const IdentifierInfo *> *CounterNames = &OwnCounterNames;
   /// CLANG_HEADER_CACHE_PIECES: the headers begun as bases.
   llvm::DenseSet<FileID> PiecesBases;
   llvm::DenseMap<FileID, std::string> CanonicalOf;
@@ -3579,6 +4368,9 @@ private:
   std::function<void(llvm::StringRef, llvm::StringRef)> ReleaseFn;
   std::function<void(const PushRequest &)> CompareFn;
   std::function<void(llvm::StringRef)> DeclinedFn;
+  /// CLANG_HEADER_CACHE_MERGE (mergeOnly): called once each part is
+  /// written or declined.
+  std::function<void(llvm::StringRef, llvm::StringRef)> MergeDoneFn;
   std::function<void()> FinishedFn;
   llvm::DenseSet<FileID> Tracked;
   bool ObserverSet = false;
@@ -3679,15 +4471,19 @@ PartExporter &PartExporter::install(CompilerInstance &CI,
   // headers inside as submodules (REPORT.md T17,
   // CLANG_HEADER_CACHE_SECTIONS=1).
   // So does linking (CLANG_HEADER_CACHE_LINK), to tell which headers
-  // inside are independent of the one around them, and partial hits
-  // (CLANG_HEADER_CACHE_PARTIAL), to tell which headers a copy left out.
+  // inside are independent of the one around them, partial hits
+  // (CLANG_HEADER_CACHE_PARTIAL), to tell which headers a copy left out,
+  // and CLANG_HEADER_CACHE_GUARD_PLUS=1, to tell which headers a copy holds
+  // read nothing its lines set.
   // Bases and pieces (CLANG_HEADER_CACHE_PIECES) mark each dependency with
   // its piece as the tracker records it, and keep no such reads.
   const char *Link = std::getenv("CLANG_HEADER_CACHE_LINK");
   const char *Partial = std::getenv("CLANG_HEADER_CACHE_PARTIAL");
+  const char *Plus = std::getenv("CLANG_HEADER_CACHE_GUARD_PLUS");
   if ((Ex.sections() && !Ex.pieces()) ||
       (Link && llvm::StringRef(Link) == "1") ||
       (Partial && llvm::StringRef(Partial) == "1") ||
+      (Plus && llvm::StringRef(Plus) == "1") ||
       std::getenv("CLANG_HEADER_CACHE_DDG"))
     T.recordFiles();
   if (Ex.pieces())

@@ -3142,6 +3142,16 @@ uint64_t ASTWriter::WritePartNameReference(ASTContext &Context, const Decl *D) {
   if (!ND)
     return Unnameable("has no name");
 
+  // A parameter, by its function: a type naming one comes from a function
+  // declared outside the part, whose parameters no name finds.
+  if (const auto *Param = dyn_cast<ParmVarDecl>(ND))
+    if (const auto *Fn = dyn_cast<FunctionDecl>(Param->getDeclContext())) {
+      W.push_back(unsigned(NameReferenceKind::Parameter));
+      W.AddDeclRef(Fn);
+      W.push_back(Param->getFunctionScopeIndex());
+      return W.Emit(DECL_NAME_REFERENCE);
+    }
+
   IdentifierInfo *II = ND->getIdentifier();
   bool Member = isa<FieldDecl, IndirectFieldDecl>(ND);
   if (II && !Member) {

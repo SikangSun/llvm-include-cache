@@ -330,6 +330,26 @@ public:
   /// IdentifierTableData.
   std::vector<unsigned> PreloadIdentifierOffsets;
 
+  /// Header cache: for a module (which lists every name it has a
+  /// declaration or a macro for in PreloadIdentifierOffsets), a filter of
+  /// those names' hashes. A lookup of a name the filter lacks finds nothing
+  /// of use here and skips the table.
+  std::vector<uint64_t> InterestingNames;
+  bool ListsInterestingNames = false;
+
+  /// A header cache unit, loaded by ASTReader::ReadASTs: one hit's copies.
+  bool IsHeaderCachePart = false;
+  /// The filter's size in bits, a power of two, less one.
+  uint32_t InterestingNamesMask = 0;
+  bool mayBeInteresting(uint32_t Hash) const {
+    for (uint32_t Bit : {Hash, Hash * 0x9E3779B1u >> 11}) {
+      Bit &= InterestingNamesMask;
+      if (!(InterestingNames[Bit / 64] & (uint64_t(1) << (Bit % 64))))
+        return false;
+    }
+    return true;
+  }
+
   // === Macros ===
 
   /// The cursor to the start of the preprocessor block, which stores

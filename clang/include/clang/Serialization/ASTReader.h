@@ -1172,6 +1172,49 @@ private:
   /// The number of lookups into identifier tables that succeed.
   unsigned NumIdentifierLookupHits = 0;
 
+  /// Header cache: set while the hook loads a hit's copies
+  /// (setReadingHeaderCacheParts); SkipOptions while ReadASTs loads a copy
+  /// after the first (ReadControlBlock).
+  bool ReadingHeaderCacheParts = false;
+
+  /// See getHeaderFileInfoGeneration. Never 0.
+  unsigned HeaderFileInfoGeneration = 1;
+  bool SkipOptions = false;
+
+  /// Header cache, the name table in memory: for each name some loaded
+  /// module lists as interesting (INTERESTING_IDENTIFIERS: a declaration, a
+  /// macro), the modules listing it, in load order. In C a name a compile
+  /// meets first is looked up in every module: a hit of git's loads 116
+  /// module files, and a local variable's name would search all 116
+  /// tables. With this table a lookup reads the modules that list the name,
+  /// and none for a name no module lists, which can find nothing of use.
+  struct NameSlot {
+    uint32_t Hash = 0;
+    uint32_t First = ~0u, Last = ~0u;
+  };
+  struct NamePosting {
+    uint32_t Module, Next;
+  };
+  std::vector<NameSlot> NameSlots;
+  std::vector<NamePosting> NamePostings;
+  unsigned NameSlotsUsed = 0;
+  /// The modules the table covers, the first so many loaded. It stands in
+  /// for a visit of every module only while it covers all of them, and
+  /// while each lists its names (a module, not a PCH) and imports none, so
+  /// that load order is ModuleManager::visit's order.
+  unsigned NameTableModules = 0;
+  bool NameTableUsable = true;
+  void addToNameTable(uint32_t Hash, unsigned Module);
+  const NameSlot *findInNameTable(uint32_t Hash) const;
+  bool useNameTable() const;
+
+  /// Measurement: identifier refreshes, and the cycles their module visits
+  /// took (-print-stats).
+  unsigned NumIdentifierRefreshes = 0;
+  uint64_t IdentifierRefreshCycles = 0;
+  unsigned NumNewNames = 0, NumNewNamesSkipped = 0, NumTableVisits = 0;
+  uint64_t NewNameCycles = 0;
+
   /// The number of selectors that have been read.
   unsigned NumSelectorsRead = 0;
 
@@ -1877,6 +1920,15 @@ public:
                         unsigned ClientLoadCapabilities,
                         ModuleFile **NewLoadedModuleFile = nullptr);
 
+  /// As ReadAST, for several AST files read in one call: one generation,
+  /// one round of finishing work for all of them. \p Loaded gets the
+  /// module file of each name, in order. On failure none stays loaded.
+  /// The header cache loads a hit's linked copies this way.
+  ASTReadResult ReadASTs(ArrayRef<StringRef> FileNames, ModuleKind Type,
+                         SourceLocation ImportLoc,
+                         unsigned ClientLoadCapabilities,
+                         SmallVectorImpl<ModuleFile *> &Loaded);
+
   /// Make the entities in the given module and any of its (non-explicit)
   /// submodules visible to name lookup.
   ///
@@ -2054,6 +2106,12 @@ public:
 
   /// Read the header file information for the given file entry.
   HeaderFileInfo GetHeaderFileInfo(FileEntryRef FE) override;
+
+  /// Changes at the start and at the end of each ReadAST(s) call: header
+  /// file information is in the AST files those load.
+  unsigned getHeaderFileInfoGeneration() const override {
+    return HeaderFileInfoGeneration;
+  }
 
   void ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag);
 
@@ -2650,6 +2708,10 @@ public:
 private:
   /// See setPartSkip.
   std::optional<PartSkip> PendingPartSkip;
+  /// While ReadASTs reads several files, the index of the first: a name
+  /// reference made while they load can find a declaration of another of
+  /// them, before any is visible (findInEveryModule). ~0u otherwise.
+  unsigned LinkBatchBegin = ~0u;
   llvm::SmallPtrSet<const Module *, 16> PartSkippedModules;
   struct PartSkipState {
     llvm::DenseMap<const FileEntry *, bool> Headers;
@@ -2706,6 +2768,11 @@ public:
   /// the reference itself.
   NamedDecl *findInEveryModule(IdentifierInfo &II, bool Tag,
                                const serialization::ModuleFile *From);
+
+  /// Header cache: whether the files the next loads read are header cache
+  /// copies (ModuleFile::IsHeaderCachePart). ReadASTs sets it itself.
+  void setReadingHeaderCacheParts(bool V) { ReadingHeaderCacheParts = V; }
+  bool readingHeaderCacheParts() const { return ReadingHeaderCacheParts; }
 
   /// Makes the header cache part \p MF's file-scope references to \p II, in
   /// the tag name space if \p Tag, resolve to \p D: the declaration the
@@ -2766,6 +2833,12 @@ public:
   /// opened name finds the same file from its directory too.
   StringRef getInputFileLookupName(serialization::ModuleFile &F,
                                    const serialization::InputFileInfo &FI);
+
+  /// Has the source manager know \p File by \p File's name, if it does not
+  /// know the file yet. It names a file, in debug information and
+  /// diagnostics, by the name it was first entered by; a header cache part
+  /// enters its files only as a location in them is first read.
+  void enterFile(FileEntryRef File);
 
   /// Visit all the input file infos of the given module file.
   void visitInputFileInfos(

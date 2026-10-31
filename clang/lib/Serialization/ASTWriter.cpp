@@ -1368,7 +1368,9 @@ void ASTWriter::writeUnhashedControlBlock(Preprocessor &PP) {
   // Diagnostic options.
   const auto &Diags = PP.getDiagnostics();
   const DiagnosticOptions &DiagOpts = Diags.getDiagnosticOptions();
-  if (!HSOpts.ModulesSkipDiagnosticOptions) {
+  // A header cache copy loads as an explicit module, for which the reader
+  // checks neither these options nor the search paths below.
+  if (!HSOpts.ModulesSkipDiagnosticOptions && !isWritingPart()) {
 #define DIAGOPT(Name, Bits, Default) Record.push_back(DiagOpts.Name);
 #define ENUM_DIAGOPT(Name, Type, Bits, Default)                                \
   Record.push_back(static_cast<unsigned>(DiagOpts.get##Name()));
@@ -1386,7 +1388,7 @@ void ASTWriter::writeUnhashedControlBlock(Preprocessor &PP) {
   }
 
   // Header search paths.
-  if (!HSOpts.ModulesSkipHeaderSearchPaths) {
+  if (!HSOpts.ModulesSkipHeaderSearchPaths && !isWritingPart()) {
     // Include entries.
     Record.push_back(HSOpts.UserEntries.size());
     for (unsigned I = 0, N = HSOpts.UserEntries.size(); I != N; ++I) {
@@ -3406,7 +3408,11 @@ void ASTWriter::WritePragmaDiagnosticMappings(const DiagnosticsEngine &Diag,
     }
   };
 
-  AddDiagState(Diag.DiagStatesByLoc.FirstDiagState, isModule);
+  // A header cache copy starts in its loading compile's own state, which
+  // has the same warning flags (ASTReader::ReadPragmaDiagnosticMappings):
+  // the command line's mappings, hundreds for -Wall, are not written.
+  AddDiagState(Diag.DiagStatesByLoc.FirstDiagState,
+               isModule && !isWritingPart());
 
   // Reserve a spot for the number of locations with state transitions.
   auto NumLocationsIdx = Record.size();

@@ -92,6 +92,9 @@ public:
     HasSeenNoTrivialPPDirective =
         0x1000, // Whether we've seen any 'no-trivial' pp-directives before
                 // current position.
+    FromCounter = 0x2000, // Made from a __COUNTER__ expansion's value: the
+                          // number itself, or a token pasted or stringized
+                          // from it.
   };
 
   tok::TokenKind getKind() const { return Kind; }

@@ -39,7 +39,7 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 18;
+constexpr uint32_t DependencyEncodingVersion = 22;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
 /// stored form.
@@ -78,6 +78,7 @@ struct SymbolView {
 struct InclusionView {
   llvm::StringRef HeaderPath;
   InclusionDependency::Reason Why = InclusionDependency::Reason::PragmaOnce;
+  bool WasRead = true;
   uint32_t Cond = 0;
   static InclusionView read(ByteReader &R);
 };
@@ -131,6 +132,12 @@ struct MacroEffectView {
   uint32_t Cond = 0;
   static MacroEffectView read(ByteReader &R);
 };
+/// The llvm::xxh3_64bits of a name, stored so that a loading compile need
+/// not hash it: one per macro effect, in the same order.
+struct NameHashView {
+  uint64_t Hash = 0;
+  static NameHashView read(ByteReader &R);
+};
 /// Elements read only where a copy is used, and rarely there at all, are
 /// read whole.
 struct MacroStackView {
@@ -172,6 +179,19 @@ struct LinkView {
   llvm::SmallVector<llvm::StringRef, 4> Names;
   uint64_t Hash = 0;
   static LinkView read(ByteReader &R);
+};
+/// guard+ tolerance (HeldHeader).
+struct HeldView {
+  llvm::StringRef Path, Guard;
+  llvm::SmallVector<llvm::StringRef, 2> Files;
+  struct Macro {
+    llvm::StringRef Name;
+    bool Defined = true;
+    uint32_t File = 0, Offset = 0;
+  };
+  llvm::SmallVector<Macro, 4> Macros;
+  llvm::SmallVector<llvm::StringRef, 4> Reads;
+  static HeldView read(ByteReader &R);
 };
 
 /// One section of a MetadataView: its elements, read in order as the loop
@@ -308,6 +328,10 @@ public:
   MetadataSection<MacroEffectView> macroEffects() const {
     return section<MacroEffectView>(MacroEffects);
   }
+  /// Each macro effect's name hashed, in the order of macroEffects().
+  MetadataSection<NameHashView> macroEffectHashes() const {
+    return section<NameHashView>(MacroEffectHashes);
+  }
   MetadataSection<DiagnosticView> diagnostics() const {
     return section<DiagnosticView>(Diagnostics);
   }
@@ -330,6 +354,12 @@ public:
   MetadataSection<LeftOutView> leftOut() const {
     return section<LeftOutView>(LeftOut);
   }
+  MetadataSection<NameView> counterNames() const {
+    return section<NameView>(CounterNames);
+  }
+  MetadataSection<HeldView> held() const {
+    return section<HeldView>(HeldHeaders);
+  }
 
   enum Section : unsigned {
     Conditional,
@@ -343,6 +373,7 @@ public:
     FileNames,
     Declarations,
     MacroEffects,
+    MacroEffectHashes,
     Diagnostics,
     WarningPragmas,
     Submodules,
@@ -351,6 +382,8 @@ public:
     Links,
     Declares,
     LeftOut,
+    CounterNames,
+    HeldHeaders,
     Groups,
     NumSections
   };

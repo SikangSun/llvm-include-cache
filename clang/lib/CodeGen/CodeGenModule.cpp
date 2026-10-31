@@ -6143,10 +6143,13 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
                   (!NeedsGlobalCtor && !NeedsGlobalDtor &&
                    D->getType().isConstantStorage(getContext(), true, true)));
 
-  // If it is in a read-only section, mark it 'constant'.
+  // If it is in a read-only section, mark it 'constant'. Sema records a
+  // section as it checks a definition it parses; one only definitions read
+  // from an AST file use is unknown, and the variable's own type decides.
   if (const SectionAttr *SA = D->getAttr<SectionAttr>()) {
-    const ASTContext::SectionInfo &SI = Context.SectionInfos[SA->getName()];
-    if ((SI.SectionFlags & ASTContext::PSF_Write) == 0)
+    auto SI = Context.SectionInfos.find(SA->getName());
+    if (SI != Context.SectionInfos.end() &&
+        (SI->second.SectionFlags & ASTContext::PSF_Write) == 0)
       GV->setConstant(true);
   }
 
@@ -7647,6 +7650,9 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
     if (!ImportedModules.insert(Import->getImportedModule()))
       break;
 
+    if (CGDebugInfo *DI = getModuleDebugInfo())
+      DI->completeImportedRecords();
+
     // Emit debug information for direct imports.
     if (!Import->getImportedOwningModule()) {
       if (CGDebugInfo *DI = getModuleDebugInfo())
@@ -7674,8 +7680,15 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
       if (!EmittedModuleInitializers.insert(Mod).second)
         continue;
 
-      for (auto *D : Context.getModuleInitializers(Mod))
+      for (auto *D : Context.getModuleInitializers(Mod)) {
+        // A header cache copy's initializer, read in for this, was handed
+        // over as it was read: emitted already.
+        if (auto *VD = dyn_cast<VarDecl>(D))
+          if (llvm::GlobalValue *GV = GetGlobalValue(getMangledName(VD));
+              GV && !GV->isDeclaration())
+            continue;
         EmitTopLevelDecl(D);
+      }
 
       // Visit the submodules of this module.
       for (auto *Submodule : Mod->submodules()) {

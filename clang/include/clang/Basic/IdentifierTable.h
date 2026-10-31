@@ -813,6 +813,12 @@ public:
 
   iterator find(StringRef Name) const { return HashTable.find(Name); }
 
+  /// The same, with \p FullHash the name's hash as the table takes it
+  /// (llvm::xxh3_64bits truncated), for a caller that has it already.
+  iterator find(StringRef Name, uint32_t FullHash) const {
+    return HashTable.find(Name, FullHash);
+  }
+
   /// Print some statistics to stderr that indicate how well the
   /// hashing is doing.
   void PrintStats() const;

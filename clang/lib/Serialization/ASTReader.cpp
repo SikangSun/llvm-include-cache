@@ -129,6 +129,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <ctime>
 #include <iterator>
@@ -1723,10 +1724,11 @@ llvm::Error ASTReader::ReadSourceManagerBlock(ModuleFile &F) {
   if (llvm::Error Err = F.Stream.SkipBlock())
     return Err;
 
-  // Enter the source manager block.
-  if (llvm::Error Err = SLocEntryCursor.EnterSubBlock(SOURCE_MANAGER_BLOCK_ID))
+  // Enter the source manager block, its abbreviations read as one run.
+  if (llvm::Error Err =
+          ReadBlockAbbrevs(SLocEntryCursor, SOURCE_MANAGER_BLOCK_ID,
+                           &F.SourceManagerBlockStartOffset))
     return Err;
-  F.SourceManagerBlockStartOffset = SLocEntryCursor.GetCurrentBitNo();
 
   RecordData Record;
   while (true) {
@@ -2057,6 +2059,20 @@ SourceLocation ASTReader::getImportLocation(ModuleFile *F) {
   return F->ImportedBy[0]->FirstLoc;
 }
 
+namespace {
+/// The abbreviation definitions at the top of a block as ReadBlockAbbrevs
+/// last read them for its block ID: their bits, and what they define after
+/// the abbreviations the block had before them. Every AST file one writer
+/// wrote holds the same: with many small files loaded, as the header cache
+/// loads them, reading them again is much of each file's cost.
+struct AbbrevRun {
+  unsigned Before = 0;
+  uint64_t Bits = 0;
+  std::vector<uint8_t> Bytes;
+  std::vector<std::shared_ptr<llvm::BitCodeAbbrev>> Abbrevs;
+};
+} // namespace
+
 /// Enter a subblock of the specified BlockID with the specified cursor. Read
 /// the abbreviations that are at the top of the block and then leave the cursor
 /// pointing into the block.
@@ -2066,8 +2082,27 @@ llvm::Error ASTReader::ReadBlockAbbrevs(BitstreamCursor &Cursor,
   if (llvm::Error Err = Cursor.EnterSubBlock(BlockID))
     return Err;
 
+  uint64_t Start = Cursor.GetCurrentBitNo();
   if (StartOfBlockOffset)
-    *StartOfBlockOffset = Cursor.GetCurrentBitNo();
+    *StartOfBlockOffset = Start;
+
+  // The same definitions as the last block of this ID: taken as read. A
+  // block's contents start on a 32-bit boundary, so its bits are its bytes.
+  ArrayRef<uint8_t> Stream = Cursor.getBitcodeBytes();
+  unsigned Before = Cursor.getCurrentAbbrevs().size();
+  static thread_local llvm::DenseMap<unsigned, AbbrevRun> Runs;
+  AbbrevRun &Run = Runs[BlockID];
+  if (Run.Bits && Run.Before == Before && Start % 8 == 0 &&
+      Start / 8 + Run.Bytes.size() <= Stream.size()) {
+    const uint8_t *At = Stream.data() + Start / 8;
+    size_t Whole = Run.Bits / 8;
+    unsigned Rest = Run.Bits % 8;
+    if (std::memcmp(At, Run.Bytes.data(), Whole) == 0 &&
+        (!Rest || ((At[Whole] ^ Run.Bytes[Whole]) & ((1u << Rest) - 1)) == 0)) {
+      Cursor.addAbbrevs(Run.Abbrevs);
+      return Cursor.JumpToBit(Start + Run.Bits);
+    }
+  }
 
   while (true) {
     uint64_t Offset = Cursor.GetCurrentBitNo();
@@ -2080,6 +2115,16 @@ llvm::Error ASTReader::ReadBlockAbbrevs(BitstreamCursor &Cursor,
     if (Code != llvm::bitc::DEFINE_ABBREV) {
       if (llvm::Error Err = Cursor.JumpToBit(Offset))
         return Err;
+      if (Start % 8 == 0 && Offset > Start &&
+          (Offset + 7) / 8 <= Stream.size()) {
+        Run.Before = Before;
+        Run.Bits = Offset - Start;
+        Run.Bytes.assign(Stream.data() + Start / 8,
+                         Stream.data() + (Offset + 7) / 8);
+        ArrayRef<std::shared_ptr<llvm::BitCodeAbbrev>> Now =
+            Cursor.getCurrentAbbrevs();
+        Run.Abbrevs.assign(Now.begin() + Before, Now.end());
+      }
       return llvm::Error::success();
     }
     if (llvm::Error Err = Cursor.ReadAbbrevRecord())
@@ -2478,6 +2523,13 @@ namespace {
   class IdentifierLookupVisitor {
     StringRef Name;
     unsigned NameHash;
+    bool UseFilters = [] {
+      static const bool Use = [] {
+        const char *E = getenv("CLANG_HEADER_CACHE_NAME_FILTER");
+        return !E || StringRef(E) != "0";
+      }();
+      return Use;
+    }();
     unsigned PriorGeneration;
     unsigned &NumIdentifierLookups;
     unsigned &NumIdentifierLookupHits;
@@ -2500,6 +2552,10 @@ namespace {
       ASTIdentifierLookupTable *IdTable
         = (ASTIdentifierLookupTable *)M.IdentifierLookupTable;
       if (!IdTable)
+        return false;
+      // A module has nothing of use for a name it does not list.
+      if (UseFilters && M.ListsInterestingNames &&
+          !M.mayBeInteresting(NameHash))
         return false;
 
       ASTIdentifierLookupTrait Trait(IdTable->getInfoObj().getReader(), M,
@@ -2529,6 +2585,71 @@ namespace {
 
 } // namespace
 
+static uint32_t mixNameHash(uint32_t H) {
+  H ^= H >> 16;
+  H *= 0x85ebca6bu;
+  H ^= H >> 13;
+  H *= 0xc2b2ae35u;
+  return H ^ (H >> 16);
+}
+
+void ASTReader::addToNameTable(uint32_t Hash, unsigned Module) {
+  if (NameSlotsUsed * 2 >= NameSlots.size()) {
+    std::vector<NameSlot> Old = std::move(NameSlots);
+    NameSlots.assign(std::max<size_t>(4096, Old.size() * 2), NameSlot());
+    size_t Mask = NameSlots.size() - 1;
+    for (const NameSlot &S : Old)
+      if (S.First != ~0u)
+        for (size_t I = mixNameHash(S.Hash) & Mask;; I = (I + 1) & Mask)
+          if (NameSlots[I].First == ~0u) {
+            NameSlots[I] = S;
+            break;
+          }
+  }
+  size_t Mask = NameSlots.size() - 1;
+  for (size_t I = mixNameHash(Hash) & Mask;; I = (I + 1) & Mask) {
+    NameSlot &S = NameSlots[I];
+    if (S.First == ~0u) {
+      S.Hash = Hash;
+      S.First = S.Last = NamePostings.size();
+      NamePostings.push_back({Module, ~0u});
+      ++NameSlotsUsed;
+      return;
+    }
+    if (S.Hash != Hash)
+      continue;
+    // A module lists a name once, but two of its names can share a hash.
+    if (NamePostings[S.Last].Module == Module)
+      return;
+    NamePostings[S.Last].Next = NamePostings.size();
+    S.Last = NamePostings.size();
+    NamePostings.push_back({Module, ~0u});
+    return;
+  }
+}
+
+const ASTReader::NameSlot *ASTReader::findInNameTable(uint32_t Hash) const {
+  if (NameSlots.empty())
+    return nullptr;
+  size_t Mask = NameSlots.size() - 1;
+  for (size_t I = mixNameHash(Hash) & Mask;; I = (I + 1) & Mask) {
+    const NameSlot &S = NameSlots[I];
+    if (S.First == ~0u)
+      return nullptr;
+    if (S.Hash == Hash)
+      return &S;
+  }
+}
+
+bool ASTReader::useNameTable() const {
+  static const bool Use = [] {
+    const char *E = getenv("CLANG_HEADER_CACHE_NAME_FILTER");
+    return !E || StringRef(E) != "0";
+  }();
+  return Use && NameTableUsable && NameTableModules &&
+         NameTableModules == ModuleMgr.size();
+}
+
 void ASTReader::updateOutOfDateIdentifier(const IdentifierInfo &II) {
   // Note that we are loading an identifier.
   Deserializing AnIdentifier(this);
@@ -2550,7 +2671,17 @@ void ASTReader::updateOutOfDateIdentifier(const IdentifierInfo &II) {
   IdentifierLookupVisitor Visitor(II.getName(), PriorGeneration,
                                   NumIdentifierLookups,
                                   NumIdentifierLookupHits);
-  ModuleMgr.visit(Visitor, HitsPtr);
+  uint64_t Start = __builtin_ia32_rdtsc();
+  if (useNameTable()) {
+    if (const NameSlot *S =
+            findInNameTable(ASTIdentifierLookupTrait::ComputeHash(II.getName())))
+      for (uint32_t P = S->First; P != ~0u; P = NamePostings[P].Next)
+        Visitor(ModuleMgr[NamePostings[P].Module]);
+  } else {
+    ModuleMgr.visit(Visitor, HitsPtr);
+  }
+  IdentifierRefreshCycles += __builtin_ia32_rdtsc() - Start;
+  ++NumIdentifierRefreshes;
   markIdentifierUpToDate(&II);
 }
 
@@ -3163,8 +3294,10 @@ ASTReader::ReadControlBlock(ModuleFile &F,
   auto readUnhashedControlBlockOnce = [&]() {
     if (!HasReadUnhashedControlBlock) {
       HasReadUnhashedControlBlock = true;
-      if (ASTReadResult Result =
-              readUnhashedControlBlock(F, ImportedBy, ClientLoadCapabilities))
+      // A header cache hit's copy after the first is checked as an import
+      // is: its diagnostic options were the first's (ReadASTs).
+      if (ASTReadResult Result = readUnhashedControlBlock(
+              F, ImportedBy || SkipOptions, ClientLoadCapabilities))
         return Result;
     }
     return Success;
@@ -3265,8 +3398,10 @@ ASTReader::ReadControlBlock(ModuleFile &F,
       case OPTIONS_BLOCK_ID:
         // If we're reading the first module for this group, check its options
         // are compatible with ours. For modules it imports, no further checking
-        // is required, because we checked them when we built it.
-        if (Listener && !ImportedBy) {
+        // is required, because we checked them when we built it. Nor for a
+        // header cache hit's copies after the first (ReadASTs): each was used
+        // in the compile that wrote the copy linking it.
+        if (Listener && !ImportedBy && !SkipOptions) {
           // Should we allow the configuration of the module file to differ from
           // the configuration of the current translation unit in a compatible
           // way?
@@ -3360,7 +3495,8 @@ ASTReader::ReadControlBlock(ModuleFile &F,
 
       F.HasTimestamps = Record[6];
 
-      const std::string &CurBranch = getClangFullRepositoryVersion();
+      // Built once: every AST file read compares it.
+      static const std::string CurBranch = getClangFullRepositoryVersion();
       StringRef ASTBranch = Blob;
       if (StringRef(CurBranch) != ASTBranch && !DisableValidation) {
         if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0)
@@ -3656,15 +3792,19 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
           PP.getPreprocessingRecord()->SetExternalSource(*this);
         break;
 
-      case SOURCE_MANAGER_BLOCK_ID:
+      case SOURCE_MANAGER_BLOCK_ID: {
+        llvm::TimeTraceScope Scope("ReadAST SourceManager");
         if (llvm::Error Err = ReadSourceManagerBlock(F))
           return Err;
         break;
+      }
 
-      case SUBMODULE_BLOCK_ID:
+      case SUBMODULE_BLOCK_ID: {
+        llvm::TimeTraceScope Scope("ReadAST Submodules");
         if (llvm::Error Err = ReadSubmoduleBlock(F, ClientLoadCapabilities))
           return Err;
         break;
+      }
 
       case COMMENTS_BLOCK_ID: {
         BitstreamCursor C = Stream;
@@ -4846,11 +4986,26 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
                                             SourceLocation ImportLoc,
                                             unsigned ClientLoadCapabilities,
                                             ModuleFile **NewLoadedModuleFile) {
-  llvm::TimeTraceScope scope("ReadAST", FileName);
+  SmallVector<ModuleFile *, 1> Loaded;
+  ASTReadResult Result =
+      ReadASTs(FileName, Type, ImportLoc, ClientLoadCapabilities, Loaded);
+  if (NewLoadedModuleFile && !Loaded.empty())
+    *NewLoadedModuleFile = Loaded.back();
+  return Result;
+}
+
+ASTReader::ASTReadResult
+ASTReader::ReadASTs(ArrayRef<StringRef> FileNames, ModuleKind Type,
+                    SourceLocation ImportLoc, unsigned ClientLoadCapabilities,
+                    SmallVectorImpl<ModuleFile *> &NewLoadedModuleFiles) {
+  llvm::TimeTraceScope scope("ReadAST", FileNames.front());
 
   llvm::SaveAndRestore SetCurImportLocRAII(CurrentImportLoc, ImportLoc);
   llvm::SaveAndRestore<std::optional<ModuleKind>> SetCurModuleKindRAII(
       CurrentDeserializingModuleKind, Type);
+  // Set until the deferred work below has run, at the end of the call.
+  llvm::SaveAndRestore<unsigned> SetBatchRAII(
+      LinkBatchBegin, FileNames.size() > 1 ? ModuleMgr.size() : ~0u);
 
   // Defer any pending actions until we get to the end of reading the AST file.
   Deserializing AnASTFile(this);
@@ -4860,17 +5015,40 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
   if (ContextObj)
     PreviousGeneration = incrementGeneration(*ContextObj);
 
+  // A file the files read here have header file information for may have
+  // had none before, whether the call succeeds or modules are removed.
+  auto NextHeaderFileInfo = [this] {
+    if (!++HeaderFileInfoGeneration)
+      ++HeaderFileInfoGeneration;
+  };
+  NextHeaderFileInfo();
+  auto AtEnd = llvm::make_scope_exit(NextHeaderFileInfo);
+
   unsigned NumModules = ModuleMgr.size();
   SmallVector<ImportedModule, 4> Loaded;
   std::optional<llvm::TimeTraceScope> CoreScope;
   CoreScope.emplace("ReadAST Core");
-  ASTReadResult CoreResult =
-      ReadASTCore(FileName, Type, ImportLoc,
-                  /*ImportedBy=*/nullptr, Loaded, 0, 0, ASTFileSignature(),
-                  ClientLoadCapabilities);
+  ASTReadResult CoreResult = Success;
+  for (StringRef FileName : FileNames) {
+    static const bool CheckEach = [] {
+      const char *E = getenv("CLANG_HEADER_CACHE_CHECK_EACH");
+      return E && StringRef(E) == "1";
+    }();
+    llvm::SaveAndRestore SkipRAII(
+        SkipOptions, !CheckEach && FileName != FileNames.front());
+    CoreResult = ReadASTCore(FileName, Type, ImportLoc,
+                             /*ImportedBy=*/nullptr, Loaded, 0, 0,
+                             ASTFileSignature(), ClientLoadCapabilities);
+    if (CoreResult != Success)
+      break;
+    // The file named, loaded after the files it imports.
+    if (!Loaded.empty())
+      NewLoadedModuleFiles.push_back(Loaded.back().Mod);
+  }
   CoreScope.reset();
   if (ASTReadResult ReadResult = CoreResult) {
     ModuleMgr.removeModules(ModuleMgr.begin() + NumModules);
+    NewLoadedModuleFiles.clear();
 
     // If we find that any modules are unusable, the global index is going
     // to be out-of-date. Just remove it.
@@ -4878,9 +5056,6 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
     ModuleMgr.setGlobalIndex(nullptr);
     return ReadResult;
   }
-
-  if (NewLoadedModuleFile && !Loaded.empty())
-    *NewLoadedModuleFile = Loaded.back().Mod;
 
   // Here comes stuff that we only do once the entire chain is loaded. Do *not*
   // remove modules from this point. Various fields are updated during reading
@@ -4933,8 +5108,35 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
     if (F.OriginalSourceFileID.isValid())
       F.OriginalSourceFileID = TranslateFileID(F, F.OriginalSourceFileID);
 
+    // Only a module lists its interesting names (ASTWriter).
+    F.ListsInterestingNames =
+        !PP.getLangOpts().CPlusPlus &&
+        (F.Kind == MK_ImplicitModule || F.Kind == MK_ExplicitModule ||
+         F.Kind == MK_PrebuiltModule);
+    if (!F.ListsInterestingNames || !F.Imports.empty())
+      NameTableUsable = false;
+    if (F.ListsInterestingNames) {
+      F.InterestingNames.assign(
+          std::max<uint64_t>(1, llvm::PowerOf2Ceil(
+                                    F.PreloadIdentifierOffsets.size() * 16) /
+                                    64),
+          0);
+      F.InterestingNamesMask = F.InterestingNames.size() * 64 - 1;
+    }
     for (auto Offset : F.PreloadIdentifierOffsets) {
       const unsigned char *Data = F.IdentifierTableData + Offset;
+      // The on-disk table stores each name's hash just before the name's
+      // key and data lengths, where the offset points.
+      if (F.ListsInterestingNames) {
+        uint32_t Hash =
+            llvm::support::endian::read32le(Data - sizeof(uint32_t));
+        if (NameTableUsable)
+          addToNameTable(Hash, F.Index);
+        for (uint32_t Bit : {Hash, Hash * 0x9E3779B1u >> 11}) {
+          Bit &= F.InterestingNamesMask;
+          F.InterestingNames[Bit / 64] |= uint64_t(1) << (Bit % 64);
+        }
+      }
 
       ASTIdentifierLookupTrait Trait(*this, F);
       auto KeyDataLen = Trait.ReadKeyDataLength(Data);
@@ -4971,6 +5173,10 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
       auto ID = Trait.ReadIdentifierID(Data + KeyDataLen.first);
       SetIdentifierInfo(ID, II);
     }
+    if (NameTableUsable && F.Index == NameTableModules)
+      ++NameTableModules;
+    else
+      NameTableUsable = false;
   }
 
   PreloadScope.reset();
@@ -5040,11 +5246,15 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName, ModuleKind Type,
   // Might be unnecessary as use declarations are only used to build the
   // module itself.
 
-  if (ContextObj)
+  if (ContextObj) {
+    llvm::TimeTraceScope Scope("ReadAST InitializeContext");
     InitializeContext();
+  }
 
-  if (SemaObj)
+  if (SemaObj) {
+    llvm::TimeTraceScope Scope("ReadAST UpdateSema");
     UpdateSema();
+  }
 
   if (DeserializationListener)
     DeserializationListener->ReaderInitialized(this);
@@ -5189,6 +5399,7 @@ ASTReader::ReadASTCore(StringRef FileName,
       MC.tryToDropPCM(FileName);
   });
   ModuleFile &F = *M;
+  F.IsHeaderCachePart = ReadingHeaderCacheParts;
   BitstreamCursor &Stream = F.Stream;
   Stream = BitstreamCursor(PCHContainerRdr.ExtractPCH(*F.Buffer));
   F.SizeInBits = F.Buffer->getBufferSize() * 8;
@@ -6182,8 +6393,8 @@ bool ASTReader::isAcceptableASTFile(
 
 llvm::Error ASTReader::ReadSubmoduleBlock(ModuleFile &F,
                                           unsigned ClientLoadCapabilities) {
-  // Enter the submodule block.
-  if (llvm::Error Err = F.Stream.EnterSubBlock(SUBMODULE_BLOCK_ID))
+  // Enter the submodule block, its abbreviations read as one run.
+  if (llvm::Error Err = ReadBlockAbbrevs(F.Stream, SUBMODULE_BLOCK_ID))
     return Err;
 
   ModuleMap &ModMap = PP.getHeaderSearchInfo().getModuleMap();
@@ -7114,7 +7325,12 @@ void ASTReader::ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag) {
 
     // Read the first state.
     DiagState *FirstState;
-    if (F.Kind == MK_ImplicitModule) {
+    // A header cache copy is served only under the compile's own warning
+    // flags, so it starts in the compile's first state, as an implicit
+    // module does: its writer leaves out the command line's mappings
+    // (ASTWriter::WritePragmaDiagnosticMappings), hundreds for each of the
+    // 116 copies a hit of git's loads.
+    if (F.Kind == MK_ImplicitModule || F.IsHeaderCachePart) {
       // Implicitly-built modules are reused with different diagnostic
       // settings.  Use the initial diagnostic state from Diag to simulate this
       // compilation's diagnostic settings.
@@ -8499,10 +8715,27 @@ NamedDecl *ASTReader::findInEveryModule(IdentifierInfo &II, bool Tag,
     if (NamedDecl *D = lookupAtFileScope(*SemaObj, II, Tag,
                                          /*CreateBuiltin=*/false))
       return D;
+  unsigned IDNS = Tag ? Decl::IDNS_Tag : Decl::IDNS_Ordinary;
+  // A header cache hit loads a copy and the copies it links with one call,
+  // and a link's declaration can be read before any of their modules is
+  // visible. The declaration it names in the lines around it, in another
+  // of those modules, is in the chain then, hidden. Only those: a module
+  // loaded by a hit that failed stays hidden for good.
+  if (SemaObj && LinkBatchBegin != ~0u)
+    for (auto I = SemaObj->IdResolver.begin(&II),
+              E = SemaObj->IdResolver.end();
+         I != E; ++I) {
+      NamedDecl *D = *I;
+      if (!D->isFromASTFile() || !D->isInIdentifierNamespace(IDNS) ||
+          !isAtFileScope(D))
+        continue;
+      const ModuleFile *MF = getOwningModuleFile(D);
+      if (MF && MF != From && MF->Index >= LinkBatchBegin)
+        return D;
+    }
   auto It = PendingIdentifierInfos.find(&II);
   if (It == PendingIdentifierInfos.end())
     return nullptr;
-  unsigned IDNS = Tag ? Decl::IDNS_Tag : Decl::IDNS_Ordinary;
   SmallVector<GlobalDeclID, 4> IDs(It->second.begin(), It->second.end());
   NamedDecl *Found = nullptr;
   for (GlobalDeclID ID : IDs)
@@ -9075,6 +9308,17 @@ void ASTReader::PrintStats() {
                  "  %u / %u identifier table lookups succeeded (%f%%)\n",
                  NumIdentifierLookupHits, NumIdentifierLookups,
                  (double)NumIdentifierLookupHits*100.0/NumIdentifierLookups);
+  if (NumNewNames)
+    std::fprintf(stderr,
+                 "  %u new names looked up (%u in no module's list, %u module "
+                 "reads) in %llu cycles\n",
+                 NumNewNames, NumNewNamesSkipped, NumTableVisits,
+                 (unsigned long long)NewNameCycles);
+  if (NumIdentifierRefreshes)
+    std::fprintf(stderr,
+                 "  %u identifier refreshes visited modules in %llu cycles\n",
+                 NumIdentifierRefreshes,
+                 (unsigned long long)IdentifierRefreshCycles);
 
   if (GlobalIndex) {
     std::fprintf(stderr, "\n");
@@ -9301,6 +9545,26 @@ IdentifierInfo *ASTReader::get(StringRef Name) {
       if (Visitor(*F))
         break;
   } else {
+    uint64_t Start = __builtin_ia32_rdtsc();
+    ++NumNewNames;
+    if (useNameTable()) {
+      // No module lists the name: what a lookup would find is at most the
+      // name itself (a parameter's, a member's), which the identifier table
+      // makes as well.
+      if (const NameSlot *S =
+              findInNameTable(ASTIdentifierLookupTrait::ComputeHash(Name))) {
+        for (uint32_t P = S->First; P != ~0u; P = NamePostings[P].Next) {
+          ++NumTableVisits;
+          Visitor(ModuleMgr[NamePostings[P].Module]);
+        }
+      } else {
+        ++NumNewNamesSkipped;
+      }
+      NewNameCycles += __builtin_ia32_rdtsc() - Start;
+      IdentifierInfo *II = Visitor.getIdentifierInfo();
+      markIdentifierUpToDate(II);
+      return II;
+    }
     // If there is a global index, look there first to determine which modules
     // provably do not have any results for this identifier.
     GlobalModuleIndex::HitSet Hits;
@@ -9312,6 +9576,7 @@ IdentifierInfo *ASTReader::get(StringRef Name) {
     }
 
     ModuleMgr.visit(Visitor, HitsPtr);
+    NewNameCycles += __builtin_ia32_rdtsc() - Start;
   }
 
   IdentifierInfo *II = Visitor.getIdentifierInfo();
@@ -10540,6 +10805,10 @@ StringRef ASTReader::getInputFileLookupName(ModuleFile &F,
     return Opened;
   auto Here = FileMgr.getOptionalFileRef(Opened, /*OpenFile=*/false);
   return Here && *Here == *Real ? Opened : Absolute;
+}
+
+void ASTReader::enterFile(FileEntryRef File) {
+  SourceMgr.getOrCreateContentCache(File);
 }
 
 void ASTReader::visitInputFileInfos(

@@ -2818,6 +2818,12 @@ public:
   /// position information.
   const ASTRecordLayout &getASTRecordLayout(const RecordDecl *D) const;
 
+  /// Whether the layout of record \p D is computed already.
+  bool hasComputedRecordLayout(const RecordDecl *D) const {
+    const RecordDecl *Def = D->getDefinition();
+    return Def && ASTRecordLayouts.count(Def);
+  }
+
   /// Get or compute information about the layout of the specified
   /// Objective-C interface.
   const ASTRecordLayout &getASTObjCInterfaceLayout(const ObjCInterfaceDecl *D)

@@ -8,6 +8,7 @@
 
 #include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/xxhash.h"
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -150,7 +151,8 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   for (const InclusionDependency &D : Deps.Inclusion) {
     Mark(D.Cond);
     W.str(D.HeaderPath);
-    W.u8(static_cast<uint8_t>(D.Why));
+    // The high bit: the file was read inside the header, not before it.
+    W.u8(static_cast<uint8_t>(D.Why) | (D.WasRead ? 0 : 0x80));
     W.vu32(D.Cond);
   }
 
@@ -219,6 +221,9 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.u8(E.Defined ? 1 : 0);
     W.vu32(E.Cond);
   }
+  Begin(MetadataView::MacroEffectHashes, Deps.MacroEffects.size());
+  for (const MacroEffect &E : Deps.MacroEffects)
+    W.u64(llvm::xxh3_64bits(E.Name));
 
   Begin(MetadataView::Diagnostics, Deps.Diagnostics.size());
   for (const SavedDiagnostic &D : Deps.Diagnostics) {
@@ -300,6 +305,31 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     W.u32(L.At);
   }
 
+  Begin(MetadataView::CounterNames, Deps.CounterNames.size());
+  for (const std::string &N : Deps.CounterNames) {
+    W.str(N);
+    W.vu32(0);
+  }
+
+  Begin(MetadataView::HeldHeaders, Deps.Held.size());
+  for (const HeldHeader &H : Deps.Held) {
+    W.str(H.Path);
+    W.str(H.Guard);
+    W.vu32(H.Files.size());
+    for (const std::string &F : H.Files)
+      W.str(F);
+    W.vu32(H.Macros.size());
+    for (const HeldHeader::Macro &M : H.Macros) {
+      W.str(M.Name);
+      W.u8(M.Defined ? 1 : 0);
+      W.vu32(M.File);
+      W.u32(M.Offset);
+    }
+    W.vu32(H.Reads.size());
+    for (const std::string &N : H.Reads)
+      W.str(N);
+  }
+
   if (Unsorted)
     G = 0;
   Begin(MetadataView::Groups, G);
@@ -359,8 +389,12 @@ SymbolView SymbolView::read(ByteReader &R) {
 InclusionView InclusionView::read(ByteReader &R) {
   InclusionView D;
   D.HeaderPath = R.str();
-  D.Why = static_cast<InclusionDependency::Reason>(
-      upTo(R, static_cast<uint8_t>(InclusionDependency::Reason::Import)));
+  uint8_t Why = R.u8();
+  D.WasRead = !(Why & 0x80);
+  Why &= 0x7f;
+  if (Why > static_cast<uint8_t>(InclusionDependency::Reason::Import))
+    R.fail();
+  D.Why = static_cast<InclusionDependency::Reason>(Why);
   D.Cond = R.vu32();
   return D;
 }
@@ -434,6 +468,8 @@ MacroEffectView MacroEffectView::read(ByteReader &R) {
   return E;
 }
 
+NameHashView NameHashView::read(ByteReader &R) { return {R.u64()}; }
+
 MacroStackView MacroStackView::read(ByteReader &R) {
   MacroStackView Out;
   MacroStackEffect &E = Out.Effect;
@@ -490,6 +526,25 @@ LinkView LinkView::read(ByteReader &R) {
     L.Names.push_back(R.str());
   L.Hash = R.u64();
   return L;
+}
+
+HeldView HeldView::read(ByteReader &R) {
+  HeldView H;
+  H.Path = R.str();
+  H.Guard = R.str();
+  for (uint32_t I = 0, N = R.vu32(); I != N && R.ok(); ++I)
+    H.Files.push_back(R.str());
+  for (uint32_t I = 0, N = R.vu32(); I != N && R.ok(); ++I) {
+    HeldView::Macro M;
+    M.Name = R.str();
+    M.Defined = upTo(R, 1) != 0;
+    M.File = R.vu32();
+    M.Offset = R.u32();
+    H.Macros.push_back(M);
+  }
+  for (uint32_t I = 0, N = R.vu32(); I != N && R.ok(); ++I)
+    H.Reads.push_back(R.str());
+  return H;
 }
 
 ConditionView ConditionView::read(ByteReader &R) {
@@ -572,10 +627,25 @@ bool MetadataView::validate() const {
       !macroStacks().valid() || !inclusion().valid() || !notAMacro().valid() ||
       !symbol().valid() || !files().valid() || !includes().valid() ||
       !fileNames().valid() || !declarations().valid() ||
-      !macroEffects().valid() || !diagnostics().valid() ||
+      !macroEffects().valid() || !macroEffectHashes().valid() ||
+      !diagnostics().valid() ||
       !warningPragmas().valid() || !submodules().valid() ||
       !conditions().valid() || !provided().valid() || !links().valid() ||
-      !declares().valid() || !leftOut().valid())
+      !declares().valid() || !leftOut().valid() || !counterNames().valid() ||
+      !held().valid())
+    return false;
+  // A held header names its file; each macro it left names itself and,
+  // where defined, one of the header's files; each name it read is one.
+  if (llvm::any_of(held(), [](const HeldView &H) {
+        return H.Path.empty() ||
+               llvm::any_of(H.Macros,
+                            [&](const HeldView::Macro &M) {
+                              return M.Name.empty() ||
+                                     (M.Defined && M.File >= H.Files.size());
+                            }) ||
+               llvm::any_of(H.Reads,
+                            [](llvm::StringRef N) { return N.empty(); });
+      }))
     return false;
   // A left-out header names its guard, which decides whether to plug it
   // in, and its file and spelling, which plug it in.
@@ -598,6 +668,18 @@ bool MetadataView::validate() const {
       llvm::any_of(macroEffects(),
                    [](const MacroEffectView &E) { return E.Name.empty(); }))
     return false;
+  // A loading compile takes a macro's name by its hash: a wrong one would
+  // replay another macro.
+  {
+    auto H = macroEffectHashes().begin(), HE = macroEffectHashes().end();
+    for (const MacroEffectView &E : macroEffects()) {
+      if (H == HE || (*H).Hash != llvm::xxh3_64bits(E.Name))
+        return false;
+      ++H;
+    }
+    if (H != HE)
+      return false;
+  }
   // An #include names its includer, and a __FILE__ its file, by the index
   // of an #include before it; anything else would send a hit's lookups to
   // the wrong place.
@@ -704,7 +786,7 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
   for (const MacroStackView &E : V->macroStacks())
     Deps.MacroStacks.push_back(E.Effect);
   for (const InclusionView &D : V->inclusion())
-    Deps.Inclusion.push_back({D.HeaderPath.str(), D.Why, D.Cond});
+    Deps.Inclusion.push_back({D.HeaderPath.str(), D.Why, D.WasRead, D.Cond});
   for (const SymbolView &D : V->symbol())
     Deps.Symbol.push_back(
         {D.Name.str(), D.Classification, D.ResolvedTypeName.str(), D.Cond});
@@ -741,6 +823,18 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
   }
   for (const NameView &N : V->declares())
     Deps.Declares.push_back(N.Name.str());
+  for (const NameView &N : V->counterNames())
+    Deps.CounterNames.push_back(N.Name.str());
+  for (const HeldView &H : V->held()) {
+    HeldHeader Out{H.Path.str(), H.Guard.str(), {}, {}, {}};
+    for (llvm::StringRef F : H.Files)
+      Out.Files.push_back(F.str());
+    for (const HeldView::Macro &M : H.Macros)
+      Out.Macros.push_back({M.Name.str(), M.Defined, M.File, M.Offset});
+    for (llvm::StringRef N : H.Reads)
+      Out.Reads.push_back(N.str());
+    Deps.Held.push_back(std::move(Out));
+  }
   for (const LinkView &L : V->links()) {
     LinkRecord R{L.Path.str(), L.Module.str(), L.Guard.str(), L.OnGuard, {},
                  L.Hash};

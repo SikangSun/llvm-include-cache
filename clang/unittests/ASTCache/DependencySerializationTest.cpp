@@ -414,6 +414,31 @@ HeaderDependencySet makeSubmoduleSet() {
   return D;
 }
 
+TEST(DependencySerializationTest, HeldHeadersRoundTrip) {
+  // CLANG_HEADER_CACHE_GUARD_PLUS=1: pyport.h, held by Python.h's copy,
+  // left PY_SSIZE_T_MAX defined in pyport.h and Py_DEBUG undefined, and
+  // read HAVE_SSIZE_T from outside the copy.
+  HeaderDependencySet D = makeFullSet();
+  HeldHeader H;
+  H.Path = "/src/cpython/Include/pyport.h";
+  H.Guard = "Py_PYPORT_H";
+  H.Files = {"/src/cpython/Include/pyport.h"};
+  H.Macros.push_back({"PY_SSIZE_T_MAX", true, 0, 1234});
+  H.Macros.push_back({"Py_DEBUG", false, 0, 0});
+  H.Reads = {"HAVE_SSIZE_T"};
+  D.Held.push_back(H);
+  D.Held.push_back({"/usr/include/once.h", "", {}, {}, {}});
+  auto Decoded = decodeDependencySet(encode(D));
+  ASSERT_TRUE(Decoded.has_value());
+  expectEqual(D, *Decoded);
+  EXPECT_EQ(Decoded->Held, D.Held);
+
+  // A macro defined in a file the header does not list would be compared
+  // with nothing.
+  D.Held[0].Macros[0].File = 1;
+  EXPECT_FALSE(decodeDependencySet(encode(D)).has_value());
+}
+
 TEST(DependencySerializationTest, LeftOutHeadersAndTheirConditionsRoundTrip) {
   // hex.h's copy left out hash.h: what it takes from hash.h applies only
   // where hash.h is not plugged in first (CLANG_HEADER_CACHE_PARTIAL).

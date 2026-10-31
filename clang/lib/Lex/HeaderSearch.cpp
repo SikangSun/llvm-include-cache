@@ -1374,13 +1374,27 @@ static void mergeHeaderFileInfo(HeaderFileInfo &HFI,
   HFI.IsValid = true;
 }
 
+bool HeaderSearch::shouldAskExternal(unsigned UID) const {
+  unsigned Generation = ExternalSource->getHeaderFileInfoGeneration();
+  if (!Generation)
+    return true;
+  if (UID >= ExternalHadNothingAt.size())
+    ExternalHadNothingAt.resize(UID + 1);
+  if (ExternalHadNothingAt[UID] == Generation)
+    return false;
+  // Read only if the source has nothing: a file it has something for is
+  // resolved and not asked about again.
+  ExternalHadNothingAt[UID] = Generation;
+  return true;
+}
+
 HeaderFileInfo &HeaderSearch::getFileInfo(FileEntryRef FE) {
   if (FE.getUID() >= FileInfo.size())
     FileInfo.resize(FE.getUID() + 1);
 
   HeaderFileInfo *HFI = &FileInfo[FE.getUID()];
   // FIXME: Use a generation count to check whether this is really up to date.
-  if (ExternalSource && !HFI->Resolved) {
+  if (ExternalSource && !HFI->Resolved && shouldAskExternal(FE.getUID())) {
     auto ExternalHFI = ExternalSource->GetHeaderFileInfo(FE);
     if (ExternalHFI.IsValid) {
       HFI->Resolved = true;
@@ -1396,6 +1410,15 @@ HeaderFileInfo &HeaderSearch::getFileInfo(FileEntryRef FE) {
   return *HFI;
 }
 
+void HeaderSearch::markLocallyIncluded(FileEntryRef FE) {
+  if (FE.getUID() >= FileInfo.size())
+    FileInfo.resize(FE.getUID() + 1);
+  HeaderFileInfo &HFI = FileInfo[FE.getUID()];
+  HFI.IsValid = true;
+  HFI.External = false;
+  HFI.IsLocallyIncluded = true;
+}
+
 const HeaderFileInfo *HeaderSearch::getExistingFileInfo(FileEntryRef FE) const {
   HeaderFileInfo *HFI;
   if (ExternalSource) {
@@ -1404,7 +1427,7 @@ const HeaderFileInfo *HeaderSearch::getExistingFileInfo(FileEntryRef FE) const {
 
     HFI = &FileInfo[FE.getUID()];
     // FIXME: Use a generation count to check whether this is really up to date.
-    if (!HFI->Resolved) {
+    if (!HFI->Resolved && shouldAskExternal(FE.getUID())) {
       auto ExternalHFI = ExternalSource->GetHeaderFileInfo(FE);
       if (ExternalHFI.IsValid) {
         HFI->Resolved = true;

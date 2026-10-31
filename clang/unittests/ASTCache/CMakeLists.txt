@@ -13,6 +13,7 @@ add_clang_unittest(ASTCacheTests
   clangAST
   clangASTCache
   clangBasic
+  clangCodeGen
   clangFrontend
   clangLex
   clangSema
@@ -22,5 +23,6 @@ add_clang_unittest(ASTCacheTests
   LLVMTestingAnnotations
   LLVMTestingSupport
   LLVM_COMPONENTS
+  Core
   Support
   )

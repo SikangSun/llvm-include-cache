@@ -32,7 +32,17 @@ CacheDaemon::create(llvm::StringRef RegionPath, uint64_t RegionSize,
   D->Region = std::move(*R);
   D->RegionPath = std::string(Absolute);
   D->Opts = Opts;
+  if (D->Opts.FixedAskList) {
+    for (const std::string &P : *D->Opts.FixedAskList)
+      D->listLocked(P);
+    D->publishLocked();
+  }
   return D;
+}
+
+std::vector<std::string> CacheDaemon::askList() const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  return Listed;
 }
 
 bool CacheDaemon::listLocked(llvm::StringRef Path) {
@@ -82,6 +92,10 @@ void CacheDaemon::learnLocked(uint64_t Build,
                               const std::vector<uint64_t> &Used) {
   for (uint64_t U : Used) {
     LastUsed[U] = ++UseClock;
+    if (uint64_t R = RecordOf.lookup(U)) {
+      Region.stampCopy(R, UseClock);
+      Region.countServe(R);
+    }
     Usage &X = Usages[U];
     uint64_t C = Counters.TimingReports;
     ++X.Uses;
@@ -94,6 +108,8 @@ void CacheDaemon::learnLocked(uint64_t Build,
   }
   if (!Build)
     return;
+  // The copies whose outcomes changed, published once each.
+  llvm::SmallVector<StoredEntry *, 16> Changed;
   for (const LearnedSearch &L : Learned) {
     auto It = Table.find(L.Filename);
     if (It == Table.end())
@@ -107,9 +123,20 @@ void CacheDaemon::learnLocked(uint64_t Build,
       }
       if (llvm::none_of(E.Searches, [&](const SearchOutcome &O) {
             return O.Key == L.Found.Key;
-          }))
+          })) {
         E.Searches.push_back(L.Found);
+        if (!llvm::is_contained(Changed, &E))
+          Changed.push_back(&E);
+      }
     }
+  }
+  for (StoredEntry *E : Changed) {
+    std::vector<uint64_t> Pairs;
+    for (const SearchOutcome &O : E->Searches) {
+      Pairs.push_back(O.Key);
+      Pairs.push_back(O.Outcome);
+    }
+    Region.publishSearches(E->Record, E->SearchBuild, Pairs);
   }
 }
 
@@ -150,12 +177,15 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
   {
     std::lock_guard<std::mutex> Lock(Mutex);
     learnLocked(Report.Build, Report.Learned, Report.Used);
+    for (const TimingReport::ComboHit &C : Report.Combos)
+      if (uint64_t R = RecordOf.lookup(C.Copy))
+        Region.countCombo(R, C.Combo, /*Serves=*/1, C.Instructions);
     ++Counters.TimingReports;
     bool Changed = false;
     for (const HeaderTiming &H : Report.Headers) {
       if (H.Path.empty() || !FirstTiming.try_emplace(H.Path, H.Micros).second)
         continue;
-      if (H.Micros >= Opts.AskCutoffMicros)
+      if (H.Micros >= Opts.AskCutoffMicros && !Opts.FixedAskList)
         Changed |= listLocked(H.Path);
     }
     // All of a compile's hits count before any header is judged: the first
@@ -308,7 +338,7 @@ CacheDaemon::handleLookup(const LookupRequest &Req, uint64_t Conn) {
     if (!Suffix.empty()) {
       for (const StoredEntry &E : Matching)
         Resp.Entries.push_back({E.MetadataOffset, E.MetadataLength, E.Offset,
-                                E.Length, std::vector<SearchOutcome>()});
+                                E.Length, E.Hash, std::vector<SearchOutcome>()});
     } else if (It != Table.end()) {
       ++Counters.Hits;
       // Where every stored entry for the name is, with no comparison of its
@@ -333,7 +363,7 @@ CacheDaemon::handleLookup(const LookupRequest &Req, uint64_t Conn) {
         Out.reserve(Order.size());
         for (const StoredEntry *E : Order)
           Out.push_back({E->MetadataOffset, E->MetadataLength, E->Offset,
-                         E->Length,
+                         E->Length, E->Hash,
                          Req.Build && E->SearchBuild == Req.Build
                              ? E->Searches
                              : std::vector<SearchOutcome>()});
@@ -393,6 +423,11 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req,
         // compiling. Discard it and acknowledge: the client that lost the
         // race already holds its own result and has no use for the winner.
         ++Counters.Duplicates;
+        if (auto M = MergeOf.find(Conn); M != MergeOf.end() && E.Record) {
+          Region.setMerged(M->second, E.Record);
+          MergeOf.erase(M);
+          ++Counters.MergesStored;
+        }
         Done();
         llvm::SmallVector<char, 0> Ack;
         encodePushAck(Ack);
@@ -405,13 +440,34 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req,
     std::optional<uint64_t> MetadataAt = Region.append(Req.Metadata);
     std::optional<uint64_t> Offset =
         MetadataAt ? Region.append(Req.Data) : std::nullopt;
+    // A copy is stored only with its record in the index, which compiles
+    // read in place of asking.
+    std::optional<uint64_t> Record;
     if (Offset) {
+      IndexedCopy C{};
+      C.MetadataOffset = *MetadataAt;
+      C.MetadataLength = Req.Metadata.size();
+      C.Offset = *Offset;
+      C.Length = Req.Data.size();
+      C.MetadataHash = Hash;
+      Record = Region.indexCopy(Req.Filename, C);
+    }
+    // A merged copy is checked just before the copy whose tree it holds.
+    if (Record)
+      if (auto M = MergeOf.find(Conn); M != MergeOf.end()) {
+        Region.setMerged(M->second, *Record);
+        MergeOf.erase(M);
+        ++Counters.MergesStored;
+      }
+    if (Record) {
       StoredEntry E;
       E.Hash = Hash;
       E.MetadataOffset = *MetadataAt;
       E.MetadataLength = Req.Metadata.size();
       E.Offset = *Offset;
       E.Length = Req.Data.size();
+      E.Record = *Record;
+      RecordOf[*MetadataAt] = *Record;
       Usages[*MetadataAt].PushedAt = Counters.TimingReports;
       Entries.push_back(std::move(E));
       Counters.BytesStored += Req.Data.size() + Req.Metadata.size();
@@ -421,6 +477,8 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req,
       Counters.Headers = Table.size();
       if (Opts.ListStored && listLocked(Req.Filename))
         publishLocked();
+    } else {
+      ++Counters.Dropped;
     }
     Done();
     // A full region is not an error the client can act on -- it already has
@@ -457,6 +515,24 @@ llvm::SmallVector<char, 0> CacheDaemon::handleClaim(const ClaimRequest &Req,
   bool Granted = true;
   {
     std::lock_guard<std::mutex> Lock(Mutex);
+    // CLANG_HEADER_CACHE_MERGE: "merge:<record>:<combination>", once per
+    // combination of a copy's links.
+    if (llvm::StringRef(Req.ModuleName).starts_with("merge:")) {
+      auto [R, C] = llvm::StringRef(Req.ModuleName).drop_front(6).split(':');
+      uint64_t Record = 0, Combo = 0;
+      std::optional<uint64_t> At;
+      if (!Req.Release && !R.getAsInteger(16, Record) &&
+          !C.getAsInteger(16, Combo))
+        At = Region.claimMerge(Record, Combo);
+      Granted = At.has_value();
+      if (Granted) {
+        MergeOf[Conn] = *At;
+        ++Counters.MergesClaimed;
+      }
+      llvm::SmallVector<char, 0> Out;
+      encodeClaimReply(Granted, Out);
+      return Out;
+    }
     if (Req.Release) {
       if (auto It = Claimed.find(Req.ModuleName);
           It != Claimed.end() && It->second == Conn)
@@ -490,6 +566,7 @@ void CacheDaemon::connectionClosed(uint64_t Conn) {
     It = Next;
   }
   WaitedFor.erase(Conn);
+  MergeOf.erase(Conn);
 }
 
 std::optional<llvm::SmallVector<char, 0>>

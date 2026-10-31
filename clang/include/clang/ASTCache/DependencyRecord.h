@@ -43,6 +43,10 @@ struct ConditionalDependency {
   /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
   /// index of its condition plus one (REPORT.md T17).
   uint32_t Cond = 0;
+  /// CLANG_HEADER_CACHE_DUMP_DEPS, for measurement only: where the
+  /// dependency was taken, "<kind>|<file>:<line>|<include chain>". Not
+  /// stored in the metadata.
+  std::string Site;
 };
 
 /// An identifier the preprocessor considered for macro expansion while
@@ -73,6 +77,10 @@ struct SyntacticDependency {
   /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
   /// index of its condition plus one (REPORT.md T17).
   uint32_t Cond = 0;
+  /// CLANG_HEADER_CACHE_DUMP_DEPS, for measurement only: where the
+  /// dependency was taken, "<kind>|<file>:<line>|<include chain>". Not
+  /// stored in the metadata.
+  std::string Site;
 };
 
 /// An identifier's grammar-ambiguity classification (is it a type-name,
@@ -96,6 +104,10 @@ struct SymbolDependency {
   /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
   /// index of its condition plus one (REPORT.md T17).
   uint32_t Cond = 0;
+  /// CLANG_HEADER_CACHE_DUMP_DEPS, for measurement only: where the
+  /// dependency was taken, "<kind>|<file>:<line>|<include chain>". Not
+  /// stored in the metadata.
+  std::string Site;
 };
 
 /// An #include inside the header was suppressed by Clang's multiple-include
@@ -110,6 +122,10 @@ struct InclusionDependency {
   std::string HeaderPath;
   enum class Reason : uint8_t { PragmaOnce, Import };
   Reason Why = Reason::PragmaOnce;
+  /// False for the other way round: the header read the file, a #pragma
+  /// once file with no guard to test, so a hit requires that the compile
+  /// has not read it, or the copy would hold it twice.
+  bool WasRead = true;
   /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
   /// index of its condition plus one (REPORT.md T17).
   uint32_t Cond = 0;
@@ -207,6 +223,10 @@ struct DeclarationDependency {
   /// When it applies (HeaderDependencySet::Conditions): 0 always, else the
   /// index of its condition plus one (REPORT.md T17).
   uint32_t Cond = 0;
+  /// CLANG_HEADER_CACHE_DUMP_DEPS, for measurement only: where the
+  /// dependency was taken, "<kind>|<file>:<line>|<include chain>". Not
+  /// stored in the metadata.
+  std::string Site;
 };
 
 /// A file whose text a part holds the parse of, with its size and
@@ -429,12 +449,51 @@ struct LinkRecord {
   /// tag, "o:" any other): a loading compile looks each up before loading
   /// the copy, and where the link is skipped requires that it finds one.
   std::vector<std::string> Names;
-  /// The copy's bytes, hashed: two copies of a header can share a module
-  /// name (the name is taken before the outside declarations are known).
+  /// The copy's metadata in its stored form, hashed: two copies of a
+  /// header can share a module name (the name is taken before the outside
+  /// declarations are known). Two copies with the same metadata are one to
+  /// the daemon, which keeps the first stored, though their PCM bytes can
+  /// differ.
   uint64_t Hash = 0;
   friend bool operator==(const LinkRecord &A, const LinkRecord &B) {
     return A.Path == B.Path && A.Module == B.Module && A.Guard == B.Guard &&
            A.OnGuard == B.OnGuard && A.Names == B.Names && A.Hash == B.Hash;
+  }
+};
+
+/// guard+ tolerance: a guarded or #pragma once header the copy holds whose
+/// text, with the headers it includes, read no macro another file set. Its
+/// text gives the same declarations and macros wherever it is read, so a
+/// compile that read it already may still be served the copy, which holds
+/// it a second time: Clang takes the copy's declarations as the ones it
+/// has. A hit checks that the macros the header set are still as it left
+/// them.
+struct HeldHeader {
+  std::string Path;
+  /// Its include guard; empty for a #pragma once header with none.
+  std::string Guard;
+  /// The header and the files it included that set its macros.
+  std::vector<std::string> Files;
+  struct Macro {
+    std::string Name;
+    bool Defined = true;
+    /// Into Files, and the offset in that file: where the definition is.
+    uint32_t File = 0;
+    uint32_t Offset = 0;
+    friend bool operator==(const Macro &A, const Macro &B) {
+      return A.Name == B.Name && A.Defined == B.Defined && A.File == B.File &&
+             A.Offset == B.Offset;
+    }
+  };
+  /// Each macro the header set or removed, as it left it.
+  std::vector<Macro> Macros;
+  /// The macros the header tested or expanded that the copy's own lines did
+  /// not set: the copy's check finds each as it was, and a hit requires
+  /// that none changed since the compile read the header.
+  std::vector<std::string> Reads;
+  friend bool operator==(const HeldHeader &A, const HeldHeader &B) {
+    return A.Path == B.Path && A.Guard == B.Guard && A.Files == B.Files &&
+           A.Macros == B.Macros && A.Reads == B.Reads;
   }
 };
 
@@ -509,9 +568,16 @@ struct HeaderDependencySet {
   /// scope ("t:" a tag, "o:" any other). Where a copy linking this one skips
   /// it, the compile has read the header already, and must declare each.
   std::vector<std::string> Declares;
+  /// The names the copy's text made from __COUNTER__ values. A compile that
+  /// loads the copy hashes them as one in a function's masked hash
+  /// (declarationFingerprint).
+  std::vector<std::string> CounterNames;
   /// CLANG_HEADER_CACHE_PARTIAL: the headers the copy left out that a
   /// compile can plug in first, in the order their #includes were reached.
   std::vector<LeftOutRecord> LeftOut;
+  /// guard+ tolerance: the headers the copy holds that read no macro from
+  /// outside them.
+  std::vector<HeldHeader> Held;
   /// CLANG_HEADER_CACHE_PIECES: each list of dependencies above that a
   /// check reads is in groups -- the base's, then each submodule's, in
   /// order -- and the stored metadata marks where each group starts, so a

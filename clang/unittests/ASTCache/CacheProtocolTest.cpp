@@ -17,6 +17,7 @@
 #include "clang/ASTCache/CacheClient.h"
 #include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/DependencySerialization.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
 #include "gtest/gtest.h"
 #include <chrono>
@@ -93,6 +94,7 @@ TEST(CacheProtocolTest, LookupResponseSaysWhereTheMetadataIs) {
   E.MetadataLength = 36;
   E.Offset = 100;
   E.Length = 20;
+  E.MetadataHash = 0xfeedface12345678;
   E.Searches.push_back({0x1234, 3});
   Resp.Entries.push_back(E);
   llvm::SmallVector<char, 0> Out;
@@ -104,6 +106,7 @@ TEST(CacheProtocolTest, LookupResponseSaysWhereTheMetadataIs) {
   EXPECT_EQ(Got->Entries[0].MetadataLength, 36u);
   EXPECT_EQ(Got->Entries[0].Offset, 100u);
   EXPECT_EQ(Got->Entries[0].Length, 20u);
+  EXPECT_EQ(Got->Entries[0].MetadataHash, 0xfeedface12345678u);
   ASSERT_EQ(Got->Entries[0].Searches.size(), 1u);
   EXPECT_EQ(Got->Entries[0].Searches[0].Key, 0x1234u);
   EXPECT_EQ(Got->Entries[0].Searches[0].Outcome, 3u);
@@ -134,6 +137,25 @@ TEST(CacheProtocolTest, TimingReportRoundTrips) {
   EXPECT_EQ(Got->Headers[0].Path, "/src/server.h");
   EXPECT_EQ(Got->Headers[0].Micros, 41250u);
   EXPECT_EQ(Got->Headers[1].Micros, 612u);
+}
+
+TEST(CacheProtocolTest, TimingReportCarriesTheCombinationsHitsLoaded) {
+  // CLANG_HEADER_CACHE_MERGE: each hit that loaded links, by the copy it
+  // started from, the combination of copies it loaded, and the
+  // instructions it took.
+  TimingReport Report;
+  Report.Used = {4096, 8192};
+  Report.Combos = {{4096, 0x1234abcdull, 61400000}, {8192, 7, 0}};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Combos.size(), 2u);
+  EXPECT_EQ(Got->Combos[0].Copy, 4096u);
+  EXPECT_EQ(Got->Combos[0].Combo, 0x1234abcdull);
+  EXPECT_EQ(Got->Combos[0].Instructions, 61400000u);
+  EXPECT_EQ(Got->Combos[1].Combo, 7u);
+  EXPECT_EQ(Got->Combos[1].Instructions, 0u);
 }
 
 TEST(CacheProtocolTest, TimingReportCarriesHitCosts) {
@@ -597,6 +619,157 @@ TEST_F(DaemonTest, OutOfRangeOffsetReadsAsNothing) {
   ASSERT_TRUE(bool(Attached));
   EXPECT_TRUE(Attached->read(1u << 30, 16).empty());
   EXPECT_TRUE(Attached->read(0, 16).empty()) << "the header is not data";
+}
+
+TEST_F(DaemonTest, TheRegionsIndexListsEachCopyNewestFirst) {
+  // A compile finds a header's copies in the region, with no request: the
+  // index gives the newest copy's record, and each record the one stored
+  // before it.
+  push("h.h", makeRecord("FEATURE", true), "AAA");
+  push("h.h", makeRecord("FEATURE", false), "BBBB");
+  push("other.h", makeRecord("OTHER", true), "CC");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 2u);
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  const IndexedCopy *Newest = Attached->copyAt(Attached->newestCopy("h.h"));
+  ASSERT_NE(Newest, nullptr);
+  EXPECT_EQ(Newest->Length, 4u);
+  EXPECT_EQ(Newest->MetadataOffset, R.Entries[1].MetadataOffset);
+  EXPECT_EQ(Newest->MetadataHash, R.Entries[1].MetadataHash);
+  const IndexedCopy *Older = Attached->copyAt(Newest->Next);
+  ASSERT_NE(Older, nullptr);
+  EXPECT_EQ(Older->Length, 3u);
+  EXPECT_EQ(Older->Offset, R.Entries[0].Offset);
+  EXPECT_EQ(Older->Next, 0u);
+  EXPECT_EQ(Attached->read(Older->Offset, Older->Length), "AAA");
+  EXPECT_EQ(Attached->copyAt(Attached->newestCopy("other.h"))->Length, 2u);
+  EXPECT_EQ(Attached->newestCopy("never-stored.h"), 0u);
+  EXPECT_EQ(Attached->copyAt(0), nullptr);
+}
+
+TEST_F(DaemonTest, AUseInACompilesReportStampsItsCopyInTheIndex) {
+  // The copy used most recently is checked first. A compile that reads the
+  // index sends what it used with its timing report, and the daemon stamps
+  // the copy's record.
+  push("h.h", makeRecord("FEATURE", true), "AAA");
+  push("h.h", makeRecord("FEATURE", false), "BBBB");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 2u);
+  TimingReport Report;
+  Report.Used = {R.Entries[0].MetadataOffset};
+  llvm::SmallVector<char, 0> Msg;
+  encodeTimingReport(Report, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  const IndexedCopy *Newest = Attached->copyAt(Attached->newestCopy("h.h"));
+  ASSERT_NE(Newest, nullptr);
+  const IndexedCopy *Older = Attached->copyAt(Newest->Next);
+  ASSERT_NE(Older, nullptr);
+  EXPECT_EQ(Newest->Stamp.load(), 0u);
+  EXPECT_GT(Older->Stamp.load(), 0u);
+  // The daemon's own reply gives the same order.
+  EXPECT_EQ(lookup("h.h").Entries[0].MetadataOffset, Older->MetadataOffset);
+}
+
+TEST_F(DaemonTest, EachCombinationAHitLoadedIsCountedAndMergedOnce) {
+  // CLANG_HEADER_CACHE_MERGE: hits that started from one copy and loaded
+  // two combinations of its links are counted apart. A merge of each is
+  // granted once; the copy pushed on that connection is its merged copy.
+  push("h.h", makeRecord("FEATURE", true), "AAA");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 1u);
+  uint64_t Copy = R.Entries[0].MetadataOffset;
+  TimingReport Report;
+  Report.Used = {Copy, Copy, Copy};
+  Report.Combos = {{Copy, 11, 1000}, {Copy, 22, 0}, {Copy, 11, 500}};
+  llvm::SmallVector<char, 0> Msg;
+  encodeTimingReport(Report, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  uint64_t At = Attached->newestCopy("h.h");
+  const IndexedCopy *C = Attached->copyAt(At);
+  ASSERT_NE(C, nullptr);
+  EXPECT_EQ(C->Serves.load(), 3u);
+  const MergeRecord *First = Attached->comboOf(*C, 11);
+  const MergeRecord *Second = Attached->comboOf(*C, 22);
+  ASSERT_NE(First, nullptr);
+  ASSERT_NE(Second, nullptr);
+  EXPECT_EQ(First->Serves.load(), 2u);
+  EXPECT_EQ(Second->Serves.load(), 1u);
+  EXPECT_EQ(First->Instructions.load(), 1500u);
+  EXPECT_EQ(Second->Instructions.load(), 0u);
+  EXPECT_EQ(Attached->comboOf(*C, 33), nullptr);
+
+  auto Claim = [&](uint64_t Combo, uint64_t Conn) {
+    llvm::SmallVector<char, 0> M;
+    encodeClaimRequest({"h.h", "merge:" + llvm::utohexstr(At) + ":" +
+                                   llvm::utohexstr(Combo),
+                        false},
+                       M);
+    std::optional<llvm::SmallVector<char, 0>> Reply =
+        Daemon->handleMessage(body(M), Conn);
+    std::optional<bool> Granted =
+        Reply ? decodeClaimReply(body(*Reply)) : std::nullopt;
+    return Granted && *Granted;
+  };
+  EXPECT_TRUE(Claim(11, 7));
+  EXPECT_FALSE(Claim(11, 8)) << "the same combination was merged twice";
+  EXPECT_TRUE(Claim(22, 8));
+  EXPECT_EQ(First->Merged.load(), 1u);
+
+  PushRequest Merged;
+  Merged.Filename = "h.h";
+  Merged.ModuleName = "merged";
+  Merged.Deps = makeRecord("FEATURE", true);
+  Merged.Data = "MERGED";
+  llvm::SmallVector<char, 0> P;
+  encodePushRequest(Merged, P);
+  ASSERT_TRUE(Daemon->handleMessage(body(P), 7).has_value());
+  EXPECT_EQ(First->Merged.load(), Attached->newestCopy("h.h"));
+  EXPECT_EQ(Second->Merged.load(), 1u);
+}
+
+TEST_F(DaemonTest, WhatACopysSearchesFoundIsInTheIndex) {
+  // REPORT.md I9: within one build, what a copy's #include searches find
+  // is shared between compiles. With no request, it is in the index.
+  push("h.h", makeRecord("FEATURE", true), "AAA");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 1u);
+  TimingReport Report;
+  Report.Build = 7;
+  Report.Learned.push_back({"h.h", R.Entries[0].MetadataOffset, {5, 2}});
+  Report.Learned.push_back({"h.h", R.Entries[0].MetadataOffset, {9, 0}});
+  llvm::SmallVector<char, 0> Msg;
+  encodeTimingReport(Report, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  const IndexedCopy *C = Attached->copyAt(Attached->newestCopy("h.h"));
+  ASSERT_NE(C, nullptr);
+  std::optional<StoredSearches> F = Attached->searchesAt(C->Searches.load());
+  ASSERT_TRUE(F.has_value());
+  EXPECT_EQ(F->Build, 7u);
+  EXPECT_EQ(F->Pairs.vec(), (std::vector<uint64_t>{5, 2, 9, 0}));
+}
+
+TEST_F(DaemonTest, ACopyTheIndexCannotHoldIsNotStored) {
+  // A 1 MiB region's index has 256 slots. A copy of a 257th header is not
+  // stored: a compile that reads the index would not find it.
+  for (int I = 0; I != 257; ++I)
+    push("h" + std::to_string(I) + ".h", makeRecord("X", true), "D");
+  EXPECT_EQ(Daemon->stats().Entries, 256u);
+  EXPECT_EQ(Daemon->stats().Dropped, 1u);
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  EXPECT_EQ(Attached->newestCopy("h256.h"), 0u);
+  EXPECT_NE(Attached->newestCopy("h255.h"), 0u);
 }
 
 TEST_F(DaemonTest, GarbageMessageClosesTheConnection) {

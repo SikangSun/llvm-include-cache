@@ -560,6 +560,19 @@ public:
   //===--------------------------------------------------------------------===//
   LLVM_ABI Error ReadAbbrevRecord();
 
+  /// The abbreviations defined in the current block so far, those of the
+  /// block info first.
+  ArrayRef<std::shared_ptr<BitCodeAbbrev>> getCurrentAbbrevs() const {
+    return CurAbbrevs;
+  }
+
+  /// Defines \p Abbrevs in the current block, as reading their definitions
+  /// would: for a reader that read the same definitions before, and moves
+  /// past them itself.
+  void addAbbrevs(ArrayRef<std::shared_ptr<BitCodeAbbrev>> Abbrevs) {
+    CurAbbrevs.insert(CurAbbrevs.end(), Abbrevs.begin(), Abbrevs.end());
+  }
+
   /// Read and return a block info block from the bitstream. If an error was
   /// encountered, return std::nullopt.
   ///

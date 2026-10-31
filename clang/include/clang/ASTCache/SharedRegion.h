@@ -25,20 +25,77 @@
 // read-only mapping in LLVM is MAP_PRIVATE and would not reliably show later
 // appends, but a client never writes.
 //
+// The region also holds an index of the stored copies: a table, by the
+// hash of a header's name, of the newest copy's record, and each record
+// names the copy stored before it. A compile reads the copies of a header
+// there, with no request to the daemon.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_ASTCACHE_SHAREDREGION_H
 #define LLVM_CLANG_ASTCACHE_SHAREDREGION_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
 
 namespace clang {
 namespace ast_cache {
+
+/// One stored copy in the region's index of copies: where its metadata and
+/// its PCM bytes are. The daemon writes it whole before it publishes it,
+/// so a compile finds the copies of a header with no request. Only Stamp,
+/// Searches, Serves and Merge change later, and only the daemon changes
+/// them.
+struct IndexedCopy {
+  /// The copy of the same header stored before this one; 0 for none.
+  uint64_t Next;
+  uint64_t MetadataOffset, MetadataLength, Offset, Length;
+  /// The xxh3 of the metadata (CacheEntryRef::MetadataHash).
+  uint64_t MetadataHash;
+  /// When a compile last used the copy, on the daemon's clock; 0 for never.
+  /// A compile checks the most recently used first (REPORT.md I15).
+  std::atomic<uint64_t> Stamp;
+  /// Where what its searches found in one build is (searchesAt); 0 for
+  /// none (REPORT.md I9).
+  std::atomic<uint64_t> Searches;
+  /// How many hits started from the copy, by the compiles' reports.
+  std::atomic<uint64_t> Serves;
+  /// CLANG_HEADER_CACHE_MERGE: where the newest MergeRecord of the copy is;
+  /// 0 for none.
+  std::atomic<uint64_t> Merge;
+};
+
+/// CLANG_HEADER_CACHE_MERGE: one combination of copies that hits starting
+/// from a copy with links loaded -- the copy, and each link loaded or
+/// skipped by its include guard -- with how many hits loaded it, and the
+/// one copy it was merged into. Only the daemon writes it.
+struct MergeRecord {
+  /// The copy's combination recorded before this one; 0 for none.
+  uint64_t Next;
+  /// The xxh3 of the module names loaded, in load order.
+  uint64_t Combo;
+  std::atomic<uint64_t> Serves;
+  /// 0 while no compile merges it; 1 while one does, or after one failed;
+  /// then the record of the merged copy, which a compile checks just before
+  /// the copy the hits started from.
+  std::atomic<uint64_t> Merged;
+  /// The instructions the hits counted in Serves took, from the lookup to
+  /// the end of the replay, summed; 0 for a hit that did not count them.
+  std::atomic<uint64_t> Instructions;
+};
+
+/// What a copy's #include searches found in one build: the build, then
+/// each outcome as two words, its search key and the outcome.
+struct StoredSearches {
+  uint64_t Build = 0;
+  llvm::ArrayRef<uint64_t> Pairs;
+};
 
 /// Where the daemon listens, and where the region is backed. Fixed paths: for
 /// a prototype the compiler and the daemon simply agree on them at build time,
@@ -96,6 +153,62 @@ public:
   /// exactly when a new list is published, so a caller can keep a parsed copy
   /// until then.
   llvm::StringRef askList(uint64_t *Version = nullptr) const;
+
+  /// Daemon side. Adds \p Copy, a copy of the header stored under \p Name,
+  /// to the index, as the newest copy of the header; its Next, Stamp and
+  /// Searches are set here. Returns where its record is, or std::nullopt
+  /// when the region or the index is full.
+  std::optional<uint64_t> indexCopy(llvm::StringRef Name,
+                                    const IndexedCopy &Copy);
+
+  /// Daemon side. A compile used the copy whose record is at \p Record:
+  /// at \p Stamp on the daemon's clock.
+  void stampCopy(uint64_t Record, uint64_t Stamp);
+
+  /// Daemon side. Makes \p Pairs (key, outcome, key, outcome, ...) what the
+  /// copy at \p Record found in build \p Build. False when the region is
+  /// full.
+  bool publishSearches(uint64_t Record, uint64_t Build,
+                       llvm::ArrayRef<uint64_t> Pairs);
+
+  /// Daemon side. A hit started from the copy at \p Record.
+  void countServe(uint64_t Record);
+
+  /// Daemon side. A hit started from the copy at \p Record and loaded
+  /// the combination \p Combo, taking \p Instructions; its record is made
+  /// if it is the first. Returns where the combination's record is, or
+  /// std::nullopt if the region is full.
+  std::optional<uint64_t> countCombo(uint64_t Record, uint64_t Combo,
+                                     uint64_t Serves = 1,
+                                     uint64_t Instructions = 0);
+
+  /// Daemon side. Marks the combination \p Combo of the copy at \p Record
+  /// as being merged. Returns where its record is, or std::nullopt if a
+  /// compile merges it already, or has.
+  std::optional<uint64_t> claimMerge(uint64_t Record, uint64_t Combo);
+
+  /// Daemon side. The combination whose record is at \p At is merged into
+  /// the copy at \p Merged.
+  void setMerged(uint64_t At, uint64_t Merged);
+
+  /// Client side. The record of the combination \p Combo of \p Copy, or
+  /// null for none; and the record at \p At.
+  const MergeRecord *comboOf(const IndexedCopy &Copy, uint64_t Combo) const;
+  const MergeRecord *mergeAt(uint64_t At) const;
+
+  /// Where \p Record, a record this region holds, is.
+  uint64_t offsetOf(const void *Record) const;
+
+  /// Client side. The record of the newest copy stored under \p Name, 0
+  /// for none; each record names the one stored before it.
+  uint64_t newestCopy(llvm::StringRef Name) const;
+
+  /// Client side. The record at \p Record, or null if that is not one
+  /// written.
+  const IndexedCopy *copyAt(uint64_t Record) const;
+
+  /// Client side. The search outcomes at \p Offset (IndexedCopy::Searches).
+  std::optional<StoredSearches> searchesAt(uint64_t Offset) const;
 
   uint64_t bytesUsed() const;
   uint64_t capacity() const { return Mapping.size(); }

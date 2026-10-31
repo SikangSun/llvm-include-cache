@@ -155,6 +155,11 @@ class Preprocessor {
   friend class VariadicMacroScopeGuard;
 
   llvm::unique_function<void(const clang::Token &)> OnToken;
+
+  /// See setCounterStringWatcher.
+  llvm::unique_function<void(const clang::Token &,
+                             ArrayRef<std::pair<unsigned, unsigned>>)>
+      OnCounterString;
   /// Functor for getting the dependency preprocessor directives of a file.
   ///
   /// These are directives derived from a special form of lexing where the
@@ -1387,6 +1392,21 @@ public:
     OnToken = std::move(F);
   }
 
+  /// Register a function called on each string a stringizing operator makes
+  /// from tokens made from a __COUNTER__ value (Token::FromCounter), with
+  /// the ranges of the string's spelling those tokens became.
+  void setCounterStringWatcher(
+      llvm::unique_function<void(const clang::Token &,
+                                 ArrayRef<std::pair<unsigned, unsigned>>)>
+          F) {
+    OnCounterString = std::move(F);
+  }
+  void counterStringMade(const Token &Tok,
+                         ArrayRef<std::pair<unsigned, unsigned>> Ranges) {
+    if (OnCounterString)
+      OnCounterString(Tok, Ranges);
+  }
+
   void setDependencyDirectivesGetter(DependencyDirectivesGetter &Get) {
     GetDependencyDirectives = &Get;
   }
@@ -1596,6 +1616,14 @@ public:
   /// Returns true if this is the first time the file was included.
   bool markIncluded(FileEntryRef File) {
     HeaderInfo.getFileInfo(File).IsLocallyIncluded = true;
+    return IncludedFiles.insert(File).second;
+  }
+
+  /// markIncluded, with what AST files know of the file merged when it is
+  /// next asked for (HeaderSearch::markLocallyIncluded): with many AST
+  /// files loaded, each question asks them all.
+  bool markIncludedLazily(FileEntryRef File) {
+    HeaderInfo.markLocallyIncluded(File);
     return IncludedFiles.insert(File).second;
   }
 

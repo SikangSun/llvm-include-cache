@@ -217,6 +217,8 @@ Token MacroArgs::StringifyArgument(const Token *ArgToks,
   // Stringify all the tokens.
   SmallString<128> Result;
   Result += "\"";
+  // Where tokens made from a __COUNTER__ value went in the spelling.
+  SmallVector<std::pair<unsigned, unsigned>, 2> FromCounter;
 
   bool isFirst = true;
   for (; ArgToks->isNot(tok::eof); ++ArgToks) {
@@ -224,6 +226,7 @@ Token MacroArgs::StringifyArgument(const Token *ArgToks,
     if (!isFirst && (Tok.hasLeadingSpace() || Tok.isAtStartOfLine()))
       Result += ' ';
     isFirst = false;
+    unsigned TokBegin = Result.size();
 
     // If this is a string or character constant, escape the token as specified
     // by 6.10.3.2p2.
@@ -261,6 +264,8 @@ Token MacroArgs::StringifyArgument(const Token *ArgToks,
           Result.resize(CurStrLen+ActualTokLen);
       }
     }
+    if (Tok.getFlag(Token::FromCounter))
+      FromCounter.push_back({TokBegin, Result.size()});
   }
 
   // If the last character of the string is a \, and if it isn't escaped, this
@@ -302,5 +307,9 @@ Token MacroArgs::StringifyArgument(const Token *ArgToks,
 
   PP.CreateString(Result, Tok,
                   ExpansionLocStart, ExpansionLocEnd);
+  if (!FromCounter.empty()) {
+    Tok.setFlag(Token::FromCounter);
+    PP.counterStringMade(Tok, FromCounter);
+  }
   return Tok;
 }

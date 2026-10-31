@@ -892,6 +892,8 @@ bool TokenLexer::pasteTokens(Token &LHSTok, ArrayRef<Token> TokenStream,
 
     // Set Token::HasUCN flag if LHS or RHS contains any UCNs.
     HasUCNs = LHSTok.hasUCN() || RHS.hasUCN() || HasUCNs;
+    if (LHSTok.getFlag(Token::FromCounter) || RHS.getFlag(Token::FromCounter))
+      Result.setFlag(Token::FromCounter);
     LHSTok = Result;
   } while (!IsAtEnd() && TokenStream[CurIdx].is(tok::hashhash));
 

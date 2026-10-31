@@ -100,8 +100,14 @@ struct CacheEntryRef {
   uint64_t MetadataLength = 0;
   uint64_t Offset = 0;
   uint64_t Length = 0;
+  /// The xxh3 of the metadata, which the daemon took when it stored it: a
+  /// link names its copy by it (CacheClient::fetch).
+  uint64_t MetadataHash = 0;
   /// What the copy's searches found in the asking compile's build.
   std::vector<SearchOutcome> Searches;
+  /// Where the copy's record in the region's index is; 0 for an entry the
+  /// daemon's reply gave (not sent).
+  uint64_t Record = 0;
 };
 
 struct LookupRequest {
@@ -148,6 +154,9 @@ struct PushRequest {
   /// The copy's metadata, encoded with ModuleName into the stored form as
   /// the push is sent.
   HeaderDependencySet Deps;
+  /// Deps already in the stored form, sent as is when not empty: the
+  /// writer of a part encodes it first, to name the copy by its hash.
+  std::string Metadata;
   /// The serialized parsed header. Copied into the shared region by the
   /// daemon, so it crosses the socket once.
   std::string Data;
@@ -179,6 +188,14 @@ struct TimingReport {
   uint64_t Build = 0;
   std::vector<LearnedSearch> Learned;
   std::vector<uint64_t> Used;
+  /// CLANG_HEADER_CACHE_MERGE: for each hit that loaded links, the copy it
+  /// started from, by metadata offset, the combination of copies it loaded
+  /// (MergeRecord::Combo), and the instructions it took (0 where not
+  /// counted).
+  struct ComboHit {
+    uint64_t Copy = 0, Combo = 0, Instructions = 0;
+  };
+  std::vector<ComboHit> Combos;
 };
 
 /// The daemon's answer to a client that has just connected: the region file

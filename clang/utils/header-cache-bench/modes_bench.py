@@ -5,17 +5,22 @@ rotated; each cache mode with its own fresh daemon, build ID and per-copy dump
 compares each mode's objects with plain clang's.
 usage: modes_bench.py <project> <out.json>
 env: KIND, CORE, DCORES (comma list, one per cache mode), BIN, LEVEL, DUMP, MODES,
-SRC_ROOT, PLAIN_MODULES.
-
+SRC_ROOT, PLAIN_MODULES, PASSES, CHANGE_CMD, CHANGE_UNDO, INSTR, PERFC, SAMPLE,
+REGION_SIZE, EXTRA.
 env, required: BIN (a release build's bin directory), BENCH_LOGS, BENCH_ROOT
 (see record_builds.sh).
+
+PASSES=N (default 1) builds N times: each later pass is a rebuild with no
+source changed, every compile again against the same daemons (nothing
+cleared) under a new build ID, plain clang timed beside it again. Pass 1 is
+in T, S, W, failed, differ; passes 2..N in "passes".
 
 Sources are read from DRAM: SRC_ROOT (default /dev/shm/bench-src, filled by
 dram_sources.sh) stands for BENCH_ROOT; SRC_ROOT=in-place reads them there. Plain clang runs as a user runs it, without
 the -fmodules -fno-implicit-module-maps only the cache needs (front end);
 PLAIN_MODULES=1 gives it them. Full builds keep them on plain clang, whose
 objects are compared with the cache's."""
-import json, os, subprocess, sys, tempfile, time
+import json, os, re, subprocess, sys, tempfile, time
 BIN = os.environ["BIN"]
 # Where record_builds.sh put the compile logs, and the directory the
 # projects were built in when it recorded them.
@@ -31,10 +36,101 @@ PLAIN_MODULES = KIND == "full" or os.environ.get("PLAIN_MODULES") == "1"
 CORE = os.environ.get("CORE", "7")
 ALL = {
     "top": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1"},
+    # Top-level folding, and a header read before any compile listed it is
+    # written if it was slow and nothing inside it was served.
+    # A copy whose header expanded __COUNTER__ is written, checked, never
+    # served; each miss where it fit but for the counter is classed
+    # (DECISIONS.md 2.7).
+    "probe": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER_PROBE": "1"},
+    # A copy whose header expanded __COUNTER__ is served where the counter
+    # starts at the value it started at (DECISIONS.md 2.7); with fold, a
+    # header inside one being written is asked for too, and a copy served
+    # there is held by the one being written.
+    "counter": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1"},
+    "counterfold": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                    "CLANG_HEADER_CACHE_FOLD_SERVED": "1"},
+    "firstread": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_FIRST_READ": "1"},
+    # Top-level folding with every name compared, as before 2026-10-24.
+    "strictnames": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_STRICT_NAMES": "1"},
     "link": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_LINK": "1"},
+    # Linked units (2026-10-31 plan): link mode on top of COUNTER=1.
+    "linkc": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+              "CLANG_HEADER_CACHE_LINK": "1"},
+    # bin-u27+: linkc, and after a copy with links served two hits, a process
+    # forked from the compile writes the tree as one copy (step 5). The
+    # compile waits for it at its exit, so that its instructions are counted
+    # with the compile's; the merge line on stderr gives them apart.
+    "linkm": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+              "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "2",
+              "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},
+    # linkm, merged after five hits (the merge count is a meta-parameter).
+    "linkm5": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "5",
+               "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},
+    # bin-u30: merge count sweep (the user's 2026-11-01 plan: find where
+    # merging pays most, per codebase, on one core). linkm<k>: merged once
+    # hits loaded a combination k times.
+    **{f"linkm{k}": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                    "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": str(k),
+                    "CLANG_HEADER_CACHE_MERGE_WAIT": "1"} for k in (3, 4, 6, 8, 12, 16, 32, 64, 128, 256)},
+    # Folding threshold sweep (user, 2026-10-31): linkc with the daemon's
+    # -ask-cutoff-us at <c> microseconds (DAEMON_ARGS): a header under the
+    # cutoff is never asked for, so the copy around it holds it. A line per
+    # hit (links, instructions) for the per-header factors.
+    **{f"linkcut{c}": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                       "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_HIT_LOG": "1"}
+       for c in (0, 100, 226, 500, 1000, 2000, 5000, 10000, 20000, 50000)},
+    # bin-u32: the history-based merge rule (CLANG_HEADER_CACHE_MERGE=auto,
+    # user 2026-10-31): a combination is merged once its hits so far pay for
+    # the merge. linkma at the default cutoff, linkcut<c>ma at <c> us.
+    "linkma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
+               "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},
+    **{f"linkcut{c}ma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                         "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
+                         "CLANG_HEADER_CACHE_MERGE_WAIT": "1"} for c in (2000, 5000)},
+    # Measurement: linkc, combinations counted and never merged, and a line
+    # per hit (CLANG_HEADER_CACHE_HIT_LOG): links, combination, instructions.
+    "linkcount": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                  "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "1000000",
+                  "CLANG_HEADER_CACHE_HIT_LOG": "1"},
+    # Measurement: linkm with a line per hit, for what a merged copy's hits cost.
+    "linkm2h": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "2",
+                "CLANG_HEADER_CACHE_MERGE_WAIT": "1", "CLANG_HEADER_CACHE_HIT_LOG": "1"},
+    # bin-u30: guard+ tolerance (CLANG_HEADER_CACHE_GUARD_PLUS): a copy
+    # holding headers the compile read already serves where they read
+    # nothing outside them and are as the compile read them.
+    "counterg": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                 "CLANG_HEADER_CACHE_GUARD_PLUS": "1"},
+    "linkcg": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_GUARD_PLUS": "1"},
+    # bin-u2+: linkc as before 2026-11-01, each link loaded by a reader call of
+    # its own, before the copy linking it.
+    "linkeach": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                 "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_LINK_LOADS": "each"},
+    # linkc, and a copy linked inside another may name a declaration of the
+    # lines around it (CLANG_HEADER_CACHE_LINK_TAKES_PARENTS).
+    "linkp": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+              "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_LINK_TAKES_PARENTS": "1"},
     "miss1": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_SECOND_MISS": "1"},
     # Headers inside a copy held as sections (REPORT.md T17), skipped by guard.
     "sections": {"CLANG_HEADER_CACHE_SECTIONS": "1"},
+    # Sections that may read what the copy's earlier lines set (bin-sec2+),
+    # each dependency tagged with its innermost section, counter on.
+    "sections2": {"CLANG_HEADER_CACHE_SECTIONS": "2", "CLANG_HEADER_CACHE_COUNTER": "1"},
+    # Measurement: sections2 without checking what skipped sections provide.
+    # bin-lay: counter mode with function fingerprints that ignore names
+    # made from __COUNTER__ values switched off (measurement).
+    "counternomask": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1", "CLANG_HEADER_CACHE_NO_MASK": "1"},
+    # bin-nolay, measurement only (unsafe): declaration checks compare no
+    # struct layouts, the upper bound of not computing them.
+    "counternolay": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1", "CLANG_HEADER_CACHE_NO_LAYOUT_CHECK": "1"},
+    "sections2nolay": {"CLANG_HEADER_CACHE_SECTIONS": "2", "CLANG_HEADER_CACHE_COUNTER": "1", "CLANG_HEADER_CACHE_NO_LAYOUT_CHECK": "1"},
+    # sections2 with partial hits: a copy that left out headers the compile
+    # has not read serves once they are read first ("-" direction).
+    "sections2partial": {"CLANG_HEADER_CACHE_SECTIONS": "2", "CLANG_HEADER_CACHE_COUNTER": "1", "CLANG_HEADER_CACHE_PARTIAL": "1"},
+    "sections2np": {"CLANG_HEADER_CACHE_SECTIONS": "2", "CLANG_HEADER_CACHE_COUNTER": "1", "CLANG_HEADER_CACHE_NO_PROVIDED_CHECK": "1"},
     # Top-level folding with partial hits: a copy that left out headers the
     # compile has not read serves once they are read first.
     "partial": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_PARTIAL": "1"},
@@ -47,6 +143,12 @@ ALL = {
     # Measurement: at each version miss, whether the section header's own
     # copies, or its versions in other bases, would fit there.
     "piecesProbe": {"CLANG_HEADER_CACHE_PIECES": "1", "CLANG_HEADER_CACHE_PROBE_REUSE": "1"},
+    # Measurement: a header expanding __COUNTER__ is written and never
+    # served; each miss notes whether such a copy fit but for the counter,
+    # with the same start value, renamable, or neither (DECISIONS.md 2.7).
+    "counterprobe": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER_PROBE": "1"},
+    # Measurement: the cache asked, nothing written, so nothing recorded.
+    "noexport": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_EXPORT_PARTS": "0"},
 }
 CM = os.environ.get("MODES", "top link miss1").split()
 MODES = ["plain"] + CM
@@ -83,11 +185,19 @@ def replay_args(args, obj):
     return ["-fmodules", "-fno-implicit-module-maps"] + a
 
 
-def daemon(core, dump):
+# Daemon options per mode (folding threshold sweep, 2026-10-31).
+DAEMON_ARGS = {f"linkcut{c}": ["-ask-cutoff-us", str(c)] for c in (0, 100, 226, 500, 1000, 2000, 5000, 10000, 20000, 50000)}
+DAEMON_ARGS.update({f"linkcut{c}ma": ["-ask-cutoff-us", str(c)] for c in (2000, 5000)})
+
+
+def daemon(core, dump, mode=None):
     w = tempfile.mkdtemp(prefix="mb-")
     region = f"/dev/shm/{os.path.basename(w)}.region"
+    # REGION_SIZE=<GiB>: a region larger than the daemon's 4 GiB default; a
+    # full region drops every later copy without a word.
+    size = ["-region-size", str(int(os.environ["REGION_SIZE"]) << 30)] if os.environ.get("REGION_SIZE") else []
     p = subprocess.Popen(["taskset", "-c", core, f"{BIN}/clang-header-cache-daemon", "-socket", f"{w}/sock",
-                          "-region", region, "-v"], stdout=open(f"{w}/daemon.log", "w"), stderr=subprocess.STDOUT,
+                          "-region", region, "-v"] + size + DAEMON_ARGS.get(mode, []), stdout=open(f"{w}/daemon.log", "w"), stderr=subprocess.STDOUT,
                          env=dict(os.environ, **({"CLANG_HEADER_CACHE_DAEMON_DUMP": dump} if dump else {})))
     while not os.path.exists(f"{w}/sock"):
         time.sleep(0.01)
@@ -96,51 +206,95 @@ def daemon(core, dump):
 
 
 CMDS = commands()
+# SAMPLE=N: every Nth compile only.
+CMDS = CMDS[::int(os.environ.get("SAMPLE", "1"))]
 print(f"{proj} {KIND}: {len(CMDS)} compiles, modes {' '.join(MODES)}", flush=True)
 objdir = tempfile.mkdtemp(prefix=f"mbo-{proj}-")
 DUMP = os.environ.get("DUMP")
 cores = os.environ.get("DCORES", "8,9,10").split(",")
-daemons = {m: daemon(cores[i % len(cores)], DUMP and f"{DUMP}-{m}.tsv") for i, m in enumerate(CM)}
+daemons = {m: daemon(cores[i % len(cores)], DUMP and f"{DUMP}-{m}.tsv", m) for i, m in enumerate(CM)}
 base = {k: v for k, v in os.environ.items() if not k.startswith("CLANG_HEADER_CACHE")}
+# One __DATE__ and __TIME__ for every compile whose object is compared
+# (cpython's getbuildinfo.c records them).
+if KIND == "full":
+    base["SOURCE_DATE_EPOCH"] = "1700000000"
 env = {"plain": dict(base)}
 # EXTRA="K=V ...": more settings for every cache mode (measurement switches).
 extra = dict(kv.split("=", 1) for kv in os.environ.get("EXTRA", "").split())
 for m in CM:
     env[m] = dict(base, CLANG_HEADER_CACHE=daemons[m][1], CLANG_HEADER_CACHE_STATS=os.environ.get("LEVEL", "1"),
-                  CLANG_HEADER_CACHE_BUILD=f"{proj}-{m}-{time.time()}", **ALL[m], **extra)
-T = {m: [] for m in MODES}; S = {m: [] for m in CM}; W = {m: [] for m in MODES}; failed = []
-for i, (cwd, args, src) in enumerate(CMDS):
+                  CLANG_HEADER_CACHE_BUILD=f"{proj}-{m}-{time.time()}", **{**ALL[m], **extra})
+PASSES = int(os.environ.get("PASSES", "1"))
+# INSTR=1: count each compile's instructions (perfc), stable where the host
+# is loaded; kept as "I" in the trace and summed in the summary line.
+PERFC = [os.environ.get("PERFC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf", "perfc"))] if os.environ.get("INSTR") == "1" else []
+passes = []
+for k in range(1, PASSES + 1):
+  if k > 1:
+    passes.append({"T": T, "S": S, "W": W, "failed": failed})
+    for m in CM:
+        env[m]["CLANG_HEADER_CACHE_BUILD"] = f"{proj}-{m}-pass{k}-{time.time()}"
+    # CHANGE_CMD: run before each later pass, to change the sources the
+    # rebuild reads (invalidation test); CHANGE_UNDO at the end.
+    if os.environ.get("CHANGE_CMD"):
+        subprocess.run(os.environ["CHANGE_CMD"], shell=True, check=True)
+  T = {m: [] for m in MODES}; S = {m: [] for m in CM}; W = {m: [] for m in MODES}; failed = []
+  I = {m: [] for m in MODES}
+  for i, (cwd, args, src) in enumerate(CMDS):
     for m in MODES[i % len(MODES):] + MODES[:i % len(MODES)]:
-        obj = f"{objdir}/{m}/{i}.o"
+        obj = f"{objdir}/{m}/{i}.o" if k == 1 else f"{objdir}/{m}/pass{k}-{i}.o"
         os.makedirs(os.path.dirname(obj), exist_ok=True)
         t = time.perf_counter()
         a = replay_args(args, obj)
         if m == "plain" and not PLAIN_MODULES:
             a = a[2:]
-        r = subprocess.run(["taskset", "-c", CORE, f"{BIN}/clang"] + a, cwd=cwd, env=env[m],
+        r = subprocess.run(["taskset", "-c", CORE] + PERFC + [f"{BIN}/clang"] + a, cwd=cwd, env=env[m],
                            capture_output=True, text=True)
         T[m].append((time.perf_counter() - t) * 1000)
+        if PERFC:
+            g = re.search(r"instructions=(\d+)", r.stderr)
+            I[m].append(int(g[1]) if g else 0)
+            r.stderr = "\n".join(l for l in r.stderr.splitlines() if "instructions=" not in l) + "\n"
         if r.returncode:
             failed.append((m, src, r.stderr[-600:]))
         W[m].append("\n".join(l for l in r.stderr.splitlines() if "header cache" not in l and not l.startswith("  ")))
         if m != "plain":
             S[m].append(r.stderr if os.environ.get("LEVEL", "1") != "1" else
                         "\n".join(l for l in r.stderr.splitlines() if "header cache" in l or l.startswith("  rejected:")))
+  if k > 1:
+    print(f"{proj} {KIND} pass {k}: " + ", ".join(
+        f"{m} {sum(T[m]) / 1000:.2f} s ({sum(T['plain']) / sum(T[m]):.2f}x, {sum(1 for f in failed if f[0] == m)} failed)"
+        for m in MODES), flush=True)
+if os.environ.get("CHANGE_UNDO"):
+    subprocess.run(os.environ["CHANGE_UNDO"], shell=True, check=True)
+if PASSES > 1:
+    passes.append({"T": T, "S": S, "W": W, "failed": failed})
+    T, S, W, failed = passes[0]["T"], passes[0]["S"], passes[0]["W"], passes[0]["failed"]
+    passes = passes[1:]
 stored = {}
 for m, (p, _) in daemons.items():
     p.terminate(); p.wait()
     if os.path.exists(p.region):
         os.remove(p.region)
     stored[m] = open(p.log).read()
+# Against plain clang's object from the same pass: cpython's getbuildinfo.c
+# records __TIME__.
+def differs(m, pre=""):
+    return [CMDS[i][2] for i in range(len(CMDS))
+            if not (os.path.exists(f"{objdir}/plain/{pre}{i}.o") and os.path.exists(f"{objdir}/{m}/{pre}{i}.o"))
+            or open(f"{objdir}/plain/{pre}{i}.o", "rb").read() != open(f"{objdir}/{m}/{pre}{i}.o", "rb").read()]
 differ = {}
 if KIND == "full":
     for m in CM:
-        differ[m] = [CMDS[i][2] for i in range(len(CMDS))
-                     if not (os.path.exists(f"{objdir}/plain/{i}.o") and os.path.exists(f"{objdir}/{m}/{i}.o"))
-                     or open(f"{objdir}/plain/{i}.o", "rb").read() != open(f"{objdir}/{m}/{i}.o", "rb").read()]
+        differ[m] = differs(m)
+        for k, P in enumerate(passes, 2):
+            P["differ"] = dict(P.get("differ", {}), **{m: differs(m, f"pass{k}-")})
 json.dump({"cmds": [c[2] for c in CMDS], "modes": MODES, "T": T, "S": S, "W": W, "failed": failed, "differ": differ,
-           "daemon": stored}, open(out, "w"))
+           "daemon": stored, "passes": passes, "I": I}, open(out, "w"))
 tot = {m: sum(T[m]) / 1000 for m in MODES}
 nf = {m: sum(1 for f in failed if f[0] == m) for m in MODES}
 print(f"{proj} {KIND}: " + ", ".join(f"{m} {tot[m]:.2f} s ({tot['plain'] / tot[m]:.2f}x, {nf[m]} failed"
                                      + (f", {len(differ[m])} objects differ" if m in differ else "") + ")" for m in MODES), flush=True)
+if PERFC:
+    gi = {m: sum(I[m]) / 1e9 for m in MODES}
+    print(f"{proj} {KIND} instructions: " + ", ".join(f"{m} {gi[m]:.1f} G ({gi['plain'] / gi[m]:.2f}x)" for m in MODES), flush=True)

@@ -17,6 +17,7 @@
 #define LLVM_CLANG_ASTCACHE_DECLFINGERPRINT_H
 
 #include "clang/ASTCache/DependencyRecord.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include <optional>
@@ -24,9 +25,22 @@
 
 namespace clang {
 class Decl;
+class IdentifierInfo;
 class NamedDecl;
 
 namespace ast_cache {
+
+/// When a struct or union's fingerprint holds its layout.
+enum class LayoutPart {
+  /// Always, computing the layout if the compile has not.
+  Always,
+  /// Only if the compile computed the layout already. A part holds a
+  /// constant from the layout, such as a sizeof in an array bound, only if
+  /// the compile computed the layout while it parsed the part.
+  IfComputed,
+  /// Never.
+  Never,
+};
 
 /// \p D's fingerprint, or std::nullopt for a declaration a part cannot depend
 /// on by name: one without a name, or not at file scope.
@@ -45,9 +59,20 @@ namespace ast_cache {
 /// for a definition or an asm label. The exporting compile passes those made
 /// before the header began: a hit checks the loading compile where the
 /// header begins, before the part adds its own definition of, say, bsearch.
-std::optional<std::string>
-declarationFingerprint(const NamedDecl &D,
-                       llvm::function_ref<bool(const Decl *)> Counts = nullptr);
+///
+/// \p Layout says when a struct or union's description holds its layout.
+///
+/// With \p Masked, the names a compile made from __COUNTER__ values, a
+/// function definition whose body uses one also gets " masked <hash>": its
+/// ODR hash with each such name hashed the same. Two such definitions that
+/// differ only in those names do the same thing.
+std::optional<std::string> declarationFingerprint(
+    const NamedDecl &D, llvm::function_ref<bool(const Decl *)> Counts = nullptr,
+    LayoutPart Layout = LayoutPart::Always,
+    const llvm::DenseSet<const IdentifierInfo *> *Masked = nullptr);
+
+/// Whether fingerprint \p F holds a layout.
+bool hasLayout(llvm::StringRef F);
 
 /// The C name space \p D's name is looked up in.
 DeclarationDependency::Space nameSpaceOf(const NamedDecl &D);
@@ -56,7 +81,8 @@ DeclarationDependency::Space nameSpaceOf(const NamedDecl &D);
 /// carries a copy fingerprinted \p Carried. Equal fingerprints always do. A
 /// part that carries only a declaration of a struct, union, enum, function or
 /// variable is also satisfied by a definition, since a declaration merges
-/// with one; a part that carries a definition needs the same definition.
+/// with one; a part that carries a definition needs the same definition, or,
+/// for a function with a masked hash, one with the same masked hash.
 bool fingerprintSatisfies(llvm::StringRef Carried, llvm::StringRef Live);
 
 } // namespace ast_cache
