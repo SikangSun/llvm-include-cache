@@ -453,3 +453,93 @@ fragment instance everything D5's simulator needs:
 - no tag is declared in a parameter list.
 
 A recording takes 35 s, serial.
+
+**D5, the full simulator, done 2026-10-30.** `simulate.py`:
+
+- **Order.** Compiles run in log order, a first build and then the scored
+  recompilation. Within each compile, instances run in processing order,
+  with the compile's `#define`/`#undef` between them.
+- **Stored versions.** One per location: the latest parse. A version keeps
+  its macro list and its uses (location and version).
+- **Reasons, in order, why an instance is not reused:**
+  - nested (p.33);
+  - a tag declared in a parameter list (p.28-29);
+  - uses the main file;
+  - repeat (p.28);
+  - nothing stored;
+  - the macro check fails;
+  - uses: p.28's timestamp rule, read through version identity, which one
+    version per location makes equivalent;
+  - unsafe: the rule allows reuse but the oracle differs. Charged as a parse.
+
+**The oracle, ours** (computed in the simulator from the recorded
+dependencies).
+
+- **What it hashes:** the tokens, the pragma state, and the distinct oracles
+  of the fragments holding earlier declarations of what the fragment used.
+- **Its own location is left out.** A header read twice redeclares its own
+  first reading.
+- **Each distinct oracle counts once.** Clang's `__stddef_size_t.h` is read a
+  varying number of times, giving identical earlier declarations. Counting
+  each copy made 2.7% of decisions falsely unsafe.
+
+**Tests.** `tests/simulate.py` checks two builds of three compiles each,
+worked out by hand, for every variant. One is p.27's `h1.h` with `M1`
+alternating, plus a header read twice that redeclares its own typedef, plus
+a user of that typedef. It shows:
+
+- R0's collapse;
+- R1's fix;
+- R2's gain;
+- the single version thrashing between `M1` and not `M1`;
+- the ideal cache keeping both versions.
+
+**Results, redis recompilation.** Front end; Bothner rows credited 1.65 ms of
+compiler start-up per compile.
+
+| | All 187 compiles | redis-server (125) |
+|---|---|---|
+| Plain clang | 15.38 s | 13.32 s |
+| **Header cache** | **5.41 s: 2.84x** (2.46x geometric mean per compile) | **4.13 s: 3.23x** (3.05x) |
+| **Bothner, R1 + macro lists (headline)** | **7.76 s: 1.98x** (1.78x) | **6.31 s: 2.11x** (1.99x) |
+| R0, the paper's literal rule | 11.29 s: 1.36x (1.28x) | 9.61 s: 1.39x (1.31x) |
+| R2, most favourable | 6.50 s: 2.37x (2.05x) | 5.30 s: 2.51x (2.25x) |
+| R1, no macro checks (the 2003 prototype) | 1.98x | 2.11x |
+| R1, §8.2's two bits | 1.86x | 1.96x |
+| Ideal fragment cache: any earlier parse with the same oracle | 6.12 s: 2.51x (2.15x) | 4.95 s: 2.69x (2.40x) |
+| Every fragment reused | 5.48 s: 2.81x (2.39x) | 4.37 s: 3.05x (2.73x) |
+
+**Headline decisions**, share of the recompilation's 161,403 fragment
+instances:
+
+| Outcome | Instances |
+|---|---|
+| Reused | 51.9% (76.2% of the time in fragments) |
+| Nested | 38.2% |
+| Repeat | 7.6% |
+| Macro check fails | 1.6% |
+| Uses fail | 0.6% |
+| Unsafe | 0.1% |
+
+**Findings for the paper.**
+
+- **The literal rule (R0) collapses on Clang.** Its modular `__stddef_size_t.h`
+  is read more than once per compile. Its re-parse becomes the stored version
+  and depends on its own location, so it is never valid again, and every
+  `size_t` user fails with it. In `server.c` that is 303 failed uses under
+  R0, against 26 under R1, and the first failure is at that header.
+- **Without macro checks (the 2003 prototype)** the rule would reuse 2,276
+  fragment instances whose tokens differ. That is miscompiled code: 1,860 in
+  `bits/mathcalls.h`, read three times per compile with different macros,
+  and 334 in redis's `commands.def`.
+- **Under every rule, 92 instances are unsafe** because an earlier
+  declaration differs, for example `va_list` already declared by another
+  header. The oracle counts these conservatively; they are 0.06%.
+- **No variant reaches the cache.** Even an ideal fragment cache that keeps
+  every version and restores for free (2.51x, 2.69x) stays below it.
+
+**Not done yet:**
+
+- option 3 (`#define` inside fragments) as a row;
+- D6's blanking validation and object check;
+- the other five projects.

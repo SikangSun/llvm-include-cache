@@ -820,7 +820,9 @@ public:
     // declarations, 0: inside one, -1: no event), order, pragma state, oracle,
     // flags (1: uses the main file, 2: its oracle does, 4: a tag in a
     // parameter list), uses, [[name id, macro state (low 32 bits; 0: not a
-    // macro)], ...]].
+    // macro)], ...], deps]. The simulator recomputes the oracle from the
+    // token hash, the pragma state and the deps, leaving out deps at what its
+    // rule counts as the fragment's own location.
     auto hex = [](uint64_t V) { return llvm::format_hex_no_prefix(V, 16); };
     OS << "],\"frags\":[";
     for (size_t I = 0; I < Frags.size(); ++I) {
@@ -841,6 +843,9 @@ public:
           OS << (First ? "" : ",") << "[" << Id << "," << uint32_t(St) << "]";
           First = false;
         }
+        OS << "],[";
+        for (size_t K = 0; K < X.Deps.size(); ++K)
+          OS << (K ? "," : "") << X.Deps[K];
         OS << "]";
       }
       OS << "]";
