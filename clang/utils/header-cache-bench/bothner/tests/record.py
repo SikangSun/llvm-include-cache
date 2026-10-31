@@ -45,6 +45,21 @@ files = {
     "s.h": "struct S { char c; int i; };\n",
     "p1.c": '#pragma pack(1)\n#include "s.h"\n',
     "p2.c": '#include "s.h"\n',
+    # What the meaning depends on without a lookup: the struct a typedef
+    # names (defined elsewhere, wider under WIDE), a member access through a
+    # pointer typedef; and a library builtin, valid to call only once a
+    # header declared it.
+    "td.h": "typedef struct L L;\n",
+    "tdef.h": "#if WIDE\nstruct L { long a; };\n#else\nstruct L { int a; };\n#endif\n",
+    "tuse.h": "extern L arr[2];\n",
+    "mem.h": "#if WIDE\nstruct M2 { long x; };\n#else\nstruct M2 { int x; };\n#endif\n",
+    "memuse.h": "typedef struct M2 *MP;\nstatic inline long getx(MP m) { return m->x; }\n",
+    "mc.h": "void *memcpy(void *, const void *, unsigned long);\n",
+    "mcuse.h": "static inline void cp(void *d, const void *s) { memcpy(d, s, 1); }\n",
+    "t1.c": '#define WIDE 1\n#include "td.h"\n#include "tdef.h"\n#include "tuse.h"\n#include "mem.h"\n#include "memuse.h"\n#include "mc.h"\n#include "mcuse.h"\n',
+    "t2.c": '#include "td.h"\n#include "tdef.h"\n#include "tuse.h"\n#include "mem.h"\n#include "memuse.h"\n#include "mc.h"\n#include "mcuse.h"\n',
+    # The main file using a header's declaration (what blank.py must not blank).
+    "r1.c": '#define BUFSIZ 10\n#include "a.h"\n#include "buf.h"\nint use(void) { return j; }\n',
 }
 for name, text in files.items():
     os.makedirs(os.path.dirname(os.path.join(work, name)), exist_ok=True)
@@ -119,5 +134,18 @@ _, q2 = record("p2.c")
 s1, s2 = q1["./s.h"][0], q2["./s.h"][0]
 check(s1["hash"] == s2["hash"] and s1["pragma"] != s2["pragma"] and s1["oracle"] != s2["oracle"],
       "s.h under #pragma pack(1): same tokens, other pragma state, other oracle")
+_, t1 = record("t1.c")
+_, t2 = record("t2.c")
+u1, u2 = t1["./tuse.h"][0], t2["./tuse.h"][0]
+check(u1["hash"] == u2["hash"] and u1["uses"] == u2["uses"] == [("./td.h", 0)] and u1["oracle"] != u2["oracle"],
+      "tuse.h `extern L arr[2];`: same tokens, uses the typedef only, but its oracle sees struct L change")
+g1, g2 = t1["./memuse.h"][0], t2["./memuse.h"][0]
+check(g1["hash"] == g2["hash"] and g1["oracle"] != g2["oracle"],
+      "memuse.h `m->x` through a pointer typedef: same tokens, its oracle sees struct M2 change")
+check(t1["./mcuse.h"][0]["uses"] == [("./mc.h", 0)],
+      f"mcuse.h calls memcpy, which needs mc.h's declaration: uses {t1['./mcuse.h'][0]['uses']}")
+_, r1 = record("r1.c")
+check(r1["./a.h"][0]["flags"] & 8 and not r1["./buf.h"][0]["flags"] & 8,
+      f"r1.c uses a.h's j, not buf.h's buffer: flags {r1['./a.h'][0]['flags']}, {r1['./buf.h'][0]['flags']}")
 print("all ok" if ok else "FAILURES")
 sys.exit(0 if ok else 1)

@@ -324,33 +324,54 @@ struct Rec {
   std::map<unsigned, uint64_t> Ids; // name id -> macro state, first sighting
   llvm::SmallSetVector<int, 8> Uses, Deps;
   bool UsesMain = false, DepsMain = false, Param = false;
+  bool MainRef = false; // the main file used one of its declarations
 };
 
-// Every name a declaration's parse resolved to a declaration: references,
+// Every name a declaration's parse resolved to a declaration (Lookup): references,
 // types written by name, and the earlier declaration a redeclaration merges
-// with. Member and designator names are left out, as Bothner leaves them out.
+// with. Bothner records only these (p.27). Also, for the oracle and blank.py
+// only (not Lookup), what the meaning depends on without a lookup: the
+// declarations of the tag a typedef names, and of the struct a member access
+// or a designator reaches into.
 class UseVisitor : public RecursiveASTVisitor<UseVisitor> {
 public:
-  std::function<void(SourceLocation, const Decl *)> Ref;
+  std::function<void(SourceLocation, const Decl *, bool Lookup)> Ref;
   bool VisitDeclRefExpr(DeclRefExpr *E) {
-    Ref(E->getLocation(), E->getDecl());
+    Ref(E->getLocation(), E->getDecl(), true);
     return true;
   }
   bool VisitTypedefTypeLoc(TypedefTypeLoc TL) {
-    Ref(TL.getBeginLoc(), TL.getDecl());
+    Ref(TL.getBeginLoc(), TL.getDecl(), true);
+    const Type *T = TL.getDecl()->getUnderlyingType().getCanonicalType().getTypePtr();
+    while (T->isAnyPointerType() || T->isArrayType())
+      T = T->getPointeeOrArrayElementType()->getCanonicalTypeInternal().getTypePtr();
+    if (const TagDecl *Tag = T->getAsTagDecl())
+      Ref(TL.getBeginLoc(), Tag, false);
     return true;
   }
   bool VisitRecordTypeLoc(RecordTypeLoc TL) {
-    Ref(TL.getBeginLoc(), TL.getDecl());
+    Ref(TL.getBeginLoc(), TL.getDecl(), true);
     return true;
   }
   bool VisitEnumTypeLoc(EnumTypeLoc TL) {
-    Ref(TL.getBeginLoc(), TL.getDecl());
+    Ref(TL.getBeginLoc(), TL.getDecl(), true);
     return true;
   }
   bool VisitDecl(Decl *D) {
     if (Decl *P = D->getPreviousDecl())
-      Ref(D->getLocation(), P);
+      Ref(D->getLocation(), P, true);
+    return true;
+  }
+  bool VisitMemberExpr(MemberExpr *E) {
+    if (auto *F = dyn_cast<FieldDecl>(E->getMemberDecl()))
+      Ref(E->getMemberLoc(), F->getParent(), false);
+    return true;
+  }
+  bool VisitDesignatedInitExpr(DesignatedInitExpr *E) {
+    for (const DesignatedInitExpr::Designator &D : E->designators())
+      if (D.isFieldDesignator())
+        if (const FieldDecl *F = D.getFieldDecl())
+          Ref(D.getFieldLoc(), F->getParent(), false);
     return true;
   }
 };
@@ -728,18 +749,37 @@ public:
         return SM.getComposedLoc(EntryFID[Frags[F].Entry], Frags[F].Start);
       };
       UseVisitor V;
-      V.Ref = [&](SourceLocation At, const Decl *D) {
+      V.Ref = [&](SourceLocation At, const Decl *D, bool Lookup) {
         int U = ownerOf(SM.getExpansionLoc(At).getRawEncoding(), O_PRE, false);
+        if (U == O_MAIN && D) {
+          // Which fragments the main file depends on: only those it does not
+          // can be blanked to check the time model (blank.py).
+          for (const Decl *Q : D->redecls())
+            if (!Q->isImplicit())
+              if (int OQ = declOwner(Q); OQ >= 0)
+                R[OQ].MainRef = true;
+          return;
+        }
         if (U < 0 || !D)
           return;
-        const Decl *First = D->getCanonicalDecl();
-        if (First->isImplicit())
-          return; // a builtin: there from the start, as GCC's were (p.23)
-        int O = declOwner(First);
-        if (O >= 0 && O != U && R[O].Order < R[U].Order)
-          R[U].Uses.insert(O);
-        else if (O == O_MAIN && SM.isBeforeInTranslationUnit(First->getLocation(), startOf(U)))
-          R[U].UsesMain = true;
+        // The entity's first declaration that is not implicit. Usually its
+        // first declaration; for a library builtin (memcpy), the header's:
+        // GCC's builtins were there from the start (p.23), but in C99 a call
+        // to one is valid only once a header declared it (ours).
+        const Decl *First = nullptr;
+        for (const Decl *Q : D->redecls())
+          if (!Q->isImplicit() &&
+              (!First || SM.isBeforeInTranslationUnit(Q->getLocation(), First->getLocation())))
+            First = Q;
+        if (!First)
+          return; // a builtin no header declares
+        if (Lookup) {
+          int O = declOwner(First);
+          if (O >= 0 && O != U && R[O].Order < R[U].Order)
+            R[U].Uses.insert(O);
+          else if (O == O_MAIN && SM.isBeforeInTranslationUnit(First->getLocation(), startOf(U)))
+            R[U].UsesMain = true;
+        }
         for (const Decl *Q : D->redecls()) {
           if (Q->isImplicit())
             continue;
@@ -819,7 +859,7 @@ public:
     // mode also [token hash, nesting before, nesting after (1: between
     // declarations, 0: inside one, -1: no event), order, pragma state, oracle,
     // flags (1: uses the main file, 2: its oracle does, 4: a tag in a
-    // parameter list), uses, [[name id, macro state (low 32 bits; 0: not a
+    // parameter list, 8: the main file uses it), uses, [[name id, macro state (low 32 bits; 0: not a
     // macro)], ...], deps]. The simulator recomputes the oracle from the
     // token hash, the pragma state and the deps, leaving out deps at what its
     // rule counts as the fragment's own location.
@@ -834,7 +874,7 @@ public:
         const Rec &X = R[I];
         OS << ",\"" << hex(X.Hash) << "\"," << int(X.Before) << "," << int(X.After)
            << "," << X.Order << ",\"" << hex(X.Pragma) << "\",\"" << hex(X.Oracle)
-           << "\"," << (X.UsesMain | X.DepsMain << 1 | X.Param << 2) << ",[";
+           << "\"," << (X.UsesMain | X.DepsMain << 1 | X.Param << 2 | X.MainRef << 3) << ",[";
         for (size_t K = 0; K < X.Uses.size(); ++K)
           OS << (K ? "," : "") << X.Uses[K];
         OS << "],[";

@@ -55,9 +55,12 @@ p.22-23; measured 1.57-1.68 ms with redis's flags).
 
 usage: simulate.py <record dir> <timing dir> [recompile json]
                    [--trace INDEX] [--variant NAME] [--out per-compile.json]
+                   [--reused reused.json]
 The recompile JSON (recompile.py) gives plain clang's and the cache's
 recompilation times; without it, the timing run's plain clang with modules.
-env: CREDIT_MS (default 1.65)
+env: CREDIT_MS (default 1.65); SAVED_SCALE (default 1): multiplies the time
+every reused fragment saves, to widen the bound by the time model's error
+(blank.py measured it).
 """
 import argparse, collections, json, os, statistics, sys
 
@@ -68,9 +71,12 @@ ap.add_argument("recompile", nargs="?")
 ap.add_argument("--trace", type=int, help="print every decision of this compile (log index)")
 ap.add_argument("--variant", default="R1 V1", help="the variant --trace follows")
 ap.add_argument("--out", help="write per-compile results here")
+ap.add_argument("--reused", help="write, per compile, the instances --variant reuses in the recompilation "
+                "(file as opened, offset, occurrence): blank.py's input")
 args = ap.parse_args()
 recomp = json.load(open(args.recompile)) if args.recompile else None
 CREDIT = float(os.environ.get("CREDIT_MS", "1.65")) / 1e3
+SCALE = float(os.environ.get("SAVED_SCALE", "1"))
 
 VARIANTS = {  # name: (rule, macro check)
     "R1 V1": ("R1", "V1"), "R0 V1": ("R0", "V1"), "R2 V1": ("R2", "V1"),
@@ -155,7 +161,7 @@ def simulate(rule, macro, trace=None):
             ver = [None] * len(b["xs"])
             key_of = (lambda x: (x["loc"], x["occ"])) if rule == "R2" else (lambda x: x["loc"])
             orc = oracles(b)
-            why, saved, unsafe = collections.Counter(), 0, collections.Counter()
+            why, saved, unsafe, reused = collections.Counter(), 0, collections.Counter(), []
             p = 0
             for _, kind, item in b["seq"]:
                 if kind == 0:        # #define or #undef
@@ -209,6 +215,7 @@ def simulate(rule, macro, trace=None):
                         ver[k] = v.id
                     saved += x["ns"]
                     why["reused"] += 1
+                    reused.append(k)
                 else:                # parsed: the stored version from now on
                     why[reason] += 1
                     clock += 1
@@ -238,7 +245,7 @@ def simulate(rule, macro, trace=None):
                     print(f"  {x['loc'][1]}:{x['loc'][2]}#{x['occ']}  {reason or 'reused':8} {x['ns'] / 1e3:8.1f} us"
                           f"  uses {[(b['xs'][u]['loc'][1], b['xs'][u]['loc'][2]) for u in x['uses']]}")
             if phase == 1:
-                out.append({"i": b["i"], "why": why, "saved": saved, "unsafe": unsafe})
+                out.append({"i": b["i"], "why": why, "saved": saved, "unsafe": unsafe, "reused": reused})
     return out
 
 
@@ -287,14 +294,15 @@ def table(label, sel):
         return
     P = sum(plain_of(b)[0] for b in bs)
     print(f"\n{label}: {len(bs)} compiles; plain clang {P:.2f} s; compiler start-up credited "
-          f"{CREDIT * 1e3:.2f} ms per compile in every Bothner row")
+          f"{CREDIT * 1e3:.2f} ms per compile in every Bothner row"
+          + (f"; time saved by reuse scaled by {SCALE}" if SCALE != 1 else ""))
     rows = []
     if all(plain_of(b)[1] is not None for b in bs):
         rows.append(("header cache, recompilation", {b["i"]: plain_of(b)[1] for b in bs}))
     for name, res in results.items():
-        saved = {r["i"]: r["saved"] / 1e9 for r in res}
+        saved = {r["i"]: SCALE * r["saved"] / 1e9 for r in res}
         rows.append((f"Bothner {name}", {b["i"]: plain_of(b)[0] - saved[b["i"]] - CREDIT for b in bs}))
-    rows.append(("every fragment reused", {b["i"]: plain_of(b)[0] - sum(x["ns"] for x in b["xs"]) / 1e9 - CREDIT
+    rows.append(("every fragment reused", {b["i"]: plain_of(b)[0] - SCALE * sum(x["ns"] for x in b["xs"]) / 1e9 - CREDIT
                                            for b in bs}))
     for name, times in rows:
         T = sum(times.values())
@@ -304,6 +312,11 @@ def table(label, sel):
 
 table("all", lambda b: True)
 table("redis-server (src/)", lambda b: "/redis/src" in b["cwd"])
+
+if args.reused:
+    json.dump({str(r["i"]): [[by_build[r["i"]]["xs"][k]["loc"][1], by_build[r["i"]]["xs"][k]["loc"][2],
+                              by_build[r["i"]]["xs"][k]["occ"]] for k in r["reused"]]
+               for r in results[args.variant]}, open(args.reused, "w"))
 
 if args.out:
     json.dump({name: [{"i": r["i"], "src": by_build[r["i"]]["src"], "why": dict(r["why"]), "saved_ns": r["saved"]}

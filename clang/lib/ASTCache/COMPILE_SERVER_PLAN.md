@@ -495,17 +495,18 @@ a user of that typedef. It shows:
 - the ideal cache keeping both versions.
 
 **Results, redis recompilation.** Front end; Bothner rows credited 1.65 ms of
-compiler start-up per compile.
+compiler start-up per compile. These are after D6's three fixes to the
+uses (below); before them the headline was 1.98x (2.11x).
 
 | | All 187 compiles | redis-server (125) |
 |---|---|---|
 | Plain clang | 15.38 s | 13.32 s |
 | **Header cache** | **5.41 s: 2.84x** (2.46x geometric mean per compile) | **4.13 s: 3.23x** (3.05x) |
-| **Bothner, R1 + macro lists (headline)** | **7.76 s: 1.98x** (1.78x) | **6.31 s: 2.11x** (1.99x) |
-| R0, the paper's literal rule | 11.29 s: 1.36x (1.28x) | 9.61 s: 1.39x (1.31x) |
-| R2, most favourable | 6.50 s: 2.37x (2.05x) | 5.30 s: 2.51x (2.25x) |
-| R1, no macro checks (the 2003 prototype) | 1.98x | 2.11x |
-| R1, §8.2's two bits | 1.86x | 1.96x |
+| **Bothner, R1 + macro lists (headline)** | **7.79 s: 1.97x** (1.77x) | **6.34 s: 2.10x** (1.97x) |
+| R0, the paper's literal rule | 11.30 s: 1.36x (1.28x) | 9.62 s: 1.38x (1.30x) |
+| R2, most favourable | 6.53 s: 2.35x (2.04x) | 5.33 s: 2.50x (2.23x) |
+| R1, no macro checks (the 2003 prototype) | 1.97x | 2.10x |
+| R1, §8.2's two bits | 1.85x | 1.95x |
 | Ideal fragment cache: any earlier parse with the same oracle | 6.12 s: 2.51x (2.15x) | 4.95 s: 2.69x (2.40x) |
 | Every fragment reused | 5.48 s: 2.81x (2.39x) | 4.37 s: 3.05x (2.73x) |
 
@@ -514,7 +515,7 @@ instances:
 
 | Outcome | Instances |
 |---|---|
-| Reused | 51.9% (76.2% of the time in fragments) |
+| Reused | 51.8% (75.9% of the time in fragments) |
 | Nested | 38.2% |
 | Repeat | 7.6% |
 | Macro check fails | 1.6% |
@@ -532,14 +533,73 @@ instances:
   fragment instances whose tokens differ. That is miscompiled code: 1,860 in
   `bits/mathcalls.h`, read three times per compile with different macros,
   and 334 in redis's `commands.def`.
-- **Under every rule, 92 instances are unsafe** because an earlier
-  declaration differs, for example `va_list` already declared by another
-  header. The oracle counts these conservatively; they are 0.06%.
+- **Under every rule, 193 instances are unsafe** because an earlier
+  declaration of something they use differs (most in `stdlib.h` and
+  `stdio.h`). The oracle counts these conservatively; they are 0.1%.
 - **No variant reaches the cache.** Even an ideal fragment cache that keeps
   every version and restores for free (2.51x, 2.69x) stays below it.
+
+**D6, the time model and the plugin checked, done 2026-10-31.**
+
+**`blank.py`: what the model charges against what removal saves.**
+
+- **Compiles.** 15 redis compiles: five large, five middle-sized, five small
+  or from `deps/`.
+- **What is removed.** The locations whose every instance the headline
+  reuses, and that nothing else in the compile uses or redeclares: no other
+  fragment and not the main file. Record mode now also notes which fragments
+  the main file uses (flag 8).
+- **How.** Their fragments are blanked, newlines kept, in copies of their
+  headers. The compile reads the copies through a VFS overlay
+  (`-ivfsoverlay`, original names kept, so `__FILE__` and `#pragma once`
+  are unchanged). The control is an overlay of unchanged copies; its
+  preprocessed output equals the compile's without an overlay. Best of 11
+  each, interleaved.
+
+| | Charged by the model | Saved when measured | Model against measured |
+|---|---|---|---|
+| 15 compiles (540-554 of about 1,500 locations blanked in the large ones) | 264.6 ms | 261.2 ms | +1.3% |
+| Per compile | | | median +1.2%, from -3.8% (`redis-cli.c`) to +21.2% (`lapi.c`: 0.44 ms of a 47 ms compile) |
+
+- **The model overstates the saving slightly**, which favours Bothner.
+- **A strict bound.** `SAVED_SCALE=1.038` adds the worst underestimate to every
+  reused fragment's time. Then:
+  - headline: 2.05x (2.19x for redis-server);
+  - R2: 2.48x (2.64x);
+  - ideal fragment cache: 2.66x (2.87x);
+  - every fragment reused: 3.01x (3.30x).
+
+  All but the last, which no rule reaches, stay below the cache's 2.84x
+  (3.23x).
+- **Limit.** Only fragments nothing uses can be removed this way, about a
+  third of the locations. The time charged to used fragments is not checked
+  directly.
+
+**Three references record mode missed.** Blanking found them: three compiles
+failed to compile with the first selection.
+
+- **An array of a typedef'd struct** needs the struct's definition
+  (`connListener` in `server.h`), which no name lookup reaches.
+- **A member access** likewise needs its struct's definition.
+- **A call to a library builtin** (`memcpy`) is valid in C99 only once a
+  header declared it. Record mode had treated Clang's implicit builtin as
+  present from the start, as GCC's were (p.23).
+
+Now:
+
+- the first two feed the oracle (Bothner recorded name lookups only);
+- the third is a use;
+- `tests/record.py` checks all three.
+
+With them the headline is 1.97x (2.10x), and the oracle counts 193 unsafe
+instances instead of 92. All results above are from this version.
+
+**`objects.py`: the plugin changes nothing.** All 187 redis compiles were
+built to objects three ways: plain clang; with the plugin timing; with it
+recording (an AST walk before code generation). They are byte-identical. The
+two `foo.c` probes fail in all three ways.
 
 **Not done yet:**
 
 - option 3 (`#define` inside fragments) as a row;
-- D6's blanking validation and object check;
 - the other five projects.
