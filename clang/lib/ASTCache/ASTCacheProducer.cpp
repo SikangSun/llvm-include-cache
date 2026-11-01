@@ -755,8 +755,10 @@ ProduceResult clang::ast_cache::produceHeader(const ProduceRequest &In) {
   R.Push.Deps.Entry = O.Entry;
   R.Push.Deps.Exit = O.Exit;
   R.Push.Deps.MacroEffects = O.MacroEffects;
-  R.Push.Deps.WarningState =
-      warningState(warningFlagsHash(CI.getDiagnosticOpts()), nullptr);
+  uint64_t Flags = warningFlagsHash(
+      CI.getDiagnosticOpts(), CI.getDiagnostics().getDiagnosticIDs(),
+      CI.getFileManager().getVirtualFileSystem());
+  R.Push.Deps.WarningState = warningState(Flags, nullptr);
   R.Push.Data = (*Buf)->getBuffer().str();
   return R;
 }

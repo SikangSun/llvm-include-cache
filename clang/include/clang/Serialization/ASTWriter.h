@@ -213,6 +213,8 @@ private:
   std::function<bool(const MacroDirective *)> PartMacros;
   std::function<bool(SourceLocation::UIntTy)> PartKeepsExpansion;
   std::function<bool(FileEntryRef)> PartKeepsHeaderInfo;
+  /// See getModuleNameOffsets.
+  SmallVector<uint64_t, 2> ModuleNameOffsets;
   std::function<bool(const IdentifierInfo *)> PartPoisons;
 
   /// See setPartScope.
@@ -1056,6 +1058,13 @@ public:
     PartKeepsHeaderInfo = std::move(KeepsHeaderInfo);
   }
   bool isWritingPart() const { return bool(PartDecls); }
+
+  /// Header cache: where the written module's name is in the written bytes,
+  /// as MODULE_NAME and as its SUBMODULE_DEFINITION's name, so that a part
+  /// can be named again after it is written.
+  ArrayRef<uint64_t> getModuleNameOffsets() const {
+    return ModuleNameOffsets;
+  }
 
   /// Which identifiers the part's own header poisoned (#pragma GCC poison).
   /// A part writes only those as poisoned: one poisoned before the header

@@ -67,6 +67,10 @@ public:
     /// CLANG_HEADER_CACHE_SECOND_MISS: parts not written, the first time
     /// their copy would have been.
     unsigned HeldBack = 0;
+    /// Parts named again after Clang's writer ran, their finished metadata
+    /// differing from what it was before; and the merge keys written
+    /// (HeaderDependencySet::Owned).
+    unsigned Renamed = 0, OwnedKeys = 0;
     /// CLANG_HEADER_CACHE_FIRST_READ: headers recorded at their first read;
     /// of them, the ones written, and the ones read faster than the cutoff.
     unsigned FirstReads = 0, FirstReadsWritten = 0, FirstReadsFast = 0;

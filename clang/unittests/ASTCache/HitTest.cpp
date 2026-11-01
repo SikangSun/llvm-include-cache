@@ -37,6 +37,7 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Options/OptionUtils.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -1956,6 +1957,110 @@ TEST_F(ExportTest, AHeaderWrittenInsideOneBeingWrittenIsLinked) {
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
 }
 
+TEST_F(ExportTest, AStructItsLinkDefinesIsOnlyDeclaredWhereTheCopyBegins) {
+  // The kernel's device.h includes module.h, and before it sysfs.h has only
+  // declared struct module. dev.h's copy, which links mod.h's, must say so:
+  // where dev.h begins the struct is declared, not defined, and a.c, read
+  // again with fwd.h served, is served dev.h too.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Fwd =
+      write("fwd.h", "#ifndef FWD_H\n#define FWD_H\nstruct module;\n"
+                     "int fwd(struct module *m);\n#endif\n");
+  std::string Mod = write("mod.h", "#ifndef MOD_H\n#define MOD_H\n"
+                                   "struct module { int refs; };\n#endif\n");
+  // dev.h names the struct before it includes mod.h, as device.h does.
+  std::string Dev =
+      write("dev.h", "#ifndef DEV_H\n#define DEV_H\n"
+                     "int dev_attach(struct module *m);\n#include \"" +
+                         Mod +
+                         "\"\nstatic inline int dev_refs(struct module *m) "
+                         "{ return m->refs; }\n#endif\n");
+  std::string A =
+      write("a.c", "#include \"" + Fwd + "\"\n#include \"" + Dev + "\"\n");
+  std::string B =
+      write("b.c", "#include \"" + Mod + "\"\n#include \"" + Fwd +
+                       "\"\n#include \"" + Dev +
+                       "\"\nint b(struct module *m) { return dev_refs(m); }\n");
+  EXPECT_TRUE(reads(A, Dev)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Dev)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(A, Dev))
+      << "dev.h's copy did not fit the compile that wrote it";
+  // Where mod.h came first, the struct is defined, which the copy allows.
+  EXPECT_FALSE(reads(B, Dev)) << "dev.h's copy was not served to b.c";
+}
+
+TEST_F(ExportTest, ACopyDoesNotNameABlockScopeExternDeclaration) {
+  // The kernel's mm.h declares __init_end inside a function, and
+  // asm-generic/sections.h declares it again at file scope. No file-scope
+  // lookup finds the first, so sec.h's copy, which int.h's links, must not
+  // name it: a.c, read again, is served int.h, and compiles.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Fn = write(
+      "fn.h", "#ifndef FN_H\n#define FN_H\nstatic inline char *init_end(void)"
+              " { extern char __init_end[]; return __init_end; }\n#endif\n");
+  std::string Sec =
+      write("sec.h", "#ifndef SEC_H\n#define SEC_H\n"
+                     "extern char __init_begin[], __init_end[];\n"
+                     "static inline int in_init(char *p) "
+                     "{ return p >= __init_begin && p < __init_end; }\n"
+                     "#endif\n");
+  std::string Int = write("int.h", "#ifndef INT_H\n#define INT_H\n#include \"" +
+                                       Sec + "\"\nint irq(char *p);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Fn + "\"\n#include \"" + Int +
+                                   "\"\nint a(void) { return in_init("
+                                   "init_end()); }\n");
+  EXPECT_TRUE(reads(A, Int)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Int)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(A, Entered)) << "a.c did not compile with the copies";
+  EXPECT_FALSE(Entered.count(Int)) << "int.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Sec)) << "sec.h was opened";
+}
+
+TEST_F(ExportTest, AMacroRedefinedAfterALinkedHeaderKeepsItsNewDefinition) {
+  // git's sane-ctype.h includes <ctype.h>, then replaces its isspace. Served
+  // compat.h's copy, with posix.h's, sane.h's and ctype.h's copies linked,
+  // c.c must end with sane.h's isspace (git's color.c called glibc's
+  // __ctype_b_loc where plain clang calls git's sane_ctype).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Ctype = write("ctype.h", "#ifndef CTYPE_H\n#define CTYPE_H\n"
+                                       "long libc_isspace(int);\n"
+                                       "#define isspace(c) libc_isspace(c)\n"
+                                       "#endif\n");
+  std::string Sane = write("sane.h", "#ifndef SANE_H\n#define SANE_H\n"
+                                     "#include \"" +
+                                         Ctype +
+                                         "\"\n#undef isspace\n"
+                                         "char sane_isspace(int);\n"
+                                         "#define isspace(c) sane_isspace(c)\n"
+                                         "#endif\n");
+  std::string Posix = write("posix.h", "#ifndef POSIX_H\n#define POSIX_H\n"
+                                       "int posix_fd(void);\n#include \"" +
+                                           Sane + "\"\n#endif\n");
+  std::string Compat =
+      write("compat.h", "#ifndef COMPAT_H\n#define COMPAT_H\n#include \"" +
+                            Posix + "\"\nint compat(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Compat + "\"\n");
+  std::string C =
+      write("c.c", "#include \"" + Compat +
+                       "\"\n_Static_assert(sizeof(isspace(0)) == "
+                       "sizeof(char), \"isspace is ctype.h's\");\n");
+  EXPECT_TRUE(reads(B, Compat)) << "nothing is listed yet";
+  size_t Before = Daemon->stats().Entries;
+  EXPECT_TRUE(reads(B, Compat)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, Before + 4)
+      << "the four headers were not all written";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c ended with ctype.h's isspace";
+  EXPECT_FALSE(Entered.count(Compat)) << "compat.h's copy was not served";
+}
+
 TEST_F(ExportTest, ALinkIsSkippedWhereItsHeaderWasRead) {
   // inner.h reads nothing outer.h's lines set, and outer.h's lines read
   // nothing inner.h sets, so the link is skipped where inner.h was read:
@@ -3062,11 +3167,11 @@ TEST_F(ExportTest, APartIsNotServedUnderAnotherNameWithDebugInfo) {
 
 TEST_F(ExportTest, ASecondCopyOfAHeaderIsNotTakenForTheFirst) {
   // h.h is unguarded and refers to f, declared outside it, by name. a.c's
-  // part has f without a prototype, b.c's has f(int), and nothing else tells
-  // them apart, so they share a name. c.c includes h.h after each
-  // declaration. Taking a.c's part again would leave fp without a
-  // prototype; loading b.c's too would declare a second fp. c.c reads h.h
-  // the second time, and its fp has f(int)'s prototype.
+  // part has f without a prototype, b.c's has f(int). c.c includes h.h
+  // after each declaration. Taking a.c's part again would leave fp without
+  // a prototype; loading b.c's too would declare a second fp, whose type
+  // differs from the first's (mergesHere). c.c reads h.h the second time,
+  // and its fp has f(int)'s prototype.
   std::string H = write("h.h", "extern __typeof__(f) *fp;\n");
   std::string A = write("a.c", "int f();\n#include \"" + H + "\"\n");
   std::string B = write("b.c", "int f(int);\n#include \"" + H + "\"\n");
@@ -3080,6 +3185,166 @@ TEST_F(ExportTest, ASecondCopyOfAHeaderIsNotTakenForTheFirst) {
   EXPECT_TRUE(reads(B, H)) << "a.c's part fits b.c";
   ASSERT_EQ(Daemon->stats().Entries, 2u) << "h.h was not exported twice";
   EXPECT_TRUE(reads(C, H)) << "c.c was served both parts";
+}
+
+namespace {
+/// The number of declarations of \p Name at file scope that are not
+/// redeclarations of one another.
+unsigned entitiesNamed(ASTContext &Ctx, llvm::StringRef Name) {
+  llvm::SmallPtrSet<const Decl *, 4> Seen;
+  for (NamedDecl *D :
+       Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get(Name)))
+    Seen.insert(D->getCanonicalDecl());
+  return Seen.size();
+}
+} // namespace
+
+TEST_F(ExportTest, ACopyIsNotTakenWhereTheTextDeclaredItsNamesWithOtherTypes) {
+  // h.h is unguarded. c.c reads it first where f has no prototype, as text:
+  // the one copy, b.c's, needs f(int). It reads it again after f(int),
+  // where b.c's copy fits, but that copy's fp is int (*)(int) and c.c's is
+  // int (*)(). Clang would keep the copy's as a second fp; the text
+  // redeclares c.c's.
+  std::string H = write("h.h", "extern __typeof__(f) *fp;\n");
+  std::string B = write("b.c", "int f(int);\n#include \"" + H + "\"\n");
+  std::string C = write("c.c", "int f();\n#include \"" + H +
+                                   "\"\nint f(int);\n#include \"" + H + "\"\n");
+  EXPECT_TRUE(reads(B, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, H)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "h.h was not exported";
+  unsigned Fps = 0;
+  AtEnd = [&](ASTContext &Ctx) { Fps = entitiesNamed(Ctx, "fp"); };
+  EXPECT_TRUE(reads(C, H));
+  AtEnd = nullptr;
+  EXPECT_EQ(Fps, 1u) << "c.c declares two fp";
+}
+
+TEST_F(ExportTest, ALinkIsNotLoadedWhereTheTextDeclaredItsNamesWithOtherTypes) {
+  // As above, with h.h's copy linked from w.h's: c.c reads h.h as text
+  // where f has no prototype, then w.h, whose copy from b.c fits and links
+  // h.h's copy with fp int (*)(int).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string H = write("h.h", "extern __typeof__(f) *fp;\n");
+  std::string W = write("w.h", "#ifndef W_H\n#define W_H\n#include \"" + H +
+                                   "\"\nint w(void);\n#endif\n");
+  std::string B = write("b.c", "int f(int);\n#include \"" + W + "\"\n");
+  std::string C = write("c.c", "int f();\n#include \"" + H +
+                                   "\"\nint f(int);\n#include \"" + W + "\"\n");
+  EXPECT_TRUE(reads(B, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, W)) << "nothing is stored yet";
+  unsigned Fps = 0;
+  AtEnd = [&](ASTContext &Ctx) { Fps = entitiesNamed(Ctx, "fp"); };
+  EXPECT_TRUE(reads(C, W)) << "w.h's copy was served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Fps, 1u) << "c.c declares two fp";
+}
+
+TEST_F(ExportTest, ACopyIsTakenWhereTheTextDeclaredItsNamesWithTheSameTypes) {
+  // h.h is unguarded. c.c reads it first with EXTRA defined, as text, then
+  // again without, where b.c's copy fits. The copy's v is the int c.c
+  // declared, and Clang merges the two: it is served.
+  std::string H = write("h.h", "#ifdef EXTRA\nextern int extra;\n#endif\n"
+                               "extern int v;\n");
+  std::string B = write("b.c", "#include \"" + H + "\"\n");
+  std::string C = write("c.c", "#define EXTRA\n#include \"" + H +
+                                   "\"\n#undef EXTRA\n#include \"" + H +
+                                   "\"\nint g(void) { return v + extra; }\n");
+  EXPECT_TRUE(reads(B, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, H)) << "nothing is stored yet";
+  uint64_t Before = Daemon->stats().HitsTimed;
+  unsigned Vs = 0;
+  AtEnd = [&](ASTContext &Ctx) { Vs = entitiesNamed(Ctx, "v"); };
+  EXPECT_TRUE(reads(C, H));
+  AtEnd = nullptr;
+  EXPECT_EQ(Daemon->stats().HitsTimed, Before + 1) << "b.c's copy was not served";
+  EXPECT_EQ(Vs, 1u) << "c.c declares two v";
+}
+
+TEST_F(ExportTest, CopiesThatDifferInWhatTheyTakeFromOutsideHaveTwoNames) {
+  // t.h redeclares a typedef, as clang's stddef.h does size_t. b.c declares
+  // it first (u.h), so its copy of t.h takes size_type from outside; a.c
+  // does not, so its copy declares it. The two copies are alike until
+  // Clang's writer runs, and under one module name could not both load
+  // into a compile (Redis lost hits on stddef.h's copies).
+  std::string U = write("u.h", "#ifndef U_H\n#define U_H\n"
+                               "typedef unsigned long size_type;\n#endif\n");
+  std::string T = write("t.h", "#ifndef T_H\n#define T_H\n"
+                               "typedef unsigned long size_type;\n"
+                               "size_type t_len(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + U + "\"\n#include \"" + T +
+                                   "\"\n");
+  std::string A = write("a.c", "#include \"" + T + "\"\n");
+  EXPECT_TRUE(reads(B, T)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, T)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(A, T)) << "b.c's copy needs a size_type before t.h";
+  std::string Dump;
+  llvm::raw_string_ostream OS(Dump);
+  Daemon->dumpEntries(OS);
+  std::set<std::string> Names;
+  unsigned Copies = 0;
+  for (llvm::StringRef Line : llvm::split(Dump, '\n')) {
+    llvm::SmallVector<llvm::StringRef, 4> F;
+    Line.split(F, '\t', /*MaxSplit=*/3);
+    if (F.size() > 2 && F[0] == "entry" && F[1] == T) {
+      ++Copies;
+      Names.insert(F[2].str());
+    }
+  }
+  ASSERT_EQ(Copies, 2u) << "t.h was not written by both compiles";
+  EXPECT_EQ(Names.size(), 2u) << "the two copies of t.h share a module name";
+}
+
+/// Headers listed by name, under the test's directory, and no other
+/// (CacheDaemon::Options::FixedAskList): one not listed is read as text
+/// inside the header around it, whose copy holds it.
+class FixedListTest : public ExportTest {
+protected:
+  CacheDaemon::Options daemonOptions() override {
+    CacheDaemon::Options O = ExportTest::daemonOptions();
+    O.FixedAskList.emplace();
+    for (const char *N : Listed)
+      O.FixedAskList->push_back(Dir + "/" + N);
+    return O;
+  }
+  std::vector<const char *> Listed = {"u.h", "p.h", "s.h"};
+};
+
+TEST_F(FixedListTest, ATypeNamesTheLatestOfItsDeclarationsFromOneHit) {
+  // p.h includes s.h, whose copy p.h's links, and then f.h, not listed,
+  // which p.h's copy holds: as git's compat/posix.h includes <stdio.h>, then
+  // <stdarg.h>, both declaring va_list. A hit on u.h loads u.h's, p.h's and
+  // s.h's copies with one call, p.h's before s.h's. c.c's myva must name
+  // f.h's declaration, the latest, as the text's does: debug information
+  // describes the declaration a type names.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string S = write("s.h", "#ifndef S_H\n#define S_H\n"
+                               "typedef int myva;\n#endif\n");
+  std::string F = write("f.h", "typedef int myva;\n");
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n#include \"" + S +
+                                   "\"\n#include \"" + F +
+                                   "\"\nint p_one(void);\n#endif\n");
+  std::string U = write("u.h", "#ifndef U_H\n#define U_H\n#include \"" + P +
+                                   "\"\nint u_one(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + U + "\"\nmyva use_a;\n");
+  std::string C = write("c.c", "#include \"" + U + "\"\nmyva use_c;\n");
+  EXPECT_TRUE(reads(A, U)) << "nothing is stored yet";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("use_c")))
+      if (auto *V = dyn_cast<VarDecl>(D))
+        if (const auto *T = V->getType()->getAs<TypedefType>())
+          Named = Ctx.getSourceManager()
+                      .getPresumedLoc(T->getDecl()->getLocation())
+                      .getFilename();
+  };
+  EXPECT_FALSE(reads(C, U)) << "u.h's copy was not served";
+  AtEnd = nullptr;
+  EXPECT_EQ(Named, F) << "myva names s.h's declaration";
 }
 
 TEST_F(ExportTest, ACompileWithAnErrorWritesNoPart) {
@@ -3202,6 +3467,37 @@ TEST_F(ExportTest, ACopyIsNotServedUnderOtherWarningFlags) {
   ExtraArgs = {"-Wall"};
   EXPECT_TRUE(reads(B, W)) << "a copy written without -Wall was served";
   EXPECT_EQ(Warnings, 1u);
+}
+
+TEST_F(ExportTest, ACopyIsServedUnderOtherFlagsThatGiveTheSameLevels) {
+  // The kernel's kernel/sched compiles repeat a flag the others give once,
+  // and -Wall turns -Wunused-variable on again: every warning has the same
+  // level, so w.h prints the same, and a.c's copy serves b.c.
+  ExtraArgs = {"-Wall", "-Wno-unused-but-set-variable"};
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#include \"" + W + "\"\n");
+  EXPECT_TRUE(reads(A, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, W)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "w.h was not exported";
+  ExtraArgs = {"-Wunused-variable", "-Wall", "-Wno-unused-but-set-variable",
+               "-Wno-unused-but-set-variable"};
+  EXPECT_FALSE(reads(B, W)) << "flags giving the same levels did not serve";
+  EXPECT_EQ(Warnings, 1u) << "the served header's warning was not printed";
+}
+
+TEST_F(ExportTest, ACopyIsNotServedWhereAnAddedFlagChangesALevel) {
+  // b.c adds one flag to a.c's, which silences the warning w.h prints.
+  ExtraArgs = {"-Wall"};
+  std::string W = write("w.h", WarningHeader);
+  std::string A = write("a.c", "#include \"" + W + "\"\n");
+  std::string B = write("b.c", "#include \"" + W + "\"\n");
+  EXPECT_TRUE(reads(A, W)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, W)) << "nothing is stored yet";
+  ASSERT_EQ(Daemon->stats().Entries, 1u) << "w.h was not exported";
+  ExtraArgs = {"-Wall", "-Wno-unused-variable"};
+  EXPECT_TRUE(reads(B, W)) << "served where a warning's level differs";
+  EXPECT_EQ(Warnings, 0u) << "-Wno-unused-variable did not silence it";
 }
 
 TEST_F(ExportTest, NotServedWhereAWarningPragmaIsInForce) {

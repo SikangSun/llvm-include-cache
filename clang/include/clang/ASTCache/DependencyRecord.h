@@ -568,6 +568,13 @@ struct HeaderDependencySet {
   /// scope ("t:" a tag, "o:" any other). Where a copy linking this one skips
   /// it, the compile has read the header already, and must declare each.
   std::vector<std::string> Declares;
+  /// The names a file with no include guard declares first in the copy's own
+  /// lines, each with what Clang's reader compares to merge it with a
+  /// compile's declaration of the name (ownMergeKey). Such a file can be
+  /// read again, and a copy is loaded only where each name the compile
+  /// declares already has the same key: two declarations Clang does not
+  /// merge are two declarations, where the text would have made one.
+  std::vector<DeclarationDependency> Owned;
   /// The names the copy's text made from __COUNTER__ values. A compile that
   /// loads the copy hashes them as one in a function's masked hash
   /// (declarationFingerprint).

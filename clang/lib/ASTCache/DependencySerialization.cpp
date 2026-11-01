@@ -54,7 +54,8 @@ SavedDiagnostic::Range decodeRange(ByteReader &R) {
 
 void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
                                       llvm::StringRef ModuleName,
-                                      llvm::SmallVectorImpl<char> &Out) {
+                                      llvm::SmallVectorImpl<char> &Out,
+                                      size_t *NameAt) {
   size_t Base = Out.size();
   ByteWriter W(Out);
   W.u32(DependencyEncodingVersion);
@@ -67,6 +68,9 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   W.u32(Deps.CounterStart);
   W.u32(Deps.CounterUses);
   W.u8(Deps.CounterSemantic ? 1 : 0);
+  // After the length.
+  if (NameAt)
+    *NameAt = Out.size() + 4 - Base;
   W.str(ModuleName);
   W.str(Deps.HeaderName);
 
@@ -329,6 +333,10 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     for (const std::string &N : H.Reads)
       W.str(N);
   }
+
+  Begin(MetadataView::Owned, Deps.Owned.size());
+  for (const DeclarationDependency &D : Deps.Owned)
+    Declaration(D);
 
   if (Unsorted)
     G = 0;
@@ -632,7 +640,7 @@ bool MetadataView::validate() const {
       !warningPragmas().valid() || !submodules().valid() ||
       !conditions().valid() || !provided().valid() || !links().valid() ||
       !declares().valid() || !leftOut().valid() || !counterNames().valid() ||
-      !held().valid())
+      !held().valid() || !owned().valid())
     return false;
   // A held header names its file; each macro it left names itself and,
   // where defined, one of the header's files; each name it read is one.
@@ -823,6 +831,8 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
   }
   for (const NameView &N : V->declares())
     Deps.Declares.push_back(N.Name.str());
+  for (const DeclarationView &D : V->owned())
+    Deps.Owned.push_back({D.In, D.Name.str(), D.Fingerprint.str(), D.Cond});
   for (const NameView &N : V->counterNames())
     Deps.CounterNames.push_back(N.Name.str());
   for (const HeldView &H : V->held()) {

@@ -2235,6 +2235,28 @@ const Decl *ASTWriter::getFirstLocalDecl(const Decl *D) {
 template <typename T>
 void ASTDeclWriter::VisitRedeclarable(Redeclarable<T> *D) {
   T *First = D->getFirstDecl();
+  // A header cache part names an outside declaration, and a loading compile
+  // finds it, by a file-scope lookup, which finds no block-scope extern
+  // declaration: the kernel's mm.h declares __init_end inside a function
+  // before asm-generic/sections.h declares it at file scope. The chain the
+  // part holds begins after the outside ones that are such.
+  auto Unnameable = [&](const T *R) {
+    return Writer.isWritingPart() && !Writer.IsLocalDecl(R) &&
+           R->isLocalExternDecl();
+  };
+  if (Unnameable(First)) {
+    SmallVector<T *, 8> Chain;
+    for (T *R = First->getMostRecentDecl(); R; R = R->getPreviousDecl()) {
+      Chain.push_back(R);
+      if (R == First)
+        break;
+    }
+    for (T *R : llvm::reverse(Chain))
+      if (!Unnameable(R)) {
+        First = R;
+        break;
+      }
+  }
   T *MostRecent = First->getMostRecentDecl();
   T *DAsT = static_cast<T *>(D);
   if (MostRecent != First) {
@@ -2284,7 +2306,9 @@ void ASTDeclWriter::VisitRedeclarable(Redeclarable<T> *D) {
     //
     // FIXME: This is not correct; when we reach an imported declaration we
     // won't emit its previous declaration.
-    (void)Writer.GetDeclRef(D->getPreviousDecl());
+    // Not one the part's chain begins after (Unnameable).
+    if (T *Prev = D->getPreviousDecl(); !Prev || !Unnameable(Prev))
+      (void)Writer.GetDeclRef(Prev);
     // A part does not hold a redeclaration made after its header ended,
     // such as the main file's definition of a function the header declared.
     if (!Writer.isWritingPart() || Writer.IsLocalDecl(MostRecent))

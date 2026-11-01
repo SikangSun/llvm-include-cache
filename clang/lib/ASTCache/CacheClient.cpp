@@ -967,8 +967,13 @@ MismatchReason clang::ast_cache::matchesLiveState(
       }
       if (Cost)
         ++Cost->Read[MetadataView::Declarations];
+      // Brought up to date first, as Fresh does for a macro: a copy loaded
+      // since the name was last used can declare it, or define the struct
+      // a forward declaration found here names (sysfs.h's struct module;).
+      IdentifierInfo &II = Idents.get(D.Name);
+      PP.refreshIdentifier(II);
       NamedDecl *Live = ASTReader::lookupAtFileScope(
-          *S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
+          *S, II, D.In == DeclarationDependency::Space::Tag,
           /*CreateBuiltin=*/true);
       // The declaration an earlier check of the copy found, not declared
       // again since: its fingerprint is the one that check compared.
@@ -1100,8 +1105,10 @@ MismatchReason clang::ast_cache::matchesLiveState(
     size_t K = D.Cond - 1;
     if (!D.Cond || D.Fingerprint.empty() || K >= Loaded.size() || Loaded[K])
       continue;
+    IdentifierInfo &II = Idents.get(D.Name);
+    PP.refreshIdentifier(II);
     NamedDecl *Live = ASTReader::lookupAtFileScope(
-        *S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
+        *S, II, D.In == DeclarationDependency::Space::Tag,
         /*CreateBuiltin=*/true);
     std::optional<std::string> F;
     if (Live)

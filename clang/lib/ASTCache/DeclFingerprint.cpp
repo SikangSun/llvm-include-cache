@@ -211,3 +211,41 @@ bool clang::ast_cache::fingerprintSatisfies(llvm::StringRef Carried,
   return Defined != llvm::StringRef::npos &&
          Live.take_front(Defined) == Carried;
 }
+
+std::optional<std::string> clang::ast_cache::mergeKey(const NamedDecl &D) {
+  if (!D.getDeclName().isIdentifier() || D.getName().empty() || !atFileScope(D))
+    return std::nullopt;
+  std::string S;
+  llvm::raw_string_ostream OS(S);
+  if (auto *TD = dyn_cast<TypedefNameDecl>(&D)) {
+    OS << "typedef " << TD->getUnderlyingType().getCanonicalType().getAsString();
+    return S;
+  }
+  if (auto *Tag = dyn_cast<TagDecl>(&D)) {
+    OS << Tag->getKindName();
+    return S;
+  }
+  if (auto *EC = dyn_cast<EnumConstantDecl>(&D)) {
+    OS << "enumerator " << toString(EC->getInitVal(), 10);
+    return S;
+  }
+  if (auto *F = dyn_cast<FunctionDecl>(&D)) {
+    const FunctionDecl *First = F->getCanonicalDecl();
+    QualType T = First->getTypeSourceInfo()
+                     ? First->getTypeSourceInfo()->getType()
+                     : First->getType();
+    OS << "function " << T.getCanonicalType().getAsString() << " linkage "
+       << static_cast<unsigned>(F->getLinkageInternal());
+    if (F->isMultiVersion())
+      OS << " multiversion";
+    if (F->hasAttr<OverloadableAttr>())
+      OS << " overloadable";
+    return S;
+  }
+  if (auto *V = dyn_cast<VarDecl>(&D)) {
+    OS << "variable " << V->getType().getCanonicalType().getAsString()
+       << " linkage " << static_cast<unsigned>(V->getLinkageInternal());
+    return S;
+  }
+  return std::nullopt;
+}

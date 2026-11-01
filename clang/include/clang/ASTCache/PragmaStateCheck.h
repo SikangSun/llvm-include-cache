@@ -80,13 +80,20 @@ inline bool isPragmaStateDefault(const Sema &S) {
 /// field out of one is not -- the encodings are opaque by design.
 PragmaSnapshot capturePragmaState(const Sema &S);
 
-/// A hash of the flags that decide which diagnostics a compile prints, and
-/// as what: -W..., -w, -pedantic, -pedantic-errors, -R... and a warning
-/// suppression mappings file. A copy holds the diagnostics its header
-/// printed under its compile's flags, and is served only under the same
-/// (REPORT.md Q34). Flags that change only how a diagnostic looks -- colors,
-/// columns, carets -- are not in it.
-uint64_t warningFlagsHash(const DiagnosticOptions &Opts);
+/// A hash of what the flags make of each diagnostic a compile can print:
+/// the level -W..., -w, -pedantic, -pedantic-errors and -R... give every
+/// warning, extension and remark, whether warnings in system headers print,
+/// and a warning suppression mappings file. A copy holds the diagnostics its
+/// header printed under its compile's flags, and is served only where they
+/// would print the same (REPORT.md Q34). Two lists that give every
+/// diagnostic the same level hash the same: the kernel's kernel/sched
+/// compiles repeat -Wno-unused-but-set-variable. A -W flag with a value
+/// other than a level (-Wframe-larger-than=, -Wlarge-by-value-copy=) is
+/// hashed as its text. Flags that change only how a diagnostic looks --
+/// colors, columns, carets -- are not in it.
+uint64_t warningFlagsHash(const DiagnosticOptions &Opts,
+                          llvm::IntrusiveRefCntPtr<DiagnosticIDs> IDs,
+                          llvm::vfs::FileSystem &FS);
 
 /// Follows #pragma GCC diagnostic, #pragma clang diagnostic and #pragma
 /// warning: which are in force, and how they nest. A copy is served only

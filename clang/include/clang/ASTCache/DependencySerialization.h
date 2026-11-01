@@ -39,13 +39,15 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 22;
+constexpr uint32_t DependencyEncodingVersion = 23;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
-/// stored form.
+/// stored form; and in \p NameAt, if set, where the name's bytes are,
+/// counted from where the metadata begins in \p Out.
 void encodeMetadata(const HeaderDependencySet &Deps,
                     llvm::StringRef ModuleName,
-                    llvm::SmallVectorImpl<char> &Out);
+                    llvm::SmallVectorImpl<char> &Out,
+                    size_t *NameAt = nullptr);
 
 /// The elements of a MetadataView: the fields of the HeaderDependencySet
 /// elements of the same name, with each string pointing into the metadata.
@@ -360,6 +362,10 @@ public:
   MetadataSection<HeldView> held() const {
     return section<HeldView>(HeldHeaders);
   }
+  /// HeaderDependencySet::Owned: each with its merge key as Fingerprint.
+  MetadataSection<DeclarationView> owned() const {
+    return section<DeclarationView>(Owned);
+  }
 
   enum Section : unsigned {
     Conditional,
@@ -384,6 +390,7 @@ public:
     LeftOut,
     CounterNames,
     HeldHeaders,
+    Owned,
     Groups,
     NumSections
   };

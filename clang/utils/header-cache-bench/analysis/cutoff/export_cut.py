@@ -33,7 +33,8 @@ for p, runs in RUNS.items():
         for m in j["modes"][1:]:
             c = int(m[7:])
             tot, tt = sum(j["I"][m]), sum(j["T"][m])
-            h = l = e = tr = 0; hg = txt = chk = wr = 0.0; nl = []
+            h = l = e = tr = loads = 0; hg = txt = chk = wr = 0.0; nl = []
+            n = len(j["I"][m])
             for s in j["S"][m]:
                 if x := HIT.search(s): h += int(x[1]); l += int(x[2])
                 if x := EXP.search(s): e += int(x[1])
@@ -41,14 +42,16 @@ for p, runs in RUNS.items():
                 if x := CHK.search(s): chk += float(x[1])
                 if x := WR.search(s): wr += float(x[1])
                 for g in LNK.finditer(s):
-                    hg += int(g[4]); nl.append(int(g[2]))
+                    hg += int(g[4]); nl.append(int(g[2])); loads += 1 + int(g[2])
                     lk[int(g[2])].append((int(g[4]), int(g[6]) + int(g[7])))
             row = dict(project=p, run=run, cutoff_us=c, speedup=round(plain / tot, 4), wall_speedup=round(plain_t / tt, 3),
                        total_g=round(tot / 1e9, 2), hits_g=round(hg / 1e9, 2), other_g=round((tot - hg) / 1e9, 2),
                        hits_pct=round(100 * hg / plain, 2), other_pct=round(100 * (tot - hg) / plain, 2),
                        lookups=l, hits=h, misses=l - h, miss_pct=round(100 * (l - h) / l, 1) if l else 0, written=e,
                        links_per_hit=round(statistics.mean(nl), 2) if nl else 0, text_s=round(txt / 1e3, 2),
-                       lookup_s=round(chk / 1e3, 2), write_s=round(wr / 1e3, 2), direct_text_reads=tr)
+                       lookup_s=round(chk / 1e3, 2), write_s=round(wr / 1e3, 2), direct_text_reads=tr,
+                       requests_per_compile=round(l / n, 1), loads_per_compile=round(loads / n, 1),
+                       parse_ms_per_compile=round(txt / n, 1))
             sweep.append(row); pts[(run, c)] = row
         # Headers by first read time, from the run's highest cutoff, where a
         # compile asks for almost nothing: each header's first read is the

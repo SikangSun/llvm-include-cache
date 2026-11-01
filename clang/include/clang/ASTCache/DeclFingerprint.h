@@ -85,6 +85,14 @@ DeclarationDependency::Space nameSpaceOf(const NamedDecl &D);
 /// for a function with a masked hash, one with the same masked hash.
 bool fingerprintSatisfies(llvm::StringRef Carried, llvm::StringRef Live);
 
+/// What Clang's reader compares to merge a declaration it loads with one of
+/// the same name the compile has (ASTContext::isSameEntity, for C): the
+/// kind and the linkage, and a typedef's type, a tag's kind, an enumerator's
+/// value, a function's type as its first declaration wrote it, or a
+/// variable's type as \p D has it. Two declarations with different keys
+/// stay two. None for a declaration not at file scope or of another kind.
+std::optional<std::string> mergeKey(const NamedDecl &D);
+
 } // namespace ast_cache
 } // namespace clang
 

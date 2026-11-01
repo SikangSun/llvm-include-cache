@@ -10854,6 +10854,40 @@ void ASTReader::visitTopLevelModuleMaps(
   }
 }
 
+/// Orders \p Decls, one name's declarations from AST files, so that of the
+/// declarations of one entity the older come first, each chain in the places
+/// its declarations held. C lookup finds the one pushed last first, and of
+/// two declarations of one type keeps the first it finds
+/// (isPreferredLookupResult), where plain clang finds the latest. A header
+/// cache hit loads a copy and its links with one call, and a name's
+/// declarations arrive in the order the copies are visited, not the order the
+/// text declared them: compat/posix.h's copy, holding <stdarg.h>'s
+/// `typedef __builtin_va_list va_list;`, before the copy of <stdio.h> it
+/// links, whose `typedef __gnuc_va_list va_list;` the text declared first.
+static void pushOlderFirst(SmallVectorImpl<Decl *> &Decls) {
+  if (Decls.size() < 2)
+    return;
+  auto Depth = [](const Decl *D) {
+    unsigned N = 0;
+    for (const Decl *P = D->getPreviousDecl(); P; P = P->getPreviousDecl())
+      ++N;
+    return N;
+  };
+  llvm::SmallDenseMap<const Decl *, SmallVector<unsigned, 2>, 2> Places;
+  for (unsigned I = 0, N = Decls.size(); I != N; ++I)
+    Places[Decls[I]->getCanonicalDecl()].push_back(I);
+  for (auto &[Canon, At] : Places) {
+    if (At.size() < 2)
+      continue;
+    SmallVector<std::pair<unsigned, Decl *>, 4> Chain;
+    for (unsigned I : At)
+      Chain.push_back({Depth(Decls[I]), Decls[I]});
+    llvm::stable_sort(Chain, llvm::less_first());
+    for (unsigned K = 0; K != At.size(); ++K)
+      Decls[At[K]] = Chain[K].second;
+  }
+}
+
 void ASTReader::finishPendingActions() {
   while (!PendingIdentifierInfos.empty() ||
          !PendingDeducedFunctionTypes.empty() ||
@@ -10922,6 +10956,8 @@ void ASTReader::finishPendingActions() {
     for (TopLevelDeclsMap::iterator TLD = TopLevelDecls.begin(),
            TLDEnd = TopLevelDecls.end(); TLD != TLDEnd; ++TLD) {
       IdentifierInfo *II = TLD->first;
+      if (!getContext().getLangOpts().CPlusPlus)
+        pushOlderFirst(TLD->second);
       for (unsigned I = 0, N = TLD->second.size(); I != N; ++I) {
         pushExternalDeclIntoScope(cast<NamedDecl>(TLD->second[I]), II);
       }

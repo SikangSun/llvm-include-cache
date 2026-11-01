@@ -1495,6 +1495,10 @@ void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot) {
     unsigned AbbrevCode = Stream.EmitAbbrev(std::move(Abbrev));
     RecordData::value_type Record[] = {MODULE_NAME};
     Stream.EmitRecordWithBlob(AbbrevCode, Record, WritingModule->Name);
+    // A blob ends the record, padded to a 32-bit word.
+    if (isWritingPart())
+      ModuleNameOffsets.push_back(Stream.GetCurrentBitNo() / 8 -
+                                  alignTo(WritingModule->Name.size(), 4));
 
     auto BaseDir = [&]() -> std::optional<SmallString<128>> {
       if (PP.getHeaderSearchInfo().getHeaderSearchOpts().ModuleFileHomeIsCwd) {
@@ -3205,6 +3209,9 @@ void ASTWriter::WriteSubmodules(Module *WritingModule, ASTContext *Context) {
                                          Mod->ModuleMapIsPrivate,
                                          Mod->NamedModuleHasInit};
       Stream.EmitRecordWithBlob(DefinitionAbbrev, Record, Mod->Name);
+      if (isWritingPart() && Mod == WritingModule)
+        ModuleNameOffsets.push_back(Stream.GetCurrentBitNo() / 8 -
+                                    alignTo(Mod->Name.size(), 4));
     }
 
     // Emit the requirements.

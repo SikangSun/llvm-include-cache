@@ -1427,6 +1427,25 @@ private:
     return SM.isBeforeInTranslationUnit(P.IncludeLoc, L);
   }
 
+  /// Whether \p D was made before \p P began, where a hit checks the
+  /// loading compile. Not one in the lines of a header \p P holds or links,
+  /// nor one from a copy loaded inside \p P, as a link served there: device.h
+  /// includes module.h, and where device.h begins struct module is only
+  /// declared (sysfs.h's struct module;), though its definition is not in
+  /// device.h's own lines.
+  bool beforePart(const Part &P, const Decl *D) const {
+    if (D->isFromASTFile()) {
+      const serialization::ModuleFile *MF =
+          CI.getASTReader() ? CI.getASTReader()->getOwningModuleFile(D)
+                            : nullptr;
+      return !MF || MF->Index < P.ModulesAtBegin;
+    }
+    SourceLocation L = D->getLocation();
+    if (L.isValid() && P.contains(SM.getExpansionLoc(L).getRawEncoding()))
+      return false;
+    return !madeAfter(P, D);
+  }
+
   /// Module files the compile has loaded. A deep copy cannot be of a
   /// declaration from one, since a part imports nothing.
   size_t modulesLoaded() const {
@@ -1467,9 +1486,10 @@ private:
     }
     // The warning flags and the pragmas in force here decide what the
     // header prints; a hit compares them (REPORT.md Q34).
-    P.WarningState =
-        warningState(warningFlagsHash(CI.getDiagnosticOpts()), Pragmas,
-                     P.IncludeLoc);
+    uint64_t Flags = warningFlagsHash(
+        CI.getDiagnosticOpts(), CI.getDiagnostics().getDiagnosticIDs(),
+        CI.getFileManager().getVirtualFileSystem());
+    P.WarningState = warningState(Flags, Pragmas, P.IncludeLoc);
     if (Pragmas)
       P.PragmasAtBegin = Pragmas->mark();
     // A part refers to a declaration from a loaded copy by name; it cannot
@@ -1995,29 +2015,67 @@ private:
   }
 
   /// The names \p P's own lines declare at file scope, for a copy that
-  /// links this one and skips it (HeaderDependencySet::Declares).
-  void declares(const Part &P, std::vector<std::string> &Out) {
+  /// links this one and skips it (HeaderDependencySet::Declares), if
+  /// \p Declares is set; and the names a file with no include guard, which
+  /// a compile can read again, declares first there, each with its merge
+  /// key (HeaderDependencySet::Owned). A name declared before \p P is one
+  /// of its outside declarations, checked as those are.
+  void ownNames(const Part &P, std::vector<std::string> *Declares,
+                std::vector<DeclarationDependency> &Owned) {
     llvm::StringSet<> Seen;
     auto Add = [&](const NamedDecl *ND) {
       if (!ND->getIdentifier())
         return;
       std::string N = (isa<TagDecl>(ND) ? "t:" : "o:") + ND->getName().str();
       if (Seen.insert(N).second)
-        Out.push_back(std::move(N));
+        Declares->push_back(std::move(N));
     };
+    HeaderSearch &HS = CI.getPreprocessor().getHeaderSearchInfo();
+    llvm::DenseMap<FileID, bool> Unguarded;
+    auto ReadAgain = [&](SourceLocation L) {
+      // A builtin's declaration has no file.
+      FileID F = L.isValid() ? SM.getFileID(SM.getExpansionLoc(L)) : FileID();
+      if (F.isInvalid())
+        return false;
+      auto [It, New] = Unguarded.try_emplace(F, false);
+      if (New)
+        if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(F)) {
+          HeaderFileInfo &HFI = HS.getFileInfo(*FE);
+          It->second = !HFI.isPragmaOnce && !HFI.isImport &&
+                       !HFI.getControllingMacro(HS.getExternalLookup());
+        }
+      return It->second;
+    };
+    llvm::DenseSet<std::pair<const IdentifierInfo *, unsigned>> First;
     ASTContext &Ctx = CI.getASTContext();
-    Decl *First =
+    Decl *Begin =
         P.DeclsAfter
             ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
             : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
-    for (Decl *D = First; D; D = D->getNextDeclInContext()) {
-      if (D->isFromASTFile() || !inPart(P, D->getLocation()))
+    for (Decl *D = Begin; D; D = D->getNextDeclInContext()) {
+      if (D->isFromASTFile())
         continue;
-      if (auto *ND = dyn_cast<NamedDecl>(D))
-        Add(ND);
-      if (auto *ED = dyn_cast<EnumDecl>(D))
-        for (const EnumConstantDecl *E : ED->enumerators())
-          Add(E);
+      auto *ND = dyn_cast<NamedDecl>(D);
+      // Without Declares, a declaration in a guarded file needs nothing
+      // more.
+      bool Again = ND && ND->getIdentifier() && ReadAgain(D->getLocation());
+      if ((!Declares && !Again) || !inPart(P, D->getLocation()))
+        continue;
+      if (Declares) {
+        if (ND)
+          Add(ND);
+        if (auto *ED = dyn_cast<EnumDecl>(D))
+          for (const EnumConstantDecl *E : ED->enumerators())
+            Add(E);
+      }
+      bool Tag = isa_and_nonnull<TagDecl>(ND);
+      if (!Again || !First.insert({ND->getIdentifier(), Tag}).second ||
+          D->getPreviousDecl())
+        continue;
+      if (std::optional<std::string> K = mergeKey(*ND))
+        Owned.push_back({Tag ? DeclarationDependency::Space::Tag
+                             : DeclarationDependency::Space::Ordinary,
+                         ND->getName().str(), std::move(*K)});
     }
   }
 
@@ -2149,9 +2207,7 @@ private:
   /// which covers what the header read while parsing but not the outside
   /// declarations, and those its text named, by name and fingerprint.
   std::string claimKey(const Part &P, llvm::StringRef Name) {
-    auto Before = [&](const Decl *D) {
-      return !inPart(P, D->getLocation()) && !madeAfter(P, D);
-    };
+    auto Before = [&](const Decl *D) { return beforePart(P, D); };
     std::vector<std::string> Keys;
     llvm::DenseSet<std::pair<unsigned, const IdentifierInfo *>> Seen;
     for (const NamedDecl *ND : P.UsedOutside) {
@@ -2271,19 +2327,24 @@ private:
 
     if (GuardPlus && !PiecesMode)
       heldHeaders(P, Deps);
+    ownNames(P, LinkMode ? &Deps.Declares : nullptr, Deps.Owned);
+    Counts.OwnedKeys += Deps.Owned.size();
 
     // The same header, metadata and compiler options give the same name in
     // any compile, which lets the daemon recognise a part it already holds.
+    auto NameFor = [&](llvm::StringRef Encoded) {
+      uint64_t Hash = llvm::xxh3_64bits(Encoded);
+      std::string Key = P.Stored;
+      Key += '\0';
+      Key += CI.getInvocation().getModuleHash();
+      Key += '\0';
+      Key.append(reinterpret_cast<const char *>(&Hash), sizeof(Hash));
+      return "__hcp_" + llvm::utohexstr(llvm::xxh3_64bits(Key),
+                                        /*LowerCase=*/true, /*Width=*/16);
+    };
     llvm::SmallVector<char, 256> Encoded;
     encodeMetadata(Deps, /*ModuleName=*/{}, Encoded);
-    std::string Key = P.Stored;
-    Key += '\0';
-    Key += CI.getInvocation().getModuleHash();
-    Key += '\0';
-    Key.append(Encoded.begin(), Encoded.end());
-    std::string Name =
-        "__hcp_" + llvm::utohexstr(llvm::xxh3_64bits(Key), /*LowerCase=*/true,
-                                   /*Width=*/16);
+    std::string Name = NameFor(llvm::StringRef(Encoded.data(), Encoded.size()));
 
     if (getenv("DEBUG_LINK"))
       llvm::errs() << "PART " << P.Stored << " " << Name << "\n";
@@ -2388,8 +2449,6 @@ private:
     if (!P.LeftOutPaths.empty())
       leftOutDeclarations(P, Deps, W.DeclarationLocs);
     P.WrittenDecls = Deps.Declarations;
-    if (LinkMode)
-      declares(P, Deps.Declares);
     provide(P, Deps, W.Cross);
     if (!W.DiagnosticFailure.empty())
       return decline(P, W.DiagnosticFailure);
@@ -2414,6 +2473,39 @@ private:
                                      : "its values only set names apart"));
     Deps.WarningPragmas = P.WarningPragmas;
 
+    // The stored name hashes the finished metadata. Two parts alike before
+    // writing can differ in what the writer found: clang's stddef.h, entered
+    // for size_t, redeclares a size_t an earlier header declared in one
+    // compile and declares the first one in another, so only one of the two
+    // takes size_t from outside. Under one name the two could not both load
+    // into a compile (loadAll), and a hit that needed the second read the
+    // header as text. One encoding names the copy and is stored: the name in
+    // it, the old one, is hashed as underscores, and the new one, of the
+    // same length, is written over it, and where Clang's writer put the
+    // module's name in the part's bytes.
+    llvm::SmallVector<char, 0> Metadata;
+    size_t NameAt = 0;
+    encodeMetadata(Deps, Name, Metadata, &NameAt);
+    std::fill_n(Metadata.begin() + NameAt, Name.size(), '_');
+    std::string Final =
+        NameFor(llvm::StringRef(Metadata.data(), Metadata.size()));
+    std::copy(Final.begin(), Final.end(), Metadata.begin() + NameAt);
+    if (Final != Name) {
+      if (W.NameOffsets.size() != 2)
+        return decline(P, "Clang's writer put its module name in " +
+                              std::to_string(W.NameOffsets.size()) +
+                              " places, not two");
+      for (uint64_t At : W.NameOffsets) {
+        if (At + Name.size() > W.Buffer.size() ||
+            llvm::StringRef(W.Buffer.data() + At, Name.size()) != Name)
+          return decline(P, "its module name is not where Clang's writer "
+                            "said it put it");
+        std::copy(Final.begin(), Final.end(), W.Buffer.begin() + At);
+      }
+      Name = std::move(Final);
+      ++Counts.Renamed;
+    }
+
     PushRequest R;
     R.Filename = P.Stored;
     R.ModuleName = Name;
@@ -2430,7 +2522,7 @@ private:
       ++Counts.FirstReadsWritten;
     std::string Line = P.Stored + ": " + std::to_string(W.Buffer.size()) +
                        " bytes in " + std::to_string(W.Micros) + " us, " +
-                       std::to_string(W.ByName) + " by name";
+                       std::to_string(W.ByName) + " by name, module " + Name;
     if (!R.Deps.Diagnostics.empty())
       Line += ", " + std::to_string(R.Deps.Diagnostics.size()) +
               " diagnostics to print again";
@@ -2439,11 +2531,7 @@ private:
               " locations dropped (in module files or outside the part)";
     Counts.Exports.push_back(std::move(Line));
     P.Written = Name;
-    {
-      llvm::SmallVector<char, 0> Metadata;
-      encodeMetadata(R.Deps, R.ModuleName, Metadata);
-      R.Metadata.assign(Metadata.begin(), Metadata.end());
-    }
+    R.Metadata.assign(Metadata.begin(), Metadata.end());
     P.WrittenHash = llvm::xxh3_64bits(R.Metadata);
     if (Tracker.measuringIndependence())
       measureIndependence(P, Name, W.Buffer.size());
@@ -3974,6 +4062,8 @@ private:
 
   struct Written {
     SmallVector<char, 0> Buffer;
+    /// Where the module's name is in Buffer (ASTWriter::getModuleNameOffsets).
+    SmallVector<uint64_t, 2> NameOffsets;
     /// What the part's lines outside a submodule refer to in it.
     std::vector<CrossReference> Cross;
     long long Micros = 0;
@@ -4203,6 +4293,8 @@ private:
            static_cast<uint32_t>(Writer.getDeclID(C.D).getRawValue() -
                                  NUM_PREDEF_DECL_IDS)});
     W.DroppedLocations = Writer.getPartDroppedLocations();
+    W.NameOffsets.assign(Writer.getModuleNameOffsets().begin(),
+                         Writer.getModuleNameOffsets().end());
     saveDiagnostics(P, Encoded, W);
     llvm::TimeTraceScope OutsideScope("HeaderCache ExportOutsideDecls");
     for (const PartSize &Z : Sizes)
@@ -4215,9 +4307,7 @@ private:
     // A hit checks the loading compile where the header begins, so the
     // fingerprint is of the declarations made before the header: the latest
     // of them, and none of the header's own redeclarations or definitions.
-    auto Before = [&](const Decl *D) {
-      return !inPart(P, D->getLocation()) && !madeAfter(P, D);
-    };
+    auto Before = [&](const Decl *D) { return beforePart(P, D); };
     llvm::DenseSet<std::pair<unsigned, IdentifierInfo *>> Seen;
     auto Require = [&](const NamedDecl &ND) {
       DeclarationDependency::Space In = nameSpaceOf(ND);

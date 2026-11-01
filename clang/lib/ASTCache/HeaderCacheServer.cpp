@@ -11,6 +11,7 @@
 #include "clang/ASTCache/CacheClient.h"
 #include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/CacheProtocol.h"
+#include "clang/ASTCache/DeclFingerprint.h"
 #include "clang/ASTCache/PartExporter.h"
 #include "clang/ASTCache/PragmaStateCheck.h"
 #include "clang/Basic/FileManager.h"
@@ -303,7 +304,9 @@ public:
                     bool LogServed, WarningPragmaTracker &Pragmas)
       : CI(CI), Client(std::move(Client)), LogServed(LogServed),
         Pragmas(Pragmas),
-        WarningFlags(warningFlagsHash(CI.getDiagnosticOpts())),
+        WarningFlags(warningFlagsHash(
+            CI.getDiagnosticOpts(), CI.getDiagnostics().getDiagnosticIDs(),
+            CI.getFileManager().getVirtualFileSystem())),
         NamesMatter(CI.getCodeGenOpts().getDebugInfo() !=
                         llvm::codegenoptions::NoDebugInfo ||
                     // Measurement: names compared as before.
@@ -394,6 +397,10 @@ public:
       OS << "  fitting copies passed over, another copy of the same name "
             "loaded: "
          << OtherCopySameName << "\n";
+    if (MergeKeysDiffer)
+      OS << "  fitting copies passed over, a name they declare has another "
+            "merge key here: "
+         << MergeKeysDiffer << "\n";
     if (DiagnosticsReplayed)
       OS << "  diagnostics printed again from copies: " << DiagnosticsReplayed
          << "\n";
@@ -431,7 +438,9 @@ public:
          << " macros they set read outside them), " << E.HeldBack
          << " held back as the first time their copy would be written, "
          << E.LinksServed << " links to copies served, " << E.LinksWritten
-         << " to copies written\n";
+         << " to copies written, " << E.Renamed
+         << " named again after writing, " << E.OwnedKeys
+         << " merge keys of declarations in files with no guard\n";
       if (Client->sendThread() || !Client->claimMode().empty()) {
         const CacheClient::Stats &C = Client->stats();
         OS << "header cache concurrency: " << C.Waited
@@ -653,6 +662,9 @@ public:
           if (PopulateOnly || ForceMiss)
             return false;
           auto Loading = std::chrono::steady_clock::now();
+          if (Client->lastMetadata() &&
+              !mergesHere(*Client->lastMetadata(), ModuleName))
+            return false;
           // CLANG_HEADER_CACHE_LINK: the copies it links load first, or
           // with it, in one reader call.
           if (LinkMode && Client->lastMetadata() &&
@@ -855,8 +867,10 @@ public:
           HS.getFileInfo(File).getControllingMacro(HS.getExternalLookup());
       Exporter->linked(Path, LastModuleName, G ? G->getName() : "", Copy.MF,
                        Deps, IncludeLoc, [&](llvm::StringRef Name) {
+                         IdentifierInfo &II = Ids.get(Name);
+                         PP.refreshIdentifier(II);
                          NamedDecl *D = ASTReader::lookupAtFileScope(
-                             Sem, Ids.get(Name), /*Tag=*/false,
+                             Sem, II, /*Tag=*/false,
                              /*CreateBuiltin=*/false);
                          return D ? D->getLocation() : SourceLocation();
                        }, ModulesBefore, llvm::xxh3_64bits(Deps.bytes()),
@@ -869,8 +883,10 @@ public:
       for (const auto &[Guard, Defined] : LiveGuardTests)
         Exporter->linkGuardTested(IncludeLoc, Guard, Defined);
       Exporter->served(Copy.MF, &Deps, IncludeLoc, [&](llvm::StringRef Name) {
+        IdentifierInfo &II = Ids.get(Name);
+        PP.refreshIdentifier(II);
         NamedDecl *D = ASTReader::lookupAtFileScope(
-            Sem, Ids.get(Name), /*Tag=*/false, /*CreateBuiltin=*/false);
+            Sem, II, /*Tag=*/false, /*CreateBuiltin=*/false);
         return D ? D->getLocation() : SourceLocation();
       });
       for (auto [F, M] : PendingLinks)
@@ -930,10 +946,10 @@ public:
     // first, so the directives replayed below override them rather than the
     // other way around.
     auto Replaying = std::chrono::steady_clock::now();
-    // The links' effects first, top down (loadTree), then the copy's own:
-    // the copy keeps only the macros its own lines set last (PartExporter),
-    // so outer.h's LIMIT, defined again after its link inner.h defined it,
-    // ends as outer.h's.
+    // The links' effects first, each after the links it has (finishLinks),
+    // then the copy's own: the copy keeps only the macros its own lines set
+    // last (PartExporter), so outer.h's LIMIT, defined again after its link
+    // inner.h defined it, ends as outer.h's.
     finishLinks(IncludeLoc);
     // The pushes go first: they save this compile's definitions, which the
     // copy's own would hide once visible.
@@ -1284,8 +1300,10 @@ private:
       size_t K = D.Cond - 1;
       if (!D.Cond || (K < Loads.size() && Loads[K]))
         continue;
+      IdentifierInfo &II = Idents.get(D.Name);
+      CI.getPreprocessor().refreshIdentifier(II);
       NamedDecl *Live = ASTReader::lookupAtFileScope(
-          S, Idents.get(D.Name), D.In == DeclarationDependency::Space::Tag,
+          S, II, D.In == DeclarationDependency::Space::Tag,
           /*CreateBuiltin=*/true);
       if (!Live)
         return false;
@@ -1389,6 +1407,45 @@ private:
                                         /*CreateBuiltin=*/true);
   }
 
+  /// Whether the copy \p Meta, of module \p Name, merges here: each name a
+  /// file with no guard declares first in its own lines, the compile
+  /// declares with the same merge key or not at all. Clang's reader merges
+  /// a declaration it loads only with one of the same key, and two make
+  /// every later use of the name find one of them. The text read again
+  /// would redeclare the compile's: h.h, `extern __typeof__(f) *fp;`, read
+  /// after `int f();` and again after `int f(int);`, has the second time
+  /// a copy written where only f(int) was declared, whose fp is
+  /// int (*)(int) where the compile's is int (*)().
+  bool mergesHere(const MetadataView &Meta, llvm::StringRef Name) {
+    if (Meta.owned().empty() || LoadedTargets.count(Name))
+      return true;
+    Preprocessor &PP = CI.getPreprocessor();
+    for (const DeclarationView &D : Meta.owned()) {
+      IdentifierInfo *II = PP.getIdentifierInfo(D.Name);
+      PP.refreshIdentifier(*II);
+      NamedDecl *Live = ASTReader::lookupAtFileScope(
+          CI.getSema(), *II, D.In == DeclarationDependency::Space::Tag,
+          /*CreateBuiltin=*/false);
+      if (!Live)
+        continue;
+      // A variable is compared with the latest declaration of it.
+      if (isa<VarDecl>(Live))
+        Live = cast<NamedDecl>(Live->getMostRecentDecl());
+      std::optional<std::string> Key = mergeKey(*Live);
+      if (!Key || *Key != D.Fingerprint) {
+        ++MergeKeysDiffer;
+        if (getenv("DEBUG_LINK"))
+          llvm::errs() << "MERGE KEY " << Name << " " << D.Name << " "
+                       << D.Fingerprint << " here "
+                       << (Key ? *Key : std::string("none")) << "\n";
+        return false;
+      }
+    }
+    return true;
+  }
+  /// Copies not loaded because mergesHere is false.
+  unsigned MergeKeysDiffer = 0;
+
   bool declaredHere(const Fetched &F) {
     for (const NameView &N : F.Meta->declares())
       if (!findLinkName(N.Name))
@@ -1465,6 +1522,8 @@ private:
     for (const Fetched &C : F.Links)
       for (const std::string &N : C.Names)
         findLinkName(N);
+    if (!mergesHere(*F.Meta, F.Module))
+      return false;
     Module *M = load(F.Bytes, F.Module, Loc);
     if (getenv("DEBUG_LINK")) {
       llvm::errs() << "LINK load " << F.Path << " " << F.Module
@@ -1508,6 +1567,12 @@ private:
       llvm::TimeTraceScope S("HeaderCache LinkEffects");
       replayMacroEffects(D, *M, Loc);
     }
+    // The names its text made from __COUNTER__ values are the compile's now,
+    // as for the copy the hit asked for (tryServe): a later check masks them
+    // in the hashes of the functions that use them (preempt.h's
+    // class_preempt_destructor).
+    for (const NameView &N : D.counterNames())
+      Client->counterNames().insert(PP.getIdentifierInfo(N.Name));
     applyPragmaDelta(CI.getSema(), D.entry(), D.exit());
     if (Exporter)
       Exporter->replaying(true);
@@ -1626,6 +1691,11 @@ private:
       guardsOf(All, Guards);
       linksToLoad(All, Guards, Set, Order);
     }
+    for (const Fetched *F : Order)
+      if (!mergesHere(*F->Meta, F->Module)) {
+        ++TreeFails[1];
+        return nullptr;
+      }
     // CLANG_HEADER_CACHE_MERGE: which copies the hit loads, for the timing
     // report; the process forked here reads the header instead, and writes
     // them as one copy.
@@ -1690,8 +1760,22 @@ private:
   /// as the #include read them; then the names the copies take from the
   /// links are read from them.
   void finishLinks(SourceLocation Loc) {
+    // Each link after the links it has, siblings in text order, as loadLink
+    // does when it loads them one at a time: a copy's effects keep only the
+    // macros its own lines set last, so a header that redefines a macro its
+    // link defined (git's sane-ctype.h, after <ctype.h>'s isspace) must
+    // replay after that link.
+    llvm::DenseMap<const Fetched *, Module *> ModuleOf;
     for (auto [F, M] : PendingLinks)
-      linkLoaded(*F, *M, Loc);
+      ModuleOf[F] = M;
+    auto After = [&](auto &Self, const std::vector<Fetched> &Links) -> void {
+      for (const Fetched &F : Links) {
+        Self(Self, F.Links);
+        if (Module *M = ModuleOf.lookup(&F))
+          linkLoaded(F, *M, Loc);
+      }
+    };
+    After(After, PendingTree);
     // A tag is looked up, so that its definition in a link joins the
     // declarations the compile has of it: a member a copy names is found
     // in the definition (git's http-push.c). Another name, only if the
@@ -1767,6 +1851,9 @@ private:
                                   MFs) == ASTReader::Success;
       Reader.setReadingHeaderCacheParts(false);
       if (!Read || MFs.size() != Load.size()) {
+        if (getenv("DEBUG_LINK"))
+          llvm::errs() << "LOADALL refused read=" << Read << " " << MFs.size()
+                       << "/" << Load.size() << "\n";
         ++LoadsRefused;
         return false;
       }
@@ -1776,8 +1863,12 @@ private:
       for (size_t I = 0; I != Load.size(); ++I) {
         serialization::ModuleFile *MF = MFs[I];
         Module *Top = MM.findModule(MF->ModuleName);
-        if (!Top)
+        if (!Top) {
+          if (getenv("DEBUG_LINK"))
+            llvm::errs() << "LOADALL no module " << MF->ModuleName << " of "
+                         << Units[Load[I]].second << "\n";
           return false;
+        }
         MM.cacheModuleLoad(
             *CI.getPreprocessor().getIdentifierInfo(MF->ModuleName), Top);
         Module *Target = Top->findSubmodule(TargetSubmoduleName);
@@ -1805,16 +1896,11 @@ private:
     // declarations, so the hit only needs them visible again and the effects
     // replayed.
     //
-    // Another copy can have the same name: a name is taken before the outside
-    // declarations a copy refers to are known, so two copies of a header
-    // that differ only in those share it. Such a copy is not the loaded one.
-    // In `int f(); #include "h.h" int f(int); #include "h.h"`, with h.h
-    // `extern __typeof__(f) *fp;`, the loaded copy's fp has no prototype and
-    // the second copy's has f(int)'s; taking the first again leaves fp
-    // without one (REPORT.md Q9). Loading the second too would declare a
-    // second fp, since Clang merges two copies' declarations only when they
-    // are the same. Plain clang reads the second include as text, which
-    // makes its fp a redeclaration of the first, and so does this compile.
+    // Another copy has the same name only where its finished metadata is the
+    // same (PartExporter names a copy after Clang's writer runs): a twin a
+    // daemon stored in place of the loaded one. It is passed over. A copy
+    // of another name whose declarations Clang would not merge with the
+    // compile's is passed over before this (mergesHere).
     // REPORT.md T17: the submodules this hit skips, whose declarations the
     // reader leaves unread, each the copy's lines refer to standing for the
     // compile's own.

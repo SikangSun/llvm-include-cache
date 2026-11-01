@@ -11,7 +11,9 @@
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/xxhash.h"
+#include <mutex>
 
 using namespace clang;
 using namespace clang::ast_cache;
@@ -114,22 +116,77 @@ void clang::ast_cache::applyPragmaDelta(Sema &S, const PragmaSnapshot &Entry,
         FPOptionsOverride::getFromOpaqueInt(Exit.FpPragmaRaw));
 }
 
-uint64_t clang::ast_cache::warningFlagsHash(const DiagnosticOptions &Opts) {
-  std::string Key;
-  Key += Opts.IgnoreWarnings ? 'w' : '-';
-  Key += Opts.Pedantic ? 'p' : '-';
-  Key += Opts.PedanticErrors ? 'e' : '-';
+uint64_t clang::ast_cache::warningFlagsHash(
+    const DiagnosticOptions &Opts, llvm::IntrusiveRefCntPtr<DiagnosticIDs> IDs,
+    llvm::vfs::FileSystem &FS) {
+  // The flags' text, which gives the levels: a compile writes many copies
+  // and computes the levels once.
+  std::string Text;
+  Text += Opts.IgnoreWarnings ? 'w' : '-';
+  Text += Opts.Pedantic ? 'p' : '-';
+  Text += Opts.PedanticErrors ? 'e' : '-';
   for (const std::vector<std::string> *List :
-       {&Opts.Warnings, &Opts.Remarks, &Opts.SystemHeaderWarningsModules}) {
-    Key += '\0';
+       {&Opts.Warnings, &Opts.Remarks, &Opts.SystemHeaderWarningsModules,
+        &Opts.UndefPrefixes}) {
+    Text += '\0';
     for (const std::string &Flag : *List) {
+      Text += Flag;
+      Text += '\1';
+    }
+  }
+  Text += '\0';
+  Text += Opts.DiagnosticSuppressionMappingsFile;
+  static std::mutex Mutex;
+  static llvm::StringMap<uint64_t> Known;
+  std::lock_guard<std::mutex> Lock(Mutex);
+  auto [It, New] = Known.try_emplace(Text, 0);
+  if (!New)
+    return It->second;
+
+  // The levels the flags alone give, as WarningPragmaTracker::commandLine.
+  DiagnosticOptions Copy = Opts;
+  DiagnosticsEngine Levels(IDs, Copy, new IgnoringDiagConsumer());
+  ProcessWarningOptions(Levels, Copy, FS, /*ReportDiags=*/false);
+  std::string Key;
+  Key += Levels.getSuppressSystemWarnings() ? 's' : '-';
+  Key += Levels.getIgnoreAllWarnings() ? 'w' : '-';
+  Key += Levels.getErrorsAsFatal() ? 'f' : '-';
+  // Errors are errors and notes notes, whatever the flags.
+  for (diag::Flavor F : {diag::Flavor::WarningOrError, diag::Flavor::Remark}) {
+    std::vector<diag::kind> All;
+    DiagnosticIDs::getAllDiagnostics(F, All);
+    for (diag::kind ID : All)
+      if (F == diag::Flavor::Remark || IDs->isWarningOrExtension(ID))
+        Key += char('0' + static_cast<unsigned>(Levels.getDiagnosticLevel(
+                              ID, SourceLocation())));
+    Key += '\0';
+  }
+  // What a level does not say: a -W flag's value, which modules' system
+  // headers warn, which macros -Wundef names, and which files are spared.
+  std::vector<llvm::StringRef> Values;
+  for (const std::string &Flag : Opts.Warnings) {
+    llvm::StringRef F(Flag);
+    if (F.contains('=') && !F.starts_with("error=") &&
+        !F.starts_with("no-error="))
+      Values.push_back(F);
+  }
+  llvm::sort(Values);
+  for (const std::vector<llvm::StringRef> &List :
+       {Values, std::vector<llvm::StringRef>(
+                    Opts.SystemHeaderWarningsModules.begin(),
+                    Opts.SystemHeaderWarningsModules.end()),
+        std::vector<llvm::StringRef>(Opts.UndefPrefixes.begin(),
+                                     Opts.UndefPrefixes.end())}) {
+    Key += '\0';
+    for (llvm::StringRef Flag : List) {
       Key += Flag;
       Key += '\1';
     }
   }
   Key += '\0';
   Key += Opts.DiagnosticSuppressionMappingsFile;
-  return llvm::xxh3_64bits(Key);
+  It->second = llvm::xxh3_64bits(Key);
+  return It->second;
 }
 
 const DiagnosticsEngine &WarningPragmaTracker::commandLine() const {
