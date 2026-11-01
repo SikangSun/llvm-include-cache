@@ -423,8 +423,9 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req,
         // compiling. Discard it and acknowledge: the client that lost the
         // race already holds its own result and has no use for the winner.
         ++Counters.Duplicates;
-        if (auto M = MergeOf.find(Conn); M != MergeOf.end() && E.Record) {
-          Region.setMerged(M->second, E.Record);
+        if (auto M = MergeOf.find(Conn); M != MergeOf.end() && E.Record &&
+                                          M->second.second == Req.Filename) {
+          Region.setMerged(M->second.first, E.Record);
           MergeOf.erase(M);
           ++Counters.MergesStored;
         }
@@ -454,8 +455,9 @@ llvm::SmallVector<char, 0> CacheDaemon::handlePush(const ReceivedPush &Req,
     }
     // A merged copy is checked just before the copy whose tree it holds.
     if (Record)
-      if (auto M = MergeOf.find(Conn); M != MergeOf.end()) {
-        Region.setMerged(M->second, *Record);
+      if (auto M = MergeOf.find(Conn);
+          M != MergeOf.end() && M->second.second == Req.Filename) {
+        Region.setMerged(M->second.first, *Record);
         MergeOf.erase(M);
         ++Counters.MergesStored;
       }
@@ -516,17 +518,22 @@ llvm::SmallVector<char, 0> CacheDaemon::handleClaim(const ClaimRequest &Req,
   {
     std::lock_guard<std::mutex> Lock(Mutex);
     // CLANG_HEADER_CACHE_MERGE: "merge:<record>:<combination>", once per
-    // combination of a copy's links.
+    // combination of a copy's links. Given back, by a compile whose merged
+    // copy was declined, it is not merged again.
     if (llvm::StringRef(Req.ModuleName).starts_with("merge:")) {
       auto [R, C] = llvm::StringRef(Req.ModuleName).drop_front(6).split(':');
       uint64_t Record = 0, Combo = 0;
       std::optional<uint64_t> At;
-      if (!Req.Release && !R.getAsInteger(16, Record) &&
-          !C.getAsInteger(16, Combo))
+      if (Req.Release) {
+        if (auto M = MergeOf.find(Conn);
+            M != MergeOf.end() && M->second.second == Req.Filename)
+          MergeOf.erase(M);
+      } else if (!R.getAsInteger(16, Record) && !C.getAsInteger(16, Combo)) {
         At = Region.claimMerge(Record, Combo);
+      }
       Granted = At.has_value();
       if (Granted) {
-        MergeOf[Conn] = *At;
+        MergeOf[Conn] = {*At, Req.Filename};
         ++Counters.MergesClaimed;
       }
       llvm::SmallVector<char, 0> Out;

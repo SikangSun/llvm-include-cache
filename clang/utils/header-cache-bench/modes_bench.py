@@ -83,6 +83,14 @@ ALL = {
     # bin-u32: the history-based merge rule (CLANG_HEADER_CACHE_MERGE=auto,
     # user 2026-10-31): a combination is merged once its hits so far pay for
     # the merge. linkma at the default cutoff, linkcut<c>ma at <c> us.
+    # bin-u39+: linkma merges in the compile itself (task 10, user
+    # 2026-11-01); linkmaf forks a process for each merge, as before.
+    "linkmaf": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
+                "CLANG_HEADER_CACHE_MERGE_WAIT": "1", "CLANG_HEADER_CACHE_MERGE_FORK": "1"},
+    "linkmah": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
+                "CLANG_HEADER_CACHE_HIT_LOG": "1"},
     "linkma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
                "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},

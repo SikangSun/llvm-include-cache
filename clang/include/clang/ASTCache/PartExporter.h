@@ -149,12 +149,18 @@ public:
                                bool WasDefined) = 0;
 
   /// CLANG_HEADER_CACHE_MERGE, in a process forked from the compile to
-  /// merge one tree: the parts open are dropped unwritten, copies served
-  /// later are folded, not linked, and \p Done is called with each part's
-  /// stored name, and the module name it was sent under (empty if it was
-  /// not), once it is written or declined.
+  /// merge one tree (CLANG_HEADER_CACHE_MERGE_FORK=1): the parts open are
+  /// dropped unwritten, and the next part merges, as with mergeNext.
   virtual void
   mergeOnly(std::function<void(llvm::StringRef, llvm::StringRef)> Done) = 0;
+
+  /// CLANG_HEADER_CACHE_MERGE: the next part begun merges a tree. Copies
+  /// served inside it are folded into it, not linked, and \p Done is called
+  /// once, with the part's stored name and the module name it was sent
+  /// under (empty if it was not), when it is written or declined, or when
+  /// the compile ends with it never begun.
+  virtual void
+  mergeNext(std::function<void(llvm::StringRef, llvm::StringRef)> Done) = 0;
 
   /// CLANG_HEADER_CACHE_LINK: the copy of the header at \p Path, module
   /// \p Module and file \p MF, stood in for an #include at \p Loc inside

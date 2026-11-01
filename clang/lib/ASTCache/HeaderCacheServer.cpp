@@ -373,9 +373,15 @@ public:
          << LoadsRefused << "\n";
     OS << "header cache index: " << S.IndexReads
        << " lookups and fetches read the region's index\n";
-    if (MergeCount)
+    if (MergeCount && MergeFork)
       OS << "header cache merges: " << MergesForked
          << " started in a process of their own\n";
+    if (MergeCount && !MergeFork)
+      OS << "header cache merges in the compile: " << MergesHere
+         << " started (" << MergesHereSent << " sent), " << MergesRefused
+         << " another compile had claimed, " << MergesInside
+         << " not started inside a header being written, " << MergesBusy
+         << " not started before the merge before them was sent\n";
     OS << "header cache time: " << ms(LookupMicros) << " ms in lookups ("
        << ms(S.DaemonMicros) << " waiting for the daemon, " << ms(S.CheckMicros)
        << " checking candidates, " << ms(LoadMicros) << " loading), "
@@ -673,7 +679,8 @@ public:
             if (!LinkEach) {
               Target = loadTree(Outer, Bytes, ModuleName, IncludeLoc);
               if (!Target) {
-                ++LinksFailed;
+                // Not where this compile merges the tree (ForceMiss).
+                LinksFailed += !ForceMiss;
                 return false;
               }
             } else if (!loadLinks(Outer, IncludeLoc)) {
@@ -692,7 +699,8 @@ public:
         },
         &Site, Step);
     LookupScope.reset();
-    // The process forked to merge reads this header as text.
+    // The compile that merges, or the process forked to, reads this header
+    // as text.
     ForceMiss = false;
     uint64_t Took = micros(Asked);
     LookupMicros += Took;
@@ -1024,12 +1032,19 @@ public:
                                        : std::move(NextReason),
                     Entry && Timed.insert(Entry).second});
     NextReason.clear();
+    // CLANG_HEADER_CACHE_MERGE: the header this compile merges, entered
+    // after the lookup that missed on purpose.
+    if (MergingHere && !MergeDepth && Entry == MergeTarget)
+      MergeDepth = Open.size();
   }
 
   void headerExited() {
     if (Open.empty())
       return;
     OpenFile F = Open.pop_back_val();
+    // Past the header it merges, the compile serves and writes as before.
+    if (MergeDepth && Open.size() + 1 == MergeDepth)
+      mergeLeft();
     auto Micros = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - F.Start)
                       .count();
@@ -1063,7 +1078,7 @@ public:
   void mainFileEnded() {
     // The process forked to merge reports nothing: its hits are the
     // compile's.
-    if (MergeTarget)
+    if (MergeProcess)
       return;
     for (const std::string &Line : HitLines)
       llvm::errs() << "header cache hit: " << Line << "\n";
@@ -1709,7 +1724,9 @@ private:
       uint64_t Combo = llvm::xxh3_64bits(Names);
       Client->noteCombo(Combo);
       HitCombo = Combo;
-      if (!MergeTarget && forkMerge(Combo, Bytes.size() + HitLinkBytes))
+      if (!MergeTarget &&
+          (MergeFork ? forkMerge(Combo, Bytes.size() + HitLinkBytes)
+                     : mergeHere(Combo, Bytes.size() + HitLinkBytes)))
         return nullptr;
     }
     std::vector<std::pair<llvm::StringRef, llvm::StringRef>> Units;
@@ -2473,14 +2490,34 @@ private:
       mergeConstant("CLANG_HEADER_CACHE_MERGE_PER_BYTE", 257);
   /// The header being asked for.
   OptionalFileEntryRef Asking;
-  /// In the process forked to merge: the header it writes, whether its
-  /// part was begun, and the lookup that must miss.
+  /// CLANG_HEADER_CACHE_MERGE_FORK=1: a process forked from the compile
+  /// merges a tree, as before 2026-11-01. Otherwise the compile merges it
+  /// itself, in its own thread (mergeHere).
+  bool MergeFork = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE_FORK");
+    return V && llvm::StringRef(V) == "1";
+  }();
+  /// In the compile that merges, or the process forked to: the header it
+  /// writes, whether its part was begun, and the lookup that must miss.
   const FileEntry *MergeTarget = nullptr;
   bool MergeExporting = false, ForceMiss = false;
   std::string MergePath;
-  /// The combinations, by copy record, this compile forked for.
+  /// The combinations, by copy record, this compile merged or forked for.
   llvm::DenseSet<std::pair<uint64_t, uint64_t>> MergeForked;
   unsigned MergesForked = 0;
+  /// Whether this is the process forked to merge.
+  bool MergeProcess = false;
+  /// mergeHere: whether this compile merges a tree now; how many headers
+  /// were open once it entered the header (0 before); the claim; the
+  /// compile's instructions when the merge began; and the mean
+  /// instructions of the hits on the tree so far, which the merge takes
+  /// the place of.
+  bool MergingHere = false;
+  size_t MergeDepth = 0;
+  std::string MergeKey;
+  uint64_t MergeInstrStart = 0, MergeHitInstr = 0;
+  unsigned MergesHere = 0, MergesHereSent = 0, MergesRefused = 0,
+           MergesInside = 0, MergesBusy = 0;
   /// In the process forked to merge, for the latest hit: each link's guard
   /// the state here decided on, and whether it was defined.
   std::vector<std::pair<std::string, bool>> LiveGuardTests;
@@ -2503,9 +2540,10 @@ private:
   size_t HitLinks = 0;
   uint64_t HitLinkBytes = 0, HitCombo = 0;
   int HitCounter = -2;
-  /// The compile's own instructions so far (HitLog, MergeAuto), or 0.
+  /// The compile's own instructions so far (HitLog, MergeAuto, merges in
+  /// the compile), or 0.
   uint64_t hitInstructions() {
-    if (!HitLog && !MergeAuto)
+    if (!HitLog && !MergeAuto && !(MergeCount && !MergeFork))
       return 0;
 #ifdef __linux__
     if (HitCounter == -2) {
@@ -2549,16 +2587,112 @@ private:
            MergeFixed + MergePerByte * MergeBytesShare * double(TreeBytes);
   }
 
-  bool forkMerge(uint64_t Combo, uint64_t TreeBytes) {
-    uint64_t At = Client->lastRecordOffset();
+  /// Whether the hit on the copy the latest lookup took, which would load
+  /// the combination \p Combo of \p TreeBytes bytes, is where its tree is
+  /// merged (mergeDue), and no compile merged it. \p At is set to the
+  /// copy's record, and \p M to the combination's, if it has one.
+  bool mergeWanted(uint64_t Combo, uint64_t TreeBytes, uint64_t &At,
+                   const MergeRecord *&M) {
+    At = Client->lastRecordOffset();
     const IndexedCopy *R = Client->lastRecord();
     if (!R || !Asking || !Exporter || PopulateOnly)
       return false;
-    const MergeRecord *M = Client->comboOf(*R, Combo);
+    M = Client->comboOf(*R, Combo);
     uint64_t Serves = M ? M->Serves.load(std::memory_order_relaxed) : 0;
-    if ((M && M->Merged.load(std::memory_order_acquire) != 0) ||
-        !mergeDue(M, Serves, TreeBytes) ||
-        !MergeForked.insert({At, Combo}).second)
+    return !(M && M->Merged.load(std::memory_order_acquire) != 0) &&
+           mergeDue(M, Serves, TreeBytes) &&
+           MergeForked.insert({At, Combo}).second;
+  }
+
+  /// CLANG_HEADER_CACHE_MERGE: the compile merges the tree the latest hit
+  /// would load itself, in its own thread. It claims the combination
+  /// \p Combo from the daemon, so that one compile merges it, as one writes
+  /// a copy; misses on the header; reads it as text, the copies served
+  /// inside it folded in (Folding); writes that one copy; and goes on. Not
+  /// inside a header being written: that part links the copies served
+  /// inside it, and this one folds them. True if the lookup must miss.
+  bool mergeHere(uint64_t Combo, uint64_t TreeBytes) {
+    uint64_t At = 0;
+    const MergeRecord *M = nullptr;
+    if (!mergeWanted(Combo, TreeBytes, At, M))
+      return false;
+    if (Exporter->recording()) {
+      ++MergesInside;
+      return false;
+    }
+    // One merge at a time: until its copy is sent, the daemon takes the
+    // next copy of the claimed header for the merged one, and the exporter
+    // calls back for that part. The next #include can come before the
+    // copy is written, which waits for the header's last declaration.
+    if (MergingHere) {
+      ++MergesBusy;
+      return false;
+    }
+    std::string Path = absolutePath(CI.getFileManager(), Asking->getName());
+    std::string Key =
+        "merge:" + llvm::utohexstr(At) + ":" + llvm::utohexstr(Combo);
+    if (!Client->claim(Path, Key)) {
+      ++MergesRefused;
+      return false;
+    }
+    uint64_t Serves = M ? M->Serves.load(std::memory_order_relaxed) : 0;
+    MergeHitInstr =
+        Serves ? M->Instructions.load(std::memory_order_relaxed) / Serves : 0;
+    MergeTarget = &Asking->getFileEntry();
+    MergePath = std::move(Path);
+    MergeKey = std::move(Key);
+    MergeCombo = Combo;
+    MergeStart = std::chrono::steady_clock::now();
+    MergeInstrStart = hitInstructions();
+    MergingHere = ForceMiss = true;
+    MergeDepth = 0;
+    ++MergesHere;
+    Exporter->mergeNext([this](llvm::StringRef, llvm::StringRef Written) {
+      mergedHere(Written);
+    });
+    return true;
+  }
+
+  /// The compile left the header it merges: from here on it links the
+  /// copies served inside a header it writes, and writes the headers it
+  /// misses on.
+  void mergeLeft() {
+    MergeTarget = nullptr;
+    MergeExporting = false;
+    MergeDepth = 0;
+  }
+
+  /// The merged copy was sent under \p Written, or not (empty). A line on
+  /// standard error, as the process forked to merge prints: the
+  /// instructions from the lookup to the copy sent, and the mean of the
+  /// hits on the tree so far, which the merge took the place of.
+  void mergedHere(llvm::StringRef Written) {
+    uint64_t Instructions = hitInstructions() - MergeInstrStart;
+    std::string Result = "sent " + Written.str();
+    if (Written.empty()) {
+      // The daemon would take the next copy of the header this compile
+      // sends as the merged one.
+      Client->claim(MergePath, MergeKey, /*Release=*/true);
+      Result = "declined";
+      const std::vector<std::string> &D = Exporter->stats().Declines;
+      if (!D.empty() && llvm::StringRef(D.back()).starts_with(MergePath + ":"))
+        Result += llvm::StringRef(D.back()).drop_front(MergePath.size());
+    } else {
+      ++MergesHereSent;
+    }
+    llvm::errs() << "header cache merge: " << MergePath << " " << Result
+                 << " combo=" << llvm::utohexstr(MergeCombo)
+                 << " merge_instr=" << Instructions
+                 << " merge_us=" << micros(MergeStart)
+                 << " hit_instr=" << MergeHitInstr << " in=compile\n";
+    mergeLeft();
+    MergingHere = false;
+  }
+
+  bool forkMerge(uint64_t Combo, uint64_t TreeBytes) {
+    uint64_t At = 0;
+    const MergeRecord *M = nullptr;
+    if (!mergeWanted(Combo, TreeBytes, At, M))
       return false;
     llvm::errs().flush();
     llvm::outs().flush();
@@ -2595,6 +2729,7 @@ private:
   /// The process forked to merge: nothing it does may reach the compile's
   /// output, files or connection.
   void startMerge(uint64_t Record, uint64_t Combo) {
+    MergeProcess = true;
     MergeCombo = Combo;
     for (int Sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGINT,
                     SIGTERM, SIGHUP, SIGQUIT, SIGPIPE, SIGALRM, SIGUSR1,

@@ -251,8 +251,10 @@ private:
   /// pushed.
   llvm::StringMap<uint64_t> Claimed;
   /// CLANG_HEADER_CACHE_MERGE: by connection, the record of the
-  /// combination that compile merges; the copy it pushes is the merged one.
-  llvm::DenseMap<uint64_t, uint64_t> MergeOf;
+  /// combination that compile merges, and the header's path; the copy of
+  /// that header it pushes next is the merged one. A compile that merges in
+  /// its own thread pushes copies of other headers too.
+  llvm::DenseMap<uint64_t, std::pair<uint64_t, std::string>> MergeOf;
   llvm::StringSet<> PushedNames;
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.

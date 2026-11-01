@@ -325,7 +325,19 @@ public:
     Open.clear();
     Ready.clear();
     LinkMode = false;
+    mergeNext(std::move(Done));
+  }
+
+  void mergeNext(
+      std::function<void(llvm::StringRef, llvm::StringRef)> Done) override {
+    MergeNext = true;
     MergeDoneFn = std::move(Done);
+  }
+
+  /// Calls the merge's Done once (mergeNext).
+  void mergeDone(llvm::StringRef Stored, llvm::StringRef Written) {
+    if (auto Done = std::exchange(MergeDoneFn, nullptr))
+      Done(Stored, Written);
   }
 
   void linked(llvm::StringRef Path, llvm::StringRef Module,
@@ -779,8 +791,7 @@ public:
   void translationUnitFinished() {
     writeReady();
     // CLANG_HEADER_CACHE_MERGE: the part was never written.
-    if (MergeDoneFn)
-      MergeDoneFn({}, {});
+    mergeDone({}, {});
     if (FinishedFn)
       FinishedFn();
     if (const char *Dir = std::getenv("CLANG_HEADER_CACHE_DDG"))
@@ -1013,6 +1024,10 @@ private:
     bool FirstRead = false;
     uint64_t CutoffMicros = 0;
     std::chrono::steady_clock::time_point Started;
+    /// CLANG_HEADER_CACHE_LINK: the part links the copies served inside it.
+    /// Not one that merges a tree (CLANG_HEADER_CACHE_MERGE, mergeNext): it
+    /// folds them in.
+    bool Linked = false, Merge = false;
     /// CLANG_HEADER_CACHE_CLAIM: the module name this compile claimed, to
     /// give back if the part is declined after all.
     std::string Claimed;
@@ -1463,6 +1478,8 @@ private:
     P.Stored = StoredAs.empty() ? absolutePath(CI.getFileManager(), P.Name)
                                 : StoredAs.str();
     P.Version = !StoredAs.empty();
+    P.Merge = std::exchange(MergeNext, false);
+    P.Linked = LinkMode && !P.Merge;
     if (PiecesMode && !P.Version)
       PiecesBases.insert(FID);
     P.IncludeLoc = SM.getIncludeLoc(FID);
@@ -1532,7 +1549,7 @@ private:
         P.Effects.push_back(
             {II->getName().str(),
              PP.isMacroDefined(const_cast<IdentifierInfo *>(II))});
-    if (LinkMode)
+    if (P.Linked)
       for (const IdentifierInfo *II : P.Touched) {
         std::vector<SourceLocation> &Dirs = P.Directives[II];
         for (const MacroDirective *MD = PP.getLocalMacroDirectiveHistory(II);
@@ -1561,7 +1578,7 @@ private:
     }
     // Unless the part folds it in (FoldServed), or links it.
     if (modulesLoaded() > P.ModulesAtBegin && P.Decline.empty() &&
-        !LinkMode) {
+        !P.Linked) {
       serialization::ModuleManager &MM = CI.getASTReader()->getModuleManager();
       for (size_t I = P.ModulesAtBegin, E = MM.size(); I != E; ++I)
         if (!P.Folded.count(&MM[I])) {
@@ -1582,10 +1599,10 @@ private:
     Batch = &Parts;
     for (Part &P : Parts) {
       write(P);
-      if (LinkMode)
+      if (P.Linked)
         handOver(P);
-      if (MergeDoneFn)
-        MergeDoneFn(P.Stored, P.Written);
+      if (P.Merge)
+        mergeDone(P.Stored, P.Written);
     }
     Batch = nullptr;
     Counts.Micros += std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2191,7 +2208,7 @@ private:
 
   /// Whether \p ND, which \p P's lines name, is a linked header's.
   bool linkedDecl(const Part &P, const NamedDecl &ND) const {
-    if (!LinkMode)
+    if (!P.Linked)
       return false;
     if (ND.isFromASTFile()) {
       const serialization::ModuleFile *MF =
@@ -2276,7 +2293,7 @@ private:
     // handed over from a header not linked, after bitmapset.h's
     // `struct List;`), and the part is not written.
     std::vector<DeclarationDependency> LinkNeeds;
-    if (LinkMode) {
+    if (P.Linked) {
       if (std::string Why = takeLinks(P, Deps); !Why.empty())
         return decline(P, Why);
       for (const auto &[From, D] : P.LinkOutside) {
@@ -2314,7 +2331,7 @@ private:
       if (!P.Version)
         composePieces(P, Deps);
     } else {
-      if (!LinkMode && !NoSubmodules)
+      if (!P.Linked && !NoSubmodules)
         compose(P, Deps);
       if (PartialMode) {
         PartReads R = partReads(P);
@@ -2327,7 +2344,7 @@ private:
 
     if (GuardPlus && !PiecesMode)
       heldHeaders(P, Deps);
-    ownNames(P, LinkMode ? &Deps.Declares : nullptr, Deps.Owned);
+    ownNames(P, P.Linked ? &Deps.Declares : nullptr, Deps.Owned);
     Counts.OwnedKeys += Deps.Owned.size();
 
     // The same header, metadata and compiler options give the same name in
@@ -4458,8 +4475,9 @@ private:
   std::function<void(llvm::StringRef, llvm::StringRef)> ReleaseFn;
   std::function<void(const PushRequest &)> CompareFn;
   std::function<void(llvm::StringRef)> DeclinedFn;
-  /// CLANG_HEADER_CACHE_MERGE (mergeOnly): called once each part is
-  /// written or declined.
+  /// CLANG_HEADER_CACHE_MERGE (mergeNext): whether the next part begun
+  /// merges a tree, and what to call once it is written or declined.
+  bool MergeNext = false;
   std::function<void(llvm::StringRef, llvm::StringRef)> MergeDoneFn;
   std::function<void()> FinishedFn;
   llvm::DenseSet<FileID> Tracked;

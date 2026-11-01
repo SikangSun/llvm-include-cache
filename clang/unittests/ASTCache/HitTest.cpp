@@ -2473,8 +2473,9 @@ TEST_F(ExportTest, AHeldPragmaOnceHeaderIsTakenAgainWithGuardPlus) {
 }
 
 TEST_F(ExportTest, ATreeServedTwiceIsMergedIntoOneCopy) {
-  // CLANG_HEADER_CACHE_MERGE=2: c.c's second hit on outer.h's copy, which
-  // links inner.h's, forks a process that writes the two as one copy. c.c's
+  // CLANG_HEADER_CACHE_MERGE=2: at c.c's second hit on outer.h's copy, which
+  // links inner.h's, the compile reads outer.h as text instead, inner.h's
+  // copy served inside it, and writes the two as one copy. c.c's
   // third compile is served that copy: inner.h's struct and macro, outer.h's
   // function. d.c reads inner.h before outer.h, where the merged copy would
   // define struct pair again: it is served the linked copies instead.
@@ -2506,9 +2507,10 @@ TEST_F(ExportTest, ATreeServedTwiceIsMergedIntoOneCopy) {
   std::set<std::string> Entered;
   ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
   EXPECT_EQ(Daemon->stats().MergesClaimed, 0u) << "merged at the first hit";
+  Entered.clear();
   ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile again";
-  for (int I = 0; I < 3000 && Daemon->stats().MergesStored == 0; ++I)
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_TRUE(Entered.count(Outer)) << "the merging compile took the hit";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h's copy was not served";
   ASSERT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
   EXPECT_EQ(Daemon->stats().Entries, Before + 1);
 
@@ -2522,7 +2524,8 @@ TEST_F(ExportTest, ATreeServedTwiceIsMergedIntoOneCopy) {
   const MergeRecord *Combo = R->mergeAt(Linked->Merge.load());
   ASSERT_TRUE(Combo) << "no combination of outer.h's copy was recorded";
   EXPECT_EQ(Combo->Merged.load(), R->offsetOf(Merged));
-  EXPECT_EQ(Combo->Serves.load(), 2u);
+  // The merging compile took no hit.
+  EXPECT_EQ(Combo->Serves.load(), 1u);
 
   Entered.clear();
   ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile a third time";
@@ -2535,7 +2538,47 @@ TEST_F(ExportTest, ATreeServedTwiceIsMergedIntoOneCopy) {
   EXPECT_FALSE(Entered.count(Outer)) << "outer.h was read in d.c";
   EXPECT_EQ(Merged->Serves.load(), 1u)
       << "the merged copy was served where inner.h was read";
-  EXPECT_EQ(Linked->Serves.load(), 3u) << "the linked copy was not served";
+  EXPECT_EQ(Linked->Serves.load(), 2u) << "the linked copy was not served";
+}
+
+TEST_F(ExportTest, AForkedProcessMergesWithMergeFork) {
+  // CLANG_HEADER_CACHE_MERGE_FORK=1: c.c's second hit on outer.h's copy
+  // forks a process that writes the merged copy; c.c takes the hit. c.c's
+  // third compile is served the merged copy.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "2", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE_FORK", "1", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+    unsetenv("CLANG_HEADER_CACHE_MERGE_FORK");
+  });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Outer +
+                                   "\"\nint c(void) { struct pair p = {1, 2}; "
+                                   "return outer_sum(&p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile again";
+  EXPECT_FALSE(Entered.count(Outer)) << "the compile did not take the hit";
+  for (int I = 0; I < 3000 && Daemon->stats().MergesStored == 0; ++I)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ASSERT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(R)) << llvm::toString(R.takeError());
+  const IndexedCopy *Merged = R->copyAt(R->newestCopy(Outer));
+  ASSERT_TRUE(Merged);
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile a third time";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h was read";
+  EXPECT_EQ(Merged->Serves.load(), 1u) << "the merged copy was not served";
 }
 
 TEST_F(ExportTest, AutoMergingWaitsUntilTheHitsPayForTheMerge) {
@@ -2585,7 +2628,8 @@ TEST_F(ExportTest, AutoMergingWaitsUntilTheHitsPayForTheMerge) {
   ASSERT_TRUE(Linked);
   const MergeRecord *Combo = R->mergeAt(Linked->Merge.load());
   ASSERT_TRUE(Combo);
-  EXPECT_EQ(Combo->Serves.load(), 4u);
+  // The three hits; the fourth compile merged instead.
+  EXPECT_EQ(Combo->Serves.load(), 3u);
 }
 
 TEST_F(ExportTest, AMacroAParentSetsAfterItsLinkKeepsTheParentsValue) {
@@ -3345,6 +3389,152 @@ TEST_F(FixedListTest, ATypeNamesTheLatestOfItsDeclarationsFromOneHit) {
   EXPECT_FALSE(reads(C, U)) << "u.h's copy was not served";
   AtEnd = nullptr;
   EXPECT_EQ(Named, F) << "myva names s.h's declaration";
+}
+
+TEST_F(FixedListTest, ACompileThatMergesGoesOnWritingTheHeadersAfter) {
+  // CLANG_HEADER_CACHE_MERGE=2: p.h's copy links s.h's. c.c's hit on p.h,
+  // the second, merges the two in the compile; c.c then misses on u.h and
+  // writes its copy, as any compile. d.c is served both: the merged copy
+  // and u.h's.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "2", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+  });
+  std::string S = write("s.h", "#ifndef S_H\n#define S_H\n"
+                               "struct pair { int a, b; };\n"
+                               "#define S_MAX 42\n#endif\n");
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n#include \"" + S +
+                                   "\"\nint p_sum(struct pair *p);\n#endif\n");
+  std::string U = write("u.h", "#ifndef U_H\n#define U_H\n"
+                               "int u_one(void);\n#define U_MIN 1\n#endif\n");
+  std::string Body = "\nint f(void) { struct pair p = {U_MIN, S_MAX}; "
+                     "return p_sum(&p) + u_one(); }\n";
+  std::string A = write("a.c", "#include \"" + P + "\"\n");
+  std::string C = write("c.c", "#include \"" + P + "\"\n#include \"" + U +
+                                   "\"" + Body);
+  std::string D = write("d.c", "#include \"" + P + "\"\n#include \"" + U +
+                                   "\"" + Body);
+  EXPECT_TRUE(reads(A, P)) << "nothing is stored yet";
+  EXPECT_FALSE(reads(A, P)) << "p.h's copy was not served";
+  EXPECT_EQ(Daemon->stats().MergesClaimed, 0u) << "merged at the first hit";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_TRUE(Entered.count(P)) << "the merging compile took the hit";
+  EXPECT_FALSE(Entered.count(S)) << "s.h's copy was not served";
+  EXPECT_TRUE(Entered.count(U)) << "u.h had a copy";
+  ASSERT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(R)) << llvm::toString(R.takeError());
+  const IndexedCopy *Merged = R->copyAt(R->newestCopy(P));
+  ASSERT_TRUE(Merged);
+  EXPECT_TRUE(R->copyAt(R->newestCopy(U))) << "u.h's copy was not written";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_FALSE(Entered.count(P)) << "p.h was read";
+  EXPECT_FALSE(Entered.count(S)) << "s.h was read";
+  EXPECT_FALSE(Entered.count(U)) << "u.h was read";
+  EXPECT_EQ(Merged->Serves.load(), 1u) << "the merged copy was not served";
+}
+
+TEST_F(FixedListTest, NoMergeStartsInsideAHeaderBeingWritten) {
+  // CLANG_HEADER_CACHE_MERGE=1: b.c misses on u.h, and inside it hits on
+  // p.h's copy, which links s.h's. u.h's copy links p.h's, so p.h is not
+  // merged there. c.c's hit on p.h, outside any header being written,
+  // merges it.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "1", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+  });
+  std::string S = write("s.h", "#ifndef S_H\n#define S_H\n"
+                               "struct pair { int a, b; };\n#endif\n");
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n#include \"" + S +
+                                   "\"\nint p_sum(struct pair *p);\n#endif\n");
+  std::string U = write("u.h", "#ifndef U_H\n#define U_H\n#include \"" + P +
+                                   "\"\nint u_one(void);\n#endif\n");
+  std::string Body = "\nint f(void) { struct pair p = {1, 2}; "
+                     "return p_sum(&p); }\n";
+  std::string A = write("a.c", "#include \"" + P + "\"\n");
+  std::string B = write("b.c", "#include \"" + U + "\"" + Body);
+  std::string C = write("c.c", "#include \"" + P + "\"" + Body);
+  EXPECT_TRUE(reads(A, P)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered)) << "b.c did not compile";
+  EXPECT_TRUE(Entered.count(U)) << "u.h had a copy";
+  EXPECT_FALSE(Entered.count(P)) << "p.h's copy was not served";
+  EXPECT_EQ(Daemon->stats().MergesClaimed, 0u)
+      << "merged inside a header being written";
+
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(R)) << llvm::toString(R.takeError());
+  EXPECT_TRUE(R->copyAt(R->newestCopy(U))) << "u.h's copy was not written";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_TRUE(Entered.count(P)) << "the merging compile took the hit";
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+}
+
+/// Two trees: p.h's copy links s.h's, q.h's links t.h's.
+class TwoTreesTest : public FixedListTest {
+protected:
+  TwoTreesTest() { Listed = {"p.h", "s.h", "q.h", "t.h"}; }
+};
+
+TEST_F(TwoTreesTest, ACompileMergesOneTreeAtATime) {
+  // CLANG_HEADER_CACHE_MERGE=2: c.c's hits on p.h and q.h are both the
+  // second. c.c merges p.h; q.h's #include comes before p.h's merged copy
+  // is written, so q.h is served its tree. d.c merges q.h. e.c is served
+  // both merged copies.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "2", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+  });
+  std::string S = write("s.h", "#ifndef S_H\n#define S_H\n"
+                               "struct pair { int a, b; };\n#endif\n");
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n#include \"" + S +
+                                   "\"\nint p_sum(struct pair *p);\n#endif\n");
+  std::string T = write("t.h", "#ifndef T_H\n#define T_H\n"
+                               "struct three { int a, b, c; };\n#endif\n");
+  std::string Q = write("q.h", "#ifndef Q_H\n#define Q_H\n#include \"" + T +
+                                   "\"\nint q_sum(struct three *t);\n#endif\n");
+  std::string Text = "#include \"" + P + "\"\n#include \"" + Q +
+                     "\"\nint f(void) { struct pair p = {1, 2}; "
+                     "struct three t = {1, 2, 3}; "
+                     "return p_sum(&p) + q_sum(&t); }\n";
+  std::string A = write("a.c", Text);
+  std::string B = write("b.c", Text);
+  std::string C = write("c.c", Text);
+  std::string D = write("d.c", Text);
+  std::string E = write("e.c", Text);
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(A, Entered)) << "a.c did not compile";
+  ASSERT_TRUE(compile(B, Entered)) << "b.c did not compile";
+  EXPECT_EQ(Daemon->stats().MergesClaimed, 0u) << "merged at the first hit";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_TRUE(Entered.count(P)) << "c.c did not merge p.h";
+  EXPECT_FALSE(Entered.count(Q)) << "c.c merged q.h too";
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "p.h's merged copy was lost";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(D, Entered)) << "d.c did not compile";
+  EXPECT_FALSE(Entered.count(P)) << "p.h's merged copy was not served";
+  EXPECT_TRUE(Entered.count(Q)) << "d.c did not merge q.h";
+  EXPECT_EQ(Daemon->stats().MergesStored, 2u) << "q.h's merged copy was lost";
+
+  Entered.clear();
+  ASSERT_TRUE(compile(E, Entered)) << "e.c did not compile";
+  for (const std::string &H : {P, S, Q, T})
+    EXPECT_FALSE(Entered.count(H)) << H << " was read";
 }
 
 TEST_F(ExportTest, ACompileWithAnErrorWritesNoPart) {
