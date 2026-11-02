@@ -99,6 +99,18 @@ struct CacheDaemonOptions {
   /// What one load of a header's copy as another header's link costs it;
   /// 0 charges nothing for links.
   uint64_t FoldLinkMicros = 50;
+  /// The measured cutoff (-measured-cutoff), in place of AskCutoffMicros,
+  /// with no fixed number: a header is on the ask-list while what a hit on
+  /// it saves is at least what the hit costs, both its own. The saving is
+  /// the parse time of the lines a copy of it holds -- its own, and those
+  /// of the headers inside it read without asking -- as the compile that
+  /// read it last measured it. The cost is one request for it with its
+  /// check, and one copy of it loaded, each the mean of its requests and
+  /// loads so far. A header no compile has asked for yet is asked for, so
+  /// at first every header is; one with requests but no loads stays while
+  /// it saves a request. Every report judges every header again, so a
+  /// header can leave the list and come back.
+  bool MeasuredCutoff = false;
 };
 
 class CacheDaemon {
@@ -156,6 +168,8 @@ public:
     /// The fold rule: headers below the floor at their first read, and
     /// headers taken off the ask-list once their losses passed the budget.
     uint64_t HeadersBelowFloor = 0, HeadersFolded = 0;
+    /// The measured cutoff: the times a header left the ask-list.
+    uint64_t HeadersUnlisted = 0;
     uint64_t HitsTimed = 0;
     /// CLANG_HEADER_CACHE_SECOND_MISS: copies asked about for the first time,
     /// and again.
@@ -333,6 +347,21 @@ private:
   /// Applies the fold rule to one compile's report. Mutex held; true if
   /// the ask-list changed.
   bool foldLocked(const TimingReport &Report);
+  /// The measured cutoff, per header: its requests and their time, the
+  /// copies of it loaded and their share of the load time, and the parse
+  /// time of the lines a copy of it holds, from its latest report, in the
+  /// order the headers were first reported.
+  struct HeaderCosts {
+    uint64_t Requests = 0, RequestMicros = 0, Loads = 0, LoadMicros = 0;
+  };
+  llvm::StringMap<HeaderCosts> CostsOf;
+  llvm::StringMap<uint64_t> HeldParse;
+  std::vector<std::string> HeldOrder;
+  /// Applies the measured cutoff to one compile's report. Mutex held; true
+  /// if the ask-list changed.
+  bool cutoffLocked(const TimingReport &Report);
+  /// Takes \p Path off the ask-list; true if it was on it. Mutex held.
+  bool unlistLocked(llvm::StringRef Path);
 
   std::atomic<bool> Stopping{false};
   /// Owned by run(); shutdown() on it makes a blocked accept return.

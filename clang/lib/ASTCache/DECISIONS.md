@@ -2301,6 +2301,38 @@ macro argument to where it is spelled) falls back to that place. Code is
 identical. Not fixed: keeping such an expansion's spelling needs a stand-in
 for the dropped file, a design change.
 
+### A merged copy lost a struct's definition, and a copy served again declared nothing new (found 2026-11-02)
+
+Full builds with decisions of every kind made from an earlier build's
+record (`CLANG_HEADER_CACHE_RECORD`, `CLANG_HEADER_CACHE_DECISIONS`; modes
+`linkcm` and `linkcmd` of `scratch/e2e/multi/modes_bench.py`) found two
+bugs. Both are fixed; tests in `HitTest.cpp`.
+
+**A merged copy lost a struct's definition.** git's `repository.h` declares
+`struct pathspec;`, and `pathspec.h`, which `diff.h` includes later, defines
+it. A compile that merged a tree holding `pathspec.h`'s copy wrote the
+definition into the merged copy, but the copy's name table listed no
+declaration of `pathspec`. The writer finds the newest declaration a part
+holds by walking back from the declaration Sema's resolver keeps, and the
+resolver keeps the forward declaration, which comes before the definition
+loaded from the copy. A compile served the merged copy never read the
+definition: "field has incomplete type 'struct pathspec'", 64 of git's 567
+compiles with every tree of two or more hits merged. The walk now starts
+at the newest declaration, and a part lists the declaration it chose
+(`ASTIdentifierTableTrait::declsFor`).
+
+**A copy served again declared nothing new.** Under `-fmodules`, clang's
+`__stddef_size_t.h` has no guard. nginx includes it, then `glob.h`, which
+declares `size_t` again, then `__stddef_size_t.h` again. From there `size_t`
+names `__stddef_size_t.h`'s declaration in plain clang, and debug
+information describes that one. A hit took the copy loaded already, which
+makes no new declaration, so `size_t` kept naming `glob.h`'s: 118 of nginx's
+126 objects differed, in `.debug_line` only, with the per-header cutoff,
+which asks for such small headers; the 226 us cutoff never did. A copy
+loaded already now serves again only while each declaration it holds is
+the newest of its name (`newestStill`); otherwise the header is read as
+text, and nothing is written.
+
 ## 4. Open
 
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider

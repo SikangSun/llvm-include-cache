@@ -4012,11 +4012,14 @@ public:
     // none when it holds none.
     // With submodules, the latest of each submodule's: where the one
     // holding the latest is skipped, the others still load (REPORT.md T17).
+    // The walk starts at the entity's newest declaration, not at the one
+    // the resolver holds: a definition in a copy folded into the part comes
+    // after the forward declaration the resolver keeps (git's struct
+    // pathspec, declared by repository.h, defined by pathspec.h).
     SmallVector<NamedDecl *, 16> Held;
     for (NamedDecl *D : Decls) {
       SmallVector<Module *, 2> Owners;
-      for (Decl *R = getDeclForLocalLookup(PP.getLangOpts(), D); R;
-           R = R->getPreviousDecl()) {
+      for (Decl *R = D->getMostRecentDecl(); R; R = R->getPreviousDecl()) {
         if ((R->isFromASTFile() && !Writer.isPartLocal(R)) ||
             !Writer.wasDeclEmitted(R))
           continue;
@@ -4115,10 +4118,14 @@ public:
       // "stat"), but the ASTReader adds declarations to the end of the list
       // (so we need to see the struct "stat" before the function "stat").
       // Only emit declarations that aren't from a chained PCH, though.
+      // A part lists the declarations declsFor chose: one folded in from a
+      // copy is from an AST file, and the local one before it is outside.
       SmallVector<NamedDecl *, 16> Decls = declsFor(II);
       for (NamedDecl *D : llvm::reverse(Decls))
         LE.write<DeclID>((DeclID)Writer.getDeclID(
-            getDeclForLocalLookup(PP.getLangOpts(), D)));
+            Writer.isWritingPart() ? D
+                                   : getDeclForLocalLookup(PP.getLangOpts(),
+                                                           D)));
     }
   }
 };

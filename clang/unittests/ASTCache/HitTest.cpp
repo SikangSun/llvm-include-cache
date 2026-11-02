@@ -1285,6 +1285,27 @@ protected:
     AskListTest::SetUp();
     ExportParts = true;
   }
+  /// The daemon's stored copies of \p Header, as dumpEntries lists them:
+  /// each copy's module name and the number of copies it links.
+  std::vector<std::pair<std::string, unsigned>>
+  copiesOf(llvm::StringRef Header) {
+    std::string Dump;
+    llvm::raw_string_ostream OS(Dump);
+    Daemon->dumpEntries(OS);
+    std::vector<std::pair<std::string, unsigned>> Out;
+    llvm::SmallVector<llvm::StringRef, 0> Lines;
+    llvm::StringRef(Dump).split(Lines, '\n', -1, /*KeepEmpty=*/false);
+    for (llvm::StringRef L : Lines) {
+      llvm::SmallVector<llvm::StringRef, 12> F;
+      L.split(F, '\t');
+      if (F.size() < 11 || F[0] != "entry" || F[1] != Header)
+        continue;
+      unsigned Links = 0;
+      F[10].rsplit(',').second.getAsInteger(10, Links);
+      Out.push_back({F[2].str(), Links});
+    }
+    return Out;
+  }
 };
 
 TEST_F(ExportTest, AMissExportsAPartTheNextCompileServes) {
@@ -1891,6 +1912,117 @@ TEST_F(ExportTest, ACopyBeingWrittenLinksAServedHeader) {
   ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
   EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, ADecidedFoldReadsTheHeaderWithoutAsking) {
+  // CLANG_HEADER_CACHE_DECISIONS, fold: in b.c's second compile outer.h
+  // misses, and inside it inner.h is read as text without asking, so
+  // outer.h's copy holds inner.h's lines instead of linking a copy of
+  // inner.h. c.c is served outer.h; inner.h stays shut.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string Decisions =
+      write("decisions", "fold\t" + Outer + "\t" + Inner + "\n");
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_DECISIONS", Decisions.c_str(), 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_DECISIONS");
+  });
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C =
+      write("c.c", "#include \"" + Outer +
+                       "\"\nint c(void) { struct pair p = {1, INNER_MAX}; "
+                       "return outer_sum(&p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  EXPECT_TRUE(copiesOf(Inner).empty()) << "inner.h was written on its own";
+  auto Outers = copiesOf(Outer);
+  ASSERT_EQ(Outers.size(), 1u) << "outer.h was not written";
+  EXPECT_EQ(Outers[0].second, 0u) << "outer.h's copy links a copy";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, ADecidedFoldReadsTheHeaderEvenWhereItHasACopy) {
+  // fold: a.c writes inner.h's copy. In b.c's second compile outer.h
+  // misses, and inside it inner.h is read as text, not asked for, though
+  // it has a copy: outer.h's copy holds its lines and links no copy. c.c
+  // is served outer.h alone.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n"
+                                       "static inline int twice(int x) "
+                                       "{ return 2 * x; }\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n"
+                           "#define OUTER_MAX (INNER_MAX + 1)\n#endif\n");
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_DECISIONS");
+  });
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n"
+                               "int a(void) { return twice(INNER_MAX); }\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write(
+      "c.c", "#include \"" + Outer +
+                 "\"\nint c(void) {\n  struct pair p = {1, OUTER_MAX};\n"
+                 "  return twice(p.a) + outer_sum(&p);\n}\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is stored yet";
+  auto Inners = copiesOf(Inner);
+  ASSERT_EQ(Inners.size(), 1u) << "inner.h was not written";
+  std::string Decisions =
+      write("decisions", "fold\t" + Outer + "\t" + Inner + "\n");
+  setenv("CLANG_HEADER_CACHE_DECISIONS", Decisions.c_str(), 1);
+  EXPECT_TRUE(reads(B, Outer)) << "outer.h is not listed yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h's text was not read";
+  EXPECT_TRUE(Entered.count(Inner)) << "inner.h was asked for and served";
+  auto Outers = copiesOf(Outer);
+  ASSERT_EQ(Outers.size(), 1u) << "outer.h was not written";
+  EXPECT_EQ(Outers[0].second, 0u) << "outer.h's copy links inner.h's";
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, ADecidedHeaderIsNotAskedForWhereTheCFileIncludesIt) {
+  // top: outer.h, which the .c file includes, is read as text every time
+  // and never written. inner.h inside it is still asked for and served.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string Decisions = write("decisions", "top\t" + Outer + "\n");
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_DECISIONS", Decisions.c_str(), 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_DECISIONS");
+  });
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Inner)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h was served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h's copy was not served";
+  EXPECT_TRUE(copiesOf(Outer).empty()) << "outer.h was written";
 }
 
 TEST_F(ExportTest, AHeaderEndingInAFunctionBeforeALinkIsSavedWithItsBody) {
@@ -3480,6 +3612,66 @@ TEST_F(FixedListTest, NoMergeStartsInsideAHeaderBeingWritten) {
   EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
 }
 
+TEST_F(FixedListTest, AMergedCopyCompletesAStructDeclaredBeforeIt) {
+  // git: repository.h declares struct pathspec, and diff.h includes
+  // pathspec.h, which defines it. Here f.h, not listed, declares struct
+  // pair, and s.h, linked by p.h's copy, defines it. c.c merges p.h's tree;
+  // d.c is served the merged copy after f.h and needs struct pair complete.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "2", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+  });
+  std::string F = write("f.h", "#ifndef F_H\n#define F_H\n"
+                               "struct pair;\nint f_use(struct pair *p);\n"
+                               "#endif\n");
+  std::string S = write("s.h", "#ifndef S_H\n#define S_H\n"
+                               "struct pair { int a, b; };\n#endif\n");
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n#include \"" + S +
+                                   "\"\nint p_sum(struct pair *p);\n#endif\n");
+  std::string Text = "#include \"" + F + "\"\n#include \"" + P +
+                     "\"\nstruct holder { struct pair p; };\n"
+                     "int f(struct holder *h) { return h->p.a + "
+                     "p_sum(&h->p); }\n";
+  std::set<std::string> Entered;
+  for (const char *N : {"a.c", "b.c", "c.c", "d.c"}) {
+    Entered.clear();
+    ASSERT_TRUE(compile(write(N, Text), Entered)) << N << " did not compile";
+  }
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+  EXPECT_FALSE(Entered.count(P)) << "p.h was read";
+}
+
+TEST_F(FixedListTest, AMergedCopyCompletesAStructDeclaredAfterIt) {
+  // As AMergedCopyCompletesAStructDeclaredBeforeIt, f.h after p.h: its
+  // struct pair; names the definition the merged copy holds.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "2", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+  });
+  std::string F = write("f.h", "#ifndef F_H\n#define F_H\n"
+                               "struct pair;\nint f_use(struct pair *p);\n"
+                               "#endif\n");
+  std::string S = write("s.h", "#ifndef S_H\n#define S_H\n"
+                               "struct pair { int a, b; };\n#endif\n");
+  std::string P = write("p.h", "#ifndef P_H\n#define P_H\n#include \"" + S +
+                                   "\"\nint p_sum(struct pair *p);\n#endif\n");
+  std::string Text = "#include \"" + P + "\"\n#include \"" + F +
+                     "\"\nstruct holder { struct pair p; };\n"
+                     "int f(struct holder *h) { return h->p.a + "
+                     "p_sum(&h->p); }\n";
+  std::set<std::string> Entered;
+  for (const char *N : {"a.c", "b.c", "c.c", "d.c"}) {
+    Entered.clear();
+    ASSERT_TRUE(compile(write(N, Text), Entered)) << N << " did not compile";
+  }
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+  EXPECT_FALSE(Entered.count(P)) << "p.h was read";
+}
+
 /// Two trees: p.h's copy links s.h's, q.h's links t.h's.
 class TwoTreesTest : public FixedListTest {
 protected:
@@ -3569,6 +3761,43 @@ TEST_F(ExportTest, AHeaderIncludedUnderTwoMacroStatesIsServedBothTimes) {
   EXPECT_TRUE(reads(A, Name)) << "nothing is stored yet";
   ASSERT_EQ(Daemon->stats().Entries, 2u) << "name.h was not exported twice";
   EXPECT_FALSE(reads(A, Name)) << "a part of name.h was not served";
+}
+
+TEST_F(ExportTest, AHeaderIncludedAgainAfterARedeclarationIsReadAgain) {
+  // nginx: __stddef_size_t.h, with no guard under -fmodules, declares
+  // size_t; glob.h declares it again; a later header includes
+  // __stddef_size_t.h again, and from there size_t names its declaration.
+  // z.h's copy, loaded at the first #include, declares nothing new at the
+  // second, so z.h is read there, and zsize names its declaration, as
+  // debug information shows.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Z = write("z.h", "typedef unsigned long zsize;\n");
+  std::string G = write("g.h", "#ifndef G_H\n#define G_H\n"
+                               "typedef unsigned long zsize;\n#endif\n");
+  std::string Text = "#include \"" + Z + "\"\n#include \"" + G +
+                     "\"\n#include \"" + Z + "\"\nzsize use_c;\n";
+  std::string A = write("a.c", Text);
+  std::string C = write("c.c", Text);
+  EXPECT_TRUE(reads(A, Z)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Z)) << "nothing is stored yet";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("use_c")))
+      if (auto *V = dyn_cast<VarDecl>(D))
+        if (const auto *T = V->getType()->getAs<TypedefType>())
+          Named = Ctx.getSourceManager()
+                      .getPresumedLoc(T->getDecl()->getLocation())
+                      .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(G)) << "g.h's copy was not served";
+  EXPECT_TRUE(Entered.count(Z)) << "z.h was not read at its second #include";
+  EXPECT_EQ(Named, Z) << "zsize names g.h's declaration";
 }
 
 TEST_F(ExportTest, ACallInACopyFindsTheDeclarationBeforeTheInclude) {

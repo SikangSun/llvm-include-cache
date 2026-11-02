@@ -43,6 +43,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
@@ -491,6 +492,13 @@ public:
 
   bool recording() const override {
     return llvm::any_of(Open, [](const Part &P) { return P.Decline.empty(); });
+  }
+
+  std::string innermostWriting() const override {
+    for (const Part &P : llvm::reverse(Open))
+      if (P.Decline.empty() && !P.FirstRead)
+        return P.Stored;
+    return std::string();
   }
 
   void exportWhenEntered(std::string Path) override {
@@ -2548,6 +2556,16 @@ private:
               " locations dropped (in module files or outside the part)";
     Counts.Exports.push_back(std::move(Line));
     P.Written = Name;
+    // CLANG_HEADER_CACHE_RECORD: the copy and the copies it links
+    // (HeaderCacheServer's W line).
+    if (!recordFile().empty()) {
+      std::string Rec = "W\t" + P.Stored + "\t" + Name + "\t" +
+                        std::to_string(W.Buffer.size()) + "\t" +
+                        std::to_string(W.Micros);
+      for (const LinkRecord &L : R.Deps.Links)
+        Rec += "\t" + L.Path + "\t" + L.Module;
+      appendRecord(Rec + "\n");
+    }
     R.Metadata.assign(Metadata.begin(), Metadata.end());
     P.WrittenHash = llvm::xxh3_64bits(R.Metadata);
     if (Tracker.measuringIndependence())
@@ -4554,6 +4572,31 @@ protected:
 static FrontendPluginRegistry::Add<ExportPlugin>
     ExportPluginEntry("header-cache-export",
                       "tells the header cache when a declaration is finished");
+
+const std::string &clang::ast_cache::recordFile() {
+  static const std::string File = [] {
+    const char *Dir = std::getenv("CLANG_HEADER_CACHE_RECORD");
+    if (!Dir || !*Dir)
+      return std::string();
+    auto Now = std::chrono::system_clock::now().time_since_epoch();
+    return std::string(Dir) + "/" + std::to_string(::getpid()) + "-" +
+           std::to_string(
+               std::chrono::duration_cast<std::chrono::nanoseconds>(Now)
+                   .count()) +
+           ".rec";
+  }();
+  return File;
+}
+
+void clang::ast_cache::appendRecord(llvm::StringRef Lines) {
+  const std::string &File = recordFile();
+  if (File.empty() || Lines.empty())
+    return;
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(File, EC, llvm::sys::fs::OF_Append);
+  if (!EC)
+    OS << Lines;
+}
 
 PartExporter &PartExporter::install(CompilerInstance &CI,
                                     std::function<void(PushRequest &&)> Deliver,

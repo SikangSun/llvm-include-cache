@@ -192,6 +192,26 @@ TEST(CacheProtocolTest, TimingReportCarriesWhatTheFoldRuleReads) {
   EXPECT_EQ(Got->Links, Report.Links);
 }
 
+TEST(CacheProtocolTest, TimingReportCarriesWhatTheMeasuredCutoffReads) {
+  // The lines a copy of each header holds besides its own, and what the
+  // compile's requests and loads cost it.
+  TimingReport Report;
+  Report.Headers = {{"/src/server.h", 41250, 27068, 35, true, 1500}};
+  Report.Requests = {{"/src/server.h", 310}, {"/src/sds.h", 95}};
+  Report.Loads = {{"/src/sds.h", 40}};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Headers.size(), 1u);
+  EXPECT_EQ(Got->Headers[0].FoldedMicros, 1500u);
+  ASSERT_EQ(Got->Requests.size(), 2u);
+  EXPECT_EQ(Got->Requests[1].Path, "/src/sds.h");
+  EXPECT_EQ(Got->Requests[1].Micros, 95u);
+  ASSERT_EQ(Got->Loads.size(), 1u);
+  EXPECT_EQ(Got->Loads[0].Micros, 40u);
+}
+
 TEST(CacheProtocolTest, HelloReplyRoundTrips) {
   llvm::SmallVector<char, 0> Out;
   encodeHelloReply({"/dev/shm/x.region", 0x0123456789abcdefull}, Out);
@@ -687,6 +707,46 @@ TEST_F(DaemonTest, LinkLoadsCanCostNothing) {
   reportLinks(std::vector<std::string>(500, "/src/stdio.h"));
   EXPECT_EQ(askList(), std::vector<std::string>{"/src/stdio.h"});
   EXPECT_EQ(Daemon->stats().HeadersFolded, 0u);
+}
+
+TEST_F(DaemonTest, WithTheMeasuredCutoffEveryHeaderIsAskedForAtFirst) {
+  // No fixed number: a header no compile has asked for has no cost of its
+  // own to compare with, so it is asked for, however fast it parses.
+  CacheDaemon::Options O;
+  O.MeasuredCutoff = true;
+  useDaemon(O);
+  report({{"/src/wrapper.h", 400, 20, 3, false, 300},
+          {"/src/small.h", 3, 3, 0, false, 0}});
+  EXPECT_EQ(askList(),
+            (std::vector<std::string>{"/src/wrapper.h", "/src/small.h"}));
+}
+
+TEST_F(DaemonTest, TheMeasuredCutoffIsTheHeadersOwnRequestAndLoad) {
+  // A hit on a header costs its own mean request and mean load; it saves
+  // the lines its copy holds. Each report judges every header again.
+  CacheDaemon::Options O;
+  O.MeasuredCutoff = true;
+  useDaemon(O);
+  report({{"/src/mid.h", 300, 300, 0, false, 0},
+          {"/src/big.h", 5000, 5000, 0, false, 0},
+          {"/src/tiny.h", 30, 30, 0, false, 0}});
+  llvm::SmallVector<char, 0> Msg;
+  TimingReport R;
+  R.Headers = {{"/src/big.h", 5000, 5000, 0, true, 0}};
+  R.Requests = {{"/src/mid.h", 250},
+                {"/src/mid.h", 350},
+                {"/src/big.h", 900},
+                {"/src/tiny.h", 40}};
+  R.Loads = {{"/src/mid.h", 60}, {"/src/big.h", 400}};
+  encodeTimingReport(R, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/big.h"})
+      << "mid.h: 300 us is under 300 + 60 us; tiny.h: 30 us is under one "
+         "40 us request, with no load measured yet";
+  EXPECT_EQ(Daemon->stats().HeadersUnlisted, 2u);
+  // mid.h now holds a header it used to link: 300 + 100 us.
+  report({{"/src/mid.h", 400, 300, 1, false, 100}});
+  EXPECT_EQ(askList(), (std::vector<std::string>{"/src/big.h", "/src/mid.h"}));
 }
 
 TEST_F(DaemonTest, StoredHeadersAreListedWhenAskedTo) {

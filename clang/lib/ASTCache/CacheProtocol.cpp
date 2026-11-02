@@ -147,6 +147,7 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
         W.u64(H.OwnMicros);
         W.u32(H.Children);
         W.u8(H.Asked);
+        W.u64(H.FoldedMicros);
       }
     }
     writeLearned(W, Report.Build, Report.Learned, Report.Used);
@@ -159,6 +160,14 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
     W.u32(static_cast<uint32_t>(Report.Links.size()));
     for (const std::string &L : Report.Links)
       W.str(L);
+    for (const std::vector<HeaderTiming> *L :
+         {&Report.Requests, &Report.Loads}) {
+      W.u32(static_cast<uint32_t>(L->size()));
+      for (const HeaderTiming &H : *L) {
+        W.str(H.Path);
+        W.u64(H.Micros);
+      }
+    }
   });
 }
 
@@ -347,6 +356,7 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
       H.OwnMicros = R.u64();
       H.Children = R.u32();
       H.Asked = R.u8();
+      H.FoldedMicros = R.u64();
       L->push_back(std::move(H));
     }
   }
@@ -361,6 +371,14 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
   }
   for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I)
     Report.Links.push_back(R.str().str());
+  for (std::vector<HeaderTiming> *L : {&Report.Requests, &Report.Loads}) {
+    for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+      HeaderTiming H;
+      H.Path = R.str().str();
+      H.Micros = R.u64();
+      L->push_back(std::move(H));
+    }
+  }
   if (!R.ok() || !R.atEnd())
     return std::nullopt;
   return Report;

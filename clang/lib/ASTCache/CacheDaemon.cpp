@@ -73,6 +73,49 @@ bool CacheDaemon::dropIfCostlyLocked(llvm::StringRef Path) {
   return true;
 }
 
+bool CacheDaemon::unlistLocked(llvm::StringRef Path) {
+  if (!ListedSet.erase(Path))
+    return false;
+  llvm::erase(Listed, Path);
+  Counters.HeadersListed = Listed.size();
+  ++Counters.HeadersUnlisted;
+  return true;
+}
+
+bool CacheDaemon::cutoffLocked(const TimingReport &Report) {
+  for (const HeaderTiming &T : Report.Requests) {
+    HeaderCosts &C = CostsOf[T.Path];
+    ++C.Requests;
+    C.RequestMicros += T.Micros;
+  }
+  for (const HeaderTiming &T : Report.Loads) {
+    HeaderCosts &C = CostsOf[T.Path];
+    ++C.Loads;
+    C.LoadMicros += T.Micros;
+  }
+  for (const HeaderTiming &H : Report.Headers) {
+    if (H.Path.empty())
+      continue;
+    auto [It, New] = HeldParse.try_emplace(H.Path, 0);
+    It->second = H.OwnMicros + H.FoldedMicros;
+    if (New)
+      HeldOrder.push_back(H.Path);
+  }
+  bool Changed = false;
+  for (const std::string &Path : HeldOrder) {
+    // Every hit is a request too, so a hit saving less than a request and
+    // a load never pays, however many hits there are. A header not asked
+    // for yet has no cost of its own to compare with: it is asked for.
+    HeaderCosts C = CostsOf.lookup(Path);
+    bool Pays = !C.Requests ||
+                HeldParse.lookup(Path) >=
+                    C.RequestMicros / C.Requests +
+                        (C.Loads ? C.LoadMicros / C.Loads : 0);
+    Changed |= Pays ? listLocked(Path) : unlistLocked(Path);
+  }
+  return Changed;
+}
+
 bool CacheDaemon::foldLocked(const TimingReport &Report) {
   const double C = Opts.FoldAskMicros, L = Opts.FoldLoadMicros,
                W = Opts.FoldWriteMicros;
@@ -270,11 +313,13 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
         Region.countCombo(R, C.Combo, /*Serves=*/1, C.Instructions);
     ++Counters.TimingReports;
     bool Changed = Opts.Fold && foldLocked(Report);
+    if (Opts.MeasuredCutoff && !Opts.FixedAskList && !Opts.Fold)
+      Changed |= cutoffLocked(Report);
     for (const HeaderTiming &H : Report.Headers) {
       if (H.Path.empty() || !FirstTiming.try_emplace(H.Path, H.Micros).second)
         continue;
       if (H.Micros >= Opts.AskCutoffMicros && !Opts.FixedAskList &&
-          !Opts.Fold)
+          !Opts.Fold && !Opts.MeasuredCutoff)
         Changed |= listLocked(H.Path);
     }
     // All of a compile's hits count before any header is judged: the first

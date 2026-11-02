@@ -336,6 +336,12 @@ public:
        << " not at a declaration boundary, " << NotListed
        << " not on the ask-list, " << InsideWritten
        << " inside a header being written\n";
+    if (Decisions)
+      OS << "header cache decisions: " << DecidedTop
+         << " requests not made where the .c file includes the header, "
+         << DecidedFolds
+         << " not made inside the copy of the header around it, "
+         << DecidedMerges << " merges called for\n";
     if (S.OtherStartHits)
       OS << "header cache counter: " << S.OtherStartHits
          << " copies fit whose __COUNTER__ began elsewhere\n";
@@ -403,6 +409,10 @@ public:
       OS << "  fitting copies passed over, another copy of the same name "
             "loaded: "
          << OtherCopySameName << "\n";
+    if (NotNewest)
+      OS << "  copies loaded already not served again, a declaration made "
+            "since is the newest of a name they declare: "
+         << NotNewest << "\n";
     if (MergeKeysDiffer)
       OS << "  fitting copies passed over, a name they declare has another "
             "merge key here: "
@@ -579,6 +589,22 @@ public:
       return nullptr;
     }
 
+    // CLANG_HEADER_CACHE_DECISIONS: a header the .c file includes that the
+    // rules found not worth a copy of its own there is read as text.
+    if (Decisions && Decisions->Top.contains(Path) && includerName() == "-") {
+      ++DecidedTop;
+      NextReason = "decided-top";
+      return nullptr;
+    }
+    // A header the rules fold into the copy of the header that includes it,
+    // where the compile writes that copy, is read as text without asking:
+    // the copy holds its lines (the user's way A, 2026-11-02).
+    if (!MergeTarget && decidedPair(&Decided::Fold, Path)) {
+      ++DecidedFolds;
+      NextReason = "decided-fold";
+      return nullptr;
+    }
+
     // Inside a header this compile will write, everything is read as text:
     // its part is a folded copy, and the writer can fold in only what the
     // compile parsed itself -- a served header's declarations would be
@@ -646,9 +672,11 @@ public:
     HitLinks = 0;
     HitLinkBytes = 0;
     HitCombo = 0;
+    HitUnits.clear();
     llvm::TimeTraceScope QueryScope("HeaderCache Query", Path);
     HitModules.clear();
     LiveGuardTests.clear();
+    PassedNotNewest = false;
     Asking = File;
     // CLANG_HEADER_CACHE_PIECES: a version serves only whole; the header a
     // stand-in includes after its sections has the copy its plan chose.
@@ -705,6 +733,24 @@ public:
     ForceMiss = false;
     uint64_t Took = micros(Asked);
     LookupMicros += Took;
+    // What the request cost, and each copy the hit loaded, its links
+    // after it, with its share of the load by bytes.
+    uint64_t RequestTook = Took - std::min(Took, HitLoadMicros);
+    Timings.Requests.push_back({Path, RequestTook});
+    if (Target) {
+      HitUnits.insert(HitUnits.begin(), {Path, LastModuleName, HitBytes});
+      uint64_t Total = 0;
+      for (const HitUnit &U : HitUnits)
+        Total += U.Bytes;
+      for (const HitUnit &U : HitUnits)
+        Timings.Loads.push_back(
+            {U.Path, Total ? HitLoadMicros * U.Bytes / Total : 0});
+    }
+    if (Recording)
+      record({"R", Path, includerName(), Target ? "hit" : "miss",
+              std::to_string(RequestTook), std::to_string(HitLoadMicros),
+              Target ? LastModuleName : "-",
+              std::to_string(HitBytes + HitLinkBytes)});
     // Notes this query, with LogServed. Replay is the time a hit spent
     // replaying the header's macro effects and pragma state, which is not
     // part of Took.
@@ -822,6 +868,14 @@ public:
                                  std::to_string(Client->lastPartial().size());
           return nullptr;
         }
+      }
+      // A copy loaded already fit, but a declaration made since is the
+      // newest of one of its names (newestStill): the text is read, as
+      // plain clang reads it, and held by any copy being written around it.
+      // Nothing is written: that copy fits here already.
+      if (PassedNotNewest) {
+        NextReason = "loaded-copy-not-newest";
+        return nullptr;
       }
       NextAsked = true;
       int CounterFit = Client->lastCounterFit();
@@ -1068,21 +1122,33 @@ public:
     uint64_t Own = Micros - F.ChildMicros - (cacheMicros() - F.CacheAtStart);
     if (!Open.empty())
       Open.back().ChildMicros += Micros - (cacheMicros() - F.CacheAtStart);
+    int64_t OwnTime = int64_t(Micros) - int64_t(F.ChildMicros) -
+                      int64_t(cacheMicros() - F.CacheAtStart);
+    // A copy of the header around this one holds this one's lines, and the
+    // lines this one holds in turn, unless the compile asked for a copy of
+    // this one: then a copy of its own holds them.
+    if (!Open.empty() && F.Entry && !F.Asked)
+      Open.back().FoldedMicros +=
+          static_cast<uint64_t>(std::max<int64_t>(0, OwnTime)) +
+          F.FoldedMicros;
     if (F.Entry && LogServed)
       TextLines.push_back(storedName(F.Name) + " " + std::to_string(Micros) +
                           " depth " + std::to_string(Open.size()) + " own " +
                           std::to_string(Own) + " why " + F.Reason);
+    if (Recording && F.Entry)
+      record({"T", storedName(F.Name), includerName(),
+              std::to_string(std::max<int64_t>(0, OwnTime)),
+              std::to_string(F.FoldedMicros), F.Asked ? "1" : "0",
+              F.First ? "1" : "0"});
     // Only a header's first entry in this compile is its parse; a later one
     // of an unguarded header says nothing about what a saved copy saves.
     if (!F.First)
       return;
-    int64_t OwnTime = int64_t(Micros) - int64_t(F.ChildMicros) -
-                      int64_t(cacheMicros() - F.CacheAtStart);
     Timings.Headers.push_back({storedName(F.Name),
                                static_cast<uint64_t>(Micros),
                                static_cast<uint64_t>(std::max<int64_t>(
                                    0, OwnTime)),
-                               F.Children, F.Asked});
+                               F.Children, F.Asked, F.FoldedMicros});
   }
 
   /// Tells the daemon how long this compile took to read each header, so it
@@ -1095,11 +1161,16 @@ public:
     for (const std::string &Line : HitLines)
       llvm::errs() << "header cache hit: " << Line << "\n";
     HitLines.clear();
-    if (!Timings.Headers.empty() || !Timings.Hits.empty())
+    if (!Timings.Headers.empty() || !Timings.Hits.empty() ||
+        !Timings.Requests.empty())
       Client->reportTimings(Timings);
     Timings.Headers.clear();
     Timings.Hits.clear();
     Timings.Links.clear();
+    Timings.Requests.clear();
+    Timings.Loads.clear();
+    appendRecord(RecordLines);
+    RecordLines.clear();
   }
 
 private:
@@ -1753,6 +1824,11 @@ private:
     }
     for (const Fetched *F : Order)
       Timings.Links.push_back(F->Path);
+    HitUnits.clear();
+    for (const Fetched *F : Order)
+      HitUnits.push_back({F->Path, F->Module, F->Bytes.size()});
+    if (Recording)
+      recordTree(ModuleName, Bytes.size(), All, Order);
     Step.reset();
     static const bool DebugLink = getenv("DEBUG_LINK");
     if (DebugLink) {
@@ -1848,6 +1924,11 @@ private:
         if (Known->second.Bytes.data() != Bytes.data() &&
             Known->second.Bytes != Bytes) {
           ++OtherCopySameName;
+          return false;
+        }
+        if (!newestStill(*Known->second.MF)) {
+          ++NotNewest;
+          PassedNotNewest = true;
           return false;
         }
         Known->second.Fresh = false;
@@ -1968,6 +2049,11 @@ private:
       }
       if (Known->second.Bytes.data() == Bytes.data() ||
           Known->second.Bytes == Bytes) {
+        if (!newestStill(*Known->second.MF)) {
+          ++NotNewest;
+          PassedNotNewest = true;
+          return nullptr;
+        }
         Known->second.Fresh = false;
         HitModules.push_back(Known->second.MF);
         return Known->second.Target;
@@ -2138,6 +2224,29 @@ private:
   /// Fitting copies passed over because another copy of the same name was
   /// loaded (see load).
   unsigned OtherCopySameName = 0;
+  /// Copies loaded already not served again, as a declaration made since is
+  /// the newest of one of their names (newestStill); and whether the latest
+  /// lookup passed one over, so that its header is read and not written.
+  unsigned NotNewest = 0;
+  bool PassedNotNewest = false;
+
+  /// Whether each declaration \p MF holds at file scope is still the newest
+  /// of its name. A header without a guard declares its names again each
+  /// time it is included, and a type names the newest declaration, as debug
+  /// information shows: nginx includes __stddef_size_t.h, then glob.h,
+  /// which declares size_t again, then __stddef_size_t.h again, after which
+  /// size_t names __stddef_size_t.h's declaration. A copy loaded already
+  /// declares nothing new, so it serves again only where nothing has
+  /// declared one of its names since.
+  bool newestStill(serialization::ModuleFile &MF) {
+    ASTReader &Reader = *CI.getASTReader();
+    llvm::SmallVector<Decl *, 32> Top;
+    Reader.getTopLevelDecls(MF, Top);
+    return llvm::all_of(Top, [&](Decl *D) {
+      return !isa<NamedDecl>(D) ||
+             Reader.getOwningModuleFile(D->getMostRecentDecl()) == &MF;
+    });
+  }
   /// Which warning pragmas are in force, and this compile's warning flags
   /// (warningFlagsHash).
   WarningPragmaTracker &Pragmas;
@@ -2403,6 +2512,70 @@ private:
         Micros = DefaultAskCutoffMicros;
     return Micros;
   }();
+  /// CLANG_HEADER_CACHE_DECISIONS=<file>: what the fold and merge rules
+  /// decided from an earlier build's record (CLANG_HEADER_CACHE_RECORD),
+  /// one tab-separated line each:
+  ///   top header             not asked for where the .c file includes it
+  ///   fold parent child      not asked for inside a copy of parent being
+  ///                          written: that copy holds child's lines (the
+  ///                          user's way A, 2026-11-02)
+  ///   merge tree             the tree (MergeRecord::Combo, hexadecimal) is
+  ///                          merged at its first hit, with
+  ///                          CLANG_HEADER_CACHE_MERGE=decided
+  /// A copy of parent has no name until it is written, after the requests
+  /// inside it, so a pair names the parent by its header.
+  struct Decided {
+    llvm::StringSet<> Top, Fold;
+    llvm::DenseSet<uint64_t> Merge;
+  };
+  std::optional<Decided> Decisions = [] {
+    std::optional<Decided> D;
+    const char *V = std::getenv("CLANG_HEADER_CACHE_DECISIONS");
+    if (!V || !*V)
+      return D;
+    auto File = llvm::MemoryBuffer::getFile(V);
+    if (!File) {
+      llvm::errs() << "header cache: cannot read decisions " << V << "\n";
+      return D;
+    }
+    D.emplace();
+    llvm::SmallVector<llvm::StringRef, 0> Lines;
+    (*File)->getBuffer().split(Lines, '\n', -1, /*KeepEmpty=*/false);
+    for (llvm::StringRef L : Lines) {
+      llvm::SmallVector<llvm::StringRef, 3> F;
+      L.split(F, '\t');
+      uint64_t Tree = 0;
+      std::string Pair;
+      if (F.size() == 3)
+        ((Pair = F[1].str()) += '\0') += F[2];
+      if (F.size() == 2 && F[0] == "top")
+        D->Top.insert(F[1]);
+      else if (F.size() == 3 && F[0] == "fold")
+        D->Fold.insert(Pair);
+      else if (F.size() == 2 && F[0] == "merge" &&
+               !F[1].getAsInteger(16, Tree))
+        D->Merge.insert(Tree);
+    }
+    return D;
+  }();
+  /// What the decisions did: requests not made where the .c file includes
+  /// a header, and inside the copy of the header around it; merges they
+  /// called for, which start only outside a header being written (the
+  /// merges line of the report).
+  unsigned DecidedTop = 0, DecidedFolds = 0, DecidedMerges = 0;
+  /// Whether the decisions' \p Set pairs the header the compile is
+  /// writing with \p Key: the innermost header being written includes it
+  /// directly.
+  bool decidedPair(llvm::StringSet<> Decided::*Set, llvm::StringRef Key) {
+    if (!Decisions || !LinkMode || !Exporter || !Exporter->writing())
+      return false;
+    std::string In = includerName();
+    if (In == "-" || Exporter->innermostWriting() != In)
+      return false;
+    std::string Pair = In;
+    (Pair += '\0') += Key;
+    return ((*Decisions).*Set).contains(Pair);
+  }
   /// CLANG_HEADER_CACHE_FOLD_SERVED=1: inside a header being written, a
   /// header is asked for and served too, and the copy being written holds
   /// the served copy's declarations as its own.
@@ -2480,7 +2653,16 @@ private:
     unsigned N = 0;
     if (V && llvm::StringRef(V) == "auto")
       return 2u;
+    if (V && llvm::StringRef(V) == "decided")
+      return 1u;
     return V && !llvm::StringRef(V).getAsInteger(10, N) ? N : 0u;
+  }();
+  /// CLANG_HEADER_CACHE_MERGE=decided: the trees the decisions list
+  /// (CLANG_HEADER_CACHE_DECISIONS) are merged at their first hit, and no
+  /// other.
+  bool MergeDecided = [] {
+    const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE");
+    return V && llvm::StringRef(V) == "decided";
   }();
   /// CLANG_HEADER_CACHE_MERGE=auto: a combination is merged once its hits so
   /// far pay for the merge (mergeDue), with the constants the merge study
@@ -2555,6 +2737,77 @@ private:
   size_t HitLinks = 0;
   uint64_t HitLinkBytes = 0, HitCombo = 0;
   int HitCounter = -2;
+  /// The copies the latest hit loaded: its own, then its links in load
+  /// order, each by header, module name and bytes (TimingReport::Loads).
+  struct HitUnit {
+    std::string Path, Module;
+    uint64_t Bytes = 0;
+  };
+  std::vector<HitUnit> HitUnits;
+
+  /// CLANG_HEADER_CACHE_RECORD=<dir> (recordFile()): what the fold and
+  /// merge rules read, one tab-separated line per event, appended to the
+  /// compile's file when its main file ends; the copies it writes append
+  /// their own lines as they are written (PartExporter):
+  ///   R header parent hit|miss request-us load-us copy|- bytes
+  ///     a request: parent is the header whose #include it is, - for the
+  ///     .c file; a hit names the copy it loaded and the bytes of the copy
+  ///     and the links it loaded
+  ///   K copy child child-copy loaded|skipped
+  ///     a link in a hit's tree, from the copy linking it: loaded, or
+  ///     skipped because its guard is defined, the child read before
+  ///   C copy tree links bytes
+  ///     a hit that loaded links: its tree (MergeRecord::Combo), the links
+  ///     loaded, and the bytes of the copies loaded
+  ///   T header parent own-us folded-us asked first
+  ///     a header read as text (HeaderTiming)
+  ///   W header copy bytes writer-us [child child-copy]...
+  ///     a copy written, with the copies it links (PartExporter)
+  const bool Recording = !recordFile().empty();
+  std::string RecordLines;
+  void record(std::initializer_list<llvm::StringRef> Fields) {
+    bool First = true;
+    for (llvm::StringRef F : Fields) {
+      if (!First)
+        RecordLines += '\t';
+      RecordLines += F;
+      First = false;
+    }
+    RecordLines += '\n';
+  }
+  /// The links of a hit on \p Copy, of \p Bytes, that loaded \p Order out
+  /// of the tree \p All: K lines, each from the copy linking it, and the
+  /// hit's C line.
+  void recordTree(llvm::StringRef Copy, uint64_t Bytes,
+                  const std::vector<Fetched> &All,
+                  const std::vector<const Fetched *> &Order) {
+    llvm::SmallPtrSet<const Fetched *, 16> Loaded(Order.begin(), Order.end());
+    auto Walk = [&](auto &Self, llvm::StringRef Parent,
+                    const std::vector<Fetched> &Links) -> void {
+      for (const Fetched &F : Links) {
+        bool L = Loaded.contains(&F);
+        record({"K", Parent, F.Path, F.Module, L ? "loaded" : "skipped"});
+        if (L)
+          Self(Self, F.Module, F.Links);
+      }
+    };
+    Walk(Walk, Copy, All);
+    std::string Names = Copy.str();
+    for (const Fetched *F : Order) {
+      (Names += '\0') += F->Module;
+      Bytes += F->Bytes.size();
+    }
+    record({"C", Copy, llvm::utohexstr(llvm::xxh3_64bits(Names)),
+            std::to_string(Order.size()), std::to_string(Bytes)});
+  }
+  /// The header whose #include the compile is reading: the innermost open
+  /// file past the main file; "-" for the main file.
+  std::string includerName() {
+    for (size_t I = Open.size(); I-- > 1;)
+      if (Open[I].Entry)
+        return storedName(Open[I].Name);
+    return "-";
+  }
   /// The compile's own instructions so far (HitLog, MergeAuto, merges in
   /// the compile), or 0.
   uint64_t hitInstructions() {
@@ -2613,9 +2866,17 @@ private:
     if (!R || !Asking || !Exporter || PopulateOnly)
       return false;
     M = Client->comboOf(*R, Combo);
+    if (M && M->Merged.load(std::memory_order_acquire) != 0)
+      return false;
+    if (MergeDecided) {
+      if (!Decisions || !Decisions->Merge.contains(Combo) ||
+          !MergeForked.insert({At, Combo}).second)
+        return false;
+      ++DecidedMerges;
+      return true;
+    }
     uint64_t Serves = M ? M->Serves.load(std::memory_order_relaxed) : 0;
-    return !(M && M->Merged.load(std::memory_order_acquire) != 0) &&
-           mergeDue(M, Serves, TreeBytes) &&
+    return mergeDue(M, Serves, TreeBytes) &&
            MergeForked.insert({At, Combo}).second;
   }
 
@@ -2856,6 +3117,8 @@ private:
     /// whether the compile asked for a copy of it and none fit (TimingReport).
     uint32_t Children = 0;
     bool Asked = false;
+    /// HeaderTiming::FoldedMicros.
+    uint64_t FoldedMicros = 0;
   };
   std::string NextReason;
   /// The header entered next was asked for and missed.

@@ -71,6 +71,14 @@ static cl::opt<unsigned long long>
                        "microseconds"),
               cl::init(DefaultLaterCostMicros), cl::cat(Category));
 
+static cl::opt<bool> MeasuredCutoff(
+    "measured-cutoff",
+    cl::desc("In place of -ask-cutoff-us, with no fixed number: list a "
+             "header while the parse time of the lines its copy holds is at "
+             "least one request for it and one load of its copy, each the "
+             "mean of its own so far; a header not asked for yet is listed"),
+    cl::init(false), cl::cat(Category));
+
 static cl::opt<bool> Fold(
     "fold",
     cl::desc("Judge each header as its own copy against folding it into the "
@@ -167,6 +175,7 @@ int main(int argc, char **argv) {
   Opts.FoldLoadMicros = FoldLoad;
   Opts.FoldWriteMicros = FoldWrite;
   Opts.FoldLinkMicros = FoldLink;
+  Opts.MeasuredCutoff = MeasuredCutoff;
   if (!AskListLoad.empty()) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> List =
         MemoryBuffer::getFile(AskListLoad);
@@ -233,7 +242,9 @@ int main(int argc, char **argv) {
            << " headers dropped as costing more than "
               "parsing; "
            << S.HeadersBelowFloor << " below the fold floor, "
-           << S.HeadersFolded << " folded by their losses\n"
+           << S.HeadersFolded << " folded by their losses; "
+           << S.HeadersUnlisted
+           << " taken off the list by the measured cutoff\n"
            << "waits   " << S.Waits << " (" << S.WaitsServed
            << " ended by a new copy, " << S.WaitsTimedOut
            << " by the time limit, " << (S.WaitMicros / 1000) << " ms), "

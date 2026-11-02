@@ -182,6 +182,11 @@ struct HeaderTiming {
   uint64_t OwnMicros = 0;
   uint32_t Children = 0;
   bool Asked = false;
+  /// A header read as text only: the own times of the headers inside it
+  /// that the compile read without asking for them, and of the headers
+  /// inside those in turn. A copy of the header holds their lines, so
+  /// OwnMicros plus this is what a hit on it saves.
+  uint64_t FoldedMicros = 0;
 };
 
 /// Sent once when a compile's main file ends: every header the compile read,
@@ -205,6 +210,12 @@ struct TimingReport {
   std::vector<ComboHit> Combos;
   /// The headers whose copies hits loaded as links, once per link loaded.
   std::vector<std::string> Links;
+  /// Each cache request of the compile, by header, with its time, the time
+  /// loading copies taken out; and each copy its hits loaded, links
+  /// included, by header, with its share of the load: a hit loads its copy
+  /// and the copies it links with one reader call, shared out by bytes.
+  /// Path and Micros only.
+  std::vector<HeaderTiming> Requests, Loads;
 };
 
 /// The daemon's answer to a client that has just connected: the region file

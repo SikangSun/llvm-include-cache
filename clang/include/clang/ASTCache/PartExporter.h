@@ -48,6 +48,14 @@ namespace ast_cache {
 class MetadataView;
 class WarningPragmaTracker;
 
+/// CLANG_HEADER_CACHE_RECORD=<dir>: the file this compile appends the
+/// counts and times of its requests, hits, reads and writes to, for the
+/// fold and merge rules to read after the build: <dir>/<pid>-<ns>.rec.
+/// Empty when the variable is not set.
+const std::string &recordFile();
+/// Appends \p Lines, each ending in a newline, to recordFile() if it is set.
+void appendRecord(llvm::StringRef Lines);
+
 class PartExporter {
 public:
   struct Stats {
@@ -220,6 +228,10 @@ public:
   /// Whether a header this compile is exporting is open and not declined, a
   /// first read included: a header inside it belongs to its copy.
   virtual bool recording() const = 0;
+
+  /// The stored path of the innermost open header whose copy this compile
+  /// writes (writing()); empty for none.
+  virtual std::string innermostWriting() const = 0;
 
   /// Export the header whose absolute path is \p Path the first time it is
   /// entered, whatever the cache says. For CLANG_HEADER_CACHE_EXPORT.
