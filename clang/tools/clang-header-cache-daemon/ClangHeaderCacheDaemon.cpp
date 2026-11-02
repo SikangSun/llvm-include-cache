@@ -71,6 +71,59 @@ static cl::opt<unsigned long long>
                        "microseconds"),
               cl::init(DefaultLaterCostMicros), cl::cat(Category));
 
+static cl::opt<bool> Fold(
+    "fold",
+    cl::desc("Judge each header as its own copy against folding it into the "
+             "copy around it, in place of -ask-cutoff-us: listed at its first "
+             "read if its own time plus an ask per header it includes is at "
+             "least an ask and a load, taken off once its losses pass "
+             "-fold-budget writes"),
+    cl::init(false), cl::cat(Category));
+
+static cl::opt<bool>
+    FoldFloor("fold-floor",
+              cl::desc("With -fold: list only headers at or above the floor "
+                       "(on by default); off, list every header"),
+              cl::init(true), cl::cat(Category));
+
+static cl::opt<CacheDaemon::Options::FoldListing> FoldList(
+    "fold-list", cl::desc("With -fold: what the floor reads"),
+    cl::values(clEnumValN(CacheDaemon::Options::FoldListing::OwnAndChildren,
+                          "own-children",
+                          "the own time plus an ask per header included "
+                          "(default)"),
+               clEnumValN(CacheDaemon::Options::FoldListing::Own, "own",
+                          "the own time alone"),
+               clEnumValN(CacheDaemon::Options::FoldListing::Inclusive,
+                          "inclusive",
+                          "the time with the headers inside it, against "
+                          "-ask-cutoff-us")),
+    cl::init(CacheDaemon::Options::FoldListing::OwnAndChildren),
+    cl::cat(Category));
+
+static cl::opt<double>
+    FoldBudget("fold-budget",
+               cl::desc("With -fold: the losses, in writes, after which a "
+                        "header comes off the ask-list"),
+               cl::init(8), cl::cat(Category));
+
+static cl::opt<unsigned long long>
+    FoldAsk("fold-ask-us", cl::desc("With -fold: an ask, in microseconds"),
+            cl::init(92), cl::cat(Category));
+static cl::opt<unsigned long long>
+    FoldLoad("fold-load-us",
+             cl::desc("With -fold: loading one copy, in microseconds"),
+             cl::init(50), cl::cat(Category));
+static cl::opt<unsigned long long> FoldLink(
+    "fold-link-us",
+    cl::desc("With -fold: what each load of a header's copy as another "
+             "header's link costs it, in microseconds (0: nothing)"),
+    cl::init(50), cl::cat(Category));
+static cl::opt<unsigned long long>
+    FoldWrite("fold-write-us",
+              cl::desc("With -fold: writing one copy, in microseconds"),
+              cl::init(519), cl::cat(Category));
+
 static cl::opt<std::string> AskListLoad(
     "ask-list-load",
     cl::desc("Measurement: the ask-list is exactly the headers in this file, "
@@ -106,6 +159,14 @@ int main(int argc, char **argv) {
   Opts.ListStored = ListStored;
   Opts.DropCostly = DropCostly;
   Opts.LaterCostMicros = LaterCost;
+  Opts.Fold = Fold;
+  Opts.FoldFloor = FoldFloor;
+  Opts.FoldListBy = FoldList;
+  Opts.FoldBudget = FoldBudget;
+  Opts.FoldAskMicros = FoldAsk;
+  Opts.FoldLoadMicros = FoldLoad;
+  Opts.FoldWriteMicros = FoldWrite;
+  Opts.FoldLinkMicros = FoldLink;
   if (!AskListLoad.empty()) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> List =
         MemoryBuffer::getFile(AskListLoad);
@@ -170,7 +231,9 @@ int main(int argc, char **argv) {
            << " on the ask-list; " << S.HitsTimed << " hits timed, "
            << S.HeadersDropped
            << " headers dropped as costing more than "
-              "parsing\n"
+              "parsing; "
+           << S.HeadersBelowFloor << " below the fold floor, "
+           << S.HeadersFolded << " folded by their losses\n"
            << "waits   " << S.Waits << " (" << S.WaitsServed
            << " ended by a new copy, " << S.WaitsTimedOut
            << " by the time limit, " << (S.WaitMicros / 1000) << " ms), "
@@ -178,6 +241,8 @@ int main(int argc, char **argv) {
            << S.ClaimsGranted << " granted, " << S.ClaimsRefused
            << " refused; merges " << S.MergesClaimed << " started, "
            << S.MergesStored << " stored\n";
+    if (Fold)
+      (*D)->dumpFolds(outs());
   }
   return 0;
 }

@@ -1208,6 +1208,13 @@ private:
   const NameSlot *findInNameTable(uint32_t Hash) const;
   bool useNameTable() const;
 
+  /// Header cache, CLANG_HEADER_CACHE_SCAN_ONCE=1 (measurement): the
+  /// contexts CompleteRedeclChain scanned for an unnamed declaration of a
+  /// kind. A context's lexical declarations come from the one module file
+  /// that defines it and do not change, so a second scan finds nothing the
+  /// first did not load.
+  llvm::DenseSet<std::pair<const DeclContext *, unsigned>> UnnamedScans;
+
   /// Measurement: identifier refreshes, and the cycles their module visits
   /// took (-print-stats).
   unsigned NumIdentifierRefreshes = 0;

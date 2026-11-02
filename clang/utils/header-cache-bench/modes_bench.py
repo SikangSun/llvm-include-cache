@@ -94,6 +94,28 @@ ALL = {
     "linkma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
                "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},
+    # The fold rule (user 2026-11-01: run the lower-bound rule on the
+    # workbench and the Linux sample), linkc with the daemon's -fold
+    # (DAEMON_ARGS): a header is listed at its first read if it passes the
+    # floor, and folded once its losses pass the budget. linkf<b>: the
+    # floor of own time plus an ask per header included, a budget of b
+    # writes; linkfl: that floor alone; linkf<b>w<us>: a write costs <us>;
+    # linkfn8: no floor. linkfi<b>: today's listing (226 us with the
+    # headers inside it); linkfo<b>: own time alone; linkfol: that floor
+    # alone. Suffix n: loads as another header's link cost nothing.
+    **{m: {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+           "CLANG_HEADER_CACHE_LINK": "1"}
+       for m in ("linkfl", "linkf1", "linkf2", "linkf4", "linkf8", "linkf16", "linkf32", "linkf8w2000",
+                 "linkf2w2000", "linkfn8", "linkfi1", "linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32",
+                 "linkfo2", "linkfo8", "linkfo32", "linkfol")},
+    **{m + "n": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                 "CLANG_HEADER_CACHE_LINK": "1"}
+       for m in ("linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkf8", "linkf32", "linkfo8", "linkfo32",
+                 "linkfi6", "linkfi12", "linkfo4", "linkfo16")},
+    # linkc, a context's declarations scanned once for unnamed ones
+    # (CLANG_HEADER_CACHE_SCAN_ONCE=1), not again at each completion.
+    "linkcscan": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                  "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_SCAN_ONCE": "1"},
     **{f"linkcut{c}ma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                          "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
                          "CLANG_HEADER_CACHE_MERGE_WAIT": "1"} for c in (2000, 5000)},
@@ -196,6 +218,15 @@ def replay_args(args, obj):
 # Daemon options per mode (folding threshold sweep, 2026-10-31).
 DAEMON_ARGS = {f"linkcut{c}": ["-ask-cutoff-us", str(c)] for c in (0, 100, 226, 500, 1000, 2000, 5000, 10000, 20000, 50000)}
 DAEMON_ARGS.update({f"linkcut{c}ma": ["-ask-cutoff-us", str(c)] for c in (2000, 5000)})
+DAEMON_ARGS.update({"linkfl": ["-fold", "-fold-budget=1e15"], "linkfn8": ["-fold", "-fold-floor=0", "-fold-budget=8"]})
+DAEMON_ARGS.update({f"linkf{b}": ["-fold", f"-fold-budget={b}"] for b in (1, 2, 4, 8, 16, 32)})
+DAEMON_ARGS.update({f"linkf{b}w2000": ["-fold", f"-fold-budget={b}", "-fold-write-us=2000"] for b in (2, 8)})
+DAEMON_ARGS.update({f"linkfi{b}": ["-fold", "-fold-list=inclusive", f"-fold-budget={b}"] for b in (1, 2, 4, 6, 8, 12, 16, 32)})
+DAEMON_ARGS.update({f"linkfo{b}": ["-fold", "-fold-list=own", f"-fold-budget={b}"] for b in (2, 4, 8, 16, 32)})
+DAEMON_ARGS.update({"linkfol": ["-fold", "-fold-list=own", "-fold-budget=1e15"]})
+DAEMON_ARGS.update({m + "n": DAEMON_ARGS[m] + ["-fold-link-us=0"]
+                    for m in ("linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkf8", "linkf32", "linkfo8", "linkfo32",
+                              "linkfi6", "linkfi12", "linkfo4", "linkfo16")})
 
 
 def daemon(core, dump, mode=None):

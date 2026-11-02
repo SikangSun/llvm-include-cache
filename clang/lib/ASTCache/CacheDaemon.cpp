@@ -73,6 +73,94 @@ bool CacheDaemon::dropIfCostlyLocked(llvm::StringRef Path) {
   return true;
 }
 
+bool CacheDaemon::foldLocked(const TimingReport &Report) {
+  const double C = Opts.FoldAskMicros, L = Opts.FoldLoadMicros,
+               W = Opts.FoldWriteMicros;
+  bool Changed = false;
+  llvm::StringSet<> Touched;
+  for (const HeaderTiming &H : Report.Headers) {
+    if (H.Path.empty())
+      continue;
+    // The first report of a header is its first read: it was not listed, so
+    // nothing was asked.
+    if (!FirstTiming.count(H.Path)) {
+      FoldState &F = Folds[H.Path];
+      F.Own = H.OwnMicros;
+      F.Children = H.Children;
+      if (Opts.FixedAskList)
+        continue;
+      bool Passes =
+          Opts.FoldListBy == Options::FoldListing::Inclusive
+              ? H.Micros >= Opts.AskCutoffMicros
+          : Opts.FoldListBy == Options::FoldListing::Own
+              ? F.Own >= C + L
+              : F.Own + F.Children * C >= C + L;
+      if (Opts.FoldFloor && !Passes) {
+        F.BelowFloor = true;
+        ++Counters.HeadersBelowFloor;
+        continue;
+      }
+      Changed |= listLocked(H.Path);
+      continue;
+    }
+    if (!H.Asked)
+      continue;
+    auto It = Folds.find(H.Path);
+    if (It == Folds.end())
+      continue;
+    It->second.Gain -= C + W;
+    ++It->second.Misses;
+    Touched.insert(H.Path);
+  }
+  for (const HeaderTiming &H : Report.Hits) {
+    auto It = Folds.find(H.Path);
+    if (It == Folds.end())
+      continue;
+    FoldState &F = It->second;
+    F.Gain += F.Own + F.Children * C - C - L;
+    ++F.Hits;
+    Touched.insert(H.Path);
+  }
+  for (const std::string &P : Report.Links) {
+    auto It = Folds.find(P);
+    if (It == Folds.end())
+      continue;
+    It->second.Gain -= Opts.FoldLinkMicros;
+    ++It->second.Links;
+    Touched.insert(P);
+  }
+  for (const auto &T : Touched) {
+    FoldState &F = Folds.find(T.getKey())->second;
+    if (F.Folded || F.Gain >= -Opts.FoldBudget * W ||
+        !ListedSet.contains(T.getKey()))
+      continue;
+    F.Folded = true;
+    ListedSet.erase(T.getKey());
+    llvm::erase(Listed, T.getKey());
+    Dropped.insert(T.getKey());
+    Counters.HeadersListed = Listed.size();
+    ++Counters.HeadersFolded;
+    Changed = true;
+  }
+  return Changed;
+}
+
+void CacheDaemon::dumpFolds(llvm::raw_ostream &OS) const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  OS << "fold\tstate\town_us\tchildren\thits\tmisses\tlinks\tgain_us\theader\n";
+  for (const auto &KV : Folds) {
+    const FoldState &F = KV.second;
+    OS << "fold\t"
+       << (F.BelowFloor ? "floor"
+           : F.Folded   ? "folded"
+           : ListedSet.contains(KV.getKey()) ? "listed"
+                                             : "other")
+       << "\t" << F.Own << "\t" << F.Children << "\t" << F.Hits << "\t"
+       << F.Misses << "\t" << F.Links << "\t" << (int64_t)F.Gain << "\t"
+       << KV.getKey() << "\n";
+  }
+}
+
 void CacheDaemon::publishLocked() {
   // The whole list each time. It is at most a few hundred paths -- 778 for
   // qemu, 35 KB -- and changes only while a build's first compiles report,
@@ -181,11 +269,12 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
       if (uint64_t R = RecordOf.lookup(C.Copy))
         Region.countCombo(R, C.Combo, /*Serves=*/1, C.Instructions);
     ++Counters.TimingReports;
-    bool Changed = false;
+    bool Changed = Opts.Fold && foldLocked(Report);
     for (const HeaderTiming &H : Report.Headers) {
       if (H.Path.empty() || !FirstTiming.try_emplace(H.Path, H.Micros).second)
         continue;
-      if (H.Micros >= Opts.AskCutoffMicros && !Opts.FixedAskList)
+      if (H.Micros >= Opts.AskCutoffMicros && !Opts.FixedAskList &&
+          !Opts.Fold)
         Changed |= listLocked(H.Path);
     }
     // All of a compile's hits count before any header is judged: the first

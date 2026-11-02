@@ -8351,8 +8351,14 @@ void ASTReader::CompleteRedeclChain(const Decl *D) {
         DC->lookup(Name);
     } else if (needsAnonymousDeclarationNumber(cast<NamedDecl>(D))) {
       // Find all declarations of this kind from the relevant context.
+      static const bool ScanOnce = [] {
+        const char *V = getenv("CLANG_HEADER_CACHE_SCAN_ONCE");
+        return V && StringRef(V) == "1";
+      }();
       for (auto *DCDecl : cast<Decl>(D->getLexicalDeclContext())->redecls()) {
         auto *DC = cast<DeclContext>(DCDecl);
+        if (ScanOnce && !UnnamedScans.insert({DC, D->getKind()}).second)
+          continue;
         SmallVector<Decl*, 8> Decls;
         FindExternalLexicalDecls(
             DC, [&](Decl::Kind K) { return K == D->getKind(); }, Decls);

@@ -175,6 +175,13 @@ struct ReceivedPush {
 struct HeaderTiming {
   std::string Path;
   uint64_t Micros = 0;
+  /// A header read as text (TimingReport::Headers) only: its own time, the
+  /// headers inside it and the cache's work taken out; the headers it
+  /// includes directly that were read or served; and whether the compile
+  /// asked for a copy first, and read the text because none fit.
+  uint64_t OwnMicros = 0;
+  uint32_t Children = 0;
+  bool Asked = false;
 };
 
 /// Sent once when a compile's main file ends: every header the compile read,
@@ -196,6 +203,8 @@ struct TimingReport {
     uint64_t Copy = 0, Combo = 0, Instructions = 0;
   };
   std::vector<ComboHit> Combos;
+  /// The headers whose copies hits loaded as links, once per link loaded.
+  std::vector<std::string> Links;
 };
 
 /// The daemon's answer to a client that has just connected: the region file

@@ -172,6 +172,26 @@ TEST(CacheProtocolTest, TimingReportCarriesHitCosts) {
   EXPECT_EQ(Got->Hits[1].Micros, 2251u);
 }
 
+TEST(CacheProtocolTest, TimingReportCarriesWhatTheFoldRuleReads) {
+  // Each header read as text with its own time, the headers it included
+  // directly, and whether a copy was asked for first; each link a hit
+  // loaded.
+  TimingReport Report;
+  Report.Headers = {{"/src/server.h", 41250, 27068, 35, true},
+                    {"/src/sds.h", 900, 640, 0, false}};
+  Report.Links = {"/src/sds.h", "/src/sds.h", "/src/zmalloc.h"};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Headers.size(), 2u);
+  EXPECT_EQ(Got->Headers[0].OwnMicros, 27068u);
+  EXPECT_EQ(Got->Headers[0].Children, 35u);
+  EXPECT_TRUE(Got->Headers[0].Asked);
+  EXPECT_FALSE(Got->Headers[1].Asked);
+  EXPECT_EQ(Got->Links, Report.Links);
+}
+
 TEST(CacheProtocolTest, HelloReplyRoundTrips) {
   llvm::SmallVector<char, 0> Out;
   encodeHelloReply({"/dev/shm/x.region", 0x0123456789abcdefull}, Out);
@@ -298,6 +318,21 @@ protected:
     CacheDaemon::Options O;
     O.DropCostly = true;
     return O;
+  }
+  /// The fold rule with an ask of 92 us, a load of 50 and a write of 519:
+  /// the floor is 142 us, a miss loses 611 us.
+  static CacheDaemon::Options fold(double Budget) {
+    CacheDaemon::Options O;
+    O.Fold = true;
+    O.FoldBudget = Budget;
+    return O;
+  }
+  void reportLinks(std::vector<std::string> Links) {
+    TimingReport R;
+    R.Links = std::move(Links);
+    llvm::SmallVector<char, 0> Msg;
+    encodeTimingReport(R, Msg);
+    ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
   }
 
   std::string TestDir, RegionPath;
@@ -575,6 +610,83 @@ TEST_F(DaemonTest, TheAverageHitCostDecides) {
 TEST_F(DaemonTest, DroppingIsOffByDefault) {
   report({{"/src/mid.h", 400}}, {{"/src/mid.h", 300}});
   EXPECT_EQ(askList(), std::vector<std::string>{"/src/mid.h"});
+}
+
+TEST_F(DaemonTest, TheFoldFloorReadsTheHeadersOwnTimeAndItsChildren) {
+  // A header's own lines and the asks for the headers it includes are what
+  // a hit saves; under an ask and a load (142 us) it never gains. The time
+  // with the headers inside it no longer decides.
+  useDaemon(fold(8));
+  report({{"/src/wrapper.h", 90000, 100, 0, false},
+          {"/src/includes.h", 3000, 10, 2, false},
+          {"/src/big.h", 5000, 5000, 0, false},
+          {"/src/edge.h", 142, 142, 0, false}});
+  EXPECT_EQ(askList(), (std::vector<std::string>{"/src/includes.h",
+                                                 "/src/big.h", "/src/edge.h"}))
+      << "10 us + 2 asks = 194 us passes; 100 us alone does not";
+  EXPECT_EQ(Daemon->stats().HeadersBelowFloor, 1u);
+}
+
+TEST_F(DaemonTest, AHeaderIsFoldedOnceItsLossesPassTheBudget) {
+  // Budget 2 writes = 1038 us. A miss loses an ask and a write (611 us).
+  useDaemon(fold(2));
+  report({{"/src/h.h", 300, 300, 0, false}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/h.h"});
+  report({{"/src/h.h", 300, 300, 0, true}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/h.h"}) << "-611 us";
+  report({{"/src/h.h", 300, 300, 0, true}});
+  EXPECT_TRUE(askList().empty()) << "-1222 us is past the budget";
+  EXPECT_EQ(Daemon->stats().HeadersFolded, 1u);
+  // Folding is final, as listing is.
+  report({}, {{"/src/h.h", 100}});
+  report({{"/src/h.h", 90000, 90000, 0, false}});
+  EXPECT_TRUE(askList().empty());
+}
+
+TEST_F(DaemonTest, HitsPayForMissesAndLinkLoadsCost) {
+  // A hit of big.h gains its own 5000 us less an ask and a load (4858 us);
+  // each load of its copy as another header's link loses a load (50 us).
+  useDaemon(fold(2));
+  report({{"/src/big.h", 5000, 5000, 0, false}});
+  report({{"/src/big.h", 5000, 5000, 0, true}}, {{"/src/big.h", 300}});
+  report({{"/src/big.h", 5000, 5000, 0, true}});
+  report({{"/src/big.h", 5000, 5000, 0, true}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/big.h"})
+      << "4858 - 3 x 611 = 3025 us";
+  reportLinks(std::vector<std::string>(81, "/src/big.h"));
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/big.h"})
+      << "3025 - 81 x 50 = -1025 us is within the budget";
+  reportLinks({"/src/big.h"});
+  EXPECT_TRUE(askList().empty()) << "-1075 us is past it";
+}
+
+TEST_F(DaemonTest, TheFoldFloorCanReadTheOwnTimeOrTodaysRule) {
+  // -fold-list=own: the own time alone against an ask and a load (142 us);
+  // -fold-list=inclusive: the time with the headers inside it against the
+  // ask cutoff (226 us), as without -fold.
+  CacheDaemon::Options O = fold(8);
+  O.FoldListBy = CacheDaemon::Options::FoldListing::Own;
+  useDaemon(O);
+  report({{"/src/includes.h", 3000, 10, 2, false},
+          {"/src/big.h", 5000, 5000, 0, false}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/big.h"});
+  O.FoldListBy = CacheDaemon::Options::FoldListing::Inclusive;
+  useDaemon(O);
+  report({{"/src/includes.h", 3000, 10, 2, false},
+          {"/src/small.h", 200, 200, 0, false}});
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/includes.h"});
+}
+
+TEST_F(DaemonTest, LinkLoadsCanCostNothing) {
+  // -fold-link-us=0: a header loaded only as other headers' links is not
+  // folded for it.
+  CacheDaemon::Options O = fold(2);
+  O.FoldLinkMicros = 0;
+  useDaemon(O);
+  report({{"/src/stdio.h", 4000, 4000, 12, false}});
+  reportLinks(std::vector<std::string>(500, "/src/stdio.h"));
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/stdio.h"});
+  EXPECT_EQ(Daemon->stats().HeadersFolded, 0u);
 }
 
 TEST_F(DaemonTest, StoredHeadersAreListedWhenAskedTo) {

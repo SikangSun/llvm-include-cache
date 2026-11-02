@@ -144,6 +144,9 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
       for (const HeaderTiming &H : *L) {
         W.str(H.Path);
         W.u64(H.Micros);
+        W.u64(H.OwnMicros);
+        W.u32(H.Children);
+        W.u8(H.Asked);
       }
     }
     writeLearned(W, Report.Build, Report.Learned, Report.Used);
@@ -153,6 +156,9 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
       W.u64(C.Combo);
       W.u64(C.Instructions);
     }
+    W.u32(static_cast<uint32_t>(Report.Links.size()));
+    for (const std::string &L : Report.Links)
+      W.str(L);
   });
 }
 
@@ -338,6 +344,9 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
       HeaderTiming H;
       H.Path = R.str().str();
       H.Micros = R.u64();
+      H.OwnMicros = R.u64();
+      H.Children = R.u32();
+      H.Asked = R.u8();
       L->push_back(std::move(H));
     }
   }
@@ -350,6 +359,8 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
     C.Instructions = R.u64();
     Report.Combos.push_back(C);
   }
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I)
+    Report.Links.push_back(R.str().str());
   if (!R.ok() || !R.atEnd())
     return std::nullopt;
   return Report;

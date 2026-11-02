@@ -78,6 +78,27 @@ struct CacheDaemonOptions {
   /// Measurement: when set, the ask-list is exactly these headers from the
   /// start, and no timing changes it, so that runs compare on one list.
   std::optional<std::vector<std::string>> FixedAskList;
+  /// The fold rule (-fold), in place of AskCutoffMicros: each header is
+  /// judged as its own copy against being folded into the copy around it.
+  /// It goes on the ask-list at its first read when its own time there,
+  /// plus an ask for each header it includes directly, is at least an ask
+  /// and a load (the floor; every header with FoldFloor off). It comes off
+  /// for good once its gain so far is below -FoldBudget writes, where a
+  /// hit gains its own time plus its children's asks less an ask and a
+  /// load, a miss loses an ask and a write, and each load of its copy as a
+  /// link of another header's hit loses a load. Costs in microseconds.
+  bool Fold = false;
+  bool FoldFloor = true;
+  /// What the floor reads: the own time plus an ask per header included
+  /// (OwnAndChildren), the own time alone (Own), or today's rule, the time
+  /// with the headers inside it against AskCutoffMicros (Inclusive).
+  enum class FoldListing { OwnAndChildren, Own, Inclusive };
+  FoldListing FoldListBy = FoldListing::OwnAndChildren;
+  double FoldBudget = 8;
+  uint64_t FoldAskMicros = 92, FoldLoadMicros = 50, FoldWriteMicros = 519;
+  /// What one load of a header's copy as another header's link costs it;
+  /// 0 charges nothing for links.
+  uint64_t FoldLinkMicros = 50;
 };
 
 class CacheDaemon {
@@ -132,6 +153,9 @@ public:
     /// Headers dropped from the ask-list because their hits cost more than
     /// parsing them.
     uint64_t HeadersDropped = 0;
+    /// The fold rule: headers below the floor at their first read, and
+    /// headers taken off the ask-list once their losses passed the budget.
+    uint64_t HeadersBelowFloor = 0, HeadersFolded = 0;
     uint64_t HitsTimed = 0;
     /// CLANG_HEADER_CACHE_SECOND_MISS: copies asked about for the first time,
     /// and again.
@@ -154,6 +178,10 @@ public:
   /// it was used, its metadata's sizes and definedness tests. Compiles are
   /// counted by their timing reports, one at a compile's end.
   void dumpEntries(llvm::raw_ostream &OS) const;
+  /// For measuring the fold rule: one line per header it judged -- its first
+  /// read's own time and children, its hits, misses and link loads, its
+  /// gain, and whether it is below the floor, folded or listed.
+  void dumpFolds(llvm::raw_ostream &OS) const;
 
 private:
   CacheDaemon() = default;
@@ -292,6 +320,19 @@ private:
   llvm::StringMap<std::pair<uint64_t, uint64_t>> HitCosts;
   /// Headers dropped from the ask-list. Dropping is final, as listing is.
   llvm::StringSet<> Dropped;
+  /// The fold rule's record of each header: its first read's own time and
+  /// children, its gain so far, and the reads that made it.
+  struct FoldState {
+    uint64_t Own = 0;
+    uint32_t Children = 0;
+    double Gain = 0;
+    uint32_t Hits = 0, Misses = 0, Links = 0;
+    bool BelowFloor = false, Folded = false;
+  };
+  llvm::StringMap<FoldState> Folds;
+  /// Applies the fold rule to one compile's report. Mutex held; true if
+  /// the ask-list changed.
+  bool foldLocked(const TimingReport &Report);
 
   std::atomic<bool> Stopping{false};
   /// Owned by run(); shutdown() on it makes a blocked accept return.

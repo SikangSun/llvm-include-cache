@@ -532,6 +532,7 @@ public:
     // it costs less than the round trip and the load would (DECISIONS.md
     // 2.14). The list is in shared memory; this costs no socket traffic.
     NextReason.clear();
+    NextAsked = false;
     std::string Path = storedName(File);
     // CLANG_HEADER_CACHE_DDG, measurement: every header is read as text.
     static const bool Graph = std::getenv("CLANG_HEADER_CACHE_DDG");
@@ -822,6 +823,7 @@ public:
           return nullptr;
         }
       }
+      NextAsked = true;
       int CounterFit = Client->lastCounterFit();
       if (CounterFit >= 0)
         ++CounterFits[CounterFit];
@@ -993,6 +995,8 @@ public:
     uint64_t Replay = micros(Replaying);
     ReplayMicros += Replay;
     Timings.Hits.push_back({Path, Took + Replay});
+    if (!Open.empty())
+      ++Open.back().Children;
     Log(Replay);
     uint64_t HitInstructions = hitInstructions() - InstrBefore;
     if (MergeAuto)
@@ -1026,11 +1030,14 @@ public:
     if (File && isStandIn(File->getName()))
       File = std::nullopt;
     const FileEntry *Entry = File ? &File->getFileEntry() : nullptr;
+    if (Entry && !Open.empty())
+      ++Open.back().Children;
     Open.push_back({Entry, File ? File->getName().str() : std::string(),
                     std::chrono::steady_clock::now(), cacheMicros(), 0,
                     NextReason.empty() ? std::string("not-asked")
                                        : std::move(NextReason),
                     Entry && Timed.insert(Entry).second});
+    Open.back().Asked = std::exchange(NextAsked, false);
     NextReason.clear();
     // CLANG_HEADER_CACHE_MERGE: the header this compile merges, entered
     // after the lookup that missed on purpose.
@@ -1069,8 +1076,13 @@ public:
     // of an unguarded header says nothing about what a saved copy saves.
     if (!F.First)
       return;
-    Timings.Headers.push_back(
-        {storedName(F.Name), static_cast<uint64_t>(Micros)});
+    int64_t OwnTime = int64_t(Micros) - int64_t(F.ChildMicros) -
+                      int64_t(cacheMicros() - F.CacheAtStart);
+    Timings.Headers.push_back({storedName(F.Name),
+                               static_cast<uint64_t>(Micros),
+                               static_cast<uint64_t>(std::max<int64_t>(
+                                   0, OwnTime)),
+                               F.Children, F.Asked});
   }
 
   /// Tells the daemon how long this compile took to read each header, so it
@@ -1087,6 +1099,7 @@ public:
       Client->reportTimings(Timings);
     Timings.Headers.clear();
     Timings.Hits.clear();
+    Timings.Links.clear();
   }
 
 private:
@@ -1738,6 +1751,8 @@ private:
       ++TreeFails[2];
       return nullptr;
     }
+    for (const Fetched *F : Order)
+      Timings.Links.push_back(F->Path);
     Step.reset();
     static const bool DebugLink = getenv("DEBUG_LINK");
     if (DebugLink) {
@@ -2837,8 +2852,14 @@ private:
     /// a header included again from inside itself (nginx's ngx_core.h) is
     /// left first by that inner entry, which its guard skips.
     bool First;
+    /// The headers it included directly that were read or served, and
+    /// whether the compile asked for a copy of it and none fit (TimingReport).
+    uint32_t Children = 0;
+    bool Asked = false;
   };
   std::string NextReason;
+  /// The header entered next was asked for and missed.
+  bool NextAsked = false;
   /// The cache's own time so far: lookups, the loads they made included,
   /// and writing parts.
   uint64_t cacheMicros() const {
