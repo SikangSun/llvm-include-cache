@@ -1914,6 +1914,416 @@ TEST_F(ExportTest, ACopyBeingWrittenLinksAServedHeader) {
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
 }
 
+TEST_F(ExportTest, ALinkThatSawItsParentsStructDefinedStillFits) {
+  // types.h names struct ev. ev.h defines it, then includes timer.h, whose
+  // inline function reads a member: timer.h's copy, linked at ev.h's end,
+  // saw ev_t name a defined struct. Where ev.h begins the struct is only
+  // declared, and ev.h's copy fits there: the tree brings the definition
+  // (nginx's ngx_event.h and ngx_event_timer.h, 2026-11-02).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Types =
+      write("types.h", "#ifndef TYPES_H\n#define TYPES_H\n"
+                       "typedef struct ev ev_t;\n#endif\n");
+  std::string Timer =
+      write("timer.h", "#ifndef TIMER_H\n#define TIMER_H\n#include \"" + Types +
+                           "\"\nstatic inline int ev_fd(ev_t *e) "
+                           "{ return e->fd; }\n#endif\n");
+  std::string Ev = write("ev.h", "#ifndef EV_H\n#define EV_H\n#include \"" +
+                                     Types + "\"\nstruct ev { int fd; };\n"
+                                     "#include \"" + Timer + "\"\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Types + "\"\n#include \"" + Ev +
+                                   "\"\n");
+  std::string C = write("c.c", "#include \"" + Types + "\"\n#include \"" + Ev +
+                                   "\"\nint c(ev_t *e) { return ev_fd(e); }\n");
+  EXPECT_TRUE(reads(B, Ev)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Ev)) << "nothing is stored yet";
+  auto Evs = copiesOf(Ev);
+  ASSERT_EQ(Evs.size(), 1u) << "ev.h was not written";
+  EXPECT_EQ(Evs[0].second, 1u) << "ev.h's copy does not link timer.h's";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Ev)) << "ev.h's copy did not fit";
+  EXPECT_FALSE(Entered.count(Timer)) << "timer.h was read";
+}
+
+TEST_F(ExportTest, ANameDeclaredInACopyAndItsLinksNamesTheLatest) {
+  // mc.h and me.h declare `typedef struct ctx ctx;`; enc.h includes me.h,
+  // which includes mc.h, then defines the struct under the typedef. As in
+  // the text, main.c's ctx names enc.h's typedef where enc.h's copy and
+  // the copies it links load (FFmpeg's MPVEncContext: debug information
+  // described me_cmp.h's typedef, 2026-11-03).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Mc = write("mc.h", "#ifndef MC_H\n#define MC_H\n"
+                                 "typedef struct ctx ctx;\nint mc(ctx *c);\n"
+                                 "#endif\n");
+  std::string Me = write("me.h", "#ifndef ME_H\n#define ME_H\n#include \"" +
+                                     Mc +
+                                     "\"\ntypedef struct ctx ctx;\n"
+                                     "int me(ctx *c);\n#endif\n");
+  std::string Enc = write("enc.h", "#ifndef ENC_H\n#define ENC_H\n#include \"" +
+                                       Me +
+                                       "\"\ntypedef struct ctx { int n; } ctx;\n"
+                                       "#endif\n");
+  std::string B = write("b.c", "#include \"" + Enc + "\"\n");
+  std::string Main = write("main.c", "#include \"" + Enc + "\"\nctx *g;\n");
+  EXPECT_TRUE(reads(B, Enc)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Enc)) << "nothing is stored yet";
+  auto Encs = copiesOf(Enc);
+  ASSERT_EQ(Encs.size(), 1u) << "enc.h was not written";
+  EXPECT_EQ(Encs[0].second, 1u) << "enc.h's copy does not link me.h's";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("g")))
+      if (auto *V = dyn_cast<VarDecl>(D))
+        if (const auto *T = V->getType()->getPointeeType()->getAs<TypedefType>())
+          Named = Ctx.getSourceManager()
+                      .getPresumedLoc(T->getDecl()->getLocation())
+                      .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered)) << "main.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Enc)) << "enc.h's copy was not served";
+  EXPECT_EQ(Named, Enc) << "ctx names another typedef than the text's";
+}
+
+TEST_F(ExportTest, ALinksNameFromOutsideTheTreeNamesWhatItsCheckFound) {
+  // inner.h, linked from root.h's copy, names base.h's ctx; later.h,
+  // included after root.h, declares ctx again. As in the text, inner_use's
+  // parameter names base.h's typedef, though main.c reads inner_use's
+  // declaration only after later.h (FFmpeg's internal.h named
+  // avio_internal.h's AVFormatContext, 2026-11-03).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Base = write("base.h", "#ifndef BASE_H\n#define BASE_H\n"
+                                     "typedef struct ctx { int n; } ctx;\n"
+                                     "#endif\n");
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "int inner_use(ctx *c);\n#endif\n");
+  std::string Root = write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n"
+                                     "#include \"" + Inner +
+                                         "\"\nint root_fn(void);\n#endif\n");
+  std::string Later = write("later.h", "#ifndef LATER_H\n#define LATER_H\n"
+                                       "typedef struct ctx ctx;\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Base + "\"\n#include \"" +
+                                   Root + "\"\n");
+  std::string Main =
+      write("main.c", "#include \"" + Base + "\"\n#include \"" + Root +
+                          "\"\n#include \"" + Later +
+                          "\"\nint f(ctx *c) { return inner_use(c); }\n");
+  EXPECT_TRUE(reads(B, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Root)) << "nothing is stored yet";
+  auto Roots = copiesOf(Root);
+  ASSERT_EQ(Roots.size(), 1u) << "root.h was not written";
+  EXPECT_EQ(Roots[0].second, 1u) << "root.h's copy does not link inner.h's";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("inner_use")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        if (F->getNumParams() == 1)
+          if (const auto *T = F->getParamDecl(0)
+                                  ->getType()
+                                  ->getPointeeType()
+                                  ->getAs<TypedefType>())
+            Named = Ctx.getSourceManager()
+                        .getPresumedLoc(T->getDecl()->getLocation())
+                        .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered)) << "main.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Root)) << "root.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was read";
+  EXPECT_EQ(Named, Base) << "inner_use names another typedef than the text's";
+}
+
+TEST_F(ExportTest, ANameACopyTakesFromItsLinkIsNotFixedToTheOutsideOne) {
+  // dup.h, linked from root.h's copy, declares base.h's ctx again, and
+  // root.h's lines name ctx after it. root.h's check finds base.h's ctx,
+  // which dup.h's declaration needs, but root_use's parameter names dup.h's
+  // typedef, as in the text (FFmpeg's subtitles.h and avio_internal.h,
+  // 2026-11-03).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Base = write("base.h", "#ifndef BASE_H\n#define BASE_H\n"
+                                     "typedef struct ctx { int n; } ctx;\n"
+                                     "#endif\n");
+  std::string Dup = write("dup.h", "#ifndef DUP_H\n#define DUP_H\n"
+                                   "typedef struct ctx ctx;\n#endif\n");
+  std::string Root = write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n"
+                                     "#include \"" + Dup +
+                                         "\"\nint root_use(ctx *c);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Base + "\"\n#include \"" +
+                                   Root + "\"\n");
+  std::string Main =
+      write("main.c", "#include \"" + Base + "\"\n#include \"" + Root +
+                          "\"\nint f(ctx *c) { return root_use(c); }\n");
+  EXPECT_TRUE(reads(B, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Root)) << "nothing is stored yet";
+  auto Roots = copiesOf(Root);
+  ASSERT_EQ(Roots.size(), 1u) << "root.h was not written";
+  EXPECT_EQ(Roots[0].second, 1u) << "root.h's copy does not link dup.h's";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("root_use")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        if (F->getNumParams() == 1)
+          if (const auto *T = F->getParamDecl(0)
+                                  ->getType()
+                                  ->getPointeeType()
+                                  ->getAs<TypedefType>())
+            Named = Ctx.getSourceManager()
+                        .getPresumedLoc(T->getDecl()->getLocation())
+                        .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered)) << "main.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Root)) << "root.h's copy was not served";
+  EXPECT_EQ(Named, Dup) << "root_use names another typedef than the text's";
+}
+
+TEST_F(ExportTest, ANameACopyTakesFromItsLinkNamesTheLinksDeclaration) {
+  // gr.h's lines name lut, which lut.h, linked from gr.h's copy, defines;
+  // later.h, included after gr.h, declares lut again. As in the text,
+  // gr_use's parameter names lut.h's typedef, though main.c reads gr_use
+  // only after later.h (FFmpeg's graph.h, lut3d.h and uops.h, 2026-11-03).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Lut = write("lut.h", "#ifndef LUT_H\n#define LUT_H\n"
+                                   "typedef struct lut { int n; } lut;\n"
+                                   "#endif\n");
+  std::string Gr = write("gr.h", "#ifndef GR_H\n#define GR_H\n#include \"" +
+                                     Lut + "\"\nint gr_use(lut *l);\n#endif\n");
+  std::string Later = write("later.h", "#ifndef LATER_H\n#define LATER_H\n"
+                                       "typedef struct lut lut;\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Gr + "\"\n");
+  std::string Main =
+      write("main.c", "#include \"" + Gr + "\"\n#include \"" + Later +
+                          "\"\nint f(lut *l) { return gr_use(l); }\n");
+  EXPECT_TRUE(reads(B, Gr)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Gr)) << "nothing is stored yet";
+  auto Grs = copiesOf(Gr);
+  ASSERT_EQ(Grs.size(), 1u) << "gr.h was not written";
+  EXPECT_EQ(Grs[0].second, 1u) << "gr.h's copy does not link lut.h's";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("gr_use")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        if (F->getNumParams() == 1)
+          if (const auto *T = F->getParamDecl(0)
+                                  ->getType()
+                                  ->getPointeeType()
+                                  ->getAs<TypedefType>())
+            Named = Ctx.getSourceManager()
+                        .getPresumedLoc(T->getDecl()->getLocation())
+                        .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered)) << "main.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Gr)) << "gr.h's copy was not served";
+  EXPECT_EQ(Named, Lut) << "gr_use names another typedef than the text's";
+}
+
+TEST_F(ExportTest, ANameALinkDeclaresAgainNamesTheLinks) {
+  // top.h declares `typedef struct ctx ctx;` and then includes fwd.h,
+  // which declares it again: as in the text, main.c's ctx names fwd.h's
+  // typedef where top.h's copy and fwd.h's load.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Fwd = write("fwd.h", "#ifndef FWD_H\n#define FWD_H\n"
+                                   "typedef struct ctx ctx;\n#endif\n");
+  std::string Top = write("top.h", "#ifndef TOP_H\n#define TOP_H\n"
+                                   "typedef struct ctx ctx;\n#include \"" +
+                                       Fwd +
+                                       "\"\nint top(ctx *c);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Top + "\"\n");
+  std::string Main = write("main.c", "#include \"" + Top + "\"\nctx *g;\n");
+  EXPECT_TRUE(reads(B, Top)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Top)) << "nothing is stored yet";
+  auto Tops = copiesOf(Top);
+  ASSERT_EQ(Tops.size(), 1u) << "top.h was not written";
+  EXPECT_EQ(Tops[0].second, 1u) << "top.h's copy does not link fwd.h's";
+  std::string Named;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("g")))
+      if (auto *V = dyn_cast<VarDecl>(D))
+        if (const auto *T = V->getType()->getPointeeType()->getAs<TypedefType>())
+          Named = Ctx.getSourceManager()
+                      .getPresumedLoc(T->getDecl()->getLocation())
+                      .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered)) << "main.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Top)) << "top.h's copy was not served";
+  EXPECT_EQ(Named, Fwd) << "ctx names another typedef than the text's";
+}
+
+TEST_F(ExportTest, ALinksNameGivenInsideTheTreeNamesTheTreesDeclaration) {
+  // buf.h, linked from root.h's copy, names sz_t, which sz.h, an earlier
+  // link, declares, and len_t, which root.h's lines declare; later.h,
+  // included after root.h, declares both again. As in the text, buf_use's
+  // parameters name sz.h's and root.h's typedefs, though main.c reads
+  // buf_use only after later.h (FFmpeg's buffer.h, linked from demux.h,
+  // named glob.h's size_t, not __stddef_size_t.h's, 2026-11-03).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Sz = write("sz.h", "#ifndef SZ_H\n#define SZ_H\n"
+                                 "typedef unsigned long sz_t;\n#endif\n");
+  std::string Buf = write("buf.h", "#ifndef BUF_H\n#define BUF_H\n"
+                                   "int buf_use(sz_t n, len_t l);\n#endif\n");
+  std::string Root =
+      write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n"
+                      "typedef unsigned int len_t;\n#include \"" +
+                          Sz + "\"\n#include \"" + Buf + "\"\n#endif\n");
+  std::string Later = write("later.h", "#ifndef LATER_H\n#define LATER_H\n"
+                                       "typedef unsigned long sz_t;\n"
+                                       "typedef unsigned int len_t;\n"
+                                       "#endif\n");
+  std::string B = write("b.c", "#include \"" + Root + "\"\n");
+  std::string Main =
+      write("main.c", "#include \"" + Root + "\"\n#include \"" + Later +
+                          "\"\nint f(void) { return buf_use(1, 2); }\n");
+  EXPECT_TRUE(reads(B, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Root)) << "nothing is stored yet";
+  auto Roots = copiesOf(Root);
+  ASSERT_EQ(Roots.size(), 1u) << "root.h was not written";
+  EXPECT_EQ(Roots[0].second, 2u)
+      << "root.h's copy does not link sz.h's and buf.h's";
+  std::string Named[2];
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("buf_use")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        if (F->getNumParams() == 2)
+          for (unsigned I = 0; I != 2; ++I)
+            if (const auto *T =
+                    F->getParamDecl(I)->getType()->getAs<TypedefType>())
+              Named[I] = Ctx.getSourceManager()
+                             .getPresumedLoc(T->getDecl()->getLocation())
+                             .getFilename();
+  };
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(Main, Entered)) << "main.c did not compile";
+  AtEnd = nullptr;
+  EXPECT_FALSE(Entered.count(Root)) << "root.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Buf)) << "buf.h was read";
+  EXPECT_EQ(Named[0], Sz) << "sz_t names another typedef than the text's";
+  EXPECT_EQ(Named[1], Root) << "len_t names another typedef than the text's";
+}
+
+TEST_F(ExportTest, AHeaderThatOnlyPointsToAStructFitsWhereItIsDeclared) {
+  // sub.h declares struct vec itself and only points to it, by its tag and
+  // by types.h's typedef. Its copy, written after vec.h defined the struct,
+  // fits where the struct is only declared and where it is defined
+  // otherwise (git's submodule.h and strvec.h, 2026-11-03).
+  std::string Types =
+      write("types.h", "#ifndef TYPES_H\n#define TYPES_H\n"
+                       "typedef struct vec vec_t;\n#endif\n");
+  std::string Vec = write("vec.h", "#ifndef VEC_H\n#define VEC_H\n"
+                                   "struct vec { int n; };\n#endif\n");
+  std::string Sub =
+      write("sub.h", "#ifndef SUB_H\n#define SUB_H\nstruct vec;\n"
+                     "int sub_count(const struct vec *v);\n"
+                     "struct sub { vec_t *v; struct sub *next; };\n"
+                     "static inline vec_t *sub_vec(struct sub *s) "
+                     "{ return s->v; }\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Types + "\"\n#include \"" +
+                                   Vec + "\"\n#include \"" + Sub + "\"\n");
+  std::string C =
+      write("c.c", "#include \"" + Types + "\"\n#include \"" + Sub +
+                       "\"\nint c(struct sub *s) { return sub_count(sub_vec(s)); }\n");
+  std::string D = write("d.c", "#include \"" + Types +
+                                   "\"\nstruct vec { long a, b; };\n#include \"" +
+                                   Sub + "\"\n");
+  EXPECT_TRUE(reads(B, Sub)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Sub)) << "nothing is stored yet";
+  ASSERT_EQ(copiesOf(Sub).size(), 1u) << "sub.h was not written";
+  // d.c first: a copy c.c wrote would fit d.c.
+  EXPECT_FALSE(reads(D, Sub)) << "sub.h's copy did not fit where the struct "
+                                 "is defined otherwise";
+  EXPECT_FALSE(reads(C, Sub)) << "sub.h's copy did not fit where the struct "
+                                 "is declared";
+}
+
+TEST_F(ExportTest, AHeaderThatNeedsAStructCompleteFitsOnlyItsDefinition) {
+  // Each header reads struct vec through a pointer: a member, its size, the
+  // next element, or an array of them. Written after vec.h, no copy fits
+  // where the struct is defined otherwise.
+  std::string Vec = write("vec.h", "#ifndef VEC_H\n#define VEC_H\n"
+                                   "struct vec { int n; };\n#endif\n");
+  const char *Uses[] = {
+      "static inline int vec_n(struct vec *v) { return v->n; }",
+      "static inline unsigned long vec_size(void) "
+      "{ return sizeof(struct vec); }",
+      "static inline struct vec *vec_next(struct vec *v) { return v + 1; }",
+      "struct vec_pair { struct vec (*both)[2]; };"};
+  for (unsigned I = 0; I != std::size(Uses); ++I) {
+    std::string Name = "use" + std::to_string(I) + ".h";
+    std::string Use =
+        write(Name, "#ifndef USE_H\n#define USE_H\nstruct vec;\n" +
+                        std::string(Uses[I]) + "\n#endif\n");
+    std::string B = write("b" + std::to_string(I) + ".c",
+                          "#include \"" + Vec + "\"\n#include \"" + Use +
+                              "\"\n");
+    std::string D = write("d" + std::to_string(I) + ".c",
+                          "struct vec { long pad; int n; };\n#include \"" +
+                              Use + "\"\n");
+    EXPECT_TRUE(reads(B, Use)) << Name << ": nothing is listed yet";
+    EXPECT_TRUE(reads(B, Use)) << Name << ": nothing is stored yet";
+    ASSERT_EQ(copiesOf(Use).size(), 1u) << Name << " was not written";
+    EXPECT_TRUE(reads(D, Use)) << Name << "'s copy fitted another definition";
+  }
+}
+
+TEST_F(ExportTest, ALinkThatOnlyPointsToAStructFitsWhereItIsDeclared) {
+  // root.h links sub.h's copy, which only points to struct vec. Both were
+  // written after vec.h; root.h's copy fits where the struct is only
+  // declared.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Types =
+      write("types.h", "#ifndef TYPES_H\n#define TYPES_H\n"
+                       "typedef struct vec vec_t;\n#endif\n");
+  std::string Vec = write("vec.h", "#ifndef VEC_H\n#define VEC_H\n"
+                                   "struct vec { int n; };\n#endif\n");
+  std::string Sub = write("sub.h", "#ifndef SUB_H\n#define SUB_H\n"
+                                   "int sub_count(const vec_t *v);\n#endif\n");
+  std::string Root = write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n"
+                                     "#include \"" + Sub +
+                                         "\"\nint root(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Types + "\"\n#include \"" +
+                                   Vec + "\"\n#include \"" + Root + "\"\n");
+  std::string C = write("c.c", "#include \"" + Types + "\"\n#include \"" +
+                                   Root + "\"\n");
+  EXPECT_TRUE(reads(B, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Root)) << "nothing is stored yet";
+  auto Roots = copiesOf(Root);
+  ASSERT_EQ(Roots.size(), 1u) << "root.h was not written";
+  EXPECT_EQ(Roots[0].second, 1u) << "root.h's copy does not link sub.h's";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Root)) << "root.h's copy did not fit";
+  EXPECT_FALSE(Entered.count(Sub)) << "sub.h was read";
+}
+
 TEST_F(ExportTest, ADecidedFoldReadsTheHeaderWithoutAsking) {
   // CLANG_HEADER_CACHE_DECISIONS, fold: in b.c's second compile outer.h
   // misses, and inside it inner.h is read as text without asking, so
@@ -1948,6 +2358,49 @@ TEST_F(ExportTest, ADecidedFoldReadsTheHeaderWithoutAsking) {
   std::set<std::string> Entered;
   ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
   EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, ADecidedFoldAppliesInsideAHeaderFoldedItself) {
+  // fold outer mid, fold mid inner: the record that made them saw mid.h's
+  // copy link inner.h's. In b.c's second compile outer.h misses; mid.h is
+  // read as text inside it, and so is inner.h inside mid.h, though the
+  // header being written is outer.h: outer.h's copy holds all three and
+  // links nothing. c.c is served outer.h; mid.h and inner.h stay shut.
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Mid =
+      write("mid.h", "#ifndef MID_H\n#define MID_H\n#include \"" + Inner +
+                         "\"\nint mid_max(struct pair *p);\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" + Mid +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string Decisions = write("decisions", "fold\t" + Outer + "\t" + Mid +
+                                                 "\nfold\t" + Mid + "\t" +
+                                                 Inner + "\n");
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_DECISIONS", Decisions.c_str(), 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_DECISIONS");
+  });
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Outer +
+                                   "\"\nint c(void) { struct pair p = {1, "
+                                   "INNER_MAX}; return outer_sum(&p) + "
+                                   "mid_max(&p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  EXPECT_TRUE(copiesOf(Mid).empty()) << "mid.h was written on its own";
+  EXPECT_TRUE(copiesOf(Inner).empty()) << "inner.h was written on its own";
+  auto Outers = copiesOf(Outer);
+  ASSERT_EQ(Outers.size(), 1u) << "outer.h was not written";
+  EXPECT_EQ(Outers[0].second, 0u) << "outer.h's copy links a copy";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Mid)) << "mid.h was opened";
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
 }
 
@@ -2673,6 +3126,73 @@ TEST_F(ExportTest, ATreeServedTwiceIsMergedIntoOneCopy) {
   EXPECT_EQ(Linked->Serves.load(), 2u) << "the linked copy was not served";
 }
 
+TEST_F(ExportTest, ADecidedMergeRootIsMergedAtItsFirstHit) {
+  // merge-root outer.h, CLANG_HEADER_CACHE_MERGE=decided: c.c's first hit
+  // on outer.h's copy, which links inner.h's, merges the two into one copy.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "decided", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+    unsetenv("CLANG_HEADER_CACHE_DECISIONS");
+  });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Outer +
+                                   "\"\nint c(struct pair *p) { return "
+                                   "outer_sum(p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  std::string Decisions = write("decisions", "merge-root\t" + Outer + "\n");
+  setenv("CLANG_HEADER_CACHE_DECISIONS", Decisions.c_str(), 1);
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_TRUE(Entered.count(Outer)) << "the merging compile took the hit";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h's copy was not served";
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+}
+
+/// A daemon whose offline step writes Dir/decisions: once the file exists,
+/// compiles take their decisions from it, with no variable set.
+class DaemonDecisionsTest : public ExportTest {
+protected:
+  CacheDaemon::Options daemonOptions() override {
+    CacheDaemon::Options O = ExportTest::daemonOptions();
+    O.OfflineDecisions = Dir + "/decisions";
+    return O;
+  }
+};
+
+TEST_F(DaemonDecisionsTest, CompilesTakeTheDaemonsDecisionsAndTheirMerges) {
+  // As ADecidedMergeRootIsMergedAtItsFirstHit, the decisions named by the
+  // daemon, and CLANG_HEADER_CACHE_MERGE not set: they call for a merge.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "struct pair { int a, b; };\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner +
+                           "\"\nint outer_sum(struct pair *p);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n");
+  std::string C = write("c.c", "#include \"" + Outer +
+                                   "\"\nint c(struct pair *p) { return "
+                                   "outer_sum(p); }\n");
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Outer)) << "nothing is stored yet";
+  write("decisions", "merge-root\t" + Outer + "\n");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_TRUE(Entered.count(Outer)) << "the merging compile took the hit";
+  EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+}
+
 TEST_F(ExportTest, AForkedProcessMergesWithMergeFork) {
   // CLANG_HEADER_CACHE_MERGE_FORK=1: c.c's second hit on outer.h's copy
   // forks a process that writes the merged copy; c.c takes the hit. c.c's
@@ -3304,9 +3824,12 @@ TEST_F(ExportTest, APartIsNotServedWhereAnOutsideStructIsPacked) {
 TEST_F(ExportTest, APartIsNotServedWhereAnOutsideStructDiffers) {
   // use.h's part refers to struct pt by name, and use.h's declarations were
   // compiled against its members. A compile whose struct pt has other
-  // members cannot take the part.
-  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
-                                   "int area(struct pt *p);\n#endif\n");
+  // members cannot take the part. (A part that only points to the struct
+  // can: AHeaderThatOnlyPointsToAStructFitsWhereItIsDeclared.)
+  std::string Use =
+      write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                     "static inline int area(struct pt *p) "
+                     "{ return p->x * p->y; }\n#endif\n");
   std::string A = write("a.c", "struct pt { int x, y; };\n"
                                "#include \"" +
                                    Use +

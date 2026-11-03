@@ -2333,6 +2333,154 @@ loaded already now serves again only while each declaration it holds is
 the newest of its name (`newestStill`); otherwise the header is read as
 text, and nothing is written.
 
+### A fold decision did not apply where the record saw it (found 2026-11-02)
+
+A pair `fold P h` comes from a record where a copy of `P` linked a copy of
+`h`. A copy links each copy requested while it is written: inside it, or
+inside a header read as text inside it. The compile applied the pair only
+where `P` itself included `h`. Two cases fell outside:
+
+- `P` included `h` through a header read as text. On the first builds'
+  records, 0-102 of each project's fold decisions were never of this kind
+  (git 45 of 226, FFmpeg 102 of 355).
+- `P` folded a child `m`, and `m` included `h`, with `fold m h` decided too.
+  Inside `m` the header being written is `P`, not `m`, so `h` was asked for
+  and written as a copy of its own. 30-165 folded children per project had
+  folded children of their own.
+
+The offline step's reading of the record had the first fault as well. It
+found the request behind a link by the header that included it, so a link
+through a header read as text had no request, and the rules saw only its
+cost. It now finds the request by the copy: the hit that served that copy,
+or the miss that wrote it. Decisions changed by up to a quarter (folds: git
+226 to 207, FFmpeg 355 to 271).
+
+The compile now takes the pair from the innermost open header that is
+either the one being written or one the decisions folded into it
+(`decidedPair`); headers read as text for any other reason are part of the
+copy around them, in the record's build and in this one. Test:
+`ADecidedFoldAppliesInsideAHeaderFoldedItself`.
+
+### A copy's links demanded what the copy itself defines (found 2026-11-02)
+
+nginx's ngx_event.h and ngx_http.h never hit as linked copies: every
+candidate failed with "an outside declaration the part refers to differs or
+is missing", `ngx_event_t was typedef struct ngx_event_s defined ..., is
+typedef struct ngx_event_s declared`. The counter mode's copies of the same
+headers hit, so the linked builds read both as text in every compile (1.88x
+against the counter mode's 2.68x).
+
+ngx_core.h declares `typedef struct ngx_event_s ngx_event_t;`. ngx_event.h
+defines the struct, then includes ngx_event_timer.h, ngx_event_posted.h and
+ngx_event_udp.h at its end. Their copies, linked from ngx_event.h's, saw
+`ngx_event_t` name a defined struct, which was right where they begin. A
+copy checks, where it begins, what its links need from outside the tree
+(`LinkNeeds`), and it took each need as the link recorded it. Where
+ngx_event.h begins the struct is only declared, so ngx_event.h's copy never
+fitted, though its own lines bring the definition.
+
+A link's need on a name outside the tree is now recorded as the name was
+where the copy begins, as the copy's own references are
+(`fingerprintAtBegin`): what the copy's lines and its links add before the
+link comes with the tree. The first builds' rejections had the same pattern
+in every project: a declaration recorded defined and found declared, 6
+(Redis) to 614 (nginx) times. The fix removed nginx's 614 and 487 of
+CPython's 544; first builds at the 226 us default went from 2.00x to 2.10x
+over plain clang (geometric mean of six codebases; nginx 1.88x to 2.23x).
+Test: `ALinkThatSawItsParentsStructDefinedStillFits`.
+
+Most of the rest had another cause: a header that declares a struct itself
+and uses only pointers to it, such as git's submodule.h with `struct
+strvec;`, whose copy recorded the definition the writing compile had read
+before it (git 347 of 493, postgres 99 of 316). Fixed 2026-11-03: a copy's
+reference to a named struct, or to a typedef of one, that its lines and the
+copies it folds only point to records the struct as declared
+(`CompleteTags`, in `writePart`), and a hit accepts a live definition for a
+carried declaration. A struct held by value, read through a pointer (a
+member, its size, the next element), an array's element, or cast to or
+from a pointer to another type keeps its full fingerprint. A link's need
+recorded as declared stays so where the copy begins (`fingerprintAtBegin`).
+In full builds these rejections went from 493 to 0 (git), 316 to 10
+(postgres), 57 to 3 (CPython) and 53 to 1 (FFmpeg); no object differs in
+six projects. Tests: `AHeaderThatOnlyPointsToAStructFitsWhereItIsDeclared`,
+`AHeaderThatNeedsAStructCompleteFitsOnlyItsDefinition`,
+`ALinkThatOnlyPointsToAStructFitsWhereItIsDeclared`;
+`APartIsNotServedWhereAnOutsideStructDiffers` now reads the struct's
+members, as its name says.
+
+### A tree's copies named other declarations than the text's (found 2026-11-03)
+
+FFmpeg's full builds had 10 objects (11 with the fix above) that differed
+from plain clang's in debug information only. In wmv2enc.c, a variable of
+type `MPVEncContext *` was described with me_cmp.h's typedef, where plain
+clang names mpegvideoenc.h's. FFmpeg declares `typedef struct
+MPVEncContext MPVEncContext;` in eight headers. me_cmp.h and motion_est.h
+declare it before mpegvideoenc.h, which includes them, defines the struct
+under the same typedef at line 200. There were two causes.
+
+The order of a tree's declarations. A hit loads a copy, then the copies it
+links in text order (`loadTree`). Clang pushes each loaded declaration of a
+name into Sema's resolver in the order the copies loaded, keeps every one of
+them (a declaration from a PCM never replaces another from a PCM), and name
+lookup finds the one pushed last. So the hit on mpegvideoenc.h left me_cmp.h's
+typedef first, where the text has mpegvideoenc.h's newest. Loading each copy
+after its links would invert the error: glibc's stdlib.h declares bsearch
+and then includes the header that defines it, so a copy's own declaration is
+not always the newest. A copy now lists the typedefs and tags whose newest
+declaration at its end is in its own lines while a header it links declares
+them too (`HeaderDependencySet::Latest`, metadata version 24). After a hit,
+the compile puts the tree's declarations of each listed name in the text's
+order, each copy's before those of its links or, where it lists the name,
+after them (`orderLatest`), and the name finds the newest. Functions and
+variables are left as they were; no object differed through them.
+
+When a copy's name for an outside declaration resolves. A copy names an
+outside declaration by name (2.18), and the reader resolves the name when it
+first reads the declaration that refers to it, which can be after the
+compile declared the name again. FFmpeg's internal.h, linked from
+avformat_internal.h, named avio_internal.h's AVFormatContext, included after
+both; graph.h named uops.h's SwsLut3D, not lut3d.h's; buffer.h, linked from
+demux.h, named glob.h's size_t, not __stddef_size_t.h's, an earlier link of
+demux.h's tree. The compile now keeps each hit's tree (`HitTrees`), and the
+reader asks it first when it reads a reference by name from one of the
+tree's copies (`ASTReader::setPartNameResolver`):
+- a name the tree takes from outside resolves to what the hit's check found
+  where the tree begins;
+- a name a copy's lines take from one of its links, to the newest
+  declaration among that link's copies (`LinkRecord::Names`);
+- a name a linked copy takes from inside the tree, from an earlier link or
+  its includer's lines, to that link's copies or to the includer's copy. The
+  writer records which (`LinkRecord::Takes`, metadata version 25).
+Any other name resolves as before. Among a set of copies the reader looks in
+Sema's resolver, then in the redeclaration chain of the name's newest
+declaration (a later typedef can push the link's out of the resolver)
+(`ASTReader::findNameInModules`). It does not take a declaration that waits
+in `PendingIdentifierInfos`: one read in the middle of another read is not
+in its chain yet. Taking it split Redis's `struct client` in two
+("incompatible pointer types") and crashed 97 nginx compiles; the name then
+resolves as any other, and as no lookup of it ran since the copies loaded,
+no declaration made after them is found.
+
+The first version fixed every name at the hit, for each copy the hit read
+the first time (`pinNameReference` for each). In C the first lookup of a
+name probes every loaded copy, and most of these names are never read: one
+nginx compile (compile 60, 101 copies loaded) spent 8.2% of its instruction
+samples there. Resolving a name when the reader reads it costs 1.1%.
+
+Of FFmpeg's 11 objects, the number the same as plain clang's: 1 with
+`Latest` (wmv2enc.c), 5 with names fixed to what the check found, 8 when
+names from links were left to the links, 9 with names from links fixed to
+the links' copies, and all 11 with `LinkRecord::Takes` (replays of FFmpeg's
+build to the object, each compiled in full). In full builds (bin-u58), no
+object differs from plain clang's in curl, git, nginx, Redis, CPython,
+postgres or FFmpeg.
+Tests: `ANameDeclaredInACopyAndItsLinksNamesTheLatest`,
+`ANameALinkDeclaresAgainNamesTheLinks`,
+`ALinksNameFromOutsideTheTreeNamesWhatItsCheckFound`,
+`ANameACopyTakesFromItsLinkIsNotFixedToTheOutsideOne`,
+`ANameACopyTakesFromItsLinkNamesTheLinksDeclaration`,
+`ALinksNameGivenInsideTheTreeNamesTheTreesDeclaration`.
+
 ## 4. Open
 
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider

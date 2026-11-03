@@ -1153,7 +1153,8 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
     return S.takeError();
 
   llvm::SmallVector<char, 0> Hello;
-  encodeHello(Hello);
+  const char *Offline = std::getenv("CLANG_HEADER_CACHE_OFFLINE");
+  encodeHello(Hello, Offline && llvm::StringRef(Offline) == "1");
   std::optional<HelloReply> Reply;
   if (sendMessage(**S, Hello))
     if (std::optional<std::string> Body = receiveMessage(**S))
@@ -1177,6 +1178,8 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
   C->Conn = std::move(*S);
   C->Region = std::move(*R);
   C->SocketPath = SocketPath.str();
+  C->DecisionsPath = std::move(Reply->DecisionsPath);
+  C->RecordDir = std::move(Reply->RecordDir);
   // Unique among the compiles one daemon serves at once: the process, and
   // the client within it (tests run several in one process).
   uint64_t Seed[3] = {static_cast<uint64_t>(::getpid()),
@@ -1315,6 +1318,26 @@ bool CacheClient::reconnectAfterFork() {
   Learned.clear();
   Combos.clear();
   return true;
+}
+
+bool CacheClient::sendBuildHint(llvm::StringRef SocketPath,
+                                llvm::StringRef Output) {
+  if (llvm::Error E = checkSocketPath(SocketPath)) {
+    llvm::consumeError(std::move(E));
+    return false;
+  }
+  llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> S =
+      llvm::raw_socket_stream::createConnectedUnix(SocketPath);
+  if (!S) {
+    llvm::consumeError(S.takeError());
+    return false;
+  }
+  llvm::SmallVector<char, 0> Msg;
+  encodeBuildHint({Output.str()}, Msg);
+  if (!sendMessage(**S, Msg))
+    return false;
+  std::optional<std::string> Reply = receiveMessage(**S);
+  return Reply && peekMessageKind(*Reply) == MessageKind::BuildHintAck;
 }
 
 bool CacheClient::claim(llvm::StringRef Filename, llvm::StringRef ModuleName,

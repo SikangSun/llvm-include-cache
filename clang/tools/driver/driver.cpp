@@ -12,12 +12,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Driver/Driver.h"
+#include "clang/ASTCache/CacheClient.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/HeaderInclude.h"
 #include "clang/Basic/Stack.h"
 #include "clang/Config/config.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/DriverDiagnostic.h"
+#include "clang/Driver/Tool.h"
 #include "clang/Driver/ToolChain.h"
 #include "clang/Frontend/ChainedDiagnosticConsumer.h"
 #include "clang/Frontend/CompilerInvocation.h"
@@ -412,6 +414,18 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
   if (C && !C->containsError()) {
     SmallVector<std::pair<int, const Command *>, 4> FailingCommands;
     Res = TheDriver.ExecuteCompilation(*C, FailingCommands);
+
+    // CLANG_HEADER_CACHE: a link that succeeded tells the header cache's
+    // daemon, which may then run its offline step for the next build.
+    if (!Res && FailingCommands.empty())
+      if (const char *Socket = ::getenv("CLANG_HEADER_CACHE"); Socket && *Socket)
+        for (const Command &Job : C->getJobs())
+          if (Job.getCreator().isLinkJob()) {
+            const std::vector<std::string> &Out = Job.getOutputFilenames();
+            clang::ast_cache::CacheClient::sendBuildHint(
+                Socket, Out.empty() ? "" : Out.front());
+            break;
+          }
 
     for (const auto &P : FailingCommands) {
       int CommandRes = P.first;

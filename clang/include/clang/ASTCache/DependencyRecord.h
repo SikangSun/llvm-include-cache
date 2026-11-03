@@ -455,9 +455,16 @@ struct LinkRecord {
   /// the daemon, which keeps the first stored, though their PCM bytes can
   /// differ.
   uint64_t Hash = 0;
+  /// The names the linked copy needs from outside it that the tree around
+  /// it gives ("t:" a tag, "o:" any other): each from the link of this copy
+  /// at the index given, or, for -1, from this copy's own lines. A hit
+  /// resolves the linked copy's references to them there, not to a
+  /// declaration the compile makes after the tree.
+  std::vector<std::pair<std::string, int32_t>> Takes;
   friend bool operator==(const LinkRecord &A, const LinkRecord &B) {
     return A.Path == B.Path && A.Module == B.Module && A.Guard == B.Guard &&
-           A.OnGuard == B.OnGuard && A.Names == B.Names && A.Hash == B.Hash;
+           A.OnGuard == B.OnGuard && A.Names == B.Names && A.Hash == B.Hash &&
+           A.Takes == B.Takes;
   }
 };
 
@@ -568,6 +575,13 @@ struct HeaderDependencySet {
   /// scope ("t:" a tag, "o:" any other). Where a copy linking this one skips
   /// it, the compile has read the header already, and must declare each.
   std::vector<std::string> Declares;
+  /// CLANG_HEADER_CACHE_LINK: the typedefs and tags ("o:", "t:") the copy's
+  /// own lines declare last, after a header it links declared them too. A
+  /// hit loads a copy before the copies it links, and Clang's name lookup
+  /// finds the declaration read last, so the compile makes the copy's the
+  /// one found, as the text does (FFmpeg's mpegvideoenc.h defines
+  /// MPVEncContext after me_cmp.h declares it).
+  std::vector<std::string> Latest;
   /// The names a file with no include guard declares first in the copy's own
   /// lines, each with what Clang's reader compares to merge it with a
   /// compile's declaration of the name (ownMergeKey). Such a file can be

@@ -32,6 +32,7 @@
 #include "clang/Serialization/ModuleManager.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
@@ -44,6 +45,7 @@
 #include "llvm/Support/xxhash.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <chrono>
+#include <deque>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -327,6 +329,8 @@ public:
       ParseWholeBase = llvm::StringRef(Pieces) == "A";
     }
     this->Client->pieces(PiecesMode);
+    if (Recording)
+      recordCommand();
   }
 
   void report(llvm::raw_ostream &OS) const {
@@ -678,6 +682,7 @@ public:
     LiveGuardTests.clear();
     PassedNotNewest = false;
     Asking = File;
+    AskingPath = Path;
     // CLANG_HEADER_CACHE_PIECES: a version serves only whole; the header a
     // stand-in includes after its sections has the copy its plan chose.
     // Any other header the stand-in reads serves only whole.
@@ -960,22 +965,27 @@ public:
       Exporter->served();
     }
     if (Copy.Fresh) {
-      llvm::TimeTraceScope S("HeaderCache Pin");
-      llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
-      IdentifierTable &Idents = PP.getIdentifierTable();
-      size_t I = 0;
-      auto Pin = [&](MetadataSection<DeclarationView> Decls) {
-        for (const DeclarationView &D : Decls) {
-          if (I == Found.size())
-            break;
-          // Null for one that does not apply where the hit is.
-          if (NamedDecl *To = Found[I++])
-            CI.getASTReader()->pinNameReference(
-                *Copy.MF, Idents.get(D.Name),
-                D.In == DeclarationDependency::Space::Tag, To);
-        }
-      };
-      Pin(Deps.declarations());
+      // A tree's copies resolve their names when they are read (HitTrees).
+      if (!Hits->NodeOf.count(Copy.MF)) {
+        llvm::TimeTraceScope S("HeaderCache Pin");
+        llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
+        IdentifierTable &Idents = PP.getIdentifierTable();
+        llvm::StringSet<> FromLinks = namesFromLinks(Deps);
+        size_t I = 0;
+        auto Pin = [&](MetadataSection<DeclarationView> Decls) {
+          for (const DeclarationView &D : Decls) {
+            if (I == Found.size())
+              break;
+            bool Tag = D.In == DeclarationDependency::Space::Tag;
+            // Null for one that does not apply where the hit is.
+            if (NamedDecl *To = Found[I++])
+              if (!FromLinks.contains((Tag ? "t:" : "o:") + D.Name.str()))
+                CI.getASTReader()->pinNameReference(
+                    *Copy.MF, Idents.get(D.Name), Tag, To);
+          }
+        };
+        Pin(Deps.declarations());
+      }
       reportInputFiles(*Copy.MF);
       // Debug information names a file by the name the compile first
       // entered it by, which a read of the header gives it here. qemu's
@@ -1442,12 +1452,125 @@ private:
     std::string Path, Module, Guard;
     bool OnGuard = false;
     std::vector<std::string> Names;
+    /// LinkRecord::Takes.
+    std::vector<std::pair<std::string, int32_t>> Takes;
     llvm::StringRef Bytes;
     std::optional<MetadataView> Meta;
     std::vector<Fetched> Links;
   };
   /// Each copy fetched for a link in this compile, by module name.
   llvm::StringMap<std::pair<llvm::StringRef, MetadataView>> FetchedCopies;
+
+  /// The trees the compile's hits loaded, kept for the compile. A copy
+  /// names a declaration outside it by name, and the reader resolves the
+  /// name when it first reads the reference, which can be after the
+  /// compile declared the name again: FFmpeg's internal.h, linked from
+  /// avformat_internal.h, named avio_internal.h's AVFormatContext, included
+  /// after both; graph.h named uops.h's SwsLut3D, not lut3d.h's; buffer.h
+  /// named glob.h's size_t, not the one an earlier link of demux.h's tree
+  /// declared. The reader asks here first (resolve), and shares this, as it
+  /// can read after the server is gone.
+  struct HitTrees {
+    struct Node {
+      /// Null for the hit's copy.
+      const Fetched *Self;
+      int Parent;
+      serialization::ModuleFile *MF;
+      /// For each link of the copy, its node, or -1 where it did not load.
+      llvm::SmallVector<int, 4> Links = {};
+      /// At the first reference that needs them: the names the copy's
+      /// lines take from its links (LinkRecord::Names), each with the
+      /// link's node, and where the tree around the copy gives a name
+      /// (LinkRecord::Takes).
+      bool Mapped = false;
+      llvm::StringMap<int> FromLinks = {};
+      llvm::StringMap<int32_t> Takes = {};
+      /// The modules of the copy and of the copies below it that loaded.
+      std::optional<llvm::SmallVector<serialization::ModuleFile *, 8>> Under =
+          {};
+    };
+    struct Tree {
+      std::vector<Fetched> All;
+      std::vector<Node> Nodes;
+      /// What the hit's check found for each name the tree takes from
+      /// outside it ("t:" a tag, "o:" any other).
+      llvm::StringMap<NamedDecl *> Outside;
+    };
+    std::deque<Tree> Trees;
+    /// The tree and node of each copy a hit loaded the first time.
+    llvm::DenseMap<serialization::ModuleFile *, std::pair<Tree *, int>>
+        NodeOf;
+
+    Node &mapped(Tree &T, int X) {
+      Node &N = T.Nodes[X];
+      if (N.Mapped)
+        return N;
+      N.Mapped = true;
+      const std::vector<Fetched> &Links = N.Self ? N.Self->Links : T.All;
+      for (size_t I = 0; I != Links.size(); ++I)
+        if (N.Links[I] >= 0)
+          for (const std::string &Name : Links[I].Names)
+            N.FromLinks[Name] = N.Links[I];
+      if (N.Self)
+        for (const auto &[Name, From] : N.Self->Takes)
+          N.Takes.try_emplace(Name, From);
+      return N;
+    }
+
+    llvm::ArrayRef<serialization::ModuleFile *> under(Tree &T, int X) {
+      Node &N = T.Nodes[X];
+      if (!N.Under) {
+        llvm::SmallVector<serialization::ModuleFile *, 8> Out;
+        llvm::SmallVector<int, 8> Stack{X};
+        while (!Stack.empty()) {
+          const Node &Y = T.Nodes[Stack.pop_back_val()];
+          if (Y.MF)
+            Out.push_back(Y.MF);
+          for (int C : Y.Links)
+            if (C >= 0)
+              Stack.push_back(C);
+        }
+        N.Under = std::move(Out);
+      }
+      return *N.Under;
+    }
+
+    /// Where \p MF's reference to \p II resolves, or null to look it up: a
+    /// name from one of the copy's links, among that link's copies; one the
+    /// tree around a linked copy gives, among the copies that give it; one
+    /// from outside the tree, to what the hit's check found where the tree
+    /// begins.
+    NamedDecl *resolve(ASTReader &Reader, serialization::ModuleFile &MF,
+                       IdentifierInfo &II, bool Tag) {
+      auto P = NodeOf.find(&MF);
+      if (P == NodeOf.end())
+        return nullptr;
+      Tree &T = *P->second.first;
+      int X = P->second.second;
+      llvm::SmallString<64> K(Tag ? "t:" : "o:");
+      K += II.getName();
+      Node &C = mapped(T, X);
+      if (auto L = C.FromLinks.find(K); L != C.FromLinks.end())
+        return Reader.findNameInModules(II, Tag, under(T, L->second));
+      for (; X; X = T.Nodes[X].Parent) {
+        Node &N = mapped(T, X);
+        auto F = N.Takes.find(K);
+        if (F == N.Takes.end())
+          continue;
+        Node &Up = T.Nodes[N.Parent];
+        if (F->second < 0)
+          return Up.MF ? Reader.findNameInModules(II, Tag, Up.MF) : nullptr;
+        if (static_cast<size_t>(F->second) < Up.Links.size() &&
+            Up.Links[F->second] >= 0)
+          return Reader.findNameInModules(II, Tag,
+                                          under(T, Up.Links[F->second]));
+        return nullptr;
+      }
+      return T.Outside.lookup(K);
+    }
+  };
+  std::shared_ptr<HitTrees> Hits = std::make_shared<HitTrees>();
+  bool ResolvingNames = false;
 
   bool fetchLinks(const MetadataView &Deps, std::vector<Fetched> &Out,
                   unsigned Depth) {
@@ -1461,6 +1584,8 @@ private:
       F.OnGuard = L.OnGuard;
       for (llvm::StringRef N : L.Names)
         F.Names.push_back(N.str());
+      for (const auto &[N, From] : L.Takes)
+        F.Takes.push_back({N.str(), From});
       std::string Key = L.Module.str() + "/" + llvm::utohexstr(L.Hash);
       auto Known = FetchedCopies.find(Key);
       if (Known != FetchedCopies.end()) {
@@ -1768,7 +1893,8 @@ private:
   /// or null with nothing loaded.
   Module *loadTree(const MetadataView &Deps, llvm::StringRef Bytes,
                    llvm::StringRef ModuleName, SourceLocation Loc) {
-    std::vector<Fetched> All;
+    HitTrees::Tree &Tree = Hits->Trees.emplace_back();
+    std::vector<Fetched> &All = Tree.All;
     std::optional<llvm::TimeTraceScope> Step;
     Step.emplace("HeaderCache FetchLinks");
     if (!fetchLinks(Deps, All, 0)) {
@@ -1822,6 +1948,7 @@ private:
       ++TreeFails[2];
       return nullptr;
     }
+    keepTree(Tree, Deps, ModuleName, Order);
     for (const Fetched *F : Order)
       Timings.Links.push_back(F->Path);
     HitUnits.clear();
@@ -1843,6 +1970,8 @@ private:
     Sema &S = CI.getSema();
     for (Module *M : Mods)
       S.makeModuleVisible(M, Loc);
+    if (!Order.empty())
+      orderLatest(Deps, ModuleName, All, Order);
     PendingLinks.clear();
     PendingNames.clear();
     for (size_t K = 0; K != Order.size(); ++K)
@@ -1853,15 +1982,146 @@ private:
     for (const Fetched &F : All)
       for (const std::string &N : F.Names)
         PendingNames.push_back(N);
-    // PendingLinks points into it; moving keeps the elements in place.
-    PendingTree = std::move(All);
+    PendingTree = &All;
     LastModuleName = ModuleName.str();
     return Mods.front();
   }
 
+  /// The names \p Deps's own lines take from the copies it links ("t:" a
+  /// tag, "o:" any other). The copy's check finds each where the copy
+  /// begins, as a link may need it from outside, but the copy's own
+  /// references are to the link's: FFmpeg's subtitles.h names
+  /// AVFormatContext after avio_internal.h declares it again.
+  static llvm::StringSet<> namesFromLinks(const MetadataView &Deps) {
+    llvm::StringSet<> Out;
+    for (const LinkView &L : Deps.links())
+      for (llvm::StringRef N : L.Names)
+        Out.insert(N);
+    return Out;
+  }
+
+  /// Keeps the tree of the hit on \p Deps's copy, whose copies \p Order
+  /// loaded after it, for the names they take from outside themselves
+  /// (HitTrees).
+  void keepTree(HitTrees::Tree &T, const MetadataView &Deps,
+                llvm::StringRef ModuleName,
+                llvm::ArrayRef<const Fetched *> Order) {
+    llvm::DenseSet<const Fetched *> Loads(Order.begin(), Order.end());
+    auto Add = [&](const Fetched *Self, int Parent, llvm::StringRef Module) {
+      auto L = LoadedTargets.find(Module);
+      serialization::ModuleFile *MF =
+          L == LoadedTargets.end() ? nullptr : L->second.MF;
+      int X = static_cast<int>(T.Nodes.size());
+      T.Nodes.push_back({Self, Parent, MF});
+      if (MF && L->second.Fresh)
+        Hits->NodeOf[MF] = {&T, X};
+      return X;
+    };
+    std::function<void(int, const std::vector<Fetched> &)> Walk =
+        [&](int P, const std::vector<Fetched> &Links) {
+          for (const Fetched &L : Links) {
+            int X = Loads.contains(&L) ? Add(&L, P, L.Module) : -1;
+            T.Nodes[P].Links.push_back(X);
+            if (X >= 0)
+              Walk(X, L.Links);
+          }
+        };
+    Walk(Add(nullptr, -1, ModuleName), T.All);
+    llvm::ArrayRef<NamedDecl *> Found = Client->matchedDeclarations();
+    llvm::SmallString<64> K;
+    size_t I = 0;
+    for (const DeclarationView &D : Deps.declarations()) {
+      if (I == Found.size())
+        break;
+      if (NamedDecl *To = Found[I++]) {
+        K = D.In == DeclarationDependency::Space::Tag ? "t:" : "o:";
+        K += D.Name;
+        T.Outside[K] = To;
+      }
+    }
+    if (!ResolvingNames) {
+      ResolvingNames = true;
+      ASTReader *Reader = CI.getASTReader().get();
+      Reader->setPartNameResolver(
+          [Hits = Hits, Reader](serialization::ModuleFile &MF,
+                                IdentifierInfo &II, bool Tag) {
+            return Hits->resolve(*Reader, MF, II, Tag);
+          });
+    }
+  }
+
+  /// HeaderDependencySet::Latest. A hit loads a copy before the copies it
+  /// links, and Clang's name lookup finds the declaration read last: a
+  /// link's. For each name a copy of the tree lists, the tree's
+  /// declarations of it are made the order the text made them, each copy's
+  /// before those of its links, or after them where the copy lists the
+  /// name, so that the name finds the latest.
+  void orderLatest(const MetadataView &Deps, llvm::StringRef ModuleName,
+                   const std::vector<Fetched> &All,
+                   const std::vector<const Fetched *> &Order) {
+    llvm::StringSet<> Names;
+    for (const NameView &N : Deps.latest())
+      Names.insert(N.Name);
+    for (const Fetched *F : Order)
+      for (const NameView &N : F->Meta->latest())
+        Names.insert(N.Name);
+    if (Names.empty())
+      return;
+    llvm::DenseSet<const Fetched *> Loads(Order.begin(), Order.end());
+    auto ModuleOf = [&](llvm::StringRef Name) {
+      auto It = LoadedTargets.find(Name);
+      return It == LoadedTargets.end() ? nullptr : It->second.MF;
+    };
+    Preprocessor &PP = CI.getPreprocessor();
+    Sema &S = CI.getSema();
+    ASTReader &Reader = *CI.getASTReader();
+    for (const auto &E : Names) {
+      llvm::StringRef N = E.getKey();
+      bool Tag = N.starts_with("t:");
+      IdentifierInfo &II = *PP.getIdentifierInfo(N.drop_front(2));
+      PP.refreshIdentifier(II);
+      DeclarationName Name(&II);
+      llvm::DenseMap<serialization::ModuleFile *, NamedDecl *> Of;
+      for (auto I = S.IdResolver.begin(Name); I != S.IdResolver.end(); ++I)
+        if ((*I)->isInIdentifierNamespace(Tag ? Decl::IDNS_Tag
+                                              : Decl::IDNS_Ordinary) &&
+            (*I)->isFromASTFile())
+          if (serialization::ModuleFile *MF = Reader.getOwningModuleFile(*I))
+            Of.try_emplace(MF, *I);
+      std::vector<NamedDecl *> InOrder;
+      std::function<void(const MetadataView &, llvm::StringRef,
+                         const std::vector<Fetched> &)>
+          Visit = [&](const MetadataView &M, llvm::StringRef Module,
+                      const std::vector<Fetched> &Links) {
+            NamedDecl *Own = Of.lookup(ModuleOf(Module));
+            bool Last = llvm::any_of(M.latest(), [&](const NameView &V) {
+              return V.Name == N;
+            });
+            if (Own && !Last)
+              InOrder.push_back(Own);
+            for (const Fetched &L : Links)
+              if (Loads.contains(&L))
+                Visit(*L.Meta, L.Module, L.Links);
+            if (Own && Last)
+              InOrder.push_back(Own);
+          };
+      Visit(Deps, ModuleName, All);
+      // A copy the tree holds twice counts where the text made it last.
+      llvm::DenseSet<NamedDecl *> Seen;
+      std::vector<NamedDecl *> Unique;
+      for (NamedDecl *D : llvm::reverse(InOrder))
+        if (Seen.insert(D).second)
+          Unique.push_back(D);
+      for (NamedDecl *D : Unique)
+        S.IdResolver.RemoveDecl(D);
+      for (NamedDecl *D : llvm::reverse(Unique))
+        S.IdResolver.AddDecl(D);
+    }
+  }
+
   /// The links of the hit loadTree loaded, in text order, in the tree
   /// fetched for it, and the names the copies take from them.
-  std::vector<Fetched> PendingTree;
+  std::vector<Fetched> *PendingTree = nullptr;
   std::vector<std::pair<const Fetched *, Module *>> PendingLinks;
   std::vector<std::string> PendingNames;
   /// Each link of the hit at \p Loc replays its effects after the copy's,
@@ -1883,7 +2143,8 @@ private:
           linkLoaded(F, *M, Loc);
       }
     };
-    After(After, PendingTree);
+    if (PendingTree)
+      After(After, *PendingTree);
     // A tag is looked up, so that its definition in a link joins the
     // declarations the compile has of it: a member a copy names is found
     // in the definition (git's http-push.c). Another name, only if the
@@ -1904,7 +2165,7 @@ private:
         findLinkName(N);
     PendingLinks.clear();
     PendingNames.clear();
-    PendingTree.clear();
+    PendingTree = nullptr;
   }
 
   /// Loads \p Units, each a copy's bytes and module name, with one reader
@@ -2522,16 +2783,24 @@ private:
   ///   merge tree             the tree (MergeRecord::Combo, hexadecimal) is
   ///                          merged at its first hit, with
   ///                          CLANG_HEADER_CACHE_MERGE=decided
+  ///   merge-root header      each tree with a copy of header at its root is
+  ///                          merged at its first hit, the same way: folds
+  ///                          change a tree's copies, and so its name
   /// A copy of parent has no name until it is written, after the requests
   /// inside it, so a pair names the parent by its header.
+  /// Without CLANG_HEADER_CACHE_DECISIONS, the file the daemon's offline
+  /// step wrote, if the daemon named one (CacheClient::decisionsPath).
   struct Decided {
-    llvm::StringSet<> Top, Fold;
+    llvm::StringSet<> Top, Fold, MergeRoot;
     llvm::DenseSet<uint64_t> Merge;
   };
-  std::optional<Decided> Decisions = [] {
+  const char *DecisionsEnv = std::getenv("CLANG_HEADER_CACHE_DECISIONS");
+  std::optional<Decided> Decisions = [this] {
     std::optional<Decided> D;
-    const char *V = std::getenv("CLANG_HEADER_CACHE_DECISIONS");
-    if (!V || !*V)
+    std::string V = DecisionsEnv && *DecisionsEnv
+                        ? std::string(DecisionsEnv)
+                        : Client->decisionsPath().str();
+    if (V.empty())
       return D;
     auto File = llvm::MemoryBuffer::getFile(V);
     if (!File) {
@@ -2555,6 +2824,8 @@ private:
       else if (F.size() == 2 && F[0] == "merge" &&
                !F[1].getAsInteger(16, Tree))
         D->Merge.insert(Tree);
+      else if (F.size() == 2 && F[0] == "merge-root")
+        D->MergeRoot.insert(F[1]);
     }
     return D;
   }();
@@ -2563,18 +2834,25 @@ private:
   /// called for, which start only outside a header being written (the
   /// merges line of the report).
   unsigned DecidedTop = 0, DecidedFolds = 0, DecidedMerges = 0;
-  /// Whether the decisions' \p Set pairs the header the compile is
-  /// writing with \p Key: the innermost header being written includes it
-  /// directly.
+  /// Whether the decisions' \p Set pairs \p Key with the header whose copy
+  /// would link it, as the record that made them saw that copy: the
+  /// innermost open header that is the one being written or one these
+  /// decisions folded into it. Headers read as text for other reasons, in
+  /// between, are part of the copy around them in both builds.
   bool decidedPair(llvm::StringSet<> Decided::*Set, llvm::StringRef Key) {
     if (!Decisions || !LinkMode || !Exporter || !Exporter->writing())
       return false;
-    std::string In = includerName();
-    if (In == "-" || Exporter->innermostWriting() != In)
-      return false;
-    std::string Pair = In;
-    (Pair += '\0') += Key;
-    return ((*Decisions).*Set).contains(Pair);
+    std::string Writing = Exporter->innermostWriting();
+    for (size_t I = Open.size(); I-- > 1;) {
+      if (!Open[I].Entry)
+        continue;
+      std::string In = storedName(Open[I].Name);
+      if (In != Writing && Open[I].Reason != "decided-fold")
+        continue;
+      (In += '\0') += Key;
+      return ((*Decisions).*Set).contains(In);
+    }
+    return false;
   }
   /// CLANG_HEADER_CACHE_FOLD_SERVED=1: inside a header being written, a
   /// header is asked for and served too, and the copy being written holds
@@ -2644,25 +2922,34 @@ private:
   PartExporter *Exporter = nullptr;
   bool PopulateOnly = false;
 
+  /// Decisions the daemon named that call for merges: with
+  /// CLANG_HEADER_CACHE_MERGE unset, they are merged as with =decided.
+  bool DaemonMerges = Decisions && !(DecisionsEnv && *DecisionsEnv) &&
+                      (!Decisions->Merge.empty() ||
+                       !Decisions->MergeRoot.empty());
   /// CLANG_HEADER_CACHE_MERGE=<n>: at the n-th hit that starts from a copy
   /// with links, the compile forks; the process forked reads the header as
   /// text, with the copies inside it folded in, writes that one copy, and
   /// exits. 0: never.
-  unsigned MergeCount = [] {
+  unsigned MergeCount = [this] {
     const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE");
     unsigned N = 0;
-    if (V && llvm::StringRef(V) == "auto")
+    if (!V || !*V)
+      return DaemonMerges ? 1u : 0u;
+    if (llvm::StringRef(V) == "auto")
       return 2u;
-    if (V && llvm::StringRef(V) == "decided")
+    if (llvm::StringRef(V) == "decided")
       return 1u;
-    return V && !llvm::StringRef(V).getAsInteger(10, N) ? N : 0u;
+    return !llvm::StringRef(V).getAsInteger(10, N) ? N : 0u;
   }();
   /// CLANG_HEADER_CACHE_MERGE=decided: the trees the decisions list
   /// (CLANG_HEADER_CACHE_DECISIONS) are merged at their first hit, and no
   /// other.
-  bool MergeDecided = [] {
+  bool MergeDecided = [this] {
     const char *V = std::getenv("CLANG_HEADER_CACHE_MERGE");
-    return V && llvm::StringRef(V) == "decided";
+    if (!V || !*V)
+      return DaemonMerges;
+    return llvm::StringRef(V) == "decided";
   }();
   /// CLANG_HEADER_CACHE_MERGE=auto: a combination is merged once its hits so
   /// far pay for the merge (mergeDue), with the constants the merge study
@@ -2685,8 +2972,9 @@ private:
   double MergeFixed = mergeConstant("CLANG_HEADER_CACHE_MERGE_FIXED", 17.5e6);
   double MergePerByte =
       mergeConstant("CLANG_HEADER_CACHE_MERGE_PER_BYTE", 257);
-  /// The header being asked for.
+  /// The header being asked for, and its stored name.
   OptionalFileEntryRef Asking;
+  std::string AskingPath;
   /// CLANG_HEADER_CACHE_MERGE_FORK=1: a process forked from the compile
   /// merges a tree, as before 2026-11-01. Otherwise the compile merges it
   /// itself, in its own thread (mergeHere).
@@ -2763,9 +3051,12 @@ private:
   ///     a header read as text (HeaderTiming)
   ///   W header copy bytes writer-us [child child-copy]...
   ///     a copy written, with the copies it links (PartExporter)
+  ///   A directory program arg...    E NAME=VALUE...
+  ///     first: the command that replays the compile, and its
+  ///     CLANG_HEADER_CACHE variables (recordCommand)
   const bool Recording = !recordFile().empty();
   std::string RecordLines;
-  void record(std::initializer_list<llvm::StringRef> Fields) {
+  void record(llvm::ArrayRef<llvm::StringRef> Fields) {
     bool First = true;
     for (llvm::StringRef F : Fields) {
       if (!First)
@@ -2774,6 +3065,29 @@ private:
       First = false;
     }
     RecordLines += '\n';
+  }
+  /// The command that replays this compile, for the offline step's merges:
+  /// an A line with the working directory, this program and the -cc1
+  /// arguments, and an E line with the header cache's variables. None if a
+  /// field holds a tab or a line break.
+  void recordCommand() {
+    llvm::SmallString<256> Cwd;
+    std::string Exe = llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+    std::vector<std::string> Args = CI.getInvocation().getCC1CommandLine();
+    auto Plain = [](llvm::StringRef S) {
+      return !S.empty() && S.find_first_of("\t\n") == llvm::StringRef::npos;
+    };
+    if (llvm::sys::fs::current_path(Cwd) || !Plain(Cwd) || !Plain(Exe) ||
+        !llvm::all_of(Args, Plain))
+      return;
+    std::vector<llvm::StringRef> A = {"A", Cwd, Exe};
+    A.insert(A.end(), Args.begin(), Args.end());
+    record(A);
+    std::vector<llvm::StringRef> E = {"E"};
+    for (char **V = environ; *V; ++V)
+      if (llvm::StringRef(*V).starts_with("CLANG_HEADER_CACHE") && Plain(*V))
+        E.push_back(*V);
+    record(E);
   }
   /// The links of a hit on \p Copy, of \p Bytes, that loaded \p Order out
   /// of the tree \p All: K lines, each from the copy linking it, and the
@@ -2869,7 +3183,9 @@ private:
     if (M && M->Merged.load(std::memory_order_acquire) != 0)
       return false;
     if (MergeDecided) {
-      if (!Decisions || !Decisions->Merge.contains(Combo) ||
+      if (!Decisions ||
+          !(Decisions->Merge.contains(Combo) ||
+            Decisions->MergeRoot.contains(AskingPath)) ||
           !MergeForked.insert({At, Combo}).second)
         return false;
       ++DecidedMerges;
@@ -3447,6 +3763,10 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
     llvm::consumeError(Client.takeError());
     return;
   }
+
+  // The daemon's offline step reads what compiles record until it decided.
+  if (!(*Client)->recordDir().empty())
+    setRecordDir((*Client)->recordDir());
 
   // The build this compile belongs to: within one, the daemon shares what
   // each copy's #include searches found (REPORT.md I9).

@@ -58,6 +58,7 @@
 #include <cstdint>
 #include <ctime>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -2686,6 +2687,9 @@ public:
   llvm::DenseMap<std::tuple<ModuleFile *, IdentifierInfo *, unsigned>,
                  NamedDecl *>
       PinnedNameReferences;
+  /// See setPartNameResolver.
+  std::function<NamedDecl *(ModuleFile &, IdentifierInfo &, bool)>
+      PartNameResolver;
 
 public:
   /// What a compile that loads a header cache part skips of it (REPORT.md
@@ -2796,6 +2800,26 @@ public:
                                     bool Tag) const {
     return PinnedNameReferences.lookup({&MF, &II, Tag});
   }
+
+  /// Resolves a header cache part's file-scope reference to a name, in
+  /// the tag name space if the last argument says so, when the reader first
+  /// reads it and no pinNameReference pin applies; null looks the name up.
+  /// A hit's linked copies name declarations of the copies around them,
+  /// which the name's lookup, made later, can pass over for a newer one.
+  void setPartNameResolver(
+      std::function<NamedDecl *(ModuleFile &, IdentifierInfo &, bool)> R) {
+    PartNameResolver = std::move(R);
+  }
+
+  /// See setPartNameResolver.
+  NamedDecl *resolvePartName(ModuleFile &MF, IdentifierInfo &II, bool Tag) {
+    return PartNameResolver ? PartNameResolver(MF, II, Tag) : nullptr;
+  }
+
+  /// The latest file-scope declaration of \p II, in the tag name space if
+  /// \p Tag, that one of the modules \p In made, or null.
+  NamedDecl *findNameInModules(IdentifierInfo &II, bool Tag,
+                               ArrayRef<ModuleFile *> In);
 
   /// What the next ReadAST, of a header cache part, skips of it; none
   /// clears it.

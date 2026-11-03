@@ -20,6 +20,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
 #include <csignal>
@@ -73,10 +74,11 @@ static cl::opt<unsigned long long>
 
 static cl::opt<bool> MeasuredCutoff(
     "measured-cutoff",
-    cl::desc("In place of -ask-cutoff-us, with no fixed number: list a "
-             "header while the parse time of the lines its copy holds is at "
-             "least one request for it and one load of its copy, each the "
-             "mean of its own so far; a header not asked for yet is listed"),
+    cl::desc("In place of -ask-cutoff-us as the cutoff: list a header while "
+             "the parse time of the lines its copy holds is at least one "
+             "request for it and one load of its copy, each the mean of its "
+             "own so far; before its first load the load is -ask-cutoff-us, "
+             "before its first request the request is 0"),
     cl::init(false), cl::cat(Category));
 
 static cl::opt<bool> Fold(
@@ -132,6 +134,24 @@ static cl::opt<unsigned long long>
               cl::desc("With -fold: writing one copy, in microseconds"),
               cl::init(519), cl::cat(Category));
 
+static cl::opt<std::string> Offline(
+    "offline",
+    cl::desc("The offline step between builds: a command, its words split "
+             "at spaces, run after a link a compile reports with the record "
+             "directory and the decisions file as its last two arguments "
+             "(clang/utils/header-cache/offline/offline.py)"),
+    cl::init(""), cl::cat(Category));
+static cl::opt<std::string> OfflineRecord(
+    "offline-record",
+    cl::desc("Where compiles record what the offline step reads, until the "
+             "decisions file exists"),
+    cl::init(""), cl::cat(Category));
+static cl::opt<std::string> OfflineDecisions(
+    "offline-decisions",
+    cl::desc("The decisions file the offline step writes; once it exists, "
+             "compiles take their decisions from it"),
+    cl::init(""), cl::cat(Category));
+
 static cl::opt<std::string> AskListLoad(
     "ask-list-load",
     cl::desc("Measurement: the ask-list is exactly the headers in this file, "
@@ -176,6 +196,25 @@ int main(int argc, char **argv) {
   Opts.FoldWriteMicros = FoldWrite;
   Opts.FoldLinkMicros = FoldLink;
   Opts.MeasuredCutoff = MeasuredCutoff;
+  if (!Offline.empty()) {
+    SmallVector<StringRef, 4> Words;
+    StringRef(Offline).split(Words, ' ', -1, /*KeepEmpty=*/false);
+    for (StringRef W : Words)
+      Opts.OfflineCommand.push_back(W.str());
+    // The program by its path: a process is started from a path, not looked
+    // up the way a shell would.
+    if (!StringRef(Opts.OfflineCommand[0]).contains('/')) {
+      ErrorOr<std::string> P = sys::findProgramByName(Opts.OfflineCommand[0]);
+      if (!P) {
+        errs() << "clang-header-cache-daemon: cannot find "
+               << Opts.OfflineCommand[0] << "\n";
+        return 1;
+      }
+      Opts.OfflineCommand[0] = *P;
+    }
+  }
+  Opts.OfflineRecord = OfflineRecord;
+  Opts.OfflineDecisions = OfflineDecisions;
   if (!AskListLoad.empty()) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> List =
         MemoryBuffer::getFile(AskListLoad);
@@ -251,7 +290,12 @@ int main(int argc, char **argv) {
            << S.WaitsGated << " lookups the gate did not hold; claims "
            << S.ClaimsGranted << " granted, " << S.ClaimsRefused
            << " refused; merges " << S.MergesClaimed << " started, "
-           << S.MergesStored << " stored\n";
+           << S.MergesStored << " stored\n"
+           << "offline " << S.BuildHints << " link hints; runs "
+           << S.OfflineStarted << " started, " << S.OfflineFinished
+           << " finished, " << S.OfflineFailed << " failed, "
+           << S.OfflineStopped << " stopped; last finished in "
+           << (S.OfflineMicros / 1000) << " ms\n";
     if (Fold)
       (*D)->dumpFolds(outs());
   }

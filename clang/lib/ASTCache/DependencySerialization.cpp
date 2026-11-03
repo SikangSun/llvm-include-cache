@@ -292,6 +292,11 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
     for (const std::string &N : L.Names)
       W.str(N);
     W.u64(L.Hash);
+    W.vu32(L.Takes.size());
+    for (const auto &[N, From] : L.Takes) {
+      W.str(N);
+      W.vu32(static_cast<uint32_t>(From + 1));
+    }
   }
 
   Begin(MetadataView::Declares, Deps.Declares.size());
@@ -337,6 +342,12 @@ void clang::ast_cache::encodeMetadata(const HeaderDependencySet &Deps,
   Begin(MetadataView::Owned, Deps.Owned.size());
   for (const DeclarationDependency &D : Deps.Owned)
     Declaration(D);
+
+  Begin(MetadataView::Latest, Deps.Latest.size());
+  for (const std::string &N : Deps.Latest) {
+    W.str(N);
+    W.vu32(0);
+  }
 
   if (Unsorted)
     G = 0;
@@ -533,6 +544,10 @@ LinkView LinkView::read(ByteReader &R) {
   for (uint32_t I = 0, N = R.vu32(); I != N && R.ok(); ++I)
     L.Names.push_back(R.str());
   L.Hash = R.u64();
+  for (uint32_t I = 0, N = R.vu32(); I != N && R.ok(); ++I) {
+    llvm::StringRef Name = R.str();
+    L.Takes.push_back({Name, static_cast<int32_t>(R.vu32()) - 1});
+  }
   return L;
 }
 
@@ -640,7 +655,7 @@ bool MetadataView::validate() const {
       !warningPragmas().valid() || !submodules().valid() ||
       !conditions().valid() || !provided().valid() || !links().valid() ||
       !declares().valid() || !leftOut().valid() || !counterNames().valid() ||
-      !held().valid() || !owned().valid())
+      !held().valid() || !owned().valid() || !latest().valid())
     return false;
   // A held header names its file; each macro it left names itself and,
   // where defined, one of the header's files; each name it read is one.
@@ -833,6 +848,8 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
     Deps.Declares.push_back(N.Name.str());
   for (const DeclarationView &D : V->owned())
     Deps.Owned.push_back({D.In, D.Name.str(), D.Fingerprint.str(), D.Cond});
+  for (const NameView &N : V->latest())
+    Deps.Latest.push_back(N.Name.str());
   for (const NameView &N : V->counterNames())
     Deps.CounterNames.push_back(N.Name.str());
   for (const HeldView &H : V->held()) {
@@ -850,6 +867,8 @@ clang::ast_cache::decodeMetadata(llvm::StringRef Bytes,
                  L.Hash};
     for (llvm::StringRef N : L.Names)
       R.Names.push_back(N.str());
+    for (const auto &[N, From] : L.Takes)
+      R.Takes.push_back({N.str(), From});
     Deps.Links.push_back(std::move(R));
   }
   Deps.Grouped = V->groups() != 0;

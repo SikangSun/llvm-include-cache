@@ -32,6 +32,7 @@
 #include "clang/ASTCache/CacheProtocol.h"
 #include "clang/ASTCache/SharedRegion.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -106,12 +107,31 @@ struct CacheDaemonOptions {
   /// of the headers inside it read without asking -- as the compile that
   /// read it last measured it. The cost is one request for it with its
   /// check, and one copy of it loaded, each the mean of its requests and
-  /// loads so far. A header no compile has asked for yet is asked for, so
-  /// at first every header is; one with requests but no loads stays while
-  /// it saves a request. Every report judges every header again, so a
+  /// loads so far. A cost not measured yet is the default: AskCutoffMicros
+  /// for the load and nothing for the request, so a header no compile has
+  /// asked for or loaded is asked for while its parse time is at least
+  /// AskCutoffMicros (226 us). Every report judges every header again, so a
   /// header can leave the list and come back.
   bool MeasuredCutoff = false;
+  /// The offline step between builds (-offline, user 2026-11-02). While
+  /// OfflineDecisions does not exist, compiles record what the fold and
+  /// merge rules read to OfflineRecord (HelloReply), and a hint that a link
+  /// succeeded (BuildHint) runs OfflineCommand with OfflineRecord and
+  /// OfflineDecisions as its last two arguments, its output to
+  /// OfflineDecisions + ".log". A lookup while it runs stops it, since the
+  /// build goes on; the next hint runs it again. The compiles the step runs
+  /// itself to merge (CLANG_HEADER_CACHE_OFFLINE=1) neither stop it nor
+  /// record, and take the decisions they are given. Once OfflineDecisions
+  /// exists, compiles take their decisions from it, record nothing, and
+  /// hints run nothing. An empty command runs nothing; OfflineDecisions
+  /// alone hands an earlier build's decisions to compiles.
+  std::vector<std::string> OfflineCommand;
+  std::string OfflineRecord, OfflineDecisions;
 };
+
+/// What the daemon's offline step did; shared with the thread that waits
+/// for a run, which can outlive the daemon.
+struct OfflineState;
 
 class CacheDaemon {
 public:
@@ -184,6 +204,11 @@ public:
     uint64_t ClaimsGranted = 0, ClaimsRefused = 0;
     /// CLANG_HEADER_CACHE_MERGE: merges granted, and merged copies stored.
     uint64_t MergesClaimed = 0, MergesStored = 0;
+    /// The offline step: hints received; runs started, finished (exit 0
+    /// with the decisions written), failed, and stopped by a lookup or a
+    /// later hint; the last finished run's wall time.
+    uint64_t BuildHints = 0, OfflineStarted = 0, OfflineFinished = 0,
+             OfflineFailed = 0, OfflineStopped = 0, OfflineMicros = 0;
   };
   Stats stats() const;
 
@@ -197,8 +222,11 @@ public:
   /// gain, and whether it is below the floor, folded or listed.
   void dumpFolds(llvm::raw_ostream &OS) const;
 
+  /// An offline run still in flight goes on, and writes its decisions.
+  ~CacheDaemon();
+
 private:
-  CacheDaemon() = default;
+  CacheDaemon();
 
   struct StoredEntry {
     /// The metadata's hash, so a push can be tested for duplication without
@@ -229,7 +257,10 @@ private:
   llvm::SmallVector<char, 0> handleClaim(const ClaimRequest &Req,
                                          uint64_t Conn);
   llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
-  llvm::SmallVector<char, 0> handleHello();
+  llvm::SmallVector<char, 0> handleHello(uint64_t Conn, bool Offline);
+  llvm::SmallVector<char, 0> handleBuildHint(const BuildHint &Hint);
+  /// Stops the offline run in flight, if any, because of \p Why.
+  void stopOffline(llvm::StringRef Why);
 
   /// Keeps what a compile of \p Build found its searches to find, and which
   /// copies it used. Mutex held.
@@ -362,6 +393,11 @@ private:
   bool cutoffLocked(const TimingReport &Report);
   /// Takes \p Path off the ask-list; true if it was on it. Mutex held.
   bool unlistLocked(llvm::StringRef Path);
+
+  std::shared_ptr<OfflineState> Offline;
+  /// The connections of compiles the offline step runs: their lookups do
+  /// not stop it. Mutex held.
+  llvm::DenseSet<uint64_t> OfflineConns;
 
   std::atomic<bool> Stopping{false};
   /// Owned by run(); shutdown() on it makes a blocked accept return.

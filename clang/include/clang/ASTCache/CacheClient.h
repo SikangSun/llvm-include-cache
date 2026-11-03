@@ -274,7 +274,20 @@ public:
   connect(llvm::StringRef SocketPath = DefaultSocketPath,
           llvm::StringRef RegionPath = {});
 
+  /// Tells the daemon at \p SocketPath that a link of \p Output succeeded
+  /// (BuildHint), for its offline step. False if no daemon took it, which
+  /// is ordinary: a build with no daemon running.
+  static bool sendBuildHint(llvm::StringRef SocketPath,
+                            llvm::StringRef Output);
+
   ~CacheClient();
+
+  /// The decisions file the daemon named when this client connected
+  /// (HelloReply::DecisionsPath), or empty.
+  llvm::StringRef decisionsPath() const { return DecisionsPath; }
+  /// Where the daemon asked this compile to record (HelloReply::RecordDir),
+  /// or empty.
+  llvm::StringRef recordDir() const { return RecordDir; }
 
   /// The stored result for \p Filename that applies to this compile, or an
   /// empty StringRef if there is none. The returned bytes live in the shared
@@ -514,7 +527,7 @@ private:
   std::unique_ptr<llvm::raw_socket_stream> Conn;
   SharedRegion Region;
   Stats Counters;
-  std::string SocketPath;
+  std::string SocketPath, DecisionsPath, RecordDir;
   /// Tells this compile's writing apart from other compiles' at the daemon.
   uint64_t ClientId = 0;
   bool SendThread = false, WaitMode = false, LastWaited = false;

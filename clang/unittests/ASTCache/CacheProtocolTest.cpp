@@ -19,6 +19,7 @@
 #include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "gtest/gtest.h"
 #include <chrono>
 #include <string>
@@ -220,10 +221,51 @@ TEST(CacheProtocolTest, HelloReplyRoundTrips) {
   EXPECT_EQ(Got->RegionPath, "/dev/shm/x.region");
   EXPECT_EQ(Got->InstanceId, 0x0123456789abcdefull);
 
+  EXPECT_EQ(Got->DecisionsPath, "");
+
+  // The decisions of the daemon's offline step, once it wrote them.
+  Out.clear();
+  encodeHelloReply({"/dev/shm/x.region", 2, "/dev/shm/x.decisions"}, Out);
+  Got = decodeHelloReply(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->DecisionsPath, "/dev/shm/x.decisions");
+  EXPECT_EQ(Got->RecordDir, "");
+
+  // Before them, where compiles record what the offline step reads.
+  Out.clear();
+  encodeHelloReply({"/dev/shm/x.region", 2, "", "/dev/shm/x.record"}, Out);
+  Got = decodeHelloReply(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->DecisionsPath, "");
+  EXPECT_EQ(Got->RecordDir, "/dev/shm/x.record");
+
   // A reply naming no file tells the client nothing it can attach to.
   Out.clear();
   encodeHelloReply({"", 1}, Out);
   EXPECT_FALSE(decodeHelloReply(body(Out)).has_value());
+}
+
+TEST(CacheProtocolTest, HelloSaysWhetherTheOfflineStepRunsTheCompile) {
+  llvm::SmallVector<char, 0> Out;
+  encodeHello(Out);
+  EXPECT_EQ(decodeHello(body(Out)), std::optional<bool>(false));
+  Out.clear();
+  encodeHello(Out, /*Offline=*/true);
+  EXPECT_EQ(decodeHello(body(Out)), std::optional<bool>(true));
+}
+
+TEST(CacheProtocolTest, BuildHintRoundTrips) {
+  llvm::SmallVector<char, 0> Out;
+  encodeBuildHint({"/src/git/git"}, Out);
+  EXPECT_EQ(peekMessageKind(body(Out)), MessageKind::BuildHint);
+  auto Got = decodeBuildHint(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->Output, "/src/git/git");
+
+  Out.clear();
+  encodeBuildHintAck(Out);
+  EXPECT_EQ(peekMessageKind(body(Out)), MessageKind::BuildHintAck);
+  EXPECT_FALSE(decodeBuildHint(body(Out)).has_value());
 }
 
 TEST(CacheProtocolTest, WrongKindIsRejected) {
@@ -709,16 +751,17 @@ TEST_F(DaemonTest, LinkLoadsCanCostNothing) {
   EXPECT_EQ(Daemon->stats().HeadersFolded, 0u);
 }
 
-TEST_F(DaemonTest, WithTheMeasuredCutoffEveryHeaderIsAskedForAtFirst) {
-  // No fixed number: a header no compile has asked for has no cost of its
-  // own to compare with, so it is asked for, however fast it parses.
+TEST_F(DaemonTest, WithTheMeasuredCutoffAHeaderIsAskedForAtFirstByTheDefault) {
+  // A header no compile has asked for or loaded has no cost of its own to
+  // compare with: its load costs the default, -ask-cutoff-us (226 us), and
+  // its requests nothing. wrapper.h's 400 us pay for it; small.h's 3 us do
+  // not.
   CacheDaemon::Options O;
   O.MeasuredCutoff = true;
   useDaemon(O);
   report({{"/src/wrapper.h", 400, 20, 3, false, 300},
           {"/src/small.h", 3, 3, 0, false, 0}});
-  EXPECT_EQ(askList(),
-            (std::vector<std::string>{"/src/wrapper.h", "/src/small.h"}));
+  EXPECT_EQ(askList(), std::vector<std::string>{"/src/wrapper.h"});
 }
 
 TEST_F(DaemonTest, TheMeasuredCutoffIsTheHeadersOwnRequestAndLoad) {
@@ -742,8 +785,9 @@ TEST_F(DaemonTest, TheMeasuredCutoffIsTheHeadersOwnRequestAndLoad) {
   ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
   EXPECT_EQ(askList(), std::vector<std::string>{"/src/big.h"})
       << "mid.h: 300 us is under 300 + 60 us; tiny.h: 30 us is under one "
-         "40 us request, with no load measured yet";
-  EXPECT_EQ(Daemon->stats().HeadersUnlisted, 2u);
+         "40 us request and the default load, 226 us, as no load is measured";
+  EXPECT_EQ(Daemon->stats().HeadersUnlisted, 1u)
+      << "only mid.h was listed first: tiny.h's 30 us is under 226 us";
   // mid.h now holds a header it used to link: 300 + 100 us.
   report({{"/src/mid.h", 400, 300, 1, false, 100}});
   EXPECT_EQ(askList(), (std::vector<std::string>{"/src/big.h", "/src/mid.h"}));
@@ -942,6 +986,139 @@ TEST_F(DaemonTest, ACopyTheIndexCannotHoldIsNotStored) {
   ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
   EXPECT_EQ(Attached->newestCopy("h256.h"), 0u);
   EXPECT_NE(Attached->newestCopy("h255.h"), 0u);
+}
+
+/// The daemon's offline step, with a shell script for offline.py: run after
+/// a link's hint with the record directory and the decisions file last.
+class OfflineTest : public DaemonTest {
+protected:
+  void useOffline(llvm::StringRef Script) {
+    CacheDaemon::Options O;
+    O.OfflineCommand = {"/bin/sh", "-c", Script.str(), "sh"};
+    O.OfflineRecord = TestDir + "/record";
+    O.OfflineDecisions = TestDir + "/decisions";
+    useDaemon(O);
+  }
+  HelloReply hello() {
+    llvm::SmallVector<char, 0> Msg;
+    encodeHello(Msg);
+    auto Reply = Daemon->handleMessage(body(Msg));
+    EXPECT_TRUE(Reply.has_value());
+    return decodeHelloReply(body(*Reply)).value_or(HelloReply{});
+  }
+  void hint() {
+    llvm::SmallVector<char, 0> Msg;
+    encodeBuildHint({"/src/a.out"}, Msg);
+    auto Reply = Daemon->handleMessage(body(Msg));
+    ASSERT_TRUE(Reply.has_value());
+    EXPECT_EQ(peekMessageKind(body(*Reply)), MessageKind::BuildHintAck);
+  }
+  /// Waits up to 20 s for \p Done.
+  template <typename F> bool waitFor(F Done) {
+    for (int I = 0; I != 2000 && !Done(); ++I)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return Done();
+  }
+};
+
+TEST_F(OfflineTest, AHintRunsTheStepAndLaterCompilesTakeItsDecisions) {
+  useOffline("test -d \"$1\" && printf 'top\\t/x.h\\n' > \"$2\"");
+  // Before: compiles record, and there are no decisions to take.
+  HelloReply Before = hello();
+  EXPECT_EQ(Before.RecordDir, TestDir + "/record");
+  EXPECT_EQ(Before.DecisionsPath, "");
+  EXPECT_TRUE(llvm::sys::fs::is_directory(TestDir + "/record"));
+
+  hint();
+  ASSERT_TRUE(waitFor([&] { return Daemon->stats().OfflineFinished == 1; }));
+  CacheDaemon::Stats S = Daemon->stats();
+  EXPECT_EQ(S.BuildHints, 1u);
+  EXPECT_EQ(S.OfflineStarted, 1u);
+  EXPECT_EQ(S.OfflineFailed, 0u);
+  HelloReply After = hello();
+  EXPECT_EQ(After.DecisionsPath, TestDir + "/decisions");
+  EXPECT_EQ(After.RecordDir, "");
+  // The log ends with the run's wall time.
+  auto Log = llvm::MemoryBuffer::getFile(TestDir + "/decisions.log");
+  ASSERT_TRUE(bool(Log));
+  EXPECT_TRUE((*Log)->getBuffer().starts_with("offline run 1: "));
+
+  // Decided: a later hint runs nothing.
+  hint();
+  EXPECT_EQ(Daemon->stats().OfflineStarted, 1u);
+  EXPECT_EQ(Daemon->stats().BuildHints, 2u);
+}
+
+TEST_F(OfflineTest, ALookupStopsARunAndTheNextHintRunsItAgain) {
+  useOffline("if [ -e \"$1/go\" ]; then printf 'top\\t/x.h\\n' > \"$2\"; "
+             "else touch \"$1/go\"; exec sleep 30; fi");
+  hint();
+  ASSERT_TRUE(waitFor(
+      [&] { return llvm::sys::fs::exists(TestDir + "/record/go"); }));
+  // The build goes on: the run reads a record still growing.
+  lookup("h.h");
+  EXPECT_EQ(Daemon->stats().OfflineStopped, 1u);
+  EXPECT_FALSE(llvm::sys::fs::exists(TestDir + "/decisions"));
+  EXPECT_EQ(hello().DecisionsPath, "");
+
+  hint();
+  ASSERT_TRUE(waitFor([&] { return Daemon->stats().OfflineFinished == 1; }));
+  EXPECT_EQ(Daemon->stats().OfflineStarted, 2u);
+  EXPECT_EQ(hello().DecisionsPath, TestDir + "/decisions");
+}
+
+TEST_F(OfflineTest, ALaterHintStopsTheRunInFlight) {
+  // The next link's hint: the run in flight read a record still growing.
+  useOffline("if [ -e \"$1/go\" ]; then printf 'top\\t/x.h\\n' > \"$2\"; "
+             "else touch \"$1/go\"; exec sleep 30; fi");
+  hint();
+  ASSERT_TRUE(waitFor(
+      [&] { return llvm::sys::fs::exists(TestDir + "/record/go"); }));
+  hint();
+  ASSERT_TRUE(waitFor([&] { return Daemon->stats().OfflineFinished == 1; }));
+  CacheDaemon::Stats S = Daemon->stats();
+  EXPECT_EQ(S.OfflineStarted, 2u);
+  EXPECT_EQ(S.OfflineStopped, 1u);
+  EXPECT_EQ(S.OfflineFailed, 0u);
+}
+
+TEST_F(OfflineTest, TheStepsOwnCompilesNeitherStopItNorRecord) {
+  // The step's merges run compiles (CLANG_HEADER_CACHE_OFFLINE=1): their
+  // lookups do not stop it, and they record nothing.
+  useOffline("touch \"$1/go\"; while [ ! -e \"$1/end\" ]; do sleep 0.01; done; "
+             "printf 'top\\t/x.h\\n' > \"$2\"");
+  hint();
+  ASSERT_TRUE(waitFor(
+      [&] { return llvm::sys::fs::exists(TestDir + "/record/go"); }));
+  const uint64_t Own = 7;
+  llvm::SmallVector<char, 0> Msg;
+  encodeHello(Msg, /*Offline=*/true);
+  auto Reply = Daemon->handleMessage(body(Msg), Own);
+  ASSERT_TRUE(Reply.has_value());
+  auto Hello = decodeHelloReply(body(*Reply));
+  ASSERT_TRUE(Hello.has_value());
+  EXPECT_EQ(Hello->RecordDir, "");
+  EXPECT_EQ(Hello->DecisionsPath, "");
+  Msg.clear();
+  encodeLookupRequest({"h.h"}, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg), Own).has_value());
+  EXPECT_EQ(Daemon->stats().OfflineStopped, 0u);
+  {
+    std::error_code EC;
+    llvm::raw_fd_ostream End(TestDir + "/record/end", EC);
+    ASSERT_FALSE(EC);
+  }
+  ASSERT_TRUE(waitFor([&] { return Daemon->stats().OfflineFinished == 1; }));
+  EXPECT_EQ(Daemon->stats().OfflineStopped, 0u);
+}
+
+TEST_F(OfflineTest, AFailedRunWritesNoDecisions) {
+  useOffline("exit 3");
+  hint();
+  ASSERT_TRUE(waitFor([&] { return Daemon->stats().OfflineFailed == 1; }));
+  EXPECT_EQ(Daemon->stats().OfflineFinished, 0u);
+  EXPECT_EQ(hello().DecisionsPath, "");
+  EXPECT_EQ(hello().RecordDir, TestDir + "/record");
 }
 
 TEST_F(DaemonTest, GarbageMessageClosesTheConnection) {

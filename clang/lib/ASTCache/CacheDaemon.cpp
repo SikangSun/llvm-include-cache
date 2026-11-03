@@ -10,13 +10,50 @@
 #include "clang/ASTCache/DependencySerialization.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_socket_stream.h"
 #include "llvm/Support/xxhash.h"
+#include <cerrno>
 #include <chrono>
+#include <csignal>
+#include <sys/wait.h>
 #include <thread>
 
 using namespace clang;
 using namespace clang::ast_cache;
+
+namespace clang {
+namespace ast_cache {
+struct OfflineState {
+  std::mutex Mutex;
+  /// The run in flight, if Running: its number, process and start.
+  std::atomic<bool> Running{false};
+  uint64_t Run = 0;
+  llvm::sys::ProcessInfo Process;
+  std::chrono::steady_clock::time_point Start;
+  /// Stats's offline counters.
+  uint64_t Started = 0, Finished = 0, Failed = 0, Stopped = 0, Micros = 0;
+
+  /// Stops the run in flight. Mutex held.
+  void stopLocked(llvm::StringRef Why) {
+    if (!Running.load(std::memory_order_acquire))
+      return;
+    Running.store(false, std::memory_order_release);
+    ++Stopped;
+    // Not reaped yet (the waiting thread reaps it with Mutex held): the
+    // process id is still its own.
+    ::kill(Process.Pid, SIGTERM);
+    llvm::outs() << "offline: run " << Run << " stopped by " << Why << "\n";
+    llvm::outs().flush();
+  }
+};
+} // namespace ast_cache
+} // namespace clang
+
+// A run in flight when the daemon exits goes on to write its decisions.
+CacheDaemon::CacheDaemon() : Offline(std::make_shared<OfflineState>()) {}
+
+CacheDaemon::~CacheDaemon() = default;
 
 llvm::Expected<std::unique_ptr<CacheDaemon>>
 CacheDaemon::create(llvm::StringRef RegionPath, uint64_t RegionSize,
@@ -32,6 +69,10 @@ CacheDaemon::create(llvm::StringRef RegionPath, uint64_t RegionSize,
   D->Region = std::move(*R);
   D->RegionPath = std::string(Absolute);
   D->Opts = Opts;
+  if (!D->Opts.OfflineRecord.empty())
+    if (std::error_code EC =
+            llvm::sys::fs::create_directories(D->Opts.OfflineRecord))
+      return llvm::createStringError(EC, "creating the record directory");
   if (D->Opts.FixedAskList) {
     for (const std::string &P : *D->Opts.FixedAskList)
       D->listLocked(P);
@@ -104,13 +145,14 @@ bool CacheDaemon::cutoffLocked(const TimingReport &Report) {
   bool Changed = false;
   for (const std::string &Path : HeldOrder) {
     // Every hit is a request too, so a hit saving less than a request and
-    // a load never pays, however many hits there are. A header not asked
-    // for yet has no cost of its own to compare with: it is asked for.
+    // a load never pays, however many hits there are. A cost not measured
+    // for the header yet is the default, -ask-cutoff-us for its load and
+    // nothing for its requests: a header no compile has asked for or loaded
+    // is asked for while its parse time is at least 226 us.
     HeaderCosts C = CostsOf.lookup(Path);
-    bool Pays = !C.Requests ||
-                HeldParse.lookup(Path) >=
-                    C.RequestMicros / C.Requests +
-                        (C.Loads ? C.LoadMicros / C.Loads : 0);
+    uint64_t Ask = C.Requests ? C.RequestMicros / C.Requests : 0;
+    uint64_t Load = C.Loads ? C.LoadMicros / C.Loads : Opts.AskCutoffMicros;
+    bool Pays = HeldParse.lookup(Path) >= Ask + Load;
     Changed |= Pays ? listLocked(Path) : unlistLocked(Path);
   }
   return Changed;
@@ -346,10 +388,110 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
   return Ack;
 }
 
-llvm::SmallVector<char, 0> CacheDaemon::handleHello() {
+llvm::SmallVector<char, 0> CacheDaemon::handleHello(uint64_t Conn,
+                                                    bool Offline) {
+  HelloReply Reply{RegionPath, Region.instanceId()};
+  // A compile the offline step runs records nothing, and takes the
+  // decisions it is given.
+  if (Offline) {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    OfflineConns.insert(Conn);
+  }
+  // Before the offline step wrote its decisions, compiles record what it
+  // reads; after, they take the decisions.
+  if (!Opts.OfflineDecisions.empty() && !Offline) {
+    if (llvm::sys::fs::exists(Opts.OfflineDecisions))
+      Reply.DecisionsPath = Opts.OfflineDecisions;
+    else
+      Reply.RecordDir = Opts.OfflineRecord;
+  }
   llvm::SmallVector<char, 0> Out;
-  encodeHelloReply({RegionPath, Region.instanceId()}, Out);
+  encodeHelloReply(Reply, Out);
   return Out;
+}
+
+llvm::SmallVector<char, 0> CacheDaemon::handleBuildHint(const BuildHint &Hint) {
+  llvm::SmallVector<char, 0> Ack;
+  encodeBuildHintAck(Ack);
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    ++Counters.BuildHints;
+  }
+  if (Opts.OfflineCommand.empty() || Opts.OfflineRecord.empty() ||
+      Opts.OfflineDecisions.empty() ||
+      llvm::sys::fs::exists(Opts.OfflineDecisions))
+    return Ack;
+  std::shared_ptr<OfflineState> S = Offline;
+  std::lock_guard<std::mutex> Lock(S->Mutex);
+  // The newest hint wins: a run in flight read a record the build was still
+  // adding to.
+  S->stopLocked("a later hint");
+  std::string Log = Opts.OfflineDecisions + ".log";
+  // The run's output starts the log afresh; the run's line follows it.
+  llvm::sys::fs::remove(Log);
+  llvm::SmallVector<llvm::StringRef, 8> Args(Opts.OfflineCommand.begin(),
+                                             Opts.OfflineCommand.end());
+  Args.push_back(Opts.OfflineRecord);
+  Args.push_back(Opts.OfflineDecisions);
+  std::optional<llvm::StringRef> Redirects[] = {llvm::StringRef(),
+                                                llvm::StringRef(Log),
+                                                llvm::StringRef(Log)};
+  std::string Err;
+  bool Failed = false;
+  llvm::sys::ProcessInfo P =
+      llvm::sys::ExecuteNoWait(Args[0], Args, std::nullopt, Redirects,
+                               /*MemoryLimit=*/0, &Err, &Failed);
+  if (Failed || !P.Pid) {
+    llvm::errs() << "clang-header-cache-daemon: offline step not started: "
+                 << Err << "\n";
+    ++S->Failed;
+    return Ack;
+  }
+  uint64_t Run = ++S->Run;
+  ++S->Started;
+  S->Process = P;
+  S->Start = std::chrono::steady_clock::now();
+  S->Running.store(true, std::memory_order_release);
+  llvm::outs() << "offline: run " << Run << " started after the link of "
+               << Hint.Output << "\n";
+  llvm::outs().flush();
+  // The thread holds the state, not the daemon: the daemon can exit first.
+  std::thread([S, P, Run, Log, Decisions = Opts.OfflineDecisions] {
+    // Waits without reaping, so that until Mutex is taken a stop's signal
+    // reaches this process and no other given its id.
+    siginfo_t Info{};
+    while (::waitid(P_PID, P.Pid, &Info, WEXITED | WNOWAIT) == -1 &&
+           errno == EINTR)
+      ;
+    std::lock_guard<std::mutex> Lock(S->Mutex);
+    ::waitpid(P.Pid, nullptr, 0);
+    int Code = Info.si_code == CLD_EXITED ? Info.si_status : -1;
+    // Stopped: counted where it was stopped.
+    if (S->Run != Run || !S->Running.load(std::memory_order_acquire))
+      return;
+    S->Running.store(false, std::memory_order_release);
+    uint64_t Micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - S->Start)
+                          .count();
+    bool Ok = Code == 0 && llvm::sys::fs::exists(Decisions);
+    ++(Ok ? S->Finished : S->Failed);
+    if (Ok)
+      S->Micros = Micros;
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(Log, EC, llvm::sys::fs::OF_Append);
+    if (!EC)
+      OS << "offline run " << Run << ": " << Micros << " us wall, exit "
+         << Code << "\n";
+    llvm::outs() << "offline: run " << Run << " " << (Ok ? "finished" : "failed")
+                 << " in " << Micros / 1000 << " ms (exit " << Code << ")\n";
+    llvm::outs().flush();
+  }).detach();
+  return Ack;
+}
+
+void CacheDaemon::stopOffline(llvm::StringRef Why) {
+  std::lock_guard<std::mutex> Lock(Offline->Mutex);
+  Offline->stopLocked(Why);
 }
 
 void CacheDaemon::endWritingLocked(uint64_t Conn, llvm::StringRef Filename) {
@@ -694,6 +836,7 @@ llvm::SmallVector<char, 0> CacheDaemon::handleClaim(const ClaimRequest &Req,
 
 void CacheDaemon::connectionClosed(uint64_t Conn) {
   std::lock_guard<std::mutex> Lock(Mutex);
+  OfflineConns.erase(Conn);
   endWritingLocked(Conn, /*Filename=*/{});
   // A claim still held when its compile ends is for a copy it wrote: one
   // declined is given back. Claims by the whole dependency list
@@ -718,6 +861,17 @@ CacheDaemon::handleMessage(llvm::StringRef Body, uint64_t Conn) {
 
   switch (*Kind) {
   case MessageKind::LookupRequest:
+    // A lookup: the build goes on, and the offline step's record with it.
+    // The offline step's own compiles look up too.
+    if (Offline->Running.load(std::memory_order_relaxed)) {
+      bool Own;
+      {
+        std::lock_guard<std::mutex> Lock(Mutex);
+        Own = OfflineConns.contains(Conn);
+      }
+      if (!Own)
+        stopOffline("a lookup");
+    }
     if (std::optional<LookupRequest> Req = decodeLookupRequest(Body))
       return handleLookup(*Req, Conn);
     return std::nullopt;
@@ -749,7 +903,13 @@ CacheDaemon::handleMessage(llvm::StringRef Body, uint64_t Conn) {
     }
     return std::nullopt;
   case MessageKind::Hello:
-    return handleHello();
+    if (std::optional<bool> Offline = decodeHello(Body))
+      return handleHello(Conn, *Offline);
+    return std::nullopt;
+  case MessageKind::BuildHint:
+    if (std::optional<BuildHint> Hint = decodeBuildHint(Body))
+      return handleBuildHint(*Hint);
+    return std::nullopt;
   case MessageKind::SeenRequest:
     if (std::optional<SeenRequest> Req = decodeSeenRequest(Body)) {
       bool Seen;
@@ -770,6 +930,7 @@ CacheDaemon::handleMessage(llvm::StringRef Body, uint64_t Conn) {
   case MessageKind::PushAck:
   case MessageKind::TimingAck:
   case MessageKind::HelloReply:
+  case MessageKind::BuildHintAck:
     // Reply kinds; a client sending one is talking nonsense.
     return std::nullopt;
   }
@@ -777,8 +938,17 @@ CacheDaemon::handleMessage(llvm::StringRef Body, uint64_t Conn) {
 }
 
 CacheDaemon::Stats CacheDaemon::stats() const {
-  std::lock_guard<std::mutex> Lock(Mutex);
-  Stats S = Counters;
+  Stats S;
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    S = Counters;
+  }
+  std::lock_guard<std::mutex> Lock(Offline->Mutex);
+  S.OfflineStarted = Offline->Started;
+  S.OfflineFinished = Offline->Finished;
+  S.OfflineFailed = Offline->Failed;
+  S.OfflineStopped = Offline->Stopped;
+  S.OfflineMicros = Offline->Micros;
   return S;
 }
 

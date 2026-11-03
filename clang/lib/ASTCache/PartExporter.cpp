@@ -159,6 +159,142 @@ private:
   const SourceManager &SM;
 };
 
+/// The structs, unions and enums the declarations traversed need complete,
+/// by canonical declaration: one held by value (a field, variable,
+/// parameter, result, array element or an expression's value), or one whose
+/// member, size or alignment is read, or a pointer to which is moved,
+/// compared in order, or cast to or from another pointed-to type. A
+/// pointer to one needs it declared only (git's submodule.h: `struct
+/// strvec;` and functions taking `struct strvec *`).
+class CompleteTags : public RecursiveASTVisitor<CompleteTags> {
+public:
+  llvm::DenseSet<const TagDecl *> Needed;
+
+  bool VisitDecl(Decl *D) {
+    for (const auto *A : D->specific_attrs<AlignedAttr>())
+      if (!A->isAlignmentExpr() && A->getAlignmentType())
+        byValue(A->getAlignmentType()->getType());
+    return true;
+  }
+  bool VisitValueDecl(ValueDecl *D) {
+    byValue(D->getType());
+    return true;
+  }
+  bool VisitDeclaratorDecl(DeclaratorDecl *D) {
+    // A parameter as written: `struct s a[]` needs struct s complete,
+    // though the parameter is a pointer.
+    if (TypeSourceInfo *T = D->getTypeSourceInfo())
+      byValue(T->getType());
+    return true;
+  }
+  bool VisitTypedefNameDecl(TypedefNameDecl *D) {
+    // `typedef struct s s_t;` names the struct, and needs it declared only.
+    QualType T = D->getUnderlyingType().getCanonicalType();
+    if (!isa<TagType>(T))
+      byValue(T);
+    return true;
+  }
+  bool VisitExpr(Expr *E) {
+    byValue(E->getType());
+    return true;
+  }
+  bool VisitMemberExpr(MemberExpr *E) {
+    QualType Base = E->getBase()->getType();
+    byValue(E->isArrow() ? Base->getPointeeType() : Base);
+    return true;
+  }
+  bool VisitArraySubscriptExpr(ArraySubscriptExpr *E) {
+    pointee(E->getLHS()->getType());
+    pointee(E->getRHS()->getType());
+    return true;
+  }
+  bool VisitBinaryOperator(BinaryOperator *E) {
+    if (E->isAdditiveOp() || E->isRelationalOp() ||
+        E->getOpcode() == BO_AddAssign || E->getOpcode() == BO_SubAssign) {
+      pointee(E->getLHS()->getType());
+      pointee(E->getRHS()->getType());
+    }
+    return true;
+  }
+  bool VisitUnaryOperator(UnaryOperator *E) {
+    if (E->isIncrementDecrementOp())
+      pointee(E->getSubExpr()->getType());
+    return true;
+  }
+  bool VisitCastExpr(CastExpr *E) {
+    // -Wcast-align, and the check of a call's arguments, compare the
+    // alignments of the two pointed-to types.
+    if (E->getCastKind() != CK_BitCast)
+      return true;
+    const auto *To = E->getType()->getAs<PointerType>();
+    const auto *From = E->getSubExpr()->getType()->getAs<PointerType>();
+    if (!To || !From || To->getPointeeType()->isVoidType() ||
+        From->getPointeeType()->isVoidType() ||
+        To->getPointeeType().getCanonicalType().getUnqualifiedType() ==
+            From->getPointeeType().getCanonicalType().getUnqualifiedType())
+      return true;
+    byValue(To->getPointeeType());
+    byValue(From->getPointeeType());
+    return true;
+  }
+  bool VisitUnaryExprOrTypeTraitExpr(UnaryExprOrTypeTraitExpr *E) {
+    byValue(E->getTypeOfArgument());
+    return true;
+  }
+  bool VisitOffsetOfExpr(OffsetOfExpr *E) {
+    byValue(E->getTypeSourceInfo()->getType());
+    return true;
+  }
+  bool VisitGenericSelectionExpr(GenericSelectionExpr *E) {
+    for (const TypeSourceInfo *T : E->getAssocTypeSourceInfos())
+      if (T)
+        byValue(T->getType());
+    return true;
+  }
+  bool VisitTypeTraitExpr(TypeTraitExpr *E) {
+    for (const TypeSourceInfo *T : E->getArgs())
+      byValue(T->getType());
+    return true;
+  }
+  bool VisitAtomicExpr(AtomicExpr *E) {
+    for (Stmt *S : E->children())
+      if (auto *X = dyn_cast_or_null<Expr>(S))
+        pointee(X->getType());
+    return true;
+  }
+
+private:
+  void pointee(QualType T) {
+    if (const auto *P = T->getAs<PointerType>())
+      byValue(P->getPointeeType());
+  }
+  void byValue(QualType T) { walk(T, /*Value=*/true); }
+  /// The tags in \p T: held by value if \p Value and not behind a pointer,
+  /// and every array's element, which C requires complete.
+  void walk(QualType T, bool Value) {
+    if (T.isNull())
+      return;
+    const Type *Ty = T.getCanonicalType().getTypePtr();
+    if (const auto *A = dyn_cast<ArrayType>(Ty))
+      return walk(A->getElementType(), true);
+    if (const auto *A = dyn_cast<AtomicType>(Ty))
+      return walk(A->getValueType(), true);
+    if (const auto *P = dyn_cast<PointerType>(Ty))
+      return walk(P->getPointeeType(), false);
+    if (const auto *P = dyn_cast<BlockPointerType>(Ty))
+      return walk(P->getPointeeType(), false);
+    if (const auto *F = dyn_cast<FunctionType>(Ty)) {
+      walk(F->getReturnType(), true);
+      if (const auto *FP = dyn_cast<FunctionProtoType>(F))
+        for (QualType Param : FP->getParamTypes())
+          walk(Param, true);
+      return;
+    }
+    if (const auto *Tag = dyn_cast<TagType>(Ty); Tag && Value)
+      Needed.insert(Tag->getDecl()->getCanonicalDecl());
+  }
+};
+
 class Exporter : public PartExporter, public PPCallbacks {
 public:
   Exporter(CompilerInstance &CI, ASTCacheDependencyTracker &Tracker,
@@ -2154,6 +2290,35 @@ private:
     return false;
   }
 
+  /// The fingerprint of the declaration \p D names as it was where \p P
+  /// began, as the part's own references are recorded: its redeclarations
+  /// and definitions on the part's lines, or in copies loaded inside it,
+  /// left out. None if the name finds nothing made before the part.
+  std::optional<std::string>
+  fingerprintAtBegin(const Part &P, const DeclarationDependency &D) {
+    Preprocessor &PP = CI.getPreprocessor();
+    IdentifierInfo *II = PP.getIdentifierInfo(D.Name);
+    PP.refreshIdentifier(*II);
+    NamedDecl *Live = ASTReader::lookupAtFileScope(
+        CI.getSema(), *II, D.In == DeclarationDependency::Space::Tag,
+        /*CreateBuiltin=*/false);
+    auto Before = [&](const Decl *R) { return beforePart(P, R); };
+    const Decl *AtEntry = Live ? Live->getMostRecentDecl() : nullptr;
+    while (AtEntry && !Before(AtEntry))
+      AtEntry = AtEntry->getPreviousDecl();
+    if (!AtEntry)
+      return std::nullopt;
+    // A struct the link needs only declared, as it only points to it,
+    // stays so.
+    bool Declared = llvm::StringRef(D.Fingerprint).ends_with(" declared");
+    auto Counts = [&](const Decl *R) {
+      return Before(R) && !(Declared && isa<TagDecl>(R) &&
+                            cast<TagDecl>(R)->isCompleteDefinition());
+    };
+    return declarationFingerprint(*cast<NamedDecl>(AtEntry), Counts,
+                                  LayoutPart::IfComputed, maskedNames());
+  }
+
   /// As whereIs, for the declaration of \p Name the link \p From of \p P
   /// found: the latest made before it, not its own or one after it.
   int whereIsBefore(const Part &P, bool Tag, llvm::StringRef Name, int From) {
@@ -2212,6 +2377,31 @@ private:
       return -2;
     }
     return -1;
+  }
+
+  /// The typedefs and tags among \p Declares, the names \p P's lines declare
+  /// ("o:", "t:"), whose latest declaration at \p P's end is in \p P's
+  /// lines, where a header \p P links declared the name too
+  /// (HeaderDependencySet::Latest).
+  std::vector<std::string> latestOwn(const Part &P,
+                                     llvm::ArrayRef<std::string> Declares) {
+    std::vector<std::string> Out;
+    Preprocessor &PP = CI.getPreprocessor();
+    for (llvm::StringRef N : Declares) {
+      bool Tag = N.starts_with("t:");
+      IdentifierInfo *II = PP.getIdentifierInfo(N.drop_front(2));
+      PP.refreshIdentifier(*II);
+      NamedDecl *Found = ASTReader::lookupAtFileScope(
+          CI.getSema(), *II, Tag, /*CreateBuiltin=*/false);
+      if (!Found || (!Tag && !isa<TypedefNameDecl>(Found)) ||
+          Found->isFromASTFile() || !inPart(P, Found->getLocation()))
+        continue;
+      if (llvm::any_of(Found->redecls(), [&](const Decl *R) {
+            return linkedDecl(P, *cast<NamedDecl>(R));
+          }))
+        Out.push_back(N.str());
+    }
+    return Out;
   }
 
   /// Whether \p ND, which \p P's lines name, is a linked header's.
@@ -2310,6 +2500,15 @@ private:
         if (getenv("DEBUG_LINK"))
           llvm::errs() << "OUTSIDE " << P.Stored << " " << (Tag ? "tag " : "")
                        << D.Name << " from link " << From << " -> " << K << "\n";
+        // Where the tree gives it, a hit resolves the link's references
+        // there (LinkRecord::Takes).
+        auto Takes = [&](int32_t In) {
+          std::vector<std::pair<std::string, int32_t>> &T =
+              Deps.Links[P.LinkOrder[From]].Takes;
+          std::pair<std::string, int32_t> E{(Tag ? "t:" : "o:") + D.Name, In};
+          if (!llvm::is_contained(T, E))
+            T.push_back(std::move(E));
+        };
         // In the part's own lines: with TakeParents, loaded with the links
         // in one call, the link's name finds it there, and the part's check
         // needs nothing.
@@ -2317,6 +2516,7 @@ private:
           if (!TakeParents)
             return decline(P, "a copy it links names a declaration of its "
                               "own lines: " + D.Name);
+          Takes(-1);
           continue;
         }
         if (K >= 0) {
@@ -2324,9 +2524,21 @@ private:
           std::string N = (Tag ? "t:" : "o:") + D.Name;
           if (!llvm::is_contained(Names, N))
             Names.push_back(std::move(N));
-        } else if (!llvm::is_contained(LinkNeeds, D)) {
-          LinkNeeds.push_back(D);
+          Takes(static_cast<int32_t>(P.LinkOrder[K]));
+          continue;
         }
+        // Outside the tree: a hit checks it where the part begins, as the
+        // part's own references, not as the link saw it after what the
+        // part's lines and earlier links add, which the tree brings along.
+        // ngx_event.h defines struct ngx_event_s; ngx_event_timer.h, linked
+        // at its end, saw ngx_core.h's ngx_event_t name a defined struct,
+        // which where ngx_event.h begins is only declared, so ngx_event.h's
+        // copy never fitted.
+        DeclarationDependency Need = D;
+        if (std::optional<std::string> F = fingerprintAtBegin(P, D))
+          Need.Fingerprint = std::move(*F);
+        if (!llvm::is_contained(LinkNeeds, Need))
+          LinkNeeds.push_back(std::move(Need));
       }
     }
 
@@ -2354,6 +2566,8 @@ private:
       heldHeaders(P, Deps);
     ownNames(P, P.Linked ? &Deps.Declares : nullptr, Deps.Owned);
     Counts.OwnedKeys += Deps.Owned.size();
+    if (P.Linked && !P.Links.empty())
+      Deps.Latest = latestOwn(P, Deps.Declares);
 
     // The same header, metadata and compiler options give the same name in
     // any compile, which lets the daemon recognise a part it already holds.
@@ -4343,6 +4557,26 @@ private:
     // fingerprint is of the declarations made before the header: the latest
     // of them, and none of the header's own redeclarations or definitions.
     auto Before = [&](const Decl *D) { return beforePart(P, D); };
+    // The structs the part's lines and the copies it folds need complete,
+    // found when a reference first asks.
+    std::optional<llvm::DenseSet<const TagDecl *>> Complete;
+    auto NeedsComplete = [&](const TagDecl &T) {
+      if (!Complete) {
+        CompleteTags V;
+        ASTContext &Ctx = CI.getASTContext();
+        Decl *First =
+            P.DeclsAfter
+                ? const_cast<Decl *>(P.DeclsAfter)->getNextDeclInContext()
+                : *Ctx.getTranslationUnitDecl()->noload_decls_begin();
+        for (Decl *D = First; D; D = D->getNextDeclInContext())
+          if (inPart(P, D->getLocation()))
+            V.TraverseDecl(D);
+        for (const Decl *D : FoldedDecls)
+          V.TraverseDecl(const_cast<Decl *>(D));
+        Complete = std::move(V.Needed);
+      }
+      return Complete->contains(T.getCanonicalDecl());
+    };
     llvm::DenseSet<std::pair<unsigned, IdentifierInfo *>> Seen;
     auto Require = [&](const NamedDecl &ND) {
       DeclarationDependency::Space In = nameSpaceOf(ND);
@@ -4351,8 +4585,20 @@ private:
       const Decl *AtEntry = ND.getMostRecentDecl();
       while (AtEntry && !Before(AtEntry))
         AtEntry = AtEntry->getPreviousDecl();
+      // A named struct, or a typedef of one, that the part only points to
+      // need only be declared where the part begins, whatever the compile
+      // that wrote it had read first. A deep copy holds the definition.
+      const TagDecl *Tag = dyn_cast<TagDecl>(&ND);
+      if (const auto *TD = dyn_cast<TypedefNameDecl>(&ND))
+        Tag = TD->getUnderlyingType().getCanonicalType()->getAsTagDecl();
+      bool Declared =
+          Named && Tag && Tag->getIdentifier() && !NeedsComplete(*Tag);
+      auto Counts = [&](const Decl *R) {
+        return Before(R) && !(Declared && isa<TagDecl>(R) &&
+                              cast<TagDecl>(R)->isCompleteDefinition());
+      };
       std::optional<std::string> F = declarationFingerprint(
-          AtEntry ? *cast<NamedDecl>(AtEntry) : ND, Before,
+          AtEntry ? *cast<NamedDecl>(AtEntry) : ND, Counts,
           LayoutPart::IfComputed, maskedNames());
       if (!F)
         return false;
@@ -4573,10 +4819,20 @@ static FrontendPluginRegistry::Add<ExportPlugin>
     ExportPluginEntry("header-cache-export",
                       "tells the header cache when a declaration is finished");
 
+static std::string &recordDirSetting() {
+  static std::string Dir;
+  return Dir;
+}
+
+void clang::ast_cache::setRecordDir(llvm::StringRef Dir) {
+  recordDirSetting() = Dir.str();
+}
+
 const std::string &clang::ast_cache::recordFile() {
   static const std::string File = [] {
-    const char *Dir = std::getenv("CLANG_HEADER_CACHE_RECORD");
-    if (!Dir || !*Dir)
+    const char *Env = std::getenv("CLANG_HEADER_CACHE_RECORD");
+    std::string Dir = Env && *Env ? std::string(Env) : recordDirSetting();
+    if (Dir.empty())
       return std::string();
     auto Now = std::chrono::system_clock::now().time_since_epoch();
     return std::string(Dir) + "/" + std::to_string(::getpid()) + "-" +

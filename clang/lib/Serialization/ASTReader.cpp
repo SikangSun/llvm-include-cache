@@ -8713,6 +8713,45 @@ NamedDecl *ASTReader::lookupAtFileScope(Sema &S, IdentifierInfo &II, bool Tag,
   return R.getAsSingle<NamedDecl>();
 }
 
+NamedDecl *ASTReader::findNameInModules(IdentifierInfo &II, bool Tag,
+                                        ArrayRef<ModuleFile *> Modules) {
+  if (Modules.empty())
+    return nullptr;
+  auto In = [&](const ModuleFile *M) { return llvm::is_contained(Modules, M); };
+  unsigned IDNS = Tag ? Decl::IDNS_Tag : Decl::IDNS_Ordinary;
+  if (II.isOutOfDate())
+    updateOutOfDateIdentifier(II);
+  // The latest the modules made is the first the resolver keeps of them;
+  // where a declaration made since replaced it there, the latest of them in
+  // its chain (graph.h's SwsLut3D, lut3d.h's in the text, after uops.h
+  // declared it again as text).
+  if (SemaObj) {
+    NamedDecl *Other = nullptr;
+    for (auto I = SemaObj->IdResolver.begin(&II),
+              E = SemaObj->IdResolver.end();
+         I != E; ++I) {
+      NamedDecl *D = *I;
+      if (!D->isInIdentifierNamespace(IDNS) || !isAtFileScope(D))
+        continue;
+      if (D->isFromASTFile() && In(getOwningModuleFile(D)))
+        return D;
+      if (!Other)
+        Other = D;
+    }
+    if (Other)
+      for (Decl *R = Other->getMostRecentDecl(); R; R = R->getPreviousDecl())
+        if (R->isFromASTFile() && In(getOwningModuleFile(R)))
+          return cast<NamedDecl>(R);
+  }
+  // Read in the middle of another read, the modules' declarations wait in
+  // PendingIdentifierInfos, not yet in their chains: one taken from there
+  // would be a second struct client (Redis's networking.c, "incompatible
+  // pointer types") or a variable never marked used (nginx's
+  // ngx_event_timer.h). The name resolves as any other: as no lookup of it
+  // ran since the modules loaded, no declaration made after them is found.
+  return nullptr;
+}
+
 NamedDecl *ASTReader::findInEveryModule(IdentifierInfo &II, bool Tag,
                                         const ModuleFile *From) {
   IdentifierGeneration[&II] = 0;

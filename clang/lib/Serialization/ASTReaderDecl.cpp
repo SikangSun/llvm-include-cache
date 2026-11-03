@@ -4005,6 +4005,8 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
     if (!Parent) {
       Found = Reader.getPinnedNameReference(F, *II, Tag);
       if (!Found)
+        Found = Reader.resolvePartName(F, *II, Tag);
+      if (!Found)
         if (Sema *S = Reader.getSema())
           Found = ASTReader::lookupAtFileScope(*S, *II, Tag,
                                                /*CreateBuiltin=*/false);

@@ -39,7 +39,7 @@ namespace ast_cache {
 /// version it does not know declines the whole metadata rather than
 /// guessing: misread metadata is metadata with the wrong contents, which is
 /// exactly the failure mode that validates where it must not.
-constexpr uint32_t DependencyEncodingVersion = 23;
+constexpr uint32_t DependencyEncodingVersion = 25;
 
 /// Writes \p Deps, with the module name of the copy they describe, in the
 /// stored form; and in \p NameAt, if set, where the name's bytes are,
@@ -180,6 +180,8 @@ struct LinkView {
   bool OnGuard = false;
   llvm::SmallVector<llvm::StringRef, 4> Names;
   uint64_t Hash = 0;
+  /// LinkRecord::Takes.
+  llvm::SmallVector<std::pair<llvm::StringRef, int32_t>, 2> Takes;
   static LinkView read(ByteReader &R);
 };
 /// guard+ tolerance (HeldHeader).
@@ -366,6 +368,9 @@ public:
   MetadataSection<DeclarationView> owned() const {
     return section<DeclarationView>(Owned);
   }
+  MetadataSection<NameView> latest() const {
+    return section<NameView>(Latest);
+  }
 
   enum Section : unsigned {
     Conditional,
@@ -391,6 +396,7 @@ public:
     CounterNames,
     HeldHeaders,
     Owned,
+    Latest,
     Groups,
     NumSections
   };

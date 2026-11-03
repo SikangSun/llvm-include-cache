@@ -69,6 +69,8 @@ enum class MessageKind : uint8_t {
   NoticeAck = 12,
   ClaimRequest = 13,
   ClaimReply = 14,
+  BuildHint = 15,
+  BuildHintAck = 16,
 };
 
 /// What a copy's #include searches found in one build, under one search key
@@ -227,6 +229,13 @@ struct TimingReport {
 struct HelloReply {
   std::string RegionPath;
   uint64_t InstanceId = 0;
+  /// The decisions the daemon's offline step wrote for this build
+  /// (CLANG_HEADER_CACHE_DECISIONS's file format), or empty: none yet, or no
+  /// offline step.
+  std::string DecisionsPath;
+  /// Where the compile records what the offline step reads
+  /// (CLANG_HEADER_CACHE_RECORD's directory), or empty: no recording.
+  std::string RecordDir;
 };
 
 /// CLANG_HEADER_CACHE_SECOND_MISS: a compile about to write the copy of
@@ -257,6 +266,14 @@ struct ClaimRequest {
   bool Release = false;
 };
 
+/// Sent by the clang driver once a link it ran succeeded: a program or
+/// library of the build is done, and the build may be. The daemon starts its
+/// offline step (clang-header-cache-daemon -offline) on it; \p Output names
+/// what was linked, for the daemon's log.
+struct BuildHint {
+  std::string Output;
+};
+
 /// Largest message accepted, in bytes. A parsed header is the big payload
 /// here and runs to a few megabytes; the cap exists so a corrupt length
 /// prefix fails immediately instead of trying to allocate whatever 32 bits
@@ -277,7 +294,9 @@ void encodePushAck(llvm::SmallVectorImpl<char> &Out);
 void encodeTimingReport(const TimingReport &Report,
                         llvm::SmallVectorImpl<char> &Out);
 void encodeTimingAck(llvm::SmallVectorImpl<char> &Out);
-void encodeHello(llvm::SmallVectorImpl<char> &Out);
+/// \p Offline: the compile is one the daemon's offline step runs
+/// (CLANG_HEADER_CACHE_OFFLINE=1), which its lookups do not stop.
+void encodeHello(llvm::SmallVectorImpl<char> &Out, bool Offline = false);
 void encodeHelloReply(const HelloReply &Reply,
                       llvm::SmallVectorImpl<char> &Out);
 void encodeSeenRequest(const SeenRequest &Req,
@@ -289,6 +308,8 @@ void encodeNoticeAck(llvm::SmallVectorImpl<char> &Out);
 void encodeClaimRequest(const ClaimRequest &Req,
                         llvm::SmallVectorImpl<char> &Out);
 void encodeClaimReply(bool Granted, llvm::SmallVectorImpl<char> &Out);
+void encodeBuildHint(const BuildHint &Hint, llvm::SmallVectorImpl<char> &Out);
+void encodeBuildHintAck(llvm::SmallVectorImpl<char> &Out);
 
 //===----------------------------------------------------------------------===//
 // Decoding. \p Body is one message with the length prefix already stripped;
@@ -304,12 +325,15 @@ std::optional<LookupRequest> decodeLookupRequest(llvm::StringRef Body);
 std::optional<LookupResponse> decodeLookupResponse(llvm::StringRef Body);
 std::optional<ReceivedPush> decodePushRequest(llvm::StringRef Body);
 std::optional<TimingReport> decodeTimingReport(llvm::StringRef Body);
+/// The Hello's Offline flag.
+std::optional<bool> decodeHello(llvm::StringRef Body);
 std::optional<HelloReply> decodeHelloReply(llvm::StringRef Body);
 std::optional<SeenRequest> decodeSeenRequest(llvm::StringRef Body);
 std::optional<bool> decodeSeenReply(llvm::StringRef Body);
 std::optional<WritingNotice> decodeWritingNotice(llvm::StringRef Body);
 std::optional<ClaimRequest> decodeClaimRequest(llvm::StringRef Body);
 std::optional<bool> decodeClaimReply(llvm::StringRef Body);
+std::optional<BuildHint> decodeBuildHint(llvm::StringRef Body);
 
 //===----------------------------------------------------------------------===//
 // Framed transport over a connected socket.

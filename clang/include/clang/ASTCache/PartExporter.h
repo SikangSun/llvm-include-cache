@@ -53,6 +53,10 @@ class WarningPragmaTracker;
 /// fold and merge rules to read after the build: <dir>/<pid>-<ns>.rec.
 /// Empty when the variable is not set.
 const std::string &recordFile();
+/// Without CLANG_HEADER_CACHE_RECORD, the directory recordFile() is in: the
+/// one the daemon named (CacheClient::recordDir). Before recordFile()'s
+/// first call.
+void setRecordDir(llvm::StringRef Dir);
 /// Appends \p Lines, each ending in a newline, to recordFile() if it is set.
 void appendRecord(llvm::StringRef Lines);
 

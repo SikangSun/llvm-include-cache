@@ -175,8 +175,10 @@ void clang::ast_cache::encodeTimingAck(llvm::SmallVectorImpl<char> &Out) {
   frame(Out, MessageKind::TimingAck, [](ByteWriter &) {});
 }
 
-void clang::ast_cache::encodeHello(llvm::SmallVectorImpl<char> &Out) {
-  frame(Out, MessageKind::Hello, [](ByteWriter &) {});
+void clang::ast_cache::encodeHello(llvm::SmallVectorImpl<char> &Out,
+                                   bool Offline) {
+  frame(Out, MessageKind::Hello,
+        [&](ByteWriter &W) { W.u8(Offline ? 1 : 0); });
 }
 
 void clang::ast_cache::encodeHelloReply(const HelloReply &Reply,
@@ -184,6 +186,8 @@ void clang::ast_cache::encodeHelloReply(const HelloReply &Reply,
   frame(Out, MessageKind::HelloReply, [&](ByteWriter &W) {
     W.str(Reply.RegionPath);
     W.u64(Reply.InstanceId);
+    W.str(Reply.DecisionsPath);
+    W.str(Reply.RecordDir);
   });
 }
 
@@ -229,6 +233,16 @@ void clang::ast_cache::encodeClaimReply(bool Granted,
         [&](ByteWriter &W) { W.u8(Granted ? 1 : 0); });
 }
 
+void clang::ast_cache::encodeBuildHint(const BuildHint &Hint,
+                                       llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::BuildHint,
+        [&](ByteWriter &W) { W.str(Hint.Output); });
+}
+
+void clang::ast_cache::encodeBuildHintAck(llvm::SmallVectorImpl<char> &Out) {
+  frame(Out, MessageKind::BuildHintAck, [](ByteWriter &) {});
+}
+
 //===----------------------------------------------------------------------===//
 // Decoding
 //===----------------------------------------------------------------------===//
@@ -266,6 +280,10 @@ clang::ast_cache::peekMessageKind(llvm::StringRef Body) {
     return MessageKind::ClaimRequest;
   case static_cast<uint8_t>(MessageKind::ClaimReply):
     return MessageKind::ClaimReply;
+  case static_cast<uint8_t>(MessageKind::BuildHint):
+    return MessageKind::BuildHint;
+  case static_cast<uint8_t>(MessageKind::BuildHintAck):
+    return MessageKind::BuildHintAck;
   default:
     return std::nullopt;
   }
@@ -384,6 +402,16 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
   return Report;
 }
 
+std::optional<bool> clang::ast_cache::decodeHello(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::Hello))
+    return std::nullopt;
+  uint8_t Offline = R.u8();
+  if (!R.ok() || !R.atEnd() || Offline > 1)
+    return std::nullopt;
+  return Offline == 1;
+}
+
 std::optional<HelloReply>
 clang::ast_cache::decodeHelloReply(llvm::StringRef Body) {
   ByteReader R(Body);
@@ -392,6 +420,8 @@ clang::ast_cache::decodeHelloReply(llvm::StringRef Body) {
   HelloReply Reply;
   Reply.RegionPath = R.str().str();
   Reply.InstanceId = R.u64();
+  Reply.DecisionsPath = R.str().str();
+  Reply.RecordDir = R.str().str();
   if (!R.ok() || !R.atEnd() || Reply.RegionPath.empty())
     return std::nullopt;
   return Reply;
@@ -439,6 +469,18 @@ clang::ast_cache::decodeClaimRequest(llvm::StringRef Body) {
     return std::nullopt;
   Req.Release = Release == 1;
   return Req;
+}
+
+std::optional<BuildHint>
+clang::ast_cache::decodeBuildHint(llvm::StringRef Body) {
+  ByteReader R(Body);
+  if (!expectKind(R, MessageKind::BuildHint))
+    return std::nullopt;
+  BuildHint Hint;
+  Hint.Output = R.str().str();
+  if (!R.ok() || !R.atEnd())
+    return std::nullopt;
+  return Hint;
 }
 
 std::optional<bool> clang::ast_cache::decodeClaimReply(llvm::StringRef Body) {
