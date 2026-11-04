@@ -531,6 +531,18 @@ bool PCHValidator::ReadLanguageOptions(const LangOptions &LangOpts,
                                        StringRef ModuleFilename, bool Complain,
                                        bool AllowCompatibleDifferences) {
   const LangOptions &ExistingLangOpts = PP.getLangOpts();
+  // A header cache copy may come from a compile with another stack protector
+  // mode: Linux builds a few files with -fno-stack-protector. Only code
+  // generation and the __SSP__ macros read the mode, and a header that tests
+  // those macros records the test in its copy, which the cache checks.
+  if (Reader.readingHeaderCacheParts() &&
+      LangOpts.getStackProtector() != ExistingLangOpts.getStackProtector()) {
+    LangOptions Same = LangOpts;
+    Same.setStackProtector(ExistingLangOpts.getStackProtector());
+    return checkLanguageOptions(Same, ExistingLangOpts, ModuleFilename,
+                                Complain ? &Reader.Diags : nullptr,
+                                AllowCompatibleDifferences);
+  }
   return checkLanguageOptions(LangOpts, ExistingLangOpts, ModuleFilename,
                               Complain ? &Reader.Diags : nullptr,
                               AllowCompatibleDifferences);
@@ -2071,7 +2083,74 @@ struct AbbrevRun {
   std::vector<uint8_t> Bytes;
   std::vector<std::shared_ptr<llvm::BitCodeAbbrev>> Abbrevs;
 };
+
+/// An abbreviation definition between a block's records, as readInlineAbbrev
+/// last read it for its block ID and its place among the block's
+/// abbreviations: its bits, and what it defines.
+struct InlineAbbrev {
+  uint64_t Bits = 0;
+  SmallVector<uint64_t, 2> Words;
+  std::shared_ptr<llvm::BitCodeAbbrev> Abbrev;
+};
 } // namespace
+
+/// Reads the abbreviation definition after a DEFINE_ABBREV code the cursor
+/// read in a block of ID \p BlockID, as BitstreamCursor::advance does. The
+/// files one writer wrote define the same abbreviations at the same places
+/// in a block: a definition with the bits the last one there had is taken
+/// as read, as in ReadBlockAbbrevs. Parsing and allocating each of them
+/// again was most of the cost of a small file's control and AST blocks.
+static llvm::Error readInlineAbbrev(BitstreamCursor &Cursor,
+                                    unsigned BlockID) {
+  static thread_local llvm::DenseMap<std::pair<unsigned, unsigned>,
+                                     InlineAbbrev>
+      Seen;
+  InlineAbbrev &Last =
+      Seen[{BlockID, unsigned(Cursor.getCurrentAbbrevs().size())}];
+  uint64_t Start = Cursor.GetCurrentBitNo();
+  if (Last.Abbrev && Cursor.canSkipToPos((Start + Last.Bits + 7) / 8)) {
+    bool Same = true;
+    uint64_t Left = Last.Bits;
+    for (uint64_t Word : Last.Words) {
+      unsigned N = std::min<uint64_t>(Left, 64);
+      Expected<uint64_t> Read = Cursor.Read(N);
+      if (!Read) {
+        consumeError(Read.takeError());
+        Same = false;
+        break;
+      }
+      if (*Read != Word) {
+        Same = false;
+        break;
+      }
+      Left -= N;
+    }
+    if (Same) {
+      Cursor.addAbbrevs(Last.Abbrev);
+      return llvm::Error::success();
+    }
+    if (llvm::Error Err = Cursor.JumpToBit(Start))
+      return Err;
+  }
+
+  if (llvm::Error Err = Cursor.ReadAbbrevRecord())
+    return Err;
+  uint64_t End = Cursor.GetCurrentBitNo();
+  Last.Abbrev = Cursor.getCurrentAbbrevs().back();
+  Last.Bits = End - Start;
+  Last.Words.clear();
+  if (llvm::Error Err = Cursor.JumpToBit(Start))
+    return Err;
+  for (uint64_t Left = Last.Bits; Left;) {
+    unsigned N = std::min<uint64_t>(Left, 64);
+    Expected<uint64_t> Read = Cursor.Read(N);
+    if (!Read)
+      return Read.takeError();
+    Last.Words.push_back(*Read);
+    Left -= N;
+  }
+  return llvm::Error::success();
+}
 
 /// Enter a subblock of the specified BlockID with the specified cursor. Read
 /// the abbreviations that are at the top of the block and then leave the cursor
@@ -2295,6 +2374,10 @@ MacroInfo *ASTReader::ReadMacroRecord(ModuleFile &F, uint64_t Offset) {
       }
 
       ++NumMacrosRead;
+      // The macro ends with its last token: reading the record after it,
+      // the next macro's, only to see that, cost as much as a short macro.
+      if (MacroTokens.empty())
+        return Macro;
       break;
     }
 
@@ -2310,6 +2393,8 @@ MacroInfo *ASTReader::ReadMacroRecord(ModuleFile &F, uint64_t Offset) {
       unsigned Idx = 0;
       MacroTokens[0] = ReadToken(F, Record, Idx);
       MacroTokens = MacroTokens.drop_front();
+      if (MacroTokens.empty())
+        return Macro;
       break;
     }
     }
@@ -2593,19 +2678,26 @@ static uint32_t mixNameHash(uint32_t H) {
   return H ^ (H >> 16);
 }
 
+void ASTReader::reserveNameTable(size_t Names) {
+  // At most half full.
+  if (Names * 2 <= NameSlots.size())
+    return;
+  std::vector<NameSlot> Old = std::move(NameSlots);
+  NameSlots.assign(std::max<size_t>(4096, llvm::PowerOf2Ceil(Names * 2)),
+                   NameSlot());
+  size_t Mask = NameSlots.size() - 1;
+  for (const NameSlot &S : Old)
+    if (S.First != ~0u)
+      for (size_t I = mixNameHash(S.Hash) & Mask;; I = (I + 1) & Mask)
+        if (NameSlots[I].First == ~0u) {
+          NameSlots[I] = S;
+          break;
+        }
+}
+
 void ASTReader::addToNameTable(uint32_t Hash, unsigned Module) {
-  if (NameSlotsUsed * 2 >= NameSlots.size()) {
-    std::vector<NameSlot> Old = std::move(NameSlots);
-    NameSlots.assign(std::max<size_t>(4096, Old.size() * 2), NameSlot());
-    size_t Mask = NameSlots.size() - 1;
-    for (const NameSlot &S : Old)
-      if (S.First != ~0u)
-        for (size_t I = mixNameHash(S.Hash) & Mask;; I = (I + 1) & Mask)
-          if (NameSlots[I].First == ~0u) {
-            NameSlots[I] = S;
-            break;
-          }
-  }
+  if (NameSlotsUsed * 2 >= NameSlots.size())
+    reserveNameTable(NameSlotsUsed + 1);
   size_t Mask = NameSlots.size() - 1;
   for (size_t I = mixNameHash(Hash) & Mask;; I = (I + 1) & Mask) {
     NameSlot &S = NameSlots[I];
@@ -3311,7 +3403,8 @@ ASTReader::ReadControlBlock(ModuleFile &F,
   unsigned NumUserInputs = 0;
   StringRef BaseDirectoryAsWritten;
   while (true) {
-    Expected<llvm::BitstreamEntry> MaybeEntry = Stream.advance();
+    Expected<llvm::BitstreamEntry> MaybeEntry =
+        Stream.advance(BitstreamCursor::AF_DontAutoprocessAbbrevs);
     if (!MaybeEntry) {
       Error(MaybeEntry.takeError());
       return Failure;
@@ -3443,6 +3536,13 @@ ASTReader::ReadControlBlock(ModuleFile &F,
       }
 
     case llvm::BitstreamEntry::Record:
+      if (Entry.ID == llvm::bitc::DEFINE_ABBREV) {
+        if (llvm::Error Err = readInlineAbbrev(Stream, CONTROL_BLOCK_ID)) {
+          Error(std::move(Err));
+          return Failure;
+        }
+        continue;
+      }
       // The interesting case.
       break;
     }
@@ -3723,7 +3823,8 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
   // Read all of the records and blocks for the AST file.
   RecordData Record;
   while (true) {
-    Expected<llvm::BitstreamEntry> MaybeEntry = Stream.advance();
+    Expected<llvm::BitstreamEntry> MaybeEntry =
+        Stream.advance(BitstreamCursor::AF_DontAutoprocessAbbrevs);
     if (!MaybeEntry)
       return MaybeEntry.takeError();
     llvm::BitstreamEntry Entry = MaybeEntry.get();
@@ -3825,6 +3926,11 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
       continue;
 
     case llvm::BitstreamEntry::Record:
+      if (Entry.ID == llvm::bitc::DEFINE_ABBREV) {
+        if (llvm::Error Err = readInlineAbbrev(Stream, AST_BLOCK_ID))
+          return Err;
+        continue;
+      }
       // The interesting case.
       break;
     }
@@ -4016,9 +4122,15 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
       break;
     }
 
-    case INTERESTING_IDENTIFIERS:
-      F.PreloadIdentifierOffsets.assign(Record.begin(), Record.end());
+    case INTERESTING_IDENTIFIERS: {
+      // Fixed-width numbers in a blob, the offsets and then each name's
+      // hash (ASTWriter).
+      const auto *Words = reinterpret_cast<const uint32_t *>(Blob.data());
+      size_t N = Blob.size() / sizeof(uint32_t) / 2;
+      F.PreloadIdentifierOffsets.assign(Words, Words + N);
+      F.PreloadIdentifierHashes.assign(Words + N, Words + 2 * N);
       break;
+    }
 
     case EAGERLY_DESERIALIZED_DECLS:
       // FIXME: Skip reading this record if our ASTConsumer doesn't care
@@ -5100,6 +5212,18 @@ ASTReader::ReadASTs(ArrayRef<StringRef> FileNames, ModuleKind Type,
   // Preload source locations and interesting indentifiers.
   std::optional<llvm::TimeTraceScope> PreloadScope;
   PreloadScope.emplace("ReadAST Preload");
+  // The name table gets at most the names the files list, about 90 in each
+  // of about 100 files in a header cache hit, and most names are in more
+  // than one file: room for half of them at once spares rebuilding the
+  // table as it fills, three times in a load of one nginx compile.
+  // addToNameTable still grows it if more of them are new.
+  if (NameTableUsable) {
+    size_t Listed = 0;
+    for (ImportedModule &M : Loaded)
+      Listed += M.Mod->PreloadIdentifierOffsets.size();
+    reserveNameTable((NameSlotsUsed + Listed) / 2);
+    NamePostings.reserve(NamePostings.size() + Listed);
+  }
   for (ImportedModule &M : Loaded) {
     ModuleFile &F = *M.Mod;
 
@@ -5123,8 +5247,9 @@ ASTReader::ReadASTs(ArrayRef<StringRef> FileNames, ModuleKind Type,
           0);
       F.InterestingNamesMask = F.InterestingNames.size() * 64 - 1;
     }
-    for (auto Offset : F.PreloadIdentifierOffsets) {
-      const unsigned char *Data = F.IdentifierTableData + Offset;
+    for (size_t K = 0, N = F.PreloadIdentifierOffsets.size(); K != N; ++K) {
+      const unsigned char *Data =
+          F.IdentifierTableData + F.PreloadIdentifierOffsets[K];
       // The on-disk table stores each name's hash just before the name's
       // key and data lengths, where the offset points.
       if (F.ListsInterestingNames) {
@@ -5150,7 +5275,8 @@ ASTReader::ReadASTs(ArrayRef<StringRef> FileNames, ModuleKind Type,
         // Identifiers present in the module file but not in the importing
         // instance are ignored for now, preventing growth of the identifier
         // table. They will be deserialized on first use via ASTReader::get().
-        auto It = PP.getIdentifierTable().find(Key);
+        auto It = PP.getIdentifierTable().find(
+            Key, F.PreloadIdentifierHashes[K]);
         if (It == PP.getIdentifierTable().end())
           continue;
         II = It->second;
@@ -5565,7 +5691,8 @@ ASTReader::ASTReadResult ASTReader::readUnhashedControlBlockImpl(
   RecordData Record;
   ASTReadResult Result = Success;
   while (true) {
-    Expected<llvm::BitstreamEntry> MaybeEntry = Stream.advance();
+    Expected<llvm::BitstreamEntry> MaybeEntry =
+        Stream.advance(BitstreamCursor::AF_DontAutoprocessAbbrevs);
     if (!MaybeEntry) {
       // FIXME this drops the error on the floor.
       consumeError(MaybeEntry.takeError());
@@ -5582,6 +5709,15 @@ ASTReader::ASTReadResult ASTReader::readUnhashedControlBlockImpl(
       return Result;
 
     case llvm::BitstreamEntry::Record:
+      if (Entry.ID == llvm::bitc::DEFINE_ABBREV) {
+        if (llvm::Error Err =
+                readInlineAbbrev(Stream, UNHASHED_CONTROL_BLOCK_ID)) {
+          // FIXME this drops the error on the floor.
+          consumeError(std::move(Err));
+          return Failure;
+        }
+        continue;
+      }
       // The interesting case.
       break;
     }
@@ -9275,9 +9411,10 @@ void ASTReader::PrintStats() {
       llvm::count(DeclsLoaded.materialized(), (Decl *)nullptr);
   unsigned NumIdentifiersLoaded =
       IdentifiersLoaded.size() -
-      llvm::count(IdentifiersLoaded, (IdentifierInfo *)nullptr);
+      llvm::count(IdentifiersLoaded.materialized(), (IdentifierInfo *)nullptr);
   unsigned NumMacrosLoaded =
-      MacrosLoaded.size() - llvm::count(MacrosLoaded, (MacroInfo *)nullptr);
+      MacrosLoaded.size() -
+      llvm::count(MacrosLoaded.materialized(), (MacroInfo *)nullptr);
   unsigned NumSelectorsLoaded =
       SelectorsLoaded.size() - llvm::count(SelectorsLoaded, Selector());
 

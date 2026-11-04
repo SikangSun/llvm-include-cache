@@ -204,7 +204,7 @@ each cache mode, interleaved compile by compile.
    ours (`-DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=clang
    -DLLVM_TARGETS_TO_BUILD=X86`), then
    `ninja clang clang-header-cache-daemon`.
-2. **Check out the six projects** in one directory (`BENCH_ROOT`), at:
+2. **Check out the seven projects** in one directory (`BENCH_ROOT`), at:
 
    | Project | Commit | Date |
    |---|---|---|
@@ -214,6 +214,7 @@ each cache mode, interleaved compile by compile.
    | git | 010afd3 | 2026-08-07 |
    | postgres | 086f6f1 | 2026-08-10 |
    | cpython | fe3a26f | 2026-08-26 |
+   | ffmpeg | f25dd4e | 2026-08-10 |
 
 3. **Record the builds**: `BENCH_ROOT=... BENCH_LOGS=... CCLOG_CLANG=<build>/bin/clang ./record_builds.sh`.
    It configures and builds each project through `cclog`, which logs every

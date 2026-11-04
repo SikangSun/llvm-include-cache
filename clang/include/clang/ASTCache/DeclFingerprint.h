@@ -64,8 +64,10 @@ enum class LayoutPart {
 ///
 /// With \p Masked, the names a compile made from __COUNTER__ values, a
 /// function definition whose body uses one also gets " masked <hash>": its
-/// ODR hash with each such name hashed the same. Two such definitions that
-/// differ only in those names do the same thing.
+/// ODR hash with each such name hashed the same, and each asm statement
+/// without what only sets it apart (ODRHash::setCanonicalAsm). Two such
+/// definitions that differ only in those names, local label numbers and
+/// unreferenced immediates do the same thing.
 std::optional<std::string> declarationFingerprint(
     const NamedDecl &D, llvm::function_ref<bool(const Decl *)> Counts = nullptr,
     LayoutPart Layout = LayoutPart::Always,

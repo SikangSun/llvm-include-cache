@@ -53,6 +53,9 @@ class ODRHash {
   // See setMaskedIdentifiers.
   llvm::function_ref<bool(const IdentifierInfo *)> Masked;
 
+  // See setCanonicalAsm.
+  bool CanonicalAsm = false;
+
 public:
   ODRHash() {}
 
@@ -63,6 +66,14 @@ public:
       llvm::function_ref<bool(const IdentifierInfo *)> IsMasked) {
     Masked = IsMasked;
   }
+
+  // Hash two GCC asm statements the same when they differ only in what sets
+  // each apart: the numbers of the numeric local labels its text defines,
+  // renumbered in order of first use, and the value of an "i" or "n" input
+  // its text never refers to. Linux's instrumentation_begin() makes both
+  // from __COUNTER__.
+  void setCanonicalAsm(bool V) { CanonicalAsm = V; }
+  bool canonicalAsm() const { return CanonicalAsm; }
 
   // Use this for ODR checking classes between modules.  This method compares
   // more information than the AddDecl class.

@@ -675,6 +675,22 @@ private:
   /// Returns an adjustment for offset into SourceManager, accounting for any
   /// non-affecting input files.
   SourceLocation::UIntTy getAdjustment(SourceLocation::UIntTy Offset) const;
+  /// Whether the local offset is in an entry computeNonAffectingInputFiles
+  /// dropped, the same as !IsSLocAffecting[SourceManager::getFileID], from
+  /// the dropped runs rather than from every entry of the compile.
+  bool isDroppedOffset(SourceLocation::UIntTy Offset) const;
+  /// The index in NonAffectingRanges of the first dropped run that ends at
+  /// or after the local offset, as getAdjustment and isDroppedOffset read it.
+  unsigned droppedRunAt(SourceLocation::UIntTy Offset) const;
+  /// The last droppedRunAt answer, and the offsets it holds for.
+  mutable unsigned LastRun = 0;
+  mutable SourceLocation::UIntTy LastRunFrom = 1, LastRunTo = 0;
+  /// SourceManager::getFileID and getFileLoc for a part, faster for a
+  /// location in the part's own entries, whose offsets PartOffsets holds
+  /// (and the end of the last), made at the first use.
+  FileID partFileID(SourceLocation Loc) const;
+  SourceLocation partFileLoc(SourceLocation Loc) const;
+  mutable std::vector<SourceLocation::UIntTy> PartOffsets;
 
   /// Retrieve or create a submodule ID for this module.
   unsigned getSubmoduleID(Module *Mod);

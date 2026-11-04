@@ -4942,6 +4942,73 @@ TEST_F(ExportTest, AFunctionDifferingOnlyInCounterNamesStillServesACopy) {
   EXPECT_TRUE(reads(Other, User)) << "f adds 2";
 }
 
+TEST_F(ExportTest, AFunctionDifferingOnlyInCounterAsmLabelsStillServesACopy) {
+  // CLANG_HEADER_CACHE_COUNTER=1: f's body holds the kernel's
+  // instrumentation_begin(), whose __COUNTER__ value numbers a local label
+  // and gives an "i" operand the asm text never refers to, and user.h's
+  // copy calls f. Where the compile read f.h at another counter value, f
+  // differs only in those, and the copy serves; where the asm text reads
+  // the operand, it does not.
+  setenv("CLANG_HEADER_CACHE_COUNTER", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_COUNTER"); });
+  auto Case = [&](const std::string &Name, const std::string &Mark,
+                  bool Served) {
+    std::string F = write(Name + "_f.h",
+                          "#ifndef F_H\n#define F_H\n"
+                          "#define STR_(x...) #x\n#define STR(x...) STR_(x)\n"
+                          "#define BREF(l) l##b\n#define MARK(c) " +
+                              Mark +
+                              "\nstatic inline int f(int x) {\n"
+                              "  MARK(__COUNTER__);\n  return x;\n}\n"
+                              "extern int f_end;\n#endif\n");
+    std::string User =
+        write(Name + "_user.h", "#ifndef USER_H\n#define USER_H\n#include \"" +
+                                    F +
+                                    "\"\nstatic inline int g(int x) { return "
+                                    "f(x); }\n#endif\n");
+    auto File = [&](const std::string &C, const std::string &Before) {
+      return write(Name + C, Before + "#include \"" + F + "\"\n#include \"" +
+                                 User + "\"\n");
+    };
+    std::string First = File("_first.c", "int a0 = __COUNTER__;\n");
+    std::string Later =
+        File("_later.c", "int b0 = __COUNTER__;\nint b1 = __COUNTER__;\n");
+    EXPECT_TRUE(reads(First, User)) << "nothing is listed yet";
+    EXPECT_TRUE(reads(First, User)) << "nothing is stored yet";
+    EXPECT_EQ(!reads(Later, User), Served) << Mark;
+  };
+  Case("label",
+       "__asm__ __volatile__(STR(c) \": nop\\n\\t.long \" STR(BREF(c)) "
+       "\" - .\" : : \"i\" (c))",
+       true);
+  Case("operand", "__asm__ __volatile__(\"mov %0, %%eax\" : : \"i\" (c) : "
+                  "\"eax\")",
+       false);
+}
+
+TEST_F(ExportTest, ACopyFromAnotherStackProtectorModeServesUnlessItTestsIt) {
+  // Linux builds a few files with -fno-stack-protector. The mode changes
+  // code generation and the __SSP__ macros only, so h.h's copy, written with
+  // -fstack-protector-strong, serves there; ssp.h's copy tests
+  // __SSP_STRONG__, and does not.
+  std::string H = write("h.h", "#ifndef H_H\n#define H_H\nint h(void);\n"
+                               "#endif\n");
+  std::string Ssp = write("ssp.h", "#ifndef SSP_H\n#define SSP_H\n"
+                                   "#ifdef __SSP_STRONG__\nint strong;\n"
+                                   "#endif\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + H + "\"\n#include \"" + Ssp + "\"\n");
+  ExtraArgs = {"-fstack-protector-strong"};
+  EXPECT_TRUE(reads(Main, H)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, H)) << "nothing is stored yet";
+  ExtraArgs = {"-fno-stack-protector"};
+  std::set<std::string> Entered;
+  EXPECT_TRUE(compile(Main, Entered));
+  EXPECT_FALSE(Entered.count(H)) << "h.h's copy was not served";
+  EXPECT_TRUE(Entered.count(Ssp)) << "ssp.h's copy was served";
+}
+
 TEST_F(ExportTest, ACopyWhoseValuesOnlySetNamesApartServesBehindItsStart) {
   // CLANG_HEADER_CACHE_COUNTER=unique (the user's rule, 2026-10-27): a copy
   // whose counter values only set names apart serves where the counter has

@@ -605,10 +605,17 @@ public:
   }
 
   /// The names a masked hash hashes as one: in a counter mode, those made
-  /// from counter values. CLANG_HEADER_CACHE_NO_MASK (measurement): none.
+  /// from counter values. Null, and no masked hash, until the compile uses
+  /// the counter: a masked hash also costs a second hash of each function
+  /// that a copy takes from outside. CLANG_HEADER_CACHE_NO_MASK
+  /// (measurement): none.
   const llvm::DenseSet<const IdentifierInfo *> *maskedNames() const {
     static const bool NoMask = std::getenv("CLANG_HEADER_CACHE_NO_MASK");
-    return CounterMode && !NoMask ? CounterNames : nullptr;
+    return CounterMode && !NoMask &&
+                   (!CounterNames->empty() ||
+                    CI.getPreprocessor().getCounterValue())
+               ? CounterNames
+               : nullptr;
   }
 
   void shareCounterNames(

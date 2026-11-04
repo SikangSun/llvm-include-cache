@@ -2284,6 +2284,12 @@ void ASTWriter::WriteHeaderSearch(const HeaderSearch &HS) {
       continue; // Header file info is tracked by the including module file.
     if (PartKeepsHeaderInfo && !PartKeepsHeaderInfo(*File))
       continue; // A file outside the part being written.
+    // A part's header takes in what a loaded module file knows about it,
+    // such as the guard of a copy served inside the part: asked here for the
+    // part's headers alone, as computeNonAffectingInputFiles does not search
+    // module maps for a part.
+    if (PartKeepsHeaderInfo)
+      (void)HS.getExistingFileInfo(*File);
 
     // Massage the file path into an appropriate form.
     StringRef Filename = File->getName();
@@ -3968,6 +3974,7 @@ class ASTIdentifierTableTrait {
   IdentifierResolver *IdResolver;
   bool IsModule;
   bool NeedDecls;
+  /// Each interesting identifier's offset, then its name's hash.
   ASTWriter::RecordData *InterestingIdentifierOffsets;
 
   /// Determines whether this is an "interesting" identifier that needs a
@@ -4059,8 +4066,13 @@ public:
     // Emit the offset of the key/data length information to the interesting
     // identifiers table if necessary.
     if (InterestingIdentifierOffsets &&
-        isInterestingIdentifier(II, MacroOffset))
+        isInterestingIdentifier(II, MacroOffset)) {
       InterestingIdentifierOffsets->push_back(Out.tell());
+      // With the name's hash in an identifier table: an importer looks each
+      // name up in its own table at each load (ASTReader::ReadASTs).
+      InterestingIdentifierOffsets->push_back(
+          llvm::StringMapImpl::hash(II->getName()));
+    }
 
     unsigned KeyLen = II->getLength() + 1;
     unsigned DataLen = sizeof(IdentifierID); // bytes for the persistent ID << 1
@@ -4214,8 +4226,24 @@ void ASTWriter::WriteIdentifierTable(Preprocessor &PP,
 
   // In C++, write the list of interesting identifiers (those that are
   // defined as macros, poisoned, or similar unusual things).
-  if (!InterestingIdents.empty())
-    Stream.EmitRecord(INTERESTING_IDENTIFIERS, InterestingIdents);
+  //
+  // As fixed-width numbers in a blob, the offsets and then each name's hash:
+  // a C module lists every name it declares, and decoding the offsets one
+  // by one was the largest part of reading a small module's AST block, as
+  // the header cache loads about a hundred of them in a compile.
+  if (!InterestingIdents.empty()) {
+    auto Abbrev = std::make_shared<BitCodeAbbrev>();
+    Abbrev->Add(BitCodeAbbrevOp(INTERESTING_IDENTIFIERS));
+    Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Blob));
+    unsigned InterestingAbbrev = Stream.EmitAbbrev(std::move(Abbrev));
+    std::vector<uint32_t> Words;
+    Words.reserve(InterestingIdents.size());
+    for (unsigned First : {0, 1})
+      for (size_t I = First; I < InterestingIdents.size(); I += 2)
+        Words.push_back(InterestingIdents[I]);
+    RecordData::value_type Record[] = {INTERESTING_IDENTIFIERS};
+    Stream.EmitRecordWithBlob(InterestingAbbrev, Record, bytes(Words));
+  }
 }
 
 void ASTWriter::handleVTable(CXXRecordDecl *RD) {
@@ -5714,7 +5742,15 @@ void ASTWriter::computeNonAffectingInputFiles() {
   if (!WritingModule)
     return;
 
-  auto AffectingModuleMaps = GetAffectingModuleMaps(*PP, WritingModule);
+  // Found when the first module map needs it: the search asks every loaded
+  // module file about every header the compile included, and the compile
+  // writing a header cache part has no module maps.
+  std::optional<std::optional<AffectingModuleMaps>> Affecting;
+  auto GetAffecting = [&]() -> const std::optional<AffectingModuleMaps> & {
+    if (!Affecting)
+      Affecting = GetAffectingModuleMaps(*PP, WritingModule);
+    return *Affecting;
+  };
 
   unsigned FileIDAdjustment = 0;
   unsigned OffsetAdjustment = 0;
@@ -5743,7 +5779,7 @@ void ASTWriter::computeNonAffectingInputFiles() {
       if (!PartKeepsExpansion ||
           (PartKeepsExpansion(SLoc->getOffset()) &&
            !SrcMgr.isLoadedSourceLocation(Spelling) &&
-           IsSLocAffecting[SrcMgr.getFileID(Spelling).ID]))
+           !isDroppedOffset(Spelling.getOffset())))
         return true;
     } else {
       const SrcMgr::FileInfo &File = SLoc->getFile();
@@ -5766,6 +5802,7 @@ void ASTWriter::computeNonAffectingInputFiles() {
           return true;
 
         // Don't prune module maps if all are guaranteed to be affecting.
+        const auto &AffectingModuleMaps = GetAffecting();
         if (!AffectingModuleMaps)
           return true;
 
@@ -5783,6 +5820,8 @@ void ASTWriter::computeNonAffectingInputFiles() {
   // Drops the consecutive entries [A, B).
   auto Drop = [&](unsigned A, unsigned B) {
     IsSLocAffecting.reset(A, B);
+    LastRunFrom = 1;
+    LastRunTo = 0;
 
     FileIDAdjustment += B - A;
     // Even empty files take up one element in the offset table.
@@ -7042,11 +7081,11 @@ SourceLocation ASTWriter::getAdjustedLocation(SourceLocation Loc) const {
   if (PartKeepsExpansion) {
     const SourceManager &SM = PP->getSourceManager();
     if (Loc.isMacroID() && !SM.isLoadedSourceLocation(Loc) &&
-        !IsSLocAffecting[SM.getFileID(Loc).ID])
-      Loc = SM.getFileLoc(Loc);
+        isDroppedOffset(Loc.getOffset()))
+      Loc = partFileLoc(Loc);
     // A location in a file the part dropped has no place in it.
     if (Loc.isFileID() && !SM.isLoadedSourceLocation(Loc) &&
-        !IsSLocAffecting[SM.getFileID(Loc).ID]) {
+        isDroppedOffset(Loc.getOffset())) {
       ++PartDroppedLocations;
       return SourceLocation();
     }
@@ -7078,13 +7117,69 @@ ASTWriter::getAdjustment(SourceLocation::UIntTy Offset) const {
   if (Offset < NonAffectingRanges.front().getBegin().getOffset())
     return 0;
 
+  return NonAffectingOffsetAdjustments[droppedRunAt(Offset)];
+}
+
+unsigned ASTWriter::droppedRunAt(SourceLocation::UIntTy Offset) const {
+  // The last answer holds from the end of the run before it through the end
+  // of its own run, and the locations written come mostly in order.
+  if (Offset >= LastRunFrom && Offset <= LastRunTo)
+    return LastRun;
   auto Contains = [](const SourceRange &Range, SourceLocation::UIntTy Offset) {
     return Range.getEnd().getOffset() < Offset;
   };
-
   auto It = llvm::lower_bound(NonAffectingRanges, Offset, Contains);
-  unsigned Idx = std::distance(NonAffectingRanges.begin(), It);
-  return NonAffectingOffsetAdjustments[Idx];
+  LastRun = std::distance(NonAffectingRanges.begin(), It);
+  LastRunFrom =
+      LastRun ? NonAffectingRanges[LastRun - 1].getEnd().getOffset() + 1 : 0;
+  LastRunTo = It != NonAffectingRanges.end()
+                  ? It->getEnd().getOffset()
+                  : std::numeric_limits<SourceLocation::UIntTy>::max();
+  return LastRun;
+}
+
+bool ASTWriter::isDroppedOffset(SourceLocation::UIntTy Offset) const {
+  // The dropped runs cover, in order, exactly the offsets of the dropped
+  // entries: every entry takes at least one offset.
+  unsigned Run = droppedRunAt(Offset);
+  return Run != NonAffectingRanges.size() &&
+         NonAffectingRanges[Run].getBegin().getOffset() <= Offset;
+}
+
+FileID ASTWriter::partFileID(SourceLocation Loc) const {
+  const SourceManager &SM = PP->getSourceManager();
+  if (!PartScoped || SM.isLoadedSourceLocation(Loc))
+    return SM.getFileID(Loc);
+  if (PartOffsets.empty()) {
+    for (unsigned I = PartSLocBegin; I != PartSLocEnd; ++I)
+      PartOffsets.push_back(SM.getLocalSLocEntry(I).getOffset());
+    PartOffsets.push_back(PartSLocEnd == SM.local_sloc_entry_size()
+                              ? SM.getNextLocalOffset()
+                              : SM.getLocalSLocEntry(PartSLocEnd).getOffset());
+  }
+  SourceLocation::UIntTy Offset = Loc.getOffset();
+  if (PartOffsets.size() < 2 || Offset < PartOffsets.front() ||
+      Offset >= PartOffsets.back())
+    return SM.getFileID(Loc);
+  return FileID::get(PartSLocBegin +
+                     (llvm::upper_bound(PartOffsets, Offset) -
+                      PartOffsets.begin()) -
+                     1);
+}
+
+SourceLocation ASTWriter::partFileLoc(SourceLocation Loc) const {
+  // SourceManager::getFileLoc, each step up found among the part's own
+  // entries where it lies in them, rather than among every entry.
+  const SourceManager &SM = PP->getSourceManager();
+  while (Loc.isMacroID()) {
+    const SrcMgr::SLocEntry &Entry = SM.getSLocEntry(partFileID(Loc));
+    const SrcMgr::ExpansionInfo &Expansion = Entry.getExpansion();
+    Loc = Expansion.isMacroArgExpansion()
+              ? Expansion.getSpellingLoc().getLocWithOffset(
+                    Loc.getOffset() - Entry.getOffset())
+              : Expansion.getExpansionLocStart();
+  }
+  return Loc;
 }
 
 void ASTWriter::AddFileID(FileID FID, RecordDataImpl &Record) {

@@ -129,12 +129,14 @@ std::optional<std::string> clang::ast_cache::declarationFingerprint(
       } else if (Def) {
         unsigned Hash = Def->getODRHash();
         OS << " defined " << Hash;
-        if (Masked && !Masked->empty()) {
+        if (Masked) {
           auto IsMasked = [&](const IdentifierInfo *II) {
             return Masked->contains(II);
           };
           ODRHash M;
-          M.setMaskedIdentifiers(IsMasked);
+          if (!Masked->empty())
+            M.setMaskedIdentifiers(IsMasked);
+          M.setCanonicalAsm(true);
           M.AddFunctionDecl(Def);
           if (unsigned MaskedHash = M.CalculateHash(); MaskedHash != Hash)
             OS << " masked " << MaskedHash;

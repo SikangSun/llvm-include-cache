@@ -21,7 +21,11 @@
 #include "clang/AST/ODRHash.h"
 #include "clang/AST/OpenMPClause.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/Basic/CharInfo.h"
 #include "llvm/ADT/FoldingSet.h"
+#include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 using namespace clang;
 
 namespace {
@@ -48,6 +52,10 @@ namespace {
 
 #define STMT(Node, Base) void Visit##Node(const Node *S);
 #include "clang/AST/StmtNodes.inc"
+
+    /// Whether an asm statement is hashed without what only sets it apart
+    /// (ODRHash::setCanonicalAsm).
+    virtual bool canonicalAsm() const { return false; }
 
     /// Visit a declaration that is referenced within an expression
     /// or statement.
@@ -231,7 +239,84 @@ namespace {
       if (NNS)
         Hash.AddNestedNameSpecifier(NNS);
     }
+    bool canonicalAsm() const override { return Hash.canonicalAsm(); }
   };
+}
+
+/// \p Text with the numeric local labels it defines renumbered in order of
+/// first use, definitions ("1234:") and references ("1234b", "1234f") alike:
+/// "1234: nop; .long 1234b - ." and "7: nop; .long 7b - ." are the same. A
+/// number the text never defines as a label stays as it is.
+static std::string canonicalAsmLabels(StringRef Text) {
+  auto IsIdent = [](char C) { return isAlphanumeric(C) || C == '_' || C == '.' || C == '$'; };
+  // A label is defined where a statement starts: after the start, a newline
+  // or a ';', and blanks.
+  llvm::StringSet<> Defined;
+  for (size_t I = 0, N = Text.size(); I < N;) {
+    size_t J = I;
+    while (J < N && (Text[J] == ' ' || Text[J] == '\t'))
+      ++J;
+    size_t K = J;
+    while (K < N && isDigit(Text[K]))
+      ++K;
+    if (K > J && K < N && Text[K] == ':')
+      Defined.insert(Text.slice(J, K));
+    I = Text.find_first_of("\n;", K);
+    if (I == StringRef::npos)
+      break;
+    ++I;
+  }
+  if (Defined.empty())
+    return Text.str();
+  llvm::StringMap<unsigned> Number;
+  std::string Out;
+  for (size_t I = 0, N = Text.size(); I < N;) {
+    if (!isDigit(Text[I]) || (I && IsIdent(Text[I - 1]))) {
+      Out += Text[I++];
+      continue;
+    }
+    size_t K = I;
+    while (K < N && isDigit(Text[K]))
+      ++K;
+    StringRef Digits = Text.slice(I, K);
+    bool Label = K < N && (Text[K] == ':' || ((Text[K] == 'b' || Text[K] == 'f') &&
+                                             (K + 1 == N || !IsIdent(Text[K + 1]))));
+    if (Label && Defined.contains(Digits))
+      Out += "L" + std::to_string(Number.try_emplace(Digits, Number.size()).first->second);
+    else
+      Out += Digits;
+    I = K;
+  }
+  return Out;
+}
+
+/// The operands \p Text refers to: "%0", "%c1", "%[name]"; "%%" is a '%'.
+static void asmOperandsReferred(StringRef Text, llvm::SmallBitVector &Numbers,
+                                llvm::StringSet<> &Names) {
+  for (size_t I = 0, N = Text.size(); I < N; ++I) {
+    if (Text[I] != '%')
+      continue;
+    if (I + 1 < N && Text[I + 1] == '%') {
+      ++I;
+      continue;
+    }
+    size_t J = I + 1;
+    while (J < N && isLetter(Text[J]))
+      ++J;
+    if (J < N && isDigit(Text[J])) {
+      unsigned No = 0;
+      while (J < N && isDigit(Text[J]))
+        No = No * 10 + (Text[J++] - '0');
+      if (No >= Numbers.size())
+        Numbers.resize(No + 1);
+      Numbers.set(No);
+    } else if (J < N && Text[J] == '[') {
+      size_t E = Text.find(']', J);
+      if (E != StringRef::npos)
+        Names.insert(Text.slice(J + 1, E));
+    }
+    I = J - 1;
+  }
 }
 
 void StmtProfiler::VisitStmt(const Stmt *S) {
@@ -326,6 +411,45 @@ void StmtProfiler::VisitReturnStmt(const ReturnStmt *S) {
 void StmtProfiler::VisitDeferStmt(const DeferStmt *S) { VisitStmt(S); }
 
 void StmtProfiler::VisitGCCAsmStmt(const GCCAsmStmt *S) {
+  const auto *Text = dyn_cast<StringLiteral>(S->getAsmStringExpr());
+  if (canonicalAsm() && Text && Text->isOrdinary()) {
+    VisitStmtNoChildren(S);
+    ID.AddBoolean(S->isVolatile());
+    ID.AddBoolean(S->isSimple());
+    ID.AddString(canonicalAsmLabels(Text->getString()));
+    llvm::SmallBitVector Numbers;
+    llvm::StringSet<> Names;
+    asmOperandsReferred(Text->getString(), Numbers, Names);
+    unsigned Outputs = S->getNumOutputs();
+    ID.AddInteger(Outputs);
+    for (unsigned I = 0; I != Outputs; ++I) {
+      ID.AddString(S->getOutputName(I));
+      VisitExpr(S->getOutputConstraintExpr(I));
+      Visit(S->getOutputExpr(I));
+    }
+    ID.AddInteger(S->getNumInputs());
+    for (unsigned I = 0, N = S->getNumInputs(); I != N; ++I) {
+      ID.AddString(S->getInputName(I));
+      VisitExpr(S->getInputConstraintExpr(I));
+      std::string C = S->getInputConstraint(I);
+      unsigned No = Outputs + I;
+      bool Referred = (No < Numbers.size() && Numbers.test(No)) ||
+                      (!S->getInputName(I).empty() &&
+                       Names.contains(S->getInputName(I)));
+      if ((C == "i" || C == "n") && !Referred &&
+          isa<IntegerLiteral>(S->getInputExpr(I)->IgnoreParenImpCasts()))
+        ID.AddString("<an immediate the text does not refer to>");
+      else
+        Visit(S->getInputExpr(I));
+    }
+    ID.AddInteger(S->getNumClobbers());
+    for (unsigned I = 0, N = S->getNumClobbers(); I != N; ++I)
+      VisitExpr(S->getClobberExpr(I));
+    ID.AddInteger(S->getNumLabels());
+    for (auto *L : S->labels())
+      VisitDecl(L->getLabel());
+    return;
+  }
   VisitStmt(S);
   ID.AddBoolean(S->isVolatile());
   ID.AddBoolean(S->isSimple());

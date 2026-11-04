@@ -6,7 +6,7 @@ compares each mode's objects with plain clang's.
 usage: modes_bench.py <project> <out.json>
 env: KIND, CORE, DCORES (comma list, one per cache mode), BIN, LEVEL, DUMP, MODES,
 SRC_ROOT, PLAIN_MODULES, PASSES, CHANGE_CMD, CHANGE_UNDO, INSTR, PERFC, SAMPLE,
-REGION_SIZE, EXTRA.
+REGION_SIZE, EXTRA, EXTRA_<mode>.
 env, required: BIN (a release build's bin directory), BENCH_LOGS, BENCH_ROOT
 (see record_builds.sh).
 
@@ -20,7 +20,7 @@ dram_sources.sh) stands for BENCH_ROOT; SRC_ROOT=in-place reads them there. Plai
 the -fmodules -fno-implicit-module-maps only the cache needs (front end);
 PLAIN_MODULES=1 gives it them. Full builds keep them on plain clang, whose
 objects are compared with the cache's."""
-import json, os, re, subprocess, sys, tempfile, time
+import json, os, re, shutil, subprocess, sys, tempfile, time
 BIN = os.environ["BIN"]
 # Where record_builds.sh put the compile logs, and the directory the
 # projects were built in when it recorded them.
@@ -83,6 +83,74 @@ ALL = {
     # bin-u32: the history-based merge rule (CLANG_HEADER_CACHE_MERGE=auto,
     # user 2026-10-31): a combination is merged once its hits so far pay for
     # the merge. linkma at the default cutoff, linkcut<c>ma at <c> us.
+    # The merge rule with a safety factor k (user, 2026-10-31: "the gains is
+    # just as important as zero loss"): merge once n x s >= k x cost, the
+    # same as MERGE_SHARE = 0.4 / k. A line per hit.
+    **{f"linkmak{k}": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                       "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
+                       "CLANG_HEADER_CACHE_MERGE_WAIT": "1", "CLANG_HEADER_CACHE_HIT_LOG": "1",
+                       "CLANG_HEADER_CACHE_MERGE_SHARE": str(round(0.4 / k, 4))} for k in (1, 2, 3, 4, 6)},
+    "linkch": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_HIT_LOG": "1"},
+    # bin-u40: the fold rule (user 2026-11-01: run the lower-bound rule on
+    # the workbench and the Linux sample), linkc with the daemon's -fold
+    # (DAEMON_ARGS): a header is listed at its first read if its own time
+    # plus an ask per header it includes is at least an ask and a load, and
+    # folded once its losses pass the budget. linkf<b>: a budget of b
+    # writes; linkfl: the floor alone; linkf<b>w<us>: a write costs <us>;
+    # linkfn<b>: no floor, every header listed at its first read.
+    **{m: {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+           "CLANG_HEADER_CACHE_LINK": "1"}
+       for m in ("linkfl", "linkf1", "linkf2", "linkf4", "linkf8", "linkf16", "linkf32", "linkf8w2000",
+                 "linkf2w2000", "linkfn8")},
+    # bin-u41: what the floor reads (-fold-list). linkfi<b>: today's rule
+    # (226 us with the headers inside it) to list, folded once its losses
+    # pass b writes; linkfo<b>: the own time alone against an ask and a
+    # load; linkfol: that floor alone.
+    **{m: {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+           "CLANG_HEADER_CACHE_LINK": "1"}
+       for m in ("linkfi1", "linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkfo2", "linkfo8",
+                 "linkfo32", "linkfol")},
+    # bin-u42: linkc, a context's declarations scanned once for unnamed
+    # ones (CLANG_HEADER_CACHE_SCAN_ONCE=1), not again at each completion.
+    "linkcscan": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                  "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_SCAN_ONCE": "1"},
+    # bin-u43+: linkc with the measured cutoff (daemon -measured-cutoff): a
+    # header is asked for while the parse time of the lines its copy holds is
+    # at least one request and one load, as the build measured them.
+    "linkcm": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1"},
+    # linkcm, each compile recording what the fold and merge rules read
+    # (CLANG_HEADER_CACHE_RECORD) to RECORD_DIR.
+    "linkcmr": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_RECORD": os.environ.get("RECORD_DIR", "")},
+    # bin-u46+: linkc whose daemon runs the offline step (-offline): its
+    # compiles record to RECORD_DIR, named by the daemon; after the build
+    # the harness sends the hint a link would, waits for the step, and
+    # keeps its time ("offline"). DECISIONS is the file the step writes.
+    # With PASSES=2 (the user's recompilation evaluation, 2026-11-02), the
+    # step runs between pass 1 and pass 2, on the same daemon and region:
+    # pass 2 takes its decisions and its merged copies.
+    "linkco": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1"},
+    # linkc whose daemon hands its compiles the decisions in DECISIONS
+    # (-offline-decisions): folds, tops and merges, no variable set.
+    "linkcd": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1"},
+    # linkcm with what an earlier build's record decided
+    # (CLANG_HEADER_CACHE_DECISIONS=DECISIONS), merges included.
+    "linkcmd": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_DECISIONS": os.environ.get("DECISIONS", ""),
+                "CLANG_HEADER_CACHE_MERGE": "decided"},
+    # The same with -fold-link-us=0 (suffix n): loads of a header's copy as
+    # another header's link cost it nothing.
+    **{m + "n": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                 "CLANG_HEADER_CACHE_LINK": "1"}
+       for m in ("linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkf8", "linkf32", "linkfo8", "linkfo32",
+                 "linkfi6", "linkfi12", "linkfo4", "linkfo16")},
+    "linkma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
+               "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},
     # bin-u39+: linkma merges in the compile itself (task 10, user
     # 2026-11-01); linkmaf forks a process for each merge, as before.
     "linkmaf": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
@@ -91,31 +159,6 @@ ALL = {
     "linkmah": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                 "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
                 "CLANG_HEADER_CACHE_HIT_LOG": "1"},
-    "linkma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
-               "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
-               "CLANG_HEADER_CACHE_MERGE_WAIT": "1"},
-    # The fold rule (user 2026-11-01: run the lower-bound rule on the
-    # workbench and the Linux sample), linkc with the daemon's -fold
-    # (DAEMON_ARGS): a header is listed at its first read if it passes the
-    # floor, and folded once its losses pass the budget. linkf<b>: the
-    # floor of own time plus an ask per header included, a budget of b
-    # writes; linkfl: that floor alone; linkf<b>w<us>: a write costs <us>;
-    # linkfn8: no floor. linkfi<b>: today's listing (226 us with the
-    # headers inside it); linkfo<b>: own time alone; linkfol: that floor
-    # alone. Suffix n: loads as another header's link cost nothing.
-    **{m: {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
-           "CLANG_HEADER_CACHE_LINK": "1"}
-       for m in ("linkfl", "linkf1", "linkf2", "linkf4", "linkf8", "linkf16", "linkf32", "linkf8w2000",
-                 "linkf2w2000", "linkfn8", "linkfi1", "linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32",
-                 "linkfo2", "linkfo8", "linkfo32", "linkfol")},
-    **{m + "n": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
-                 "CLANG_HEADER_CACHE_LINK": "1"}
-       for m in ("linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkf8", "linkf32", "linkfo8", "linkfo32",
-                 "linkfi6", "linkfi12", "linkfo4", "linkfo16")},
-    # linkc, a context's declarations scanned once for unnamed ones
-    # (CLANG_HEADER_CACHE_SCAN_ONCE=1), not again at each completion.
-    "linkcscan": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
-                  "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_SCAN_ONCE": "1"},
     **{f"linkcut{c}ma": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                          "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_MERGE": "auto",
                          "CLANG_HEADER_CACHE_MERGE_WAIT": "1"} for c in (2000, 5000)},
@@ -137,6 +180,10 @@ ALL = {
                "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_GUARD_PLUS": "1"},
     # bin-u2+: linkc as before 2026-11-01, each link loaded by a reader call of
     # its own, before the copy linking it.
+    # Every name a copy takes from a link entered at the hit (as before
+    # 2026-11-01), not when the reader needs it.
+    "linknames": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+                  "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_LINK_NAMES": "all"},
     "linkeach": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                  "CLANG_HEADER_CACHE_LINK": "1", "CLANG_HEADER_CACHE_LINK_LOADS": "each"},
     # linkc, and a copy linked inside another may name a declaration of the
@@ -181,6 +228,12 @@ ALL = {
     "noexport": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_EXPORT_PARTS": "0"},
 }
 CM = os.environ.get("MODES", "top link miss1").split()
+def binof(m):
+    # <mode>@<name>: the binaries in BIN_<name> (a bin directory), to compare
+    # two builds in one run.
+    return os.environ[f"BIN_{m.split('@')[1]}"] if m and "@" in m else BIN
+def basemode(m):
+    return m.split("@")[0] if m else m
 MODES = ["plain"] + CM
 
 
@@ -221,9 +274,17 @@ DAEMON_ARGS.update({f"linkcut{c}ma": ["-ask-cutoff-us", str(c)] for c in (2000, 
 DAEMON_ARGS.update({"linkfl": ["-fold", "-fold-budget=1e15"], "linkfn8": ["-fold", "-fold-floor=0", "-fold-budget=8"]})
 DAEMON_ARGS.update({f"linkf{b}": ["-fold", f"-fold-budget={b}"] for b in (1, 2, 4, 8, 16, 32)})
 DAEMON_ARGS.update({f"linkf{b}w2000": ["-fold", f"-fold-budget={b}", "-fold-write-us=2000"] for b in (2, 8)})
-DAEMON_ARGS.update({f"linkfi{b}": ["-fold", "-fold-list=inclusive", f"-fold-budget={b}"] for b in (1, 2, 4, 6, 8, 12, 16, 32)})
-DAEMON_ARGS.update({f"linkfo{b}": ["-fold", "-fold-list=own", f"-fold-budget={b}"] for b in (2, 4, 8, 16, 32)})
+DAEMON_ARGS.update({f"linkfi{b}": ["-fold", "-fold-list=inclusive", f"-fold-budget={b}"] for b in (1, 2, 4, 8, 16, 32)})
+DAEMON_ARGS.update({f"linkfo{b}": ["-fold", "-fold-list=own", f"-fold-budget={b}"] for b in (2, 8, 32)})
 DAEMON_ARGS.update({"linkfol": ["-fold", "-fold-list=own", "-fold-budget=1e15"]})
+DAEMON_ARGS.update({f"linkfi{b}": ["-fold", "-fold-list=inclusive", f"-fold-budget={b}"] for b in (6, 12)})
+DAEMON_ARGS.update({f"linkfo{b}": ["-fold", "-fold-list=own", f"-fold-budget={b}"] for b in (4, 16)})
+DAEMON_ARGS.update({m: ["-measured-cutoff"] for m in ("linkcm", "linkcmr", "linkcmd")})
+OFFLINE_PY = os.environ.get("OFFLINE_PY", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "header-cache",
+                                                       "offline", "offline.py"))
+DAEMON_ARGS.update({"linkco": ["-offline", f"{sys.executable} -I {OFFLINE_PY}", "-offline-record", os.environ.get("RECORD_DIR", ""),
+                               "-offline-decisions", os.environ.get("DECISIONS", "")],
+                    "linkcd": ["-offline-decisions", os.environ.get("DECISIONS", "")]})
 DAEMON_ARGS.update({m + "n": DAEMON_ARGS[m] + ["-fold-link-us=0"]
                     for m in ("linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkf8", "linkf32", "linkfo8", "linkfo32",
                               "linkfi6", "linkfi12", "linkfo4", "linkfo16")})
@@ -235,8 +296,8 @@ def daemon(core, dump, mode=None):
     # REGION_SIZE=<GiB>: a region larger than the daemon's 4 GiB default; a
     # full region drops every later copy without a word.
     size = ["-region-size", str(int(os.environ["REGION_SIZE"]) << 30)] if os.environ.get("REGION_SIZE") else []
-    p = subprocess.Popen(["taskset", "-c", core, f"{BIN}/clang-header-cache-daemon", "-socket", f"{w}/sock",
-                          "-region", region, "-v"] + size + DAEMON_ARGS.get(mode, []), stdout=open(f"{w}/daemon.log", "w"), stderr=subprocess.STDOUT,
+    p = subprocess.Popen(["taskset", "-c", core, f"{binof(mode)}/clang-header-cache-daemon", "-socket", f"{w}/sock",
+                          "-region", region, "-v"] + size + DAEMON_ARGS.get(basemode(mode), []), stdout=open(f"{w}/daemon.log", "w"), stderr=subprocess.STDOUT,
                          env=dict(os.environ, **({"CLANG_HEADER_CACHE_DAEMON_DUMP": dump} if dump else {})))
     while not os.path.exists(f"{w}/sock"):
         time.sleep(0.01)
@@ -244,6 +305,52 @@ def daemon(core, dump, mode=None):
     return p, f"{w}/sock"
 
 
+if "linkco" in CM or "linkcd" in CM:
+    assert os.environ.get("DECISIONS") and not ("linkco" in CM and "linkcd" in CM), "linkco/linkcd: DECISIONS, one of them"
+if "linkco" in CM:
+    # The step runs while its decisions file is missing, on this build's record.
+    assert os.environ.get("RECORD_DIR"), "linkco: RECORD_DIR"
+    subprocess.run(["rm", "-rf", os.environ["RECORD_DIR"]], check=True)
+    for f in (os.environ["DECISIONS"], os.environ["DECISIONS"] + ".log"):
+        if os.path.exists(f):
+            os.remove(f)
+if "linkcd" in CM:
+    assert os.path.exists(os.environ["DECISIONS"]), "linkcd: DECISIONS must exist"
+
+
+def build_hint(sock, output):
+    """The message clang's driver sends after a link (BuildHint), and the
+    daemon's acknowledgment."""
+    import socket, struct
+    body = struct.pack("<BI", 15, len(output.encode())) + output.encode()
+    with socket.socket(socket.AF_UNIX) as c:
+        c.connect(sock)
+        c.sendall(struct.pack("<I", len(body)) + body)
+        n = struct.unpack("<I", c.recv(4))[0]
+        return c.recv(n)[:1] == bytes([16])
+
+
+def run_offline():
+    """The offline step: the hint a link sends, then the step's run to its end."""
+    for m, (p, sock) in daemons.items():
+        if "-offline" not in DAEMON_ARGS.get(basemode(m), []):
+            continue
+        t = time.perf_counter()
+        ok = build_hint(sock, f"{proj}-{m}")
+        g = None
+        while ok and time.perf_counter() - t < 1800:
+            g = re.search(r"offline: run \d+ (finished|failed) in (\d+) ms", open(p.log).read())
+            if g:
+                break
+            time.sleep(0.05)
+        log = os.environ["DECISIONS"] + ".log"
+        offline[m] = {"hint": ok, "status": g[1] if g else "none", "ms": int(g[2]) if g else None,
+                      "log": open(log).read() if os.path.exists(log) else ""}
+        print(f"{proj} {KIND} offline: {m} {offline[m]['status']} in {offline[m]['ms']} ms: "
+              + " ".join(l for l in offline[m]["log"].splitlines() if l.startswith("{")), flush=True)
+
+
+offline = {}
 CMDS = commands()
 # SAMPLE=N: every Nth compile only.
 CMDS = CMDS[::int(os.environ.get("SAMPLE", "1"))]
@@ -261,16 +368,21 @@ env = {"plain": dict(base)}
 # EXTRA="K=V ...": more settings for every cache mode (measurement switches).
 extra = dict(kv.split("=", 1) for kv in os.environ.get("EXTRA", "").split())
 for m in CM:
+    # EXTRA_<mode> ('@' written as '_'): more settings for that mode alone.
+    own = dict(kv.split("=", 1) for kv in os.environ.get("EXTRA_" + m.replace("@", "_"), "").split())
     env[m] = dict(base, CLANG_HEADER_CACHE=daemons[m][1], CLANG_HEADER_CACHE_STATS=os.environ.get("LEVEL", "1"),
-                  CLANG_HEADER_CACHE_BUILD=f"{proj}-{m}-{time.time()}", **{**ALL[m], **extra})
+                  CLANG_HEADER_CACHE_BUILD=f"{proj}-{m}-{time.time()}", **{**ALL[basemode(m)], **extra, **own})
 PASSES = int(os.environ.get("PASSES", "1"))
 # INSTR=1: count each compile's instructions (perfc), stable where the host
 # is loaded; kept as "I" in the trace and summed in the summary line.
 PERFC = [os.environ.get("PERFC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf", "perfc"))] if os.environ.get("INSTR") == "1" else []
 passes = []
 for k in range(1, PASSES + 1):
+  if k == 2:
+    # A rebuild on the same daemons: the offline step between the builds.
+    run_offline()
   if k > 1:
-    passes.append({"T": T, "S": S, "W": W, "failed": failed})
+    passes.append({"T": T, "S": S, "W": W, "failed": failed, "I": I})
     for m in CM:
         env[m]["CLANG_HEADER_CACHE_BUILD"] = f"{proj}-{m}-pass{k}-{time.time()}"
     # CHANGE_CMD: run before each later pass, to change the sources the
@@ -287,7 +399,7 @@ for k in range(1, PASSES + 1):
         a = replay_args(args, obj)
         if m == "plain" and not PLAIN_MODULES:
             a = a[2:]
-        r = subprocess.run(["taskset", "-c", CORE] + PERFC + [f"{BIN}/clang"] + a, cwd=cwd, env=env[m],
+        r = subprocess.run(["taskset", "-c", CORE] + PERFC + [f"{binof(m)}/clang"] + a, cwd=cwd, env=env[m],
                            capture_output=True, text=True)
         T[m].append((time.perf_counter() - t) * 1000)
         if PERFC:
@@ -306,10 +418,15 @@ for k in range(1, PASSES + 1):
         for m in MODES), flush=True)
 if os.environ.get("CHANGE_UNDO"):
     subprocess.run(os.environ["CHANGE_UNDO"], shell=True, check=True)
+I1 = None
 if PASSES > 1:
-    passes.append({"T": T, "S": S, "W": W, "failed": failed})
+    passes.append({"T": T, "S": S, "W": W, "failed": failed, "I": I})
     T, S, W, failed = passes[0]["T"], passes[0]["S"], passes[0]["W"], passes[0]["failed"]
+    # "I" stays the last pass's; "I1" is pass 1's, each pass's "I" its own.
+    I1 = passes[0]["I"]
     passes = passes[1:]
+if PASSES == 1:
+    run_offline()
 stored = {}
 for m, (p, _) in daemons.items():
     p.terminate(); p.wait()
@@ -329,11 +446,28 @@ if KIND == "full":
         for k, P in enumerate(passes, 2):
             P["differ"] = dict(P.get("differ", {}), **{m: differs(m, f"pass{k}-")})
 json.dump({"cmds": [c[2] for c in CMDS], "modes": MODES, "T": T, "S": S, "W": W, "failed": failed, "differ": differ,
-           "daemon": stored, "passes": passes, "I": I}, open(out, "w"))
+           "daemon": stored, "passes": passes, "I": I, "I1": I1, "offline": offline}, open(out, "w"))
+# The trace keeps what the objects and the daemons' folders gave: they go,
+# as each run would leave 0.4-4.4 GB in /tmp. KEEP_OBJECTS=1 keeps the
+# objects, the differing ones only, to look into.
+if os.environ.get("KEEP_OBJECTS") == "1":
+    keep = {i for i, c in enumerate(CMDS) if any(c[2] in v for v in differ.values())}
+    for m in MODES:
+        for f in os.listdir(f"{objdir}/{m}") if os.path.isdir(f"{objdir}/{m}") else []:
+            if int(f.split(".")[0].split("-")[-1]) not in keep:
+                os.remove(f"{objdir}/{m}/{f}")
+    print(f"objects kept in {objdir}", flush=True)
+else:
+    shutil.rmtree(objdir, ignore_errors=True)
+for p, _ in daemons.values():
+    shutil.rmtree(os.path.dirname(p.log), ignore_errors=True)
 tot = {m: sum(T[m]) / 1000 for m in MODES}
 nf = {m: sum(1 for f in failed if f[0] == m) for m in MODES}
 print(f"{proj} {KIND}: " + ", ".join(f"{m} {tot[m]:.2f} s ({tot['plain'] / tot[m]:.2f}x, {nf[m]} failed"
                                      + (f", {len(differ[m])} objects differ" if m in differ else "") + ")" for m in MODES), flush=True)
+if PERFC and I1:
+    gi = {m: sum(I1[m]) / 1e9 for m in MODES}
+    print(f"{proj} {KIND} pass 1 instructions: " + ", ".join(f"{m} {gi[m]:.1f} G ({gi['plain'] / gi[m]:.2f}x)" for m in MODES), flush=True)
 if PERFC:
     gi = {m: sum(I[m]) / 1e9 for m in MODES}
     print(f"{proj} {KIND} instructions: " + ", ".join(f"{m} {gi[m]:.1f} G ({gi['plain'] / gi[m]:.2f}x)" for m in MODES), flush=True)

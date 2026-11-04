@@ -330,6 +330,10 @@ public:
   /// IdentifierTableData.
   std::vector<unsigned> PreloadIdentifierOffsets;
 
+  /// For each of those, the name's hash in an IdentifierTable
+  /// (llvm::StringMapImpl::hash), as the writer stores it.
+  std::vector<uint32_t> PreloadIdentifierHashes;
+
   /// Header cache: for a module (which lists every name it has a
   /// declaration or a macro for in PreloadIdentifierOffsets), a filter of
   /// those names' hashes. A lookup of a name the filter lacks finds nothing

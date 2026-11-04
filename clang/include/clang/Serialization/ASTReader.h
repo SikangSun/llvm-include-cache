@@ -783,7 +783,11 @@ private:
   /// If the pointer at index I is non-NULL, then it refers to the
   /// IdentifierInfo for the identifier with ID=I+1 that has already
   /// been loaded.
-  std::vector<IdentifierInfo *> IdentifiersLoaded;
+  ///
+  /// Paged, as DeclsLoaded is: a header cache hit loads about a hundred
+  /// small files, and a vector grown for each in turn was copied and
+  /// zero-filled again and again.
+  llvm::PagedVector<IdentifierInfo *> IdentifiersLoaded;
 
   /// A vector containing macros that have already been
   /// loaded.
@@ -791,7 +795,7 @@ private:
   /// If the pointer at index I is non-NULL, then it refers to the
   /// MacroInfo for the identifier with ID=I+1 that has already
   /// been loaded.
-  std::vector<MacroInfo *> MacrosLoaded;
+  llvm::PagedVector<MacroInfo *> MacrosLoaded;
 
   using LoadedMacroInfo =
       std::pair<IdentifierInfo *, serialization::SubmoduleID>;
@@ -1205,6 +1209,8 @@ private:
   /// that load order is ModuleManager::visit's order.
   unsigned NameTableModules = 0;
   bool NameTableUsable = true;
+  /// Makes room for \p Names names in all, so that the table grows once.
+  void reserveNameTable(size_t Names);
   void addToNameTable(uint32_t Hash, unsigned Module);
   const NameSlot *findInNameTable(uint32_t Hash) const;
   bool useNameTable() const;

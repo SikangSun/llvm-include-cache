@@ -1,11 +1,11 @@
 #!/bin/bash
-# Builds the six projects once through cclog, recording every compile command
+# Builds the seven projects once through cclog, recording every compile command
 # (BENCH_LOGS/log-<project>) for modes_bench.py to replay. Run it with the
 # sources at BENCH_ROOT (one checkout per project, at the commits in
 # HISTORY.md), then copy the built trees to DRAM with dram_sources.sh: the
 # replays need the generated headers the builds made.
 set -e
-: "${BENCH_ROOT:?set BENCH_ROOT to the directory holding the six checkouts}"
+: "${BENCH_ROOT:?set BENCH_ROOT to the directory holding the seven checkouts}"
 : "${BENCH_LOGS:?set BENCH_LOGS to a directory for the compile logs}"
 : "${CCLOG_CLANG:?set CCLOG_CLANG to a release clang of this tree}"
 export CCLOG_CLANG
@@ -18,4 +18,5 @@ cd "$BENCH_ROOT/curl" && git clean -fdxq && autoreconf -fi > /dev/null && ./conf
 cd "$BENCH_ROOT/git" && git clean -fdxq && CCLOG=$(log git) make -j$J CC=$CC > /dev/null
 cd "$BENCH_ROOT/postgres" && git clean -fdxq && ./configure CC=$CC --without-icu --without-readline --without-zlib > /dev/null && CCLOG=$(log postgres) make -j$J > /dev/null
 cd "$BENCH_ROOT/cpython" && git clean -fdxq && ./configure CC=$CC > /dev/null && CCLOG=$(log cpython) make -j$J > /dev/null
-for p in redis nginx curl git postgres cpython; do echo "$p: $(ls "$BENCH_LOGS/log-$p" | wc -l) compiler calls"; done
+cd "$BENCH_ROOT/ffmpeg" && git clean -fdxq && ./configure --cc=$CC --disable-x86asm --disable-doc > /dev/null && CCLOG=$(log ffmpeg) make -j$J > /dev/null
+for p in redis nginx curl git postgres cpython ffmpeg; do echo "$p: $(ls "$BENCH_LOGS/log-$p" | wc -l) compiler calls"; done
