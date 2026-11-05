@@ -2108,6 +2108,15 @@ SourceManager::isInTheSameTranslationUnit(FileIDAndOffset &LOffs,
     return std::make_pair(true, LOffs.second < ROffs.second);
   }
 
+  // Two main files: translation units that share this SourceManager, as a
+  // compile server's do (clang/lib/ASTCache/COMPILE_SERVER_DESIGN.md 2.2).
+  // The earlier unit's locations come first: each unit's main file was
+  // entered after everything the earlier units entered.
+  if (LOffs.first != ROffs.first && !LOffs.first.isInvalid() &&
+      !ROffs.first.isInvalid() && !isLoadedFileID(LOffs.first) &&
+      !isLoadedFileID(ROffs.first))
+    return std::make_pair(true, LOffs.first < ROffs.first);
+
   llvm_unreachable("Unsortable locations found");
 }
 

@@ -3,8 +3,9 @@
 Written 2026-11-01 for review, on `bothner-model`; revised the same day after
 three independent reviews: Clang mechanics, fidelity to the paper,
 evaluation. S0, the model's prediction of the server, ran on 2026-11-03; its
-results are in section 6 and the decisions it raises in section 8. Nothing
-of the server is built yet.
+results are in section 6 and the decisions it raises in section 8. S1-S6
+and option 3 of S8 were built on 2026-11-05; "S1-S6 results" in section 6
+has what they found.
 
 The real server replaces the model of COMPILE_SERVER_PLAN.md as the
 baseline. The model stays for two jobs:
@@ -734,6 +735,242 @@ predecessor 1. None for param, builtin, macro args, pending or pragma.
 as §11.2 has them recover little. Groups that hold `#define` lines recover
 the nesting: 2.17x, above the model's R1 (1.93x). Decisions 6-9 settle what
 the server row is.
+
+### S1-S6 results
+
+**What runs.** `bothner/BothnerServer.cpp`, a plugin, is the server. It runs
+option 2 with R0 and the checks of 2.6, the restore of 2.5 and the undo of
+2.8, on the hook of 2.4. With `socket=<path>` it takes jobs from drivers
+(`CLANG_COMPILE_SERVER`, driver.cpp), one connection a job, serially. The
+Clang changes are:
+- the hook (HeaderCacheHook.h, PPDirectives.cpp, PPLexerChange.cpp)
+- the driver's forwarding with its local fallback (driver.cpp, two message
+  kinds in CacheProtocol.h)
+- the location order (SourceManager.cpp).
+
+The observer fix of 2.9 lives in the plugin: it reads the last token the
+parser got and Sema's context. Option 3 and groups (2.7)
+are plugin arguments. `option=3` joins `#define` and `#undef` lines to the
+fragment and replays them in order. `groups=1` joins conditionals while the
+parser is nested.
+
+**Checks** (assertions build):
+
+| Check | Option 2 | Option 3 + groups |
+|---|---|---|
+| Unit tests, `tests/server_reuse.py`, 51 cases: IR, declarations, diagnostics | all pass | all pass |
+| Redis, 117 compiles, 3 passes, reuse on: IR, declarations, diagnostics | identical | identical |
+| Redis under `-Weverything`, 2 passes: diagnostics | 149 of 234 identical, 85 with the known differences only | 197 of 234 identical, 37 with the known differences only |
+| Seven projects, the cache's check, in a first build and the same build again: objects (own flags, byte for byte), diagnostics (text) | all 5,133 objects identical in both passes (7 projects); diagnostics identical | all 5,133 objects identical in both passes (7 projects); diagnostics identical |
+| Through the driver (`CLANG_COMPILE_SERVER`), redis and nginx, same check | all 243 objects identical in both passes (2 projects); diagnostics identical | all 243 objects identical in both passes (2 projects); diagnostics identical |
+
+Option 3 alone and groups alone also pass all 51 cases.
+
+**Source-location space (2.2).** A server never frees the space its
+compiles' files take, and 2 GiB is the end of it. The object check measured
+the space after each compile (option 3 with groups). It splits a project into
+servers of at most 200 compiles each, so that no server runs out:
+
+| Project | Compiles | Space per compile (MiB) | One pass in one server (GiB) | Fill + same build again (GiB) | Fits 2 GiB | Largest RSS, 200 compiles, 2 passes (GiB) |
+|---|---|---|---|---|---|---|
+| redis | 117 | 1.86 | 0.21 | 0.42 | yes | 0.58 |
+| nginx | 126 | 1.80 | 0.22 | 0.44 | yes | 0.36 |
+| curl | 479 | 0.43 | 0.20 | 0.40 | yes | 0.49 |
+| git | 567 | 2.91 | 1.61 | 3.22 | no | 0.91 |
+| cpython | 401 | 1.63 | 0.64 | 1.28 | yes | 2.00 |
+| postgres | 1,341 | 0.20 | 0.26 | 0.51 | yes | 2.58 |
+| ffmpeg | 2,102 | 1.48 | 3.05 | 6.09 | no | 0.97 |
+
+Section 4 runs one server for a fill and the same build again. A project
+whose two passes do not fit in 2 GiB cannot get the server row that way.
+When the space ends in a compile, the server refuses that compile, and the
+driver compiles it (below). The space is never freed. A later compile still
+runs if its files fit in what is left (test `space_ends`: a small `b.c`
+after the refused `a.c`). In a macro expansion, Clang ends the process
+instead, and the driver compiles the file itself (2.10).
+
+**The model's decisions (S3, S4).** simulate.py's server rule ran on
+BothnerTrace's records of the same 117 redis compiles, with the server's
+options: the 2.8 rule, location keys and token names (`server_model.py`).
+`server_compare.py` set its decisions beside the object check's, which
+uses the same flags. In the same build again:
+
+| Fragments, redis pass 1 | Option 2: model | Option 2: server | Option 3 + groups: model | Option 3 + groups: server |
+|---|---|---|---|---|
+| Reused (the model's count includes fragments that hand the parser no tokens) | 58,526 | 58,526 | 140,990 | 140,792 |
+| Parsed: uses, deps, token names | 15,792 | 15,791 | 1,848 | 1,890 |
+| Parsed: macro | 966 | 966 | 966 | 1,171 |
+| Parsed: repeat | 4,820 | 4,820 | 24,318 | 24,318 |
+| Compiles with the same reuse count | 117 of 117 | | 7 of 117 | |
+
+- **Option 2 agrees in every compile.** The server has 4,083 more nested
+  decisions. They are stretches with no tokens between two directives
+  inside a declaration, which the model's records do not hold.
+- **Option 3 with groups: the server reuses 1 to 7 fewer fragments a
+  compile** (198 in all, 0.14%). 109 are its own check: a line redefines
+  `__INT64_C`, which clang predefines. Most of the rest are groups whose
+  `#if` lines read `__USE_FILE_OFFSET64` or `__USE_XOPEN_EXTENDED`. The
+  server compares the macro's definition, and the model compares only the
+  branches the `#if` lines take.
+- **The two cut fragments at other offsets.** The server's fragment starts
+  where a directive ends, and the model's at its first token. A fragment
+  that hands the parser no tokens (`__BEGIN_DECLS` in C) is "empty" in
+  the model and reused in the server. Both skip it.
+- `server_s1.py` compiles at `-O0`, which changes the headers. Its
+  results do not compare with the records.
+
+**What the checks found.** Each item is a departure from 2.1-2.10, with the
+unit test that pins it.
+
+- **Names the AST drops (decision 9).** An enumerator in
+  `vector_size(N * sizeof(int))` leaves no reference in the AST, so a
+  fragment reused under a different `N` kept the old type (test
+  `vector_size`). Every name an identifier token spells is now a use, in
+  both name spaces, checked as the declarations of that name before the
+  fragment. On redis this refuses 595 fragments.
+- **A file's name is the compile's, not the server's.** The SourceManager
+  keeps, per file, the path the file was first entered by
+  (`ContentCache::OrigEntry`). Presumed locations, `__FILE__`, the debug
+  information and the first directory of a quoted `#include` all read it.
+  In a server that is the first compile's path. The server now sets it to
+  this compile's path at each compile's first entry of a file. A restored
+  declaration then names the file as a parse would. A fragment whose
+  `__FILE__` became a string compares the presumed name
+  (test `two_paths`).
+- **A restored declaration keeps its parse's lines.** A `#line` or a
+  `#pragma GCC system_header` inside an `#ifdef` gave a reused fragment the
+  lines, the file name and the system-header kind of the compile that
+  parsed it. The results were a wrong `__LINE__` value and debug line, and
+  profile counters in a function of a system header (tests `line_moved`,
+  `system_pragma`). Every reuse now compares where the line table puts the
+  fragment's start. It compares the system-header kind (system or not), and
+  the name, line offset and include of the line entry before the start. Clang reads
+  the kind only as system or not when it compiles. The extern "C" kind
+  (`/usr/include`) changes only `-E` output, which the server does not
+  serve. A check of the exact kind refused 656 fragments of clang's own
+  `stddef.h` and `stdarg.h` on redis. Their kind is the kind of the file
+  that includes them.
+- **Tag definitions reach the code generator.** A restore now calls
+  `HandleTagDeclDefinition` for each restored struct and enum definition,
+  inner ones first, as Sema does. Without it a type the debug information
+  first saw incomplete stayed a forward declaration (test
+  `debug_completion`).
+- **Section kinds are per compile.** `ASTContext::SectionInfos` held one
+  compile's sections into the next, a false "section type conflict" (test
+  `sections`). The server clears it at each compile's start, and a restore
+  enters its declarations' sections again with their recorded kinds.
+- **Members of a body split by directives are bindings.** A directive can
+  split a struct body. A tag first named, or an enumerator, after that
+  directive was never bound, so the checks of later fragments missed it. Two
+  distinct `struct curl_thrdq` (curl) and `struct strmap` (git) then met in
+  one compile (test `tag_in_split_body`). Each fragment now notes the struct
+  and enum bodies open at its start and binds what they gain.
+- **Used bits are reset, not leaked (2.8).** The first compile's use of
+  `strtoull` made glibc's later `__REDIRECT_NTH` an error, "cannot apply asm
+  label to function after its first use", in another compile (FFmpeg,
+  test `used_bit`). The server finds the private bit once, from a
+  declaration made for the purpose. It clears the bit on the declarations
+  the last compile could have marked. A restore marks the entities its
+  fragment's parse marked: those it odr-used that were marked when the
+  parse handed the declaration over. The rule of 2.8 for internal and
+  inline functions stays.
+- **The macro list compares what a compile's pragmas set on a name.**
+  `#pragma GCC poison` makes a use an error, and `#pragma clang
+  deprecated`, `restrict_expansion` and `final` make an expansion or a
+  redefinition warn. 2.3 clears these flags each compile. The macro list
+  now includes them for every name a fragment reads, so a reuse needs the
+  same flags (test `pragma_marked_name`).
+- **Also never reused:** fragments with `__builtin_FILE()`,
+  `__builtin_LINE()` or `__builtin_COLUMN()` (a file-scope initializer keeps
+  the value), and fragments with an `alias` or `ifunc` attribute (Sema marks
+  the target used by name).
+
+**Diagnostics as plain clang prints them.** Section 5 compares them under
+`-Weverything`, and `diagtext.py` compares them as text. A reuse prints
+nothing, so:
+- **A fragment whose parse printed a diagnostic is parsed every time.** The
+  diagnostic belongs to the open fragment and to the fragment it points
+  into. A reuse also needs the warning options and the `#pragma diagnostic`
+  state its parse had. The reason is "diagnostics" (tests `warning_reuse`,
+  `warning_options`, `warning_pragma`).
+- **A fragment parsed under a `#pragma diagnostic` is never reused.** Some
+  diagnostics point into a restored declaration later, such as `-Wpadded`
+  at a struct's first use. They get the state of the warning options,
+  because no pragma of this compile reaches the files of the parse
+  (test `pragma_late`).
+- **Record layouts are per compile.** Clang lays a struct out at its first
+  use in a compile, and `-Wpadded` reports there (test `padded`).
+- **An unknown documentation command is unknown in each compile.** Clang
+  registers `@literal` in the ASTContext after it warns, so the next compile
+  did not warn. The server clears its name at each compile's start
+  (test `doc_command`).
+- **Option 3 compares what a `#define` line finds.** Plain clang compares
+  a redefinition with the earlier definition (`-Wmacro-redefined`) and
+  reports an unused macro of the main file there (`-Wunused-macros`). For
+  each name such a line makes or removes first, a reuse now needs an
+  earlier definition that gives the line the same output. For a `#define`
+  that is no definition, one identical to the line's own, or the one the
+  parse found. For an `#undef` any earlier definition does. A reuse
+  refuses one that `-Wunused-macros` watches, a final or predefined one,
+  and one that `#pragma push_macro` lets be redefined (tests
+  `macro_redefined`, `prior_repeat`, `prior_undef`). A first version
+  needed the parse's earlier definition in every case. glibc's
+  `bits/wordsize.h` is read several times a compile, and the store keeps
+  a later reading's version, so that version refused 1,585 first readings
+  on redis.
+- **A restore lists what its parse listed for the unused warnings.** The
+  server read Sema's list of unused-warning candidates at the end of the
+  compile. By then Sema drops those the compile used. A static
+  function that the first compile called was never listed again, so a
+  later compile that did not call it lost `-Wunused-function`. The server
+  now reads the list as the parse grows it. A restore also marks referenced what its
+  fragment's expressions name, as Sema did: the bit picks
+  `-Wunneeded-internal-declaration` over `-Wunused-function`
+  (test `referenced_bit`).
+- **A reused fragment's tokens count as read.** `-Wmax-tokens` and
+  `#pragma clang max_tokens_here` compare the preprocessor's count of
+  tokens, so a reuse adds the count of its parse (test `max_tokens`).
+- **The end of the source-location space is a refusal (2.10).** Clang
+  stops a compile that finds no space left with a fatal error, which the
+  server sent back as the compile's result. Plain clang has the whole space
+  for that one file, so the server now refuses the compile, and the driver
+  compiles it (test `space_ends`).
+- **A BPF target is not served.** Sema lists external declarations for
+  their debug information there, and a restore does not list them again.
+- **The reply carries all diagnostics** (it cut them at 64 KiB), and cc1's
+  count line ("2 warnings generated."), which the driver prints.
+- **A restored fragment's last declaration reaches the code generator at
+  the parser's next token,** as in a parse, which reads past a
+  declaration's end first.
+
+Two kinds of difference stay, both in text only. The checks count them
+apart:
+- **Include lines.** A diagnostic that points into a restored declaration
+  names the include chain of the compile that parsed it. An example is
+  "In file included from b.c:1:" in a compile of `a.c`. Its location lies in that compile's
+  file entry.
+- **Order.** The same diagnostics can come in another order. Clang reports
+  `-Wunused-macros` from a hash set of locations, and the server's
+  locations have other values. A reused fragment also ends the parser's
+  read-ahead early. A parse reports some things after it reads past a
+  declaration's end, such as the `@param` checks of its comment. With a
+  reuse, they can come before the warnings of the directives that follow.
+
+These replace the two differences of decision 3: Used bits are now reset,
+and a late diagnostic gets the right `#pragma diagnostic` state.
+
+**Reuse in the object check**, the same build again (pass 1): fragments
+reused, and the share of those with a decision.
+
+| Project | Objects | Option 2 | Option 3 + groups |
+|---|---|---|---|
+| redis | 117 | 58,526 (43.0%) | 140,792 (83.6%) |
+| nginx | 126 | 89,475 (41.4%) | 281,191 (93.9%) |
+| curl | 479 | 270,886 (43.1%) | 636,446 (91.2%) |
+| git | 567 | 714,561 (54.7%) | 1,387,918 (91.2%) |
+| cpython | 401 | 242,295 (30.5%) | 751,831 (80.0%) |
+| postgres | 1,341 | 667,713 (39.8%) | 1,557,542 (74.4%) |
+| ffmpeg | 2,102 | 428,142 (48.0%) | 1,482,883 (75.2%) |
 
 ## 7. Risks
 

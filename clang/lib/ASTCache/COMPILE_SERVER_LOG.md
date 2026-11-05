@@ -1,13 +1,14 @@
 # Bothner's compile server as a baseline: work log
 
-Everything done on this baseline from 2026-10-30 to 2026-11-03, with every
+Everything done on this baseline from 2026-10-30 to 2026-11-05, with every
 decision and why, and where each piece lives. Branch `apple-compile-server`
 (from local `bothner-model`).
 
 Companion documents:
 - COMPILE_SERVER_PLAN.md: the model (D1-D7), its decisions and status.
-- COMPILE_SERVER_DESIGN.md: the real server's design, S0's results
-  (section 6) and decisions 1-9 (section 8).
+- COMPILE_SERVER_DESIGN.md: the real server's design, the results of S0
+  and of S1-S6 (section 6), and decisions 1-9 (section 8).
+- COMPILE_SERVER_IMPL.md: how the server is built, request by request.
 - This log: the order of events, the implementation choices below the
   design's level, the verification history, the data, and what is open.
 
@@ -245,7 +246,10 @@ python3 tests/server_record.py <workdir>; python3 tests/server_simulate.py <work
 `foo.c` compiles are configure probes that fail under plain clang too; every
 tool skips them.
 
-## 8. Open
+## 8. Open on 2026-11-03
+
+Section 10 has the list as it stands now.
+
 
 - Decisions 6-9 (design section 8).
 - S1 onward (design section 6): the server itself. Nothing of it is built.
@@ -253,3 +257,83 @@ tool skips them.
 - 26 of the 300 token-name refusals are not classified by hand.
 - The cache's rerun under the fixed observer (decision 4) belongs to S2.
 - The other five projects: no build logs on this machine.
+
+## 9. 2026-11-05: the server, S1-S6 and option 3
+
+The real server is built and checked. Design section 6, "S1-S6 results",
+has what the checks found. Built against `build_assert` (Release with
+assertions) on the 64-thread machine, with its build logs for all seven
+projects (`/home/sikang/c/code/scratch/e2e/multi/log-<project>`).
+
+| Path | What |
+|---|---|
+| `bothner/BothnerServer.cpp` | The server, a plugin: `-plugin bothner-server` with `requests=` and `results=` (a file of jobs) or `socket=` (jobs from drivers). Arguments `reuse=1`, `option=3`, `groups=1`. `BOTHNER_WHY=<reason>` prints where it refuses for that reason |
+| `bothner/server_s1.py` | Redis against plain clang: IR, declaration summary and diagnostics, PASSES passes. `WARN` adds flags such as `-Weverything`. `TIMING=1` is for S7 |
+| `bothner/server_objects.py` | The cache's check for the server, in a first build and the same build again: objects (own flags, byte for byte), diagnostics (text). `VIA=driver` runs every compile through the driver |
+| `bothner/diagtext.py` | The diagnostic comparison, with the two known differences |
+| `bothner/tests/server_reuse.py` | 51 cases, each run as plain clang and through one server, twice |
+| `bothner/server_model.py`, `server_compare.py` | S4: simulate.py's server rule on BothnerTrace's records, and its decisions against the server's, per compile and pass |
+| `bothner/server_space.py` | Source-location space and memory per project, from `server_objects.py`'s results |
+| `clang/tools/driver/driver.cpp` | `CLANG_COMPILE_SERVER=<socket>`: the driver forwards its cc1 job, prints the reply, and compiles locally if the server is down or refuses (status 2) |
+| `clang/include/clang/ASTCache/CacheProtocol.h` | Message kinds 11 and 12 (JSON bodies) |
+| `HeaderCacheHook.h`, `PPDirectives.cpp`, `PPLexerChange.cpp` | The fragment hook (2.4) |
+| `clang/lib/Basic/SourceManager.cpp` | Locations of two compiles' main files compare by compile |
+
+Build the plugin (or `BUILD=<build_assert> ./build.sh`):
+
+```
+B=<llvm-bothner>/build_assert
+$B/bin/clang++ -shared -fPIC -std=c++17 -fno-rtti -O2 -I<src>/llvm/include \
+  -I<src>/clang/include -I$B/include -I$B/tools/clang/include \
+  BothnerServer.cpp -o BothnerServer.so
+```
+
+Checks (each also with `OPTION=3 FRAGMENT_GROUPS=1`):
+
+```
+python3 tests/server_reuse.py <workdir>
+LOGS=<logs>/log-redis BENCH_ROOT=/home/sikang/c/benchmarks SRC_ROOT=/dev/shm/bench-src \
+  REUSE=1 PASSES=3 python3 server_s1.py <workdir>
+... WARN=-Weverything PASSES=2 python3 server_s1.py <workdir>
+BENCH_ROOT=... SRC_ROOT=... JOBS=12 CHUNK=200 python3 server_objects.py <workdir> \
+  redis nginx curl git cpython postgres ffmpeg
+... VIA=driver python3 server_objects.py <workdir> redis nginx
+python3 server_space.py <server_objects.py workdir>
+LOGS=<logs>/log-redis ... RECORD=1 CORE=8-15 python3 trace_run.py <records>
+LOGS=<logs>/log-redis ... python3 server_model.py <records> model.json
+python3 server_compare.py model.json "S3G* tok" <server_objects.py workdir>/redis/res0.jsonl
+```
+
+`trace_run.py` reports count problems on this machine: its expected counts
+(`fragcount/`) are for the other machine's 187 compiles.
+
+`SOURCE_DATE_EPOCH` is fixed in `server_objects.py`: cpython's
+`getbuildinfo.c` expands `__TIME__`.
+
+## 10. Open (2026-11-05)
+
+- Decisions 6-9 (design section 8): the server runs the recommended
+  options. The user has not answered yet.
+- Source-location space (design section 6): one server cannot serve git
+  (3.22 GiB) or ffmpeg (6.09 GiB) for a fill and the same build again.
+  ffmpeg needs 3.05 GiB for one pass. When the space ends, the server now
+  refuses the compile and the driver compiles it, so a build still
+  finishes. S7 needs a rule for these two projects.
+- S3 and S4 (design section 6): on redis in the same build again, option
+  2 reuses as many fragments as the model in every compile. Option 3 with
+  groups reuses 0.14% fewer: the server's `__INT64_C` check, and groups
+  whose `#if` lines read a macro with a changed definition. Making groups
+  compare only the branches taken is a design change.
+- S7 (timing) waits for the machine. Until S7 the restoring cost and the
+  start-up credit stay as S0 assumed them. The cache's row needs the same
+  binary: this branch is 12 commits behind header-cache `a73d53acc`.
+- Decision 4 for the cache: the server's observer fix lives in the plugin
+  (`atBoundary`) and changes no Clang file. The cache's observer is
+  unchanged, and its rerun waits.
+- The two text-only diagnostic differences (design section 6).
+- 26 of the 300 token-name refusals are not classified by hand.
+- S9 (`-j4`).
+
+Closed since section 8:
+- S1, S2, S5, S6 and option 3 of S8: the server runs and passes its checks.
+- This machine has build logs for all seven projects.

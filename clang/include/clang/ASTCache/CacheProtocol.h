@@ -71,6 +71,12 @@ enum class MessageKind : uint8_t {
   ClaimReply = 14,
   BuildHint = 15,
   BuildHintAck = 16,
+  /// Bothner's compile server (COMPILE_SERVER_DESIGN.md 2.1): a driver's cc1
+  /// job, and the server's answer. Both bodies are one JSON object after the
+  /// kind: the request has "cwd", "args" (after -cc1) and "build"; the reply
+  /// has "status" and "diags", with the server's per-compile counts.
+  CompileRequest = 17,
+  CompileReply = 18,
 };
 
 /// What a copy's #include searches found in one build, under one search key

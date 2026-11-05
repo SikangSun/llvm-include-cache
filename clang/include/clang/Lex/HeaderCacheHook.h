@@ -50,6 +50,47 @@ public:
   virtual FileID enterInstead(FileEntryRef File, SourceLocation IncludeLoc) {
     return FileID();
   }
+
+  /// Fragments, for Bothner's compile server
+  /// (clang/lib/ASTCache/COMPILE_SERVER_DESIGN.md 2.4): the text of a file
+  /// between two directives, or between a directive and the file's start or
+  /// end. A hook that sets this hears where every fragment of a file-backed
+  /// buffer ends and starts. The header cache leaves it unset, so its
+  /// compiles pay one test per directive.
+  bool WantsFragments = false;
+
+  /// How a stored fragment stands in for its text, when fragmentStart
+  /// reuses it.
+  struct FragmentSkip {
+    /// Where lexing goes on: the '#' of the directive that ends the
+    /// fragment, at the start of its line, or the end of the file.
+    unsigned End = 0;
+    /// Whether the fragment handed the parser a token and expanded a macro.
+    /// The multiple-include optimization must hear both, or tokens after an
+    /// include guard's #endif would go unseen and the header be taken as
+    /// guarded.
+    bool HadTokens = false;
+    bool ExpandedMacro = false;
+    /// The module whose visibility restores the fragment's declarations,
+    /// carried to the parser by an annot_module_include token, or null.
+    Module *Restore = nullptr;
+  };
+
+  /// The fragment of \p FID that ran up to \p Offset ends there: at the '#'
+  /// of a directive, or at the end of the file. \p InMacroArgs: the
+  /// directive sits inside a function-like macro's arguments, so skipping
+  /// the fragment would skip the macro's name.
+  virtual void fragmentEnd(FileID FID, unsigned Offset, bool InMacroArgs) {}
+
+  /// A fragment of \p FID starts at \p Offset, before its first token is
+  /// lexed: after a directive, or where an included file returned. With
+  /// \p CanSkip false the preprocessor cannot skip it (a token stream is
+  /// pending on top of the file, or macro arguments are being collected).
+  /// Returning true, where \p CanSkip, skips the text up to \p Skip.End.
+  virtual bool fragmentStart(FileID FID, unsigned Offset, bool CanSkip,
+                             FragmentSkip &Skip) {
+    return false;
+  }
 };
 
 } // namespace clang

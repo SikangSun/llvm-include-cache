@@ -13,6 +13,7 @@
 
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Lex/HeaderCacheHook.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LexDiagnostic.h"
 #include "clang/Lex/MacroInfo.h"
@@ -326,6 +327,18 @@ bool Preprocessor::HandleEndOfFile(Token &Result, bool isEndOfMacro) {
   assert(!CurTokenLexer &&
          "Ending a file when currently in a macro!");
 
+  // Fragments for Bothner's compile server: the file's last fragment ends
+  // here; where an includer resumes, its next fragment starts (below, as in
+  // HandleDirective).
+  HeaderCacheHook *FragmentHook =
+      HeaderCache && HeaderCache->WantsFragments ? HeaderCache.get() : nullptr;
+  if (FragmentHook && CurLexer && !isEndOfMacro) {
+    FileID FID = CurLexer->getFileID();
+    if (SourceMgr.getFileEntryRefForID(FID))
+      FragmentHook->fragmentEnd(FID, SourceMgr.getFileIDSize(FID),
+                                InMacroArgs);
+  }
+
   SourceLocation UnclosedSafeBufferOptOutLoc;
 
   if (IncludeMacroStack.empty() &&
@@ -523,6 +536,30 @@ bool Preprocessor::HandleEndOfFile(Token &Result, bool isEndOfMacro) {
       // processing.
       LeavingPCHThroughHeader = true;
     } else {
+      // The includer's next fragment starts here, after the ExitFile
+      // callbacks: a token pushed before them would keep Sema from hearing
+      // that the file was left.
+      if (FragmentHook && !LeavingSubmodule && !isEndOfMacro && CurLexer &&
+          SourceMgr.getFileEntryRefForID(CurLexer->getFileID())) {
+        FileID FID = CurLexer->getFileID();
+        unsigned Offset = CurLexer->getCurrentBufferOffset();
+        bool CanSkip = !InMacroArgs;
+        HeaderCacheHook::FragmentSkip Skip;
+        if (FragmentHook->fragmentStart(FID, Offset, CanSkip, Skip) &&
+            CanSkip) {
+          CurLexer->seek(Skip.End, /*IsAtStartOfLine=*/true);
+          if (Skip.HadTokens)
+            CurLexer->MIOpt.ReadToken();
+          if (Skip.ExpandedMacro)
+            CurLexer->MIOpt.ExpandedMacro();
+          if (Skip.Restore) {
+            SourceLocation Loc =
+                SourceMgr.getLocForStartOfFile(FID).getLocWithOffset(Offset);
+            EnterAnnotationToken(SourceRange(Loc, Loc),
+                                 tok::annot_module_include, Skip.Restore);
+          }
+        }
+      }
       // Client should lex another token unless we generated an EOM.
       return LeavingSubmodule;
     }

@@ -1243,6 +1243,48 @@ void Preprocessor::HandleSkippedDirectiveWhileUsingPCH(Token &Result,
 void Preprocessor::HandleDirective(Token &Result) {
   // FIXME: Traditional: # with whitespace before it not recognized by K&R?
 
+  // Fragments for Bothner's compile server (HeaderCacheHook::WantsFragments):
+  // the fragment that ran up to this '#' ends here, and every return from
+  // this function starts the next one, before its first token is lexed. A
+  // stored fragment the hook reuses is skipped with a seek, and the restore
+  // of its declarations is queued to the parser as an annot_module_include.
+  HeaderCacheHook *FragmentHook =
+      HeaderCache && HeaderCache->WantsFragments ? HeaderCache.get() : nullptr;
+  if (FragmentHook && CurPPLexer) {
+    FileID FID = CurPPLexer->getFileID();
+    if (SourceMgr.getFileEntryRefForID(FID))
+      FragmentHook->fragmentEnd(
+          FID, SourceMgr.getFileOffset(Result.getLocation()), InMacroArgs);
+  }
+  auto StartFragment = llvm::make_scope_exit([this, FragmentHook] {
+    if (!FragmentHook)
+      return;
+    // The file lexer the fragment lies in: the current one, or the one under
+    // a token stream that a pragma handler pushed.
+    Lexer *L = CurLexer.get();
+    if (!L && !CurPPLexer && !IncludeMacroStack.empty())
+      L = IncludeMacroStack.back().TheLexer.get();
+    if (!L || !SourceMgr.getFileEntryRefForID(L->getFileID()))
+      return;
+    FileID FID = L->getFileID();
+    unsigned Offset = L->getCurrentBufferOffset();
+    bool CanSkip = L == CurLexer.get() && !InMacroArgs;
+    HeaderCacheHook::FragmentSkip Skip;
+    if (!FragmentHook->fragmentStart(FID, Offset, CanSkip, Skip) || !CanSkip)
+      return;
+    CurLexer->seek(Skip.End, /*IsAtStartOfLine=*/true);
+    if (Skip.HadTokens)
+      CurLexer->MIOpt.ReadToken();
+    if (Skip.ExpandedMacro)
+      CurLexer->MIOpt.ExpandedMacro();
+    if (Skip.Restore) {
+      SourceLocation Loc =
+          SourceMgr.getLocForStartOfFile(FID).getLocWithOffset(Offset);
+      EnterAnnotationToken(SourceRange(Loc, Loc), tok::annot_module_include,
+                           Skip.Restore);
+    }
+  });
+
   // We just parsed a # character at the start of a line, so we're in directive
   // mode.  Tell the lexer this so any newlines we see will be converted into an
   // EOD token (which terminates the directive).

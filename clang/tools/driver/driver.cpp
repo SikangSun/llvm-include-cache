@@ -13,6 +13,7 @@
 
 #include "clang/Driver/Driver.h"
 #include "clang/ASTCache/CacheClient.h"
+#include "clang/ASTCache/CacheProtocol.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/HeaderInclude.h"
 #include "clang/Basic/Stack.h"
@@ -39,8 +40,10 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/IOSandbox.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/LLVMDriver.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
@@ -52,6 +55,7 @@
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/raw_socket_stream.h"
 #include "llvm/TargetParser/Host.h"
 #include <memory>
 #include <optional>
@@ -206,9 +210,75 @@ static void FixupDiagPrefixExeName(TextDiagnosticPrinter *DiagClient,
   DiagClient->setPrefix(std::string(ExeBasename));
 }
 
+// Bothner's compile server (clang/lib/ASTCache/COMPILE_SERVER_DESIGN.md 2.1).
+// When CLANG_COMPILE_SERVER names the server's socket, the driver sends each
+// in-process cc1 job there: the working directory, the arguments after -cc1,
+// and CLANG_COMPILE_SERVER_BUILD. The server compiles it and answers with the
+// exit status and the diagnostics, which are printed here. If the server
+// cannot be reached or gives no answer, the job runs here, and a note on
+// standard error says so.
+static std::optional<int> forwardCC1(ArrayRef<const char *> ArgV) {
+  const char *Path = ::getenv("CLANG_COMPILE_SERVER");
+  if (!Path || !*Path)
+    return std::nullopt;
+  auto Local = [&](const llvm::Twine &Why) -> std::optional<int> {
+    llvm::errs() << "clang: note: compile server " << Path << ": " << Why
+                 << "; compiling locally\n";
+    return std::nullopt;
+  };
+  if (llvm::Error E = clang::ast_cache::checkSocketPath(Path))
+    return Local(llvm::toString(std::move(E)));
+  SmallString<256> Cwd;
+  if (llvm::sys::fs::current_path(Cwd))
+    return Local("no working directory");
+  llvm::json::Array Args;
+  for (const char *A : ArgV.slice(2))
+    if (A)
+      Args.push_back(A);
+  llvm::json::Object Request{{"cwd", Cwd.str()}, {"args", std::move(Args)}};
+  if (const char *Build = ::getenv("CLANG_COMPILE_SERVER_BUILD"))
+    Request["build"] = Build;
+  std::string Message(4, '\0');
+  Message.push_back(char(clang::ast_cache::MessageKind::CompileRequest));
+  {
+    llvm::raw_string_ostream OS(Message);
+    OS << llvm::json::Value(std::move(Request));
+  }
+  llvm::support::endian::write32le(Message.data(), Message.size() - 4);
+  llvm::Expected<std::unique_ptr<llvm::raw_socket_stream>> S =
+      llvm::raw_socket_stream::createConnectedUnix(Path);
+  if (!S)
+    return Local(llvm::toString(S.takeError()));
+  if (!clang::ast_cache::sendMessage(**S, Message))
+    return Local("the request could not be sent");
+  std::optional<std::string> Reply = clang::ast_cache::receiveMessage(**S);
+  if (!Reply || Reply->empty() ||
+      (*Reply)[0] != char(clang::ast_cache::MessageKind::CompileReply))
+    return Local("no answer");
+  llvm::Expected<llvm::json::Value> V =
+      llvm::json::parse(StringRef(*Reply).drop_front());
+  const llvm::json::Object *O = V ? V->getAsObject() : nullptr;
+  std::optional<int64_t> Status = O ? O->getInteger("status") : std::nullopt;
+  if (!V)
+    llvm::consumeError(V.takeError());
+  if (!Status)
+    return Local("a malformed answer");
+  // Status 2: the server did not take the job (arguments it does not serve,
+  // a working directory it could not enter).
+  if (*Status == 2)
+    return Local(O->getString("error").value_or("the job was refused"));
+  if (std::optional<StringRef> Diags = O->getString("diags"))
+    llvm::errs() << *Diags;
+  // "N warnings generated.", as cc1 prints it after the diagnostics.
+  if (std::optional<StringRef> Stats = O->getString("stats"))
+    llvm::errs() << *Stats;
+  return int(*Status);
+}
+
 static int ExecuteCC1Tool(SmallVectorImpl<const char *> &ArgV,
                           const llvm::ToolContext &ToolContext,
-                          IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+                          IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                          bool MayForward = false) {
   // If we call the cc1 tool from the clangDriver library (through
   // Driver::CC1Main), we need to clean up the options usage count. The options
   // are currently global, and they might have been used previously by the
@@ -224,6 +294,9 @@ static int ExecuteCC1Tool(SmallVectorImpl<const char *> &ArgV,
   }
   StringRef Tool = ArgV[1];
   void *GetExecutablePathVP = (void *)(intptr_t)GetExecutablePath;
+  if (Tool == "-cc1" && MayForward)
+    if (std::optional<int> Status = forwardCC1(ArgV))
+      return *Status;
   if (Tool == "-cc1")
     return cc1_main(ArrayRef(ArgV).slice(1), ArgV[0], GetExecutablePathVP);
   if (Tool == "-cc1as")
@@ -373,9 +446,11 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
   if (!SetBackdoorDriverOutputsFromEnvVars(TheDriver))
     return 1;
 
+  // Only the driver's own in-process jobs go to a compile server, never a
+  // direct -cc1 invocation such as the server itself.
   auto ExecuteCC1WithContext = [&ToolContext,
                                 &VFS](SmallVectorImpl<const char *> &ArgV) {
-    return ExecuteCC1Tool(ArgV, ToolContext, VFS);
+    return ExecuteCC1Tool(ArgV, ToolContext, VFS, /*MayForward=*/true);
   };
   if (!UseNewCC1Process) {
     TheDriver.CC1Main = ExecuteCC1WithContext;
