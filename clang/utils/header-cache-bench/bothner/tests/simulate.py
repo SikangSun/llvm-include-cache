@@ -26,13 +26,19 @@ int word` or B `typedef long word`, then C `extern word flags`), sz.h twice
       q2 B reused, C S U uses, 1 repeat; q3 A reused, C S U uses, 1 repeat.
   R2: the second sz.h is a location of its own and is reused; C as in R1.
   ideal: both versions of C are kept: everything reused.
+Option 3 (O3 R1 V1): a header's guard #define joins its first fragment, and
+en.h's enum, #define lines and all, is one fragment, not nested.
+  build 1: m1 all 5 reused; m2 buf macro, b and en main (the main file's
+           size_t), a f reused; m3 buf b en macro (m2's are stored), a f reused.
+  build 2: h1.h's guard #define is a fragment of its own, with no tokens,
+           always reused; otherwise as R1: 13 reused, 2 uses, 3 repeats.
 usage: simulate.py <workdir>   (runs tests/record.py into <workdir>/record first)
 """
 import collections, json, os, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from compiles import CLANG, ENV, MOD
+from compiles import CLANG, ENV, MODEL_MOD
 
 TRACE = os.path.join(os.path.dirname(HERE), "BothnerTrace.so")
 SIM = os.path.join(os.path.dirname(HERE), "simulate.py")
@@ -52,7 +58,7 @@ for name, text in {
 }.items():
     open(os.path.join(two, name), "w").write(text)
 for src in ("q1.c", "q2.c", "q3.c"):
-    subprocess.run([CLANG, "-fsyntax-only"] + MOD + ["-w", src, "-fplugin=" + TRACE], cwd=two, check=True,
+    subprocess.run([CLANG, "-fsyntax-only"] + MODEL_MOD + ["-w", src, "-fplugin=" + TRACE], cwd=two, check=True,
                    env=dict(ENV, BOTHNER_TRACE_OUT=os.path.join(two, src + ".json"), BOTHNER_TRACE_RECORD="1"))
 
 
@@ -76,12 +82,14 @@ want = {
         "R1 V0": {"reused": 8, "nested": 9, "main": 1, "unsafe": 3},
         "tokens": {"reused": 8, "nested": 9, "main": 1, "macro": 3},
         "ideal": {"reused": 11, "nested": 9, "main": 1},
+        "O3 R1 V1": {"reused": 9, "macro": 4, "main": 2},
     },
     "two": {
         "R1 V1": {"reused": 10, "uses": 2, "repeat": 3},
         "R0 V1": {"reused": 4, "uses": 8, "repeat": 3},
         "R2 V1": {"reused": 13, "uses": 2},
         "ideal": {"reused": 15},
+        "O3 R1 V1": {"reused": 13, "uses": 2, "repeat": 3},
     },
 }
 ok = True

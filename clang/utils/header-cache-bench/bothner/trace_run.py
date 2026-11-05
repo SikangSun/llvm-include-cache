@@ -8,7 +8,8 @@ run cut short starts again where it was.
 
 Checks, per compile: the parts add up to the span; no token is outside every
 fragment; the fragments are as many as fragcount/expected_per_compile.csv
-says (FragCount on the same compiles).
+says (FragCount on the same compiles), or expected_per_compile_nomod.csv
+without the modules flags.
 With RECORD=1 each compile runs once in the plugin's record mode instead
 (token hashes and nesting for the simulator; its times mean nothing).
 usage: trace_run.py <outdir> [first index] [count]
@@ -18,7 +19,7 @@ import csv, json, os, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from compiles import ENV, commands, front_end
+from compiles import ENV, MODEL_MOD, commands, front_end
 
 TRACE = os.path.join(HERE, "BothnerTrace.so")
 RECORD = os.environ.get("RECORD") == "1"
@@ -29,7 +30,10 @@ out = os.path.abspath(sys.argv[1])
 first = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 count = int(sys.argv[3]) if len(sys.argv) > 3 else None
 os.makedirs(out, exist_ok=True)
-expected = {int(r["i"]): int(r["frag2"]) for r in csv.DictReader(open(os.path.join(HERE, "fragcount", "expected_per_compile.csv")))}
+# FragCount's counts, with the same flags (the modules flags change Clang's
+# __stddef_*.h entries).
+EXPECTED = "expected_per_compile.csv" if MODEL_MOD else "expected_per_compile_nomod.csv"
+expected = {int(r["i"]): int(r["frag2"]) for r in csv.DictReader(open(os.path.join(HERE, "fragcount", EXPECTED)))}
 
 cmds = commands()
 todo = range(first, len(cmds) if count is None else min(len(cmds), first + count))

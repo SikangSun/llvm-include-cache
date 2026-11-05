@@ -1,0 +1,105 @@
+I'll start by reading the key files and setting up my working directory.
+
+-----
+
+I'll start by reading the key files and setting up my working directory.
+
+-----
+
+Now the simulator in full.
+
+-----
+
+Now the plugin.
+
+-----
+
+Now the tests, especially server_simulate.py to see how single records become a build dir.
+
+-----
+
+Now the tests, especially server_simulate.py to see how single records become a build dir.
+
+-----
+
+Let me look at the Clang pieces the record relies on: the DeclBoundaryObserver, the expansion-candidate hook, and how RecursiveASTVisitor treats attribute arguments.
+
+-----
+
+[thinking] I've confirmed by reading the code that `InDeclGroup` is cleared before `ParseFunctionDefinition` parses K&R parameter declarations, so the observer sees "between declarations" there. Next I'll look at the expansion-candidate hook and attribute traversal in RecursiveASTVisitor.
+
+-----
+
+[thinking] I've confirmed by reading the code that `InDeclGroup` is cleared before `ParseFunctionDefinition` parses K&R parameter declarations, so the observer sees "between declarations" there. Next I'll look at the expansion-candidate hook and attribute traversal in RecursiveASTVisitor.
+
+-----
+
+[thinking] Non-dependent `vector_size`, `ext_vector_type` and `_BitInt` drop their size expression, and `cleanup`'s FunctionDecl argument is never traversed. Next I'm checking the recorded data's shape and the redis flags before building a harness.
+
+-----
+
+[thinking] I have enough context now, so I'm building a test harness: an instrumented copy of simulate.py that logs each unit's decision and which compile stored the reused version, plus a driver that records small builds with the plugin.
+
+-----
+
+The copy differs only by logging. Now the driver that writes a case, records each compile, runs both the original and the instrumented simulator (checking they agree), and prints per-unit decisions.
+
+-----
+
+Sanity-check the harness first on the `ts` case from tests/server_simulate.py (expected: S2G 1 reused + 2 conditionals; S3G 6 nested; S3G* as S2G).
+
+-----
+
+[thinking] The harness now reproduces the test's expected decisions. Next I'll try three attacks: a fragment ending inside a function-like macro's arguments, dependencies the AST drops, and a directive placed between K&R parameter declarations and the body.
+
+-----
+
+[thinking] The model confirmed the first attack: the `int a0; DECL(` fragment is reused in every variant and nothing gets flagged as unsafe. Next I'll show what a real server would pass to the parser after that skip.
+
+-----
+
+[thinking] The skip left a stray `)` that breaks the compile, though plain clang succeeds. I'm now checking whether the same pattern shows up in the redis records.
+
+-----
+
+[thinking] The skip left a stray `)` that breaks the compile, though plain clang succeeds. I'm now checking whether the same pattern shows up in the redis records.
+
+-----
+
+No redis fragment starts inside macro arguments, so attack A does not move the redis numbers, but it is a real gap. Next, attack B: dependencies that the AST does not retain.
+
+-----
+
+[thinking] The model confirmed that three headers (`vec.h`, `ext.h`, `bit.h`) never record `N`, so the wide compile reuses the narrow compile's types without any unsafe flag, while the controls that do record `N` are refused. Next I'll show that the types really differ between the two compiles.
+
+-----
+
+[thinking] Plain clang confirmed the reused typedefs differ between the two compiles: the vector sizes, `ext_vector_type(4)` and `_BitInt(32)` in one, and the 8-wide versions in the other. Next I'll look at the `cleanup` attribute, whose FunctionDecl argument RecursiveASTVisitor never visits.
+
+-----
+
+[thinking] The record shows no link from `use.h` to `done`, and the model reuses `user` across both `done` definitions. I'm now checking which `done` the cleanup binds to, by declaration line and in the IR.
+
+-----
+
+[thinking] The parse binds `done` at fn.h:6 in one compile and at fn.h:4 in the other, yet `user` is reused across them without a flag. Next I'm testing a directive placed between the K&R parameter declarations and the body.
+
+-----
+
+[thinking] The attack on `kr` is confirmed in the model: the unnested `int kr(a) int a;` is reused in the K=2 compile, and the body fragment slips past `macro` into the parser. Next I'll show both effects, that `kr` picks up the other compile's body and that the parser gets a bare `{` at file scope.
+
+-----
+
+Let me check whether any redis fragment marked "not nested" starts with `{` (the K&R signature).
+
+-----
+
+Let me check whether any redis fragment marked "not nested" starts with `{` (the K&R signature).
+
+-----
+
+[thinking] Attack C is confirmed: a restored `kr` would give the parser a bare `{` and no redis fragment matches the pattern (0 of 100,363). Next I'll test the S3G* attacks: defines inside groups, use before define, `#undef`, function bodies, and `#pragma pack`.
+
+-----
+
+You've hit your session limit · resets 6:20pm (America/New_York)

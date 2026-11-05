@@ -10,7 +10,7 @@ import json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from compiles import CLANG, ENV, MOD
+from compiles import CLANG, ENV, MODEL_MOD
 
 TRACE = os.path.join(os.path.dirname(HERE), "BothnerTrace.so")
 work = os.path.abspath(sys.argv[1])
@@ -69,7 +69,7 @@ for name, text in files.items():
 def record(src):
     """The compile's configuration and, per header as opened, its fragments."""
     out = os.path.join(work, src + ".json")
-    r = subprocess.run([CLANG, "-fsyntax-only"] + MOD + ["-w", src, "-fplugin=" + TRACE], cwd=work,
+    r = subprocess.run([CLANG, "-fsyntax-only"] + MODEL_MOD + ["-w", src, "-fplugin=" + TRACE], cwd=work,
                        env=dict(ENV, BOTHNER_TRACE_OUT=out, BOTHNER_TRACE_RECORD="1"), capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"{src} failed:\n{r.stderr}")

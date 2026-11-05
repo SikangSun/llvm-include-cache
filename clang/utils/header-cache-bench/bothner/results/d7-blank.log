@@ -1,0 +1,18 @@
+source              blanked     of  charged ms  saved ms  ratio   control ms blanked ms
+server.c                540   1631       22.80     22.14  1.030       229.24     207.10
+networking.c            542   1495       25.55     24.53  1.041       200.45     175.92
+module.c                532   1471       21.78     21.75  1.001       231.96     210.21
+cluster_legacy.c        553   1519       27.07     26.93  1.005       203.37     176.45
+redis-cli.c             393   1164       13.67     14.21  0.962       237.47     223.26
+t_string.c              554   1479       28.39     27.99  1.014       153.08     125.09
+db.c                    539   1435       24.55     23.60  1.041       133.08     109.48
+object.c                552   1491       25.22     25.77  0.979       158.36     132.59
+util.c                  433   1162       14.98     14.81  1.011       105.24      90.44
+config.c                550   1481       26.50     27.44  0.966       154.44     127.00
+sds.c                   213    463        8.68      8.24  1.054        49.33      41.09
+adlist.c                150    262        5.98      6.17  0.970        27.39      21.22
+lapi.c                   47    134        2.41      2.37  1.016        46.96      44.59
+hiredis.c               125    240        4.92      4.69  1.048        38.92      34.22
+linenoise.c             240    687        8.52      8.08  1.055        42.47      34.39
+
+15 compiles: charged 261.0 ms, saved 258.7 ms when measured: the model charges +0.9% of the measured saving, 95% interval -0.7% to +2.5% (per compile: median +1.4%, from -3.8% to +5.5%); strict bound: SAVED_SCALE=1.007

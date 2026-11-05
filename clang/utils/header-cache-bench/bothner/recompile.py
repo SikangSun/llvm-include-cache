@@ -1,10 +1,15 @@
 """The header cache's recompilation of a recorded build, beside plain clang
 (COMPILE_SERVER_PLAN.md 3.5): a fresh daemon; a first build through the cache
-fills it (not timed); then every compile again, timed, under a new build ID:
+fills it (not timed); then every compile again, timed, under new build IDs:
 plain clang as a user runs it, plain clang with the modules flags the cache
 needs, and the cache in its default mode (top-level folding), interleaved
 compile by compile with the order rotated, the best of REPS wall times each.
-The front end only. Compiles are pinned to CORE, the daemon to DCORE.
+The front end only. Compiles are pinned to CORE, the daemon to DCORE. Each
+repetition is a build of its own (its own build ID), so that the cache's
+once-per-build file checks and include searches are not warm from an earlier
+repetition of the same compile. The daemon's CPU time during the timed
+compiles is reported too: it runs on a core of its own and is not in the
+wall times.
 usage: recompile.py <out.json>
 env: REPS (default 3), CORE (default 3), DCORE (default 5), LOGS, BIN
 """
@@ -44,19 +49,22 @@ try:
         wall([CLANG, "-fsyntax-only"] + MOD + config(args, src) + [src], cwd, fill)
     print(f"first build done: {len(cmds)} compiles", flush=True)
 
-    again = cache_env(f"recompile-{stamp}")
+    again = [cache_env(f"recompile-{stamp}-{k}") for k in range(REPS)]
+    ticks = os.sysconf("SC_CLK_TCK")
+    cpu = lambda: sum(int(v) for v in open(f"/proc/{daemon.pid}/stat").read().rsplit(")", 1)[1].split()[11:13]) / ticks
+    cpu0 = cpu()
     res = {}
     for i, (cwd, args, src) in enumerate(cmds):
         flags = config(args, src) + [src]
         modes = {"plain": ([CLANG, "-fsyntax-only"] + flags, ENV),
                  "plainM": ([CLANG, "-fsyntax-only"] + MOD + flags, ENV),
-                 "cache": ([CLANG, "-fsyntax-only"] + MOD + flags, again)}
+                 "cache": ([CLANG, "-fsyntax-only"] + MOD + flags, None)}
         names = list(modes)
         best, rc, hits = {m: float("inf") for m in modes}, {}, None
         for k in range(REPS):
             for m in names[(i + k) % 3:] + names[:(i + k) % 3]:
                 argv, env = modes[m]
-                t, r = wall(argv, cwd, env)
+                t, r = wall(argv, cwd, env or again[k])
                 best[m] = min(best[m], t)
                 rc[m] = r.returncode
                 if m == "cache" and (h := HITS.search(r.stderr)):
@@ -67,6 +75,7 @@ try:
         res[str(i)] = dict(best, src=src, cwd=cwd, hits=hits)
         print(f"{i:3d} {src:40} plain {best['plain'] * 1e3:7.1f}  modules {best['plainM'] * 1e3:7.1f}  "
               f"cache {best['cache'] * 1e3:7.1f} ms  hits {hits}", flush=True)
+    daemon_cpu = cpu() - cpu0
 finally:
     daemon.terminate()
     daemon.wait()
@@ -77,4 +86,6 @@ P = sum(r["plain"] for r in res.values())
 for m in ("plainM", "cache"):
     T = sum(r[m] for r in res.values())
     print(f"{m}: {T:.2f} s against plain clang's {P:.2f} s: {P / T:.2f}x")
-json.dump({"reps": REPS, "compiles": res}, open(out, "w"))
+print(f"the daemon's CPU time over the {REPS} timed repetitions of every compile: {daemon_cpu:.2f} s "
+      f"({daemon_cpu / REPS:.3f} s a recompilation)")
+json.dump({"reps": REPS, "daemon_cpu_s": daemon_cpu, "compiles": res}, open(out, "w"))

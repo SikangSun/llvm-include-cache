@@ -13,10 +13,16 @@ the same on both sides; REPS times each, interleaved, the best of each,
 pinned to CORE. The time removing them saved is set against what the model
 charged them (the timing run's per-fragment times).
 
+The pooled ratio of charged to saved time comes with a 95% bootstrap interval
+over the compiles. Where the interval's low end is below 1, the model may
+undercharge by that much: simulate.py's SAVED_SCALE = 1 / low end makes the
+bound strict. (One compile's ratio is mostly wall-time noise: scaling by the
+worst one drives some compiles' times below zero.)
+
 usage: blank.py <record dir> <timing dir> <reused json> <workdir> [source names...]
 env: REPS (default 11), CORE (default 3)
 """
-import json, os, re, subprocess, sys, time
+import json, os, random, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -161,7 +167,14 @@ for i in chosen:
 C = sum(r["charged_ms"] for r in rows)
 S = sum(r["saved_ms"] for r in rows)
 ratios = sorted(r["charged_ms"] / r["saved_ms"] for r in rows)
+rng = random.Random(1)
+boots = sorted(sum(r["charged_ms"] for r in x) / sum(r["saved_ms"] for r in x)
+               for x in ([rows[rng.randrange(len(rows))] for _ in rows] for _ in range(10000)))
+low, high = boots[249], boots[9749]
+scale = max(1.0, 1 / low)
 print(f"\n{len(rows)} compiles: charged {C:.1f} ms, saved {S:.1f} ms when measured: the model charges "
-      f"{(C / S - 1) * 100:+.1f}% of the measured saving (per compile: median {(ratios[len(ratios) // 2] - 1) * 100:+.1f}%, "
-      f"from {(ratios[0] - 1) * 100:+.1f}% to {(ratios[-1] - 1) * 100:+.1f}%)")
-json.dump(rows, open(os.path.join(work, "blank.json"), "w"))
+      f"{(C / S - 1) * 100:+.1f}% of the measured saving, 95% interval {(low - 1) * 100:+.1f}% to "
+      f"{(high - 1) * 100:+.1f}% (per compile: median {(ratios[len(ratios) // 2] - 1) * 100:+.1f}%, "
+      f"from {(ratios[0] - 1) * 100:+.1f}% to {(ratios[-1] - 1) * 100:+.1f}%); strict bound: SAVED_SCALE={scale:.3f}")
+json.dump({"rows": rows, "charged_ms": C, "saved_ms": S, "interval": [low, high], "saved_scale": scale},
+          open(os.path.join(work, "blank.json"), "w"))

@@ -1,0 +1,195 @@
+  0 foo.c                                         9.4 ms  fragments     -  in fragments   0.0%  failed (rc 1)
+  1 foo.c                                         7.0 ms  fragments     -  in fragments   0.0%  failed (rc 1)
+  2 linenoise.c                                  46.3 ms  fragments   687  in fragments  36.3%  
+  3 lapi.c                                       50.2 ms  fragments   195  in fragments  39.2%  
+  4 hdr_histogram.c                              41.2 ms  fragments   196  in fragments  43.7%  
+  5 alloc.c                                      19.6 ms  fragments   133  in fragments  49.8%  
+  6 net.c                                        43.5 ms  fragments   747  in fragments  47.9%  
+  7 hiredis.c                                    42.0 ms  fragments   240  in fragments  38.2%  
+  8 fpconv_dtoa.c                                19.1 ms  fragments    61  in fragments  36.1%  
+  9 lcode.c                                      49.6 ms  fragments   296  in fragments  47.9%  
+ 10 lib/regcomp.c                                19.3 ms  fragments    98  in fragments  40.6%  
+ 11 lib/regerror.c                               16.0 ms  fragments    62  in fragments  39.9%  
+ 12 lib/regexec.c                                22.2 ms  fragments    98  in fragments  31.1%  
+ 13 xxhash.c                                     83.3 ms  fragments   328  in fragments  89.0%  
+ 14 sds.c                                        38.6 ms  fragments   203  in fragments  37.3%  
+ 15 lib/tre-ast.c                                18.0 ms  fragments    87  in fragments  37.9%  
+ 16 ldebug.c                                     44.5 ms  fragments   201  in fragments  48.7%  
+ 17 lib/tre-compile.c                            49.3 ms  fragments   147  in fragments  15.4%  
+ 18 xxhash.c                                     83.7 ms  fragments   328  in fragments  88.8%  
+ 19 ldo.c                                        49.2 ms  fragments   347  in fragments  53.4%  
+ 20 ldump.c                                      31.0 ms  fragments   143  in fragments  59.3%  
+ 21 lfunc.c                                      33.1 ms  fragments   144  in fragments  56.0%  
+ 22 lgc.c                                        45.3 ms  fragments   190  in fragments  44.0%  
+ 23 llex.c                                       43.4 ms  fragments   213  in fragments  51.7%  
+ 24 async.c                                      45.6 ms  fragments   252  in fragments  45.8%  
+ 25 lib/tre-filter.c                             18.0 ms  fragments    94  in fragments  43.5%  
+ 26 lib/tre-match-backtrack.c                    26.1 ms  fragments   101  in fragments  30.6%  
+ 27 lmem.c                                       30.1 ms  fragments   144  in fragments  63.6%  
+ 28 lobject.c                                    48.5 ms  fragments   410  in fragments  64.0%  
+ 29 lopcodes.c                                   28.1 ms  fragments   125  in fragments  62.1%  
+ 30 lparser.c                                    50.5 ms  fragments   199  in fragments  41.3%  
+ 31 lstate.c                                     34.3 ms  fragments   150  in fragments  56.5%  
+ 32 lib/tre-match-parallel.c                     25.3 ms  fragments   108  in fragments  31.7%  
+ 33 lib/tre-mem.c                                19.2 ms  fragments    98  in fragments  40.9%  
+ 34 read.c                                       50.0 ms  fragments   656  in fragments  54.8%  
+ 35 lib/tre-parse.c                              36.6 ms  fragments   107  in fragments  16.1%  
+ 36 lib/tre-stack.c                              18.1 ms  fragments    86  in fragments  36.2%  
+ 37 lib/xmalloc.c                                21.0 ms  fragments    93  in fragments  30.7%  
+ 38 lstring.c                                    34.1 ms  fragments   186  in fragments  61.0%  
+ 39 ltable.c                                     41.3 ms  fragments   188  in fragments  49.3%  
+ 40 ltm.c                                        33.7 ms  fragments   187  in fragments  64.6%  
+ 41 sockcompat.c                                 18.9 ms  fragments   503  in fragments  45.9%  
+ 42 lundump.c                                    37.1 ms  fragments   190  in fragments  57.5%  
+ 43 lvm.c                                        65.5 ms  fragments   408  in fragments  43.5%  
+ 44 lzio.c                                       33.3 ms  fragments   184  in fragments  63.9%  
+ 45 strbuf.c                                     29.2 ms  fragments   276  in fragments  60.3%  
+ 46 fpconv.c                                     27.8 ms  fragments   268  in fragments  59.6%  
+ 47 lauxlib.c                                    37.8 ms  fragments   286  in fragments  47.2%  
+ 48 lbaselib.c                                   37.6 ms  fragments   292  in fragments  47.7%  
+ 49 ldblib.c                                     34.2 ms  fragments   283  in fragments  50.2%  
+ 50 liolib.c                                     36.2 ms  fragments   285  in fragments  46.1%  
+ 51 lmathlib.c                                   41.7 ms  fragments   342  in fragments  63.6%  
+ 52 loslib.c                                     37.5 ms  fragments   698  in fragments  56.9%  
+ 53 ltablib.c                                    23.5 ms  fragments   108  in fragments  42.8%  
+ 54 lstrlib.c                                    43.0 ms  fragments   292  in fragments  39.8%  
+ 55 loadlib.c                                    34.5 ms  fragments   283  in fragments  49.3%  
+ 56 linit.c                                      20.7 ms  fragments   108  in fragments  54.4%  
+ 57 lua_cjson.c                                  54.9 ms  fragments   391  in fragments  52.0%  
+ 58 lua_struct.c                                 28.9 ms  fragments   153  in fragments  46.9%  
+ 59 lua_cmsgpack.c                               53.0 ms  fragments   387  in fragments  51.7%  
+ 60 lua_bit.c                                    23.2 ms  fragments   110  in fragments  43.6%  
+ 61 lua.c                                        37.2 ms  fragments   387  in fragments  51.8%  
+ 62 luac.c                                       49.8 ms  fragments   412  in fragments  63.4%  
+ 63 print.c                                      40.4 ms  fragments   240  in fragments  59.9%  
+ 64 threads_mngr.c                              105.4 ms  fragments  1414  in fragments  73.5%  
+ 65 memory_prefetch.c                           107.4 ms  fragments  1413  in fragments  71.3%  
+ 66 adlist.c                                     30.0 ms  fragments   262  in fragments  52.7%  
+ 67 quicklist.c                                  59.9 ms  fragments   459  in fragments  38.9%  
+ 68 ae.c                                         52.5 ms  fragments  1046  in fragments  57.4%  
+ 69 anet.c                                       55.9 ms  fragments  1064  in fragments  52.2%  
+ 70 dict.c                                       77.1 ms  fragments  1123  in fragments  44.8%  
+ 71 ebuckets.c                                   56.1 ms  fragments   455  in fragments  34.0%  
+ 72 eventnotifier.c                              32.7 ms  fragments   724  in fragments  52.4%  
+ 73 iothread.c                                  117.2 ms  fragments  1413  in fragments  65.6%  
+ 74 mstr.c                                       31.4 ms  fragments   252  in fragments  44.9%  
+ 75 entry.c                                     104.7 ms  fragments  1414  in fragments  71.6%  
+ 76 kvstore.c                                    56.8 ms  fragments  1006  in fragments  49.7%  
+ 77 fwtree.c                                    103.0 ms  fragments  1414  in fragments  74.0%  
+ 78 estore.c                                    105.6 ms  fragments  1414  in fragments  73.4%  
+ 79 server.c                                    246.2 ms  fragments  1889  in fragments  48.1%  
+ 80 sds.c                                        53.2 ms  fragments   463  in fragments  44.0%  
+ 81 zmalloc.c                                    58.4 ms  fragments  1131  in fragments  55.1%  
+ 82 lzf_c.c                                      16.8 ms  fragments    47  in fragments  30.9%  
+ 83 lzf_d.c                                      16.5 ms  fragments    49  in fragments  32.8%  
+ 84 pqsort.c                                     22.2 ms  fragments   160  in fragments  39.0%  
+ 85 zipmap.c                                     35.1 ms  fragments   383  in fragments  45.6%  
+ 86 sha1.c                                       40.4 ms  fragments   344  in fragments  32.1%  
+ 87 ziplist.c                                    57.7 ms  fragments   456  in fragments  38.3%  
+ 88 release.c                                    21.3 ms  fragments   141  in fragments  56.0%  
+ 89 networking.c                                215.2 ms  fragments  1753  in fragments  52.5%  
+ 90 util.c                                      113.6 ms  fragments  1420  in fragments  64.7%  
+ 91 object.c                                    169.5 ms  fragments  1749  in fragments  68.2%  
+ 92 db.c                                        145.4 ms  fragments  1435  in fragments  52.4%  
+ 93 replication.c                               158.2 ms  fragments  1461  in fragments  46.7%  
+ 94 rdb.c                                       215.2 ms  fragments  1833  in fragments  53.4%  
+ 95 t_string.c                                  168.1 ms  fragments  1737  in fragments  69.4%  
+ 96 t_list.c                                    122.1 ms  fragments  1413  in fragments  60.4%  
+ 97 t_set.c                                     126.1 ms  fragments  1415  in fragments  58.2%  
+ 98 t_zset.c                                    198.7 ms  fragments  1735  in fragments  56.4%  
+ 99 t_hash.c                                    228.7 ms  fragments  1736  in fragments  48.2%  
+100 t_array.c                                   166.0 ms  fragments  1740  in fragments  68.9%  
+101 sparsearray.c                               168.9 ms  fragments  1733  in fragments  67.8%  
+102 config.c                                    164.9 ms  fragments  1481  in fragments  45.6%  
+103 aof.c                                       151.5 ms  fragments  1545  in fragments  50.1%  
+104 pubsub.c                                    115.6 ms  fragments  1420  in fragments  66.8%  
+105 multi.c                                     108.6 ms  fragments  1417  in fragments  71.4%  
+106 debug.c                                     140.5 ms  fragments  1509  in fragments  55.8%  
+107 sort.c                                      155.0 ms  fragments  1739  in fragments  74.7%  
+108 intset.c                                     39.1 ms  fragments   445  in fragments  50.5%  
+109 syncio.c                                    103.6 ms  fragments  1413  in fragments  74.5%  
+110 cluster.c                                   130.9 ms  fragments  1433  in fragments  58.1%  
+111 cluster_asm.c                               146.2 ms  fragments  1423  in fragments  50.3%  
+112 cluster_legacy.c                            218.0 ms  fragments  1777  in fragments  52.0%  
+113 cluster_slot_stats.c                        108.7 ms  fragments  1420  in fragments  71.8%  
+114 crc16.c                                     103.3 ms  fragments  1413  in fragments  74.6%  
+115 endianconv.c                                 12.9 ms  fragments    16  in fragments  11.0%  
+116 slowlog.c                                   104.1 ms  fragments  1414  in fragments  73.5%  
+117 eval.c                                      170.6 ms  fragments  1763  in fragments  68.7%  
+118 bio.c                                       107.2 ms  fragments  1414  in fragments  71.3%  
+119 rio.c                                       108.0 ms  fragments  1414  in fragments  70.2%  
+120 rand.c                                       13.6 ms  fragments    16  in fragments   8.6%  
+121 memtest.c                                    37.9 ms  fragments   425  in fragments  47.7%  
+122 syscheck.c                                   50.0 ms  fragments  1065  in fragments  61.7%  
+123 crcspeed.c                                   23.0 ms  fragments   106  in fragments  36.2%  
+124 crccombine.c                                453.1 ms  fragments   733  in fragments  94.4%  
+125 crc64.c                                      31.7 ms  fragments   374  in fragments  53.4%  
+126 bitops.c                                    552.4 ms  fragments  1907  in fragments  88.8%  
+127 sentinel.c                                  163.8 ms  fragments  1462  in fragments  46.9%  
+128 notify.c                                    105.9 ms  fragments  1413  in fragments  72.0%  
+129 setproctitle.c                               31.8 ms  fragments   333  in fragments  58.3%  
+130 blocked.c                                   108.6 ms  fragments  1417  in fragments  69.1%  
+131 hyperloglog.c                               592.7 ms  fragments  2218  in fragments  89.1%  
+132 latency.c                                   109.2 ms  fragments  1415  in fragments  69.1%  
+133 sparkline.c                                 148.7 ms  fragments  1733  in fragments  78.6%  
+134 redis-check-rdb.c                           108.9 ms  fragments  1450  in fragments  71.0%  
+135 redis-check-aof.c                           109.8 ms  fragments  1450  in fragments  69.4%  
+136 geo.c                                       113.2 ms  fragments  1418  in fragments  66.5%  
+137 lazyfree.c                                  109.7 ms  fragments  1423  in fragments  71.7%  
+138 module.c                                    246.5 ms  fragments  1471  in fragments  34.2%  
+139 evict.c                                     155.7 ms  fragments  1742  in fragments  76.1%  
+140 expire.c                                    109.5 ms  fragments  1418  in fragments  69.7%  
+141 geohash.c                                    16.5 ms  fragments    22  in fragments  11.3%  
+142 geohash_helper.c                             66.6 ms  fragments   437  in fragments  77.9%  
+143 childinfo.c                                 103.7 ms  fragments  1413  in fragments  73.9%  
+144 defrag.c                                    148.3 ms  fragments  1733  in fragments  78.8%  
+145 siphash.c                                    25.2 ms  fragments   149  in fragments  48.0%  
+146 rax.c                                        74.6 ms  fragments   550  in fragments  37.7%  
+147 t_stream.c                                  165.6 ms  fragments  1413  in fragments  42.3%  
+148 listpack.c                                   62.8 ms  fragments   455  in fragments  35.0%  
+149 localtime.c                                  14.3 ms  fragments    47  in fragments  24.8%  
+150 lolwut.c                                    148.9 ms  fragments  1734  in fragments  78.1%  
+151 lolwut5.c                                   148.5 ms  fragments  1734  in fragments  78.3%  
+152 lolwut6.c                                   103.8 ms  fragments  1414  in fragments  74.0%  
+153 lolwut8.c                                   104.9 ms  fragments  1423  in fragments  74.0%  
+154 acl.c                                       139.8 ms  fragments  1428  in fragments  52.7%  
+155 tracking.c                                  109.3 ms  fragments  1413  in fragments  68.9%  
+156 socket.c                                    105.9 ms  fragments  1414  in fragments  71.6%  
+157 tls.c                                       119.4 ms  fragments  1418  in fragments  79.0%  
+158 sha256.c                                     24.9 ms  fragments   203  in fragments  48.1%  
+159 timeout.c                                   150.7 ms  fragments  1737  in fragments  78.3%  
+160 setcpuaffinity.c                             37.7 ms  fragments   878  in fragments  58.6%  
+161 monotonic.c                                 484.1 ms  fragments  1521  in fragments  93.2%  
+162 mt19937-64.c                                 18.5 ms  fragments    89  in fragments  47.3%  
+163 resp_parser.c                               105.8 ms  fragments  1415  in fragments  72.4%  
+164 call_reply.c                                107.1 ms  fragments  1415  in fragments  71.4%  
+165 script_lua.c                                168.0 ms  fragments  1764  in fragments  70.9%  
+166 script.c                                    110.6 ms  fragments  1423  in fragments  70.1%  
+167 functions.c                                 115.4 ms  fragments  1416  in fragments  66.3%  
+168 function_lua.c                              108.9 ms  fragments  1428  in fragments  71.2%  
+169 commands.c                                  238.1 ms  fragments  2199  in fragments  89.1%  
+170 strl.c                                       15.0 ms  fragments    43  in fragments  41.3%  
+171 connection.c                                104.1 ms  fragments  1413  in fragments  73.3%  
+172 unix.c                                      103.8 ms  fragments  1413  in fragments  73.2%  
+173 logreqres.c                                 102.9 ms  fragments  1423  in fragments  75.0%  
+174 keymeta.c                                   110.2 ms  fragments  1413  in fragments  67.4%  
+175 chk.c                                        60.3 ms  fragments   567  in fragments  58.0%  
+176 hotkeys.c                                   111.2 ms  fragments  1460  in fragments  70.0%  
+177 gcra.c                                      147.2 ms  fragments  1733  in fragments  79.4%  
+178 vector.c                                     36.4 ms  fragments   444  in fragments  56.5%  
+179 fast_float_strtod.c                          53.9 ms  fragments   546  in fragments  56.2%  
+180 client_comp.c                               102.9 ms  fragments  1413  in fragments  74.2%  
+181 ../modules/vector-sets/hnsw.c               501.2 ms  fragments   975  in fragments  88.4%  
+182 ../modules/vector-sets/vset.c               103.7 ms  fragments   524  in fragments  60.7%  
+183 ../modules/vector-sets/vset_config.c         43.2 ms  fragments   260  in fragments  79.1%  
+184 redis-cli.c                                 249.8 ms  fragments  1422  in fragments  29.8%  
+185 redisassert.c                                27.3 ms  fragments   327  in fragments  58.5%  
+186 cli_common.c                                 47.8 ms  fragments   845  in fragments  59.3%  
+187 cli_commands.c                               79.1 ms  fragments   363  in fragments  94.5%  
+188 redis-benchmark.c                           139.8 ms  fragments  1459  in fragments  63.0%  
+all: 187 compiles; span median 44.6 ms (total 14.33 s); share of span in header fragments median 56.4%, header directives 22.1%, main file 14.2%, estimated by calibration 0.7%
+src/: 125 compiles; span median 88.4 ms (total 12.72 s); share of span in header fragments median 64.7%, header directives 21.7%, main file 11.9%, estimated by calibration 0.8%
+pooled: 66.1% of all compiles' span is in header fragments
+2 compiles with problems in this run
+  0 foo.c: failed (rc 1)
+  1 foo.c: failed (rc 1)

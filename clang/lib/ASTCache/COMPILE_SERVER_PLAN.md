@@ -603,3 +603,41 @@ two `foo.c` probes fail in all three ways.
 
 - option 3 (`#define` inside fragments) as a row;
 - the other five projects.
+
+**D7, the recompilation harness and redis tables, done 2026-10-31.**
+Table: `utils/header-cache-bench/bothner/results/d7-table-strict.md`.
+
+- **Every row reads its sources from DRAM** (`SRC_ROOT=/dev/shm/bench-src`,
+  as the cache's own runs do), so no compile reads a file from disk.
+- **The model's compiles run as plain clang**, without the cache's modules
+  flags (`compiles.MODEL_MOD`; `BOTHNER_MODULES=1` restores them). Under
+  `-fmodules` Clang's `__stddef_*.h` skip their guards and are read in every
+  compile, which plain clang does not do. FragCount's counts without the
+  flags are in `fragcount/expected_per_compile_nomod.csv`.
+- **`recompile.py`:** each timed repetition is a build of its own (its own
+  build ID), so the cache's once-per-build checks are not warm from an
+  earlier repetition; the daemon's CPU time is reported (0.06 s per
+  recompilation; it runs on its own core).
+- **`blank.py`:** the pooled charged/saved ratio gets a 95% bootstrap
+  interval over the compiles. On DRAM sources: +0.9% (interval -0.7% to
+  +2.5%), so the strict bound is `SAVED_SCALE=1.007` (D6's 1.038 used the
+  single worst compile, which is mostly wall-time noise).
+- **`simulate.py`:** option 3 as model rows (`O3`); "empty" instances (no
+  tokens for the parser, e.g. `__BEGIN_DECLS`) are neither reused nor
+  parsed; R1 keeps a version number on an identical re-parse while its
+  macro list and uses become the new parse's (p.28); credits for what a
+  persistent process skips are tabled (none, start-up, start-up plus header
+  text, whole process); `--markdown` writes the table.
+
+| redis recompilation, strict | All 187 | redis-server (125) |
+|---|---|---|
+| Plain clang | 15.61 s | 13.52 s |
+| Header cache | 5.80 s: 2.69x | 4.46 s: 3.03x |
+| Model option 2, R1, macro lists (headline) | 8.04 s: 1.94x | 6.56 s: 2.06x |
+| Model option 3, R1 | 7.60 s: 2.05x | 6.18 s: 2.19x |
+| Model option 2, R0 (his rule as written) | 9.38 s: 1.66x | 7.88 s: 1.72x |
+| Ideal fragment cache, option 3 | 5.81 s: 2.69x | 4.67 s: 2.90x |
+
+**After D7 the baseline changed.** The model stays as the server's
+predictor; the real server is designed in COMPILE_SERVER_DESIGN.md, and its
+first step, S0, is reported there (section 6) and in COMPILE_SERVER_LOG.md.

@@ -16,7 +16,7 @@ import json, os, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from compiles import CLANG, ENV, MOD
+from compiles import CLANG, ENV, MODEL_MOD
 
 TRACE = os.path.join(os.path.dirname(HERE), "BothnerTrace.so")
 COUNT = os.path.join(os.path.dirname(HERE), "fragcount", "FragCount.so")
@@ -41,7 +41,7 @@ def run(argv, env=ENV):
         sys.exit(f"failed: {' '.join(argv)}\n{r.stderr}")
     return r
 
-base = [CLANG, "-fsyntax-only"] + MOD
+base = [CLANG, "-fsyntax-only"] + MODEL_MOD
 
 # 1-3: one traced run with the event dump, and FragCount's count.
 out, evs, cnt = (os.path.join(work, f) for f in ("trace.json", "events.txt", "count.json"))
