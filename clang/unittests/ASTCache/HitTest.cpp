@@ -2228,6 +2228,37 @@ TEST_F(ExportTest, ALinksNameGivenInsideTheTreeNamesTheTreesDeclaration) {
   EXPECT_EQ(Named[1], Root) << "len_t names another typedef than the text's";
 }
 
+TEST_F(ExportTest, AStructDefinedAfterItsLinksDeclareItIsOneType) {
+  // lw.h declares struct proc, lk.h names it with a typedef of the same
+  // name, and pr.h, which includes lk.h, defines it under that typedef:
+  // pr.h's copy links the other two. Where the hit loads the three,
+  // lk_check's parameter and c.c's are one type (postgres's struct PGPROC
+  // from lwlock.h, lock.h and proc.h, in a rebuild, 2026-11-05).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Lw = write("lw.h", "#ifndef LW_H\n#define LW_H\nstruct proc;\n"
+                                 "void lw_wait(struct proc *x);\n#endif\n");
+  std::string Lk =
+      write("lk.h", "#ifndef LK_H\n#define LK_H\n#include \"" + Lw +
+                        "\"\ntypedef struct proc proc;\n"
+                        "int lk_check(proc *x);\n#endif\n");
+  std::string Pr =
+      write("pr.h", "#ifndef PR_H\n#define PR_H\n#include \"" + Lk +
+                        "\"\ntypedef struct proc { int n; } proc;\n"
+                        "extern proc *pr_me;\n#endif\n");
+  std::string C =
+      write("c.c", "#include \"" + Pr +
+                       "\"\nint lk_check(proc *x) { return x->n; }\n"
+                       "int use(void) { return lk_check(pr_me); }\n");
+  EXPECT_TRUE(reads(C, Pr)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(C, Pr)) << "nothing is stored yet";
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile with the copies";
+  EXPECT_FALSE(Entered.count(Pr)) << "pr.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Lw)) << "lw.h's copy was not linked";
+}
+
 TEST_F(ExportTest, AHeaderThatOnlyPointsToAStructFitsWhereItIsDeclared) {
   // sub.h declares struct vec itself and only points to it, by its tag and
   // by types.h's typedef. Its copy, written after vec.h defined the struct,
@@ -3155,6 +3186,55 @@ TEST_F(ExportTest, ADecidedMergeRootIsMergedAtItsFirstHit) {
   EXPECT_TRUE(Entered.count(Outer)) << "the merging compile took the hit";
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h's copy was not served";
   EXPECT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+}
+
+TEST_F(ExportTest, AMergedCopyNeedsNoNameItsTreeDeclares) {
+  // mid.h's copy needs num_t to be a type: top.h declared it before. Its
+  // link inner.h's copy links num.h's, which declares num_t again, as an
+  // unguarded stddef.h declares size_t again (redis's stream.h, through
+  // xxhash.h). At the merge of top.h, num_t's latest declaration is in that
+  // link, loaded with mid.h's copy: the merged copy holds it, and needs
+  // nothing of num_t from outside. It is then served where top.h is the
+  // first header.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  setenv("CLANG_HEADER_CACHE_MERGE", "decided", 1);
+  auto Unset = llvm::make_scope_exit([] {
+    unsetenv("CLANG_HEADER_CACHE_LINK");
+    unsetenv("CLANG_HEADER_CACHE_MERGE");
+    unsetenv("CLANG_HEADER_CACHE_DECISIONS");
+  });
+  std::string Num = write("num.h", "typedef unsigned long num_t;\n");
+  std::string Inner =
+      write("inner.h", "#ifndef INNER_H\n#define INNER_H\n#include \"" + Num +
+                           "\"\nint inner(void);\n#endif\n");
+  std::string Mid =
+      write("mid.h", "#ifndef MID_H\n#define MID_H\nnum_t mid_len(void);\n"
+                     "#include \"" +
+                         Inner + "\"\n#endif\n");
+  std::string Top = write("top.h", "#ifndef TOP_H\n#define TOP_H\n"
+                                   "typedef unsigned long num_t;\n#include \"" +
+                                       Mid + "\"\nint top(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Top + "\"\n");
+  std::string C = write("c.c", "#include \"" + Top +
+                                   "\"\nint c(void) { return top() + inner() "
+                                   "+ (int)mid_len(); }\n");
+  EXPECT_TRUE(reads(B, Top)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(B, Top)) << "nothing is stored yet";
+  std::string Decisions = write("decisions", "merge-root\t" + Top + "\n");
+  setenv("CLANG_HEADER_CACHE_DECISIONS", Decisions.c_str(), 1);
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_TRUE(Entered.count(Top)) << "the merging compile took the hit";
+  ASSERT_EQ(Daemon->stats().MergesStored, 1u) << "no merged copy was stored";
+
+  llvm::Expected<SharedRegion> R = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(R)) << llvm::toString(R.takeError());
+  const IndexedCopy *Merged = R->copyAt(R->newestCopy(Top));
+  ASSERT_TRUE(Merged);
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile again";
+  EXPECT_FALSE(Entered.count(Top)) << "top.h was read";
+  EXPECT_EQ(Merged->Serves.load(), 1u) << "the merged copy was not served";
 }
 
 /// A daemon whose offline step writes Dir/decisions: once the file exists,
@@ -4772,6 +4852,75 @@ TEST_F(ExportTest, AHeaderMissedInsideAFirstReadIsWrittenToo) {
   EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
   EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
   EXPECT_FALSE(reads(A, Inner)) << "inner.h's copy was not served";
+}
+
+TEST_F(ExportTest, ALinkedFirstReadLinksACopyServedInsideIt) {
+  // CLANG_HEADER_CACHE_LINK: inner.h is served inside outer.h's first read.
+  // outer.h's copy links inner.h's, as a miss's copy does, and is written:
+  // c.c is served outer.h, and neither file is opened.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  auto Off = firstReads("0");
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nmy_size outer_len(void);\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Inner + "\"\n"
+                               "my_size a(void) { return INNER_MAX; }\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n"
+                               "my_size b(void) { return outer_len(); }\n");
+  std::string C = write("c.c", "#include \"" + Outer + "\"\n"
+                               "my_size c(void) {\n"
+                               "  return outer_len() + INNER_MAX;\n}\n");
+  EXPECT_TRUE(reads(A, Inner)) << "nothing is listed yet";
+  EXPECT_FALSE(reads(A, Inner)) << "inner.h's first read was not served";
+  size_t Before = Daemon->stats().Entries;
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "outer.h is not listed yet";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was not served inside it";
+  EXPECT_EQ(Daemon->stats().Entries, Before + 1)
+      << "outer.h's first read was not written";
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h was opened";
+}
+
+TEST_F(ExportTest, ALinkedFirstReadGivesAHeaderInsideItItsOwnCopy) {
+  // CLANG_HEADER_CACHE_LINK: b.c reads outer.h, and inner.h inside it,
+  // before any compile listed either. Both are written, outer.h's copy
+  // linking inner.h's, as misses write them once both are listed. c.c reads
+  // inner.h first: outer.h's copy still fits, its link skipped by inner.h's
+  // guard. A copy of outer.h holding inner.h's lines would not fit there.
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  auto Off = firstReads("0");
+  std::string Inner = write("inner.h", "#ifndef INNER_H\n#define INNER_H\n"
+                                       "typedef unsigned long my_size;\n"
+                                       "#define INNER_MAX 42\n#endif\n");
+  std::string Outer =
+      write("outer.h", "#ifndef OUTER_H\n#define OUTER_H\n#include \"" +
+                           Inner + "\"\nmy_size outer_len(void);\n#endif\n");
+  std::string B = write("b.c", "#include \"" + Outer + "\"\n"
+                               "my_size b(void) { return outer_len(); }\n");
+  std::string C = write("c.c", "#include \"" + Inner + "\"\n#include \"" +
+                                   Outer + "\"\nmy_size c(void) {\n"
+                                           "  return outer_len() + INNER_MAX;\n}\n");
+  std::set<std::string> Entered;
+  ASSERT_TRUE(compile(B, Entered));
+  EXPECT_TRUE(Entered.count(Outer)) << "nothing is listed yet";
+  EXPECT_TRUE(Entered.count(Inner)) << "nothing is listed yet";
+  EXPECT_EQ(Daemon->stats().Entries, 2u)
+      << "inner.h and outer.h were not both written";
+  Entered.clear();
+  ASSERT_TRUE(compile(C, Entered)) << "c.c did not compile";
+  EXPECT_FALSE(Entered.count(Inner)) << "inner.h's copy was not served";
+  EXPECT_FALSE(Entered.count(Outer)) << "outer.h's copy was not served";
 }
 
 TEST_F(ExportTest, AHeaderUsingAnUnnameableOutsideDeclarationIsNotWritten) {

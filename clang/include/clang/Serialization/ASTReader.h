@@ -2786,6 +2786,11 @@ public:
   NamedDecl *findInEveryModule(IdentifierInfo &II, bool Tag,
                                const serialization::ModuleFile *From);
 
+  /// Whether the declaration \p ID, not read yet, can be one that a lookup
+  /// in the tag name space (\p Tag), or in the ordinary one, finds. Its
+  /// record's code says, in C, without reading the declaration.
+  bool mayBeInNameSpace(GlobalDeclID ID, bool Tag);
+
   /// Header cache: whether the files the next loads read are header cache
   /// copies (ModuleFile::IsHeaderCachePart). ReadASTs sets it itself.
   void setReadingHeaderCacheParts(bool V) { ReadingHeaderCacheParts = V; }

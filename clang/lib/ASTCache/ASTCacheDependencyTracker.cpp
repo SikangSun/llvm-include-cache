@@ -1145,8 +1145,12 @@ void ASTCacheDependencyTracker::foldModule(SourceLocation Loc, int FirstID,
   FileID Where = SM.getFileID(SM.getExpansionLoc(Loc));
   for (size_t I : OpenFiles)
     Files[I].Served = true;
+  // A merge's links come here before the copy's reads and again with
+  // foldLink, once each.
   for (Frame &F : Stack)
-    if (F.Closure.contains(Where))
+    if (F.Closure.contains(Where) &&
+        !llvm::is_contained(F.Folded,
+                            std::pair<int, unsigned>(FirstID, NumIDs)))
       F.Folded.push_back({FirstID, NumIDs});
 }
 

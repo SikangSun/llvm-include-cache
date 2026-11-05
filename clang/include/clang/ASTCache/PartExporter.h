@@ -141,11 +141,14 @@ public:
   /// declarations as their own instead (CLANG_HEADER_CACHE_FOLD_SERVED), and
   /// its metadata \p Deps joins theirs; \p Loc is the #include, and
   /// \p Resolve gives where the declaration a name finds there is.
+  /// \p Links are the module files of the links loaded with the copy, which
+  /// foldLink folds next: a name the copy reads can find its declaration in
+  /// one of them.
   virtual void
   served(serialization::ModuleFile *Fold = nullptr,
          const MetadataView *Deps = nullptr, SourceLocation Loc = {},
-         llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve =
-             nullptr) = 0;
+         llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve = nullptr,
+         llvm::ArrayRef<serialization::ModuleFile *> Links = {}) = 0;
 
   /// CLANG_HEADER_CACHE_MERGE: \p MF, a link of the copy served at
   /// \p Loc and loaded with it, is folded into the headers open as the

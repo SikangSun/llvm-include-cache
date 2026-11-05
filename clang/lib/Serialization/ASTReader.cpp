@@ -8919,13 +8919,54 @@ NamedDecl *ASTReader::findInEveryModule(IdentifierInfo &II, bool Tag,
     return nullptr;
   SmallVector<GlobalDeclID, 4> IDs(It->second.begin(), It->second.end());
   NamedDecl *Found = nullptr;
+  // A declaration of the other name space is not read: reading it can read
+  // the one this read is in the middle of before that one knows its earlier
+  // declaration. postgres's proc.h defines struct PGPROC under the typedef
+  // PGPROC; reading that typedef, while the definition looked up the tag
+  // its link lwlock.h declares, gave the definition a type of its own.
   for (GlobalDeclID ID : IDs)
-    if (getOwningModuleFile(ID) == From)
+    if (getOwningModuleFile(ID) == From || !mayBeInNameSpace(ID, Tag))
       continue;
     else if (auto *D = dyn_cast_or_null<NamedDecl>(GetDecl(ID)))
       if (D->isInIdentifierNamespace(IDNS) && isAtFileScope(D))
         Found = D;
   return Found;
+}
+
+bool ASTReader::mayBeInNameSpace(GlobalDeclID ID, bool Tag) {
+  if (PP.getLangOpts().CPlusPlus || ID < NUM_PREDEF_DECL_IDS)
+    return true;
+  unsigned Index = translateGlobalDeclIDToIndex(ID);
+  if (Index >= DeclsLoaded.size() || DeclsLoaded[Index])
+    return true;
+  SourceLocation Loc;
+  RecordLocation RL = DeclCursorForID(ID, Loc);
+  llvm::BitstreamCursor &Cursor = RL.F->DeclsCursor;
+  SavedStreamPosition SavedPosition(Cursor);
+  if (llvm::Error Err = Cursor.JumpToBit(RL.Offset)) {
+    consumeError(std::move(Err));
+    return true;
+  }
+  Expected<unsigned> Abbrev = Cursor.ReadCode();
+  if (!Abbrev) {
+    consumeError(Abbrev.takeError());
+    return true;
+  }
+  Expected<unsigned> Code = Cursor.skipRecord(*Abbrev);
+  if (!Code) {
+    consumeError(Code.takeError());
+    return true;
+  }
+  switch (*Code) {
+  case DECL_RECORD:
+  case DECL_ENUM:
+    return Tag;
+  // A reference by name stands for a declaration of either name space.
+  case DECL_NAME_REFERENCE:
+    return true;
+  default:
+    return !Tag;
+  }
 }
 
 Decl *ASTReader::GetDecl(GlobalDeclID ID) {

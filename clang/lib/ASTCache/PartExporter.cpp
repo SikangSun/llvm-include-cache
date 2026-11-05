@@ -375,8 +375,8 @@ public:
 
   void served(serialization::ModuleFile *Fold, const MetadataView *Deps,
               SourceLocation Loc,
-              llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve)
-      override {
+              llvm::function_ref<SourceLocation(llvm::StringRef)> Resolve,
+              llvm::ArrayRef<serialization::ModuleFile *> Links) override {
     if (!Fold || !Deps) {
       for (Part &P : Open)
         if (P.Decline.empty())
@@ -415,6 +415,13 @@ public:
       for (const MacroEffectView &M : Deps->macroEffects())
         touch(P, CI.getPreprocessor().getIdentifierInfo(M.Name));
     }
+    // The links loaded with the copy are inside the headers open before the
+    // copy's reads are recorded, as in linked(): a name the copy reads can
+    // find its latest declaration in one of them. redis's stream.h reads
+    // size_t, which the copy of xxhash.h it links declares again.
+    for (serialization::ModuleFile *L : Links)
+      if (L)
+        Tracker.foldModule(Loc, L->SLocEntryBaseID, L->LocalNumSLocEntries);
     Tracker.foldServed(Loc, Fold->SLocEntryBaseID, Fold->LocalNumSLocEntries,
                        *Deps, Resolve);
   }

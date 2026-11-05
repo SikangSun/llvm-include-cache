@@ -2481,6 +2481,106 @@ Tests: `ANameDeclaredInACopyAndItsLinksNamesTheLatest`,
 `ANameACopyTakesFromItsLinkNamesTheLinksDeclaration`,
 `ALinksNameGivenInsideTheTreeNamesTheTreesDeclaration`.
 
+### A merged copy needed a name that its own links declare (found 2026-11-05)
+
+In redis, the daemon's merge pick (in progress, 2026-11-05) chose
+`server.h`, and two compiles merged its tree. Later compiles did not load
+the merged copies. There were 59 later hits with the merged tree's links.
+In each, the check rejected the merged copy with "an identifier classifies
+differently" (`size_t was a type, is not`). Every redis `.c` file includes
+`server.h` first. So nothing declares `size_t` where the merged copy
+begins.
+
+`server.h` includes `stream.h`, whose copy needs `size_t` to be a type:
+`server.h`'s earlier lines declare it. That copy links the copy of
+`xxhash.h`, which includes `<stddef.h>`. With `-fmodules`,
+`__stddef_size_t.h` declares `size_t` again in every copy that reads it.
+At the merge, the hit on `stream.h` loads its copy and its links, and the
+latest declaration of `size_t` is then in the new `xxhash.h` link. The
+merge recorded the served copy's reads (`served`) before it folded the
+links (`foldLink`). So the tracker found that declaration in no folded
+range, and kept `size_t` as a name from outside the tree. The path that
+links a served copy folds its links first for the same reason (its comment
+names `stdio.h`'s `__off_t`). The merge path did not.
+
+Now `served` takes the module files of the hit's links, and folds their
+ranges before it records the copy's reads. `foldModule` no longer adds a
+range that a frame holds already. Test:
+`AMergedCopyNeedsNoNameItsTreeDeclares`. It failed before the fix, as
+redis did.
+
+After the fix, no object differs from plain clang's in first builds of six
+projects with the merge pick. The links loaded after the first pick fell 80% in redis,
+against 8% before the fix. In cpython they fell 65%, against 3% more
+before the fix.
+
+### A struct defined after its links declare it became two types (found 2026-11-05)
+
+A labmate's check of the linked mode built seven projects and then the
+same build again on the same daemon. The first build matched plain clang.
+In the second, five postgres files and three FFmpeg files failed, and one
+more FFmpeg object differed. Two of the errors:
+- `conflicting types for 'DeadLockCheck'`
+- `incompatible pointer types assigning to 'PGPROC *' (aka 'struct PGPROC
+  *') from 'PGPROC *'`.
+
+All postgres errors involve `struct PGPROC`, and all FFmpeg errors involve
+`struct MPVEncContext`. Top-level folding passed.
+Compiling `deadlock.c` three times on a new daemon fails the third time.
+
+postgres's `lwlock.h` declares `struct PGPROC;`, `lock.h` includes it and
+declares `typedef struct PGPROC PGPROC;`, and `proc.h` includes `lock.h`
+and defines the struct under that typedef. When one compile writes all
+three, `proc.h`'s copy links the other two, and a hit loads all three
+together. The reader then reads `proc.h`'s definition before it knows the
+definition's earlier declaration. That declaration is a name record for
+`tag PGPROC`, which `lwlock.h`'s copy declares. While the hit loads, the
+copies' declarations of a name wait in `PendingIdentifierInfos`, so the
+tree's resolver and Sema find nothing. The last resort,
+`ASTReader::findInEveryModule`, read every waiting declaration of `PGPROC`
+in the other copies, the typedefs too. `lock.h`'s typedef named the tag
+too, and its lookup read `proc.h`'s typedef. The type of that typedef
+names the definition still being read. So `getCanonicalTagType` made the
+definition its own canonical type, before the reader set its first
+declaration. The definition and `lwlock.h`'s declaration were then one
+chain with two types. The first build had no failure, so none of its hits
+loaded such a tree, for a reason not checked here. FFmpeg has the same
+shape: `me_cmp.h` and `motion_est.h` declare `typedef struct
+MPVEncContext MPVEncContext;`, and `mpegvideoenc.h` includes them and
+defines the struct under that typedef.
+
+`findInEveryModule` now reads only the waiting declarations that can be in
+the name space it looks in. In C, the code of a declaration's record says
+which (`ASTReader::mayBeInNameSpace`), so no declaration of the other name
+space is read. A lookup of a tag reads no typedef, and the definition's
+first declaration is known before any type names it. Test:
+`AStructDefinedAfterItsLinksDeclareItIsOneType`. It failed before the fix,
+with the same two errors, and the typedef must have the struct's name to
+fail.
+
+With the fix, all 313 header-cache unit tests pass, the test's small case
+compiles, and the report's four postgres orders of `backend_status.c` and
+`deadlock.c` compile. FFmpeg's files compiled three times passed before
+the fix too, so FFmpeg needs a whole build and its rebuild. In that check
+(bin-u74, 2026-11-05, `KIND=full PASSES=2`), seven projects build once and
+then again on the same daemon, and each object is compared with plain
+clang's from the same build. No compile fails and no object differs:
+
+| Project | Compiles | First build: failed / differ | Same build again: failed / differ | Same build again: hits / lookups |
+|---|---|---|---|---|
+| redis | 117 | 0 / 0 | 0 / 0 | 697 / 791 |
+| nginx | 126 | 0 / 0 | 0 / 0 | 348 / 351 |
+| curl | 479 | 0 / 0 | 0 / 0 | 2,270 / 2,271 |
+| postgres | 1,341 | 0 / 0 | 0 / 0 | 11,881 / 12,158 |
+| git | 567 | 0 / 0 | 0 / 0 | 4,638 / 4,717 |
+| cpython | 401 | 0 / 0 | 0 / 0 | 2,316 / 2,763 |
+| ffmpeg | 2,102 | 0 / 0 | 0 / 0 | 14,368 / 16,360 |
+
+When the reader refuses a tree load, the compile does not use that copy
+("one-call loads failed: read" in the statistics). The fix does not change
+how often: in the first build, redis 43 before (bin-u71) and 43 after,
+cpython 70 and 70.
+
 ## 4. Open
 
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider

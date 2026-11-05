@@ -574,11 +574,17 @@ public:
       // before any compile has listed it records the header, and writes its
       // copy if the header turns out slow enough to be listed. Otherwise
       // this compile's context gets a copy only at a later build's miss.
-      // Inside a header being recorded, a header is that header's.
+      // Inside a header being recorded, a header is that header's -- but
+      // with CLANG_HEADER_CACHE_LINK it is recorded too, and the copy around
+      // it links its copy, as the copies misses write once both are listed.
+      // One included again from inside itself is read as text, as below.
       DeclBoundaryObserver *B = PP.getDeclBoundaryObserver();
+      bool OpenAlready = llvm::any_of(Open, [&](const OpenFile &O) {
+        return O.Entry == &File.getFileEntry();
+      });
       if (FirstReadCutoff && Exporter && !PopulateOnly && !MergeTarget &&
-          !Exporter->recording() && CI.hasSema() && B &&
-          B->isAtDeclarationBoundary())
+          (!Exporter->recording() || (LinkMode && !OpenAlready)) &&
+          CI.hasSema() && B && B->isAtDeclarationBoundary())
         Exporter->exportIfSlow(File, *FirstReadCutoff);
       return nullptr;
     }
@@ -925,9 +931,11 @@ public:
     // its dependencies, the guards of those headers among them: where the
     // compile read one of them outside the headers open, their copies need
     // it not read, and the copies they hold or link hold it.
+    // CLANG_HEADER_CACHE_FIRST_READ with CLANG_HEADER_CACHE_LINK: a header
+    // recorded at its first read links the copy too.
     bool Folding = Exporter && (FoldServed || MergeTarget) &&
                    Exporter->writing() && Copy.MF;
-    if (LinkMode && !MergeTarget && Exporter && Exporter->writing()) {
+    if (LinkMode && !MergeTarget && Exporter && Exporter->recording()) {
       llvm::TimeTraceScope S("HeaderCache Linked");
       Sema &Sem = CI.getSema();
       IdentifierTable &Ids = PP.getIdentifierTable();
@@ -951,16 +959,25 @@ public:
       // the copy, then each link it loaded, in load order.
       for (const auto &[Guard, Defined] : LiveGuardTests)
         Exporter->linkGuardTested(IncludeLoc, Guard, Defined);
-      Exporter->served(Copy.MF, &Deps, IncludeLoc, [&](llvm::StringRef Name) {
-        IdentifierInfo &II = Ids.get(Name);
-        PP.refreshIdentifier(II);
-        NamedDecl *D = ASTReader::lookupAtFileScope(
-            Sem, II, /*Tag=*/false, /*CreateBuiltin=*/false);
-        return D ? D->getLocation() : SourceLocation();
-      });
+      llvm::SmallVector<serialization::ModuleFile *, 8> Links;
+      llvm::SmallVector<const Fetched *, 8> LinkOf;
       for (auto [F, M] : PendingLinks)
-        if (auto L = LoadedTargets.find(F->Module); L != LoadedTargets.end())
-          Exporter->foldLink(L->second.MF, *F->Meta, IncludeLoc);
+        if (auto L = LoadedTargets.find(F->Module); L != LoadedTargets.end()) {
+          Links.push_back(L->second.MF);
+          LinkOf.push_back(F);
+        }
+      Exporter->served(
+          Copy.MF, &Deps, IncludeLoc,
+          [&](llvm::StringRef Name) {
+            IdentifierInfo &II = Ids.get(Name);
+            PP.refreshIdentifier(II);
+            NamedDecl *D = ASTReader::lookupAtFileScope(
+                Sem, II, /*Tag=*/false, /*CreateBuiltin=*/false);
+            return D ? D->getLocation() : SourceLocation();
+          },
+          Links);
+      for (size_t K = 0; K != Links.size(); ++K)
+        Exporter->foldLink(Links[K], *LinkOf[K]->Meta, IncludeLoc);
     } else if (Exporter) {
       Exporter->served();
     }
