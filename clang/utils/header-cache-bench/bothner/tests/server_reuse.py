@@ -15,7 +15,9 @@ usage: server_reuse.py <workdir> [case ...]
 env: BIN (clang's bin directory; default build_assert/bin of this checkout),
      SO (BothnerServer.so built against BIN), OPTION (2, the default, or 3:
      #define and #undef lines join fragments, design 2.7), FRAGMENT_GROUPS (1:
-     conditionals join fragments while the parser is nested, 2.7)
+     conditionals join fragments while the parser is nested, 2.7), KEYS
+     (reading: a location's readings in a compile are keys of their own,
+     decision 8)
 """
 import json, os, shlex, shutil, subprocess, sys, time
 
@@ -28,6 +30,9 @@ ENV = {k: v for k, v in os.environ.items() if not k.startswith(("CLANG_HEADER_CA
 FLAGS = ["-std=gnu11"]
 OPTION = os.environ.get("OPTION", "2")
 GROUPS = os.environ.get("FRAGMENT_GROUPS") == "1"
+KEYS = os.environ.get("KEYS") == "reading"
+# SPACE_SHARE=<s>: the server's space-share (memory spaces side by side).
+SPACE_SHARE = os.environ.get("SPACE_SHARE", "")
 sys.path.insert(0, os.path.join(HERE, ".."))
 import diagtext  # noqa: E402
 
@@ -38,7 +43,10 @@ import diagtext  # noqa: E402
 # compile of that .c file in the second round reused a fragment of the header
 # named; ("refused", file, round): the server
 # must refuse that compile in that round (status 2), and the driver then
-# compiles it itself.
+# compiles it itself; ("new_space", file, round): the server must give that
+# compile a new memory space (a new configuration with an empty store,
+# because the old source-location space could not hold it), and the compile
+# must still match plain clang.
 CASES = {
     # p.26: D1/D2 under M1/M2, and a guarded header.
     "m1m2": ({
@@ -426,7 +434,28 @@ CASES = {
         "many.h": "#include \"big.h\"\n" * 300,
         "a.c": "#include \"many.h\"\nint a;\n",
         "b.c": "int b(void) { return 1; }\n",
-    }, [("c", "a.c", []), ("c", "b.c", [])], [("refused", "a.c", 2)]),
+    }, [("c", "a.c", []), ("c", "b.c", [])], [("new_space", "a.c", 2)]),
+    # Decision 8: a header read twice in a compile under other macros, as
+    # math.h reads bits/mathcalls.h. With location keys the second reading
+    # is a repeat and the stored version is the last reading's, so no
+    # reading fits; with per-reading keys each reading has its own.
+    "readings": ({
+        "m.h": "int FN(f)(int);\nint FN(g)(int);\n",
+        "a.c": "#define FN(x) x##_d\n#include \"m.h\"\n#undef FN\n"
+               "#define FN(x) x##_f\n#include \"m.h\"\n"
+               "int a(void) { return f_d(1) + g_f(2); }\n",
+    }, [("c", "a.c", [])], [("reused", "a.c", "m.h")] if KEYS else [("never", "a.c", "m.h")]),
+    # Memory spaces side by side: with space-share=0.5, b.c opens a second
+    # space beside a.c's, and in round 2 each goes back to its own space and
+    # store. Replacing a full space instead would empty the store.
+    "spaces_side_by_side": ({
+        "big.h": "/*\n" + ("x" * 1023 + "\n") * 4096 + "*/\n",
+        "many.h": "#include \"big.h\"\n" * 100,
+        "d.h": "int dfun(void);\nint dval;\n",
+        "a.c": "#include \"d.h\"\n#include \"many.h\"\nint a(void) { return dfun() + dval; }\n",
+        "b.c": "#include \"d.h\"\n#include \"many.h\"\nint b(void) { return dfun() + dval; }\n",
+    }, [("c", "a.c", []), ("c", "b.c", [])],
+       [("reused", "a.c", "d.h"), ("reused", "b.c", "d.h")] if SPACE_SHARE == "0.5" else []),
     "implicit_c89": ({
         "im.h": "static int imf(void) { return undeclared_fn(1); }\nint imv;\n",
         "a.c": "#include \"im.h\"\nint a(void) { return imf() + undeclared_fn(2) + imv; }\n",
@@ -450,7 +479,10 @@ class Server:
              "-plugin-arg-bothner-server", "requests=-", "-plugin-arg-bothner-server", "results=-",
              "-plugin-arg-bothner-server", "reuse=1"]
             + (["-plugin-arg-bothner-server", "option=3"] if OPTION == "3" else [])
-            + (["-plugin-arg-bothner-server", "groups=1"] if GROUPS else []) + ["-x", "c", "/dev/null"],
+            + (["-plugin-arg-bothner-server", "groups=1"] if GROUPS else [])
+            + (["-plugin-arg-bothner-server", "keys=reading"] if KEYS else [])
+            + (["-plugin-arg-bothner-server", "space-share=" + SPACE_SHARE] if SPACE_SHARE else [])
+            + ["-x", "c", "/dev/null"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=ENV, text=True)
 
     def serve(self, req):
@@ -511,6 +543,8 @@ def run_case(work, name):
             if refused:
                 failures.append(f"{cfile} (round {rnd + 1}): not refused, status {res.get('status')} {res.get('diags', '')[-300:]}")
                 continue
+            if ("new_space", cfile, rnd + 1) in expect and not res.get("new_space"):
+                failures.append(f"{cfile} (round {rnd + 1}): no new memory space")
             if res.get("status"):
                 failures.append(f"{cfile} (round {rnd + 1}): server status {res.get('status')} {res.get('error', '')} {res.get('diags', '')[-400:]}")
                 continue

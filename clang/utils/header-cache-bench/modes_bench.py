@@ -227,6 +227,24 @@ ALL = {
     # Measurement: the cache asked, nothing written, so nothing recorded.
     "noexport": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_EXPORT_PARTS": "0"},
 }
+# Bothner's compile server (COMPILE_SERVER_DESIGN.md), the user's choices of
+# 2026-11-06: option 3 with groups that hold #define lines (decision 6b), 2.8's
+# rule (7a), one key per reading (8b), token names as uses (9a, built in).
+# One server per mode, pinned to CORE, serves every compile of the mode through
+# the driver (CLANG_COMPILE_SERVER); the project's own flags, without the
+# cache's -fmodules. "serverloc": the same with Bothner's location keys (8a).
+# Each compile's instructions add the server's own for its request.
+SERVER_ARGS = {"server": ["reuse=1", "option=3", "groups=1", "keys=reading"],
+               "serverloc": ["reuse=1", "option=3", "groups=1"]}
+# server2b: the server with memory spaces side by side sized for two builds
+# (space-share=0.5), so that the same build again finds every store.
+SERVER_ARGS["server2b"] = SERVER_ARGS["server"] + ["space-share=0.5"]
+ALL.update({m: {} for m in SERVER_ARGS})
+SERVER_SO = os.environ.get("SERVER_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bothner", "BothnerServer.so"))
+
+
+def is_server(m):
+    return basemode(m) in SERVER_ARGS
 CM = os.environ.get("MODES", "top link miss1").split()
 def binof(m):
     # <mode>@<name>: the binaries in BIN_<name> (a bin directory), to compare
@@ -350,6 +368,49 @@ def run_offline():
               + " ".join(l for l in offline[m]["log"].splitlines() if l.startswith("{")), flush=True)
 
 
+def server(mode):
+    """A compile server for the mode on CORE, with its socket and results file."""
+    w = tempfile.mkdtemp(prefix="mbs-")
+    args = sum((["-plugin-arg-bothner-server", a] for a in
+                [f"socket={w}/sock", f"results={w}/results.jsonl"] + SERVER_ARGS[basemode(mode)]), [])
+    p = subprocess.Popen(["taskset", "-c", CORE, f"{binof(mode)}/clang", "-cc1", "-load", SERVER_SO,
+                          "-plugin", "bothner-server"] + args + ["-x", "c", "/dev/null"],
+                         stdout=open(f"{w}/server.log", "w"), stderr=subprocess.STDOUT,
+                         env={k: v for k, v in os.environ.items()
+                              if not k.startswith(("CLANG_HEADER_CACHE", "CLANG_COMPILE_SERVER"))})
+    while not os.path.exists(f"{w}/sock"):
+        if p.poll() is not None:
+            sys.exit(f"compile server for {mode} exited: {open(w + '/server.log').read()[-2000:]}")
+        time.sleep(0.01)
+    p.log, p.results, p.read_at = f"{w}/server.log", f"{w}/results.jsonl", 0
+    return p, f"{w}/sock"
+
+
+def server_results(p):
+    """The results lines the server wrote since the last call."""
+    if not os.path.exists(p.results):
+        return []
+    with open(p.results) as f:
+        f.seek(p.read_at)
+        text = f.read()
+    end = text.rfind("\n") + 1
+    p.read_at += len(text[:end].encode())
+    return [json.loads(l) for l in text[:end].splitlines() if l.strip()]
+
+
+def quit_server(sock):
+    """{"quit": true} in CacheProtocol.h's framing (MessageKind::CompileRequest)."""
+    import socket, struct
+    body = bytes([17]) + b'{"quit": true}'
+    with socket.socket(socket.AF_UNIX) as c:
+        c.connect(sock)
+        c.sendall(struct.pack("<I", len(body)) + body)
+        try:
+            c.recv(4)
+        except OSError:
+            pass
+
+
 offline = {}
 CMDS = commands()
 # SAMPLE=N: every Nth compile only.
@@ -358,8 +419,11 @@ print(f"{proj} {KIND}: {len(CMDS)} compiles, modes {' '.join(MODES)}", flush=Tru
 objdir = tempfile.mkdtemp(prefix=f"mbo-{proj}-")
 DUMP = os.environ.get("DUMP")
 cores = os.environ.get("DCORES", "8,9,10").split(",")
-daemons = {m: daemon(cores[i % len(cores)], DUMP and f"{DUMP}-{m}.tsv", m) for i, m in enumerate(CM)}
-base = {k: v for k, v in os.environ.items() if not k.startswith("CLANG_HEADER_CACHE")}
+daemons = {m: daemon(cores[i % len(cores)], DUMP and f"{DUMP}-{m}.tsv", m) for i, m in enumerate(CM)
+           if not is_server(m)}
+servers = {m: server(m) for m in CM if is_server(m)}
+SV = {m: [] for m in servers}
+base = {k: v for k, v in os.environ.items() if not k.startswith(("CLANG_HEADER_CACHE", "CLANG_COMPILE_SERVER"))}
 # One __DATE__ and __TIME__ for every compile whose object is compared
 # (cpython's getbuildinfo.c records them).
 if KIND == "full":
@@ -368,6 +432,9 @@ env = {"plain": dict(base)}
 # EXTRA="K=V ...": more settings for every cache mode (measurement switches).
 extra = dict(kv.split("=", 1) for kv in os.environ.get("EXTRA", "").split())
 for m in CM:
+    if is_server(m):
+        env[m] = dict(base, CLANG_COMPILE_SERVER=servers[m][1], CLANG_COMPILE_SERVER_BUILD=f"{proj}-{m}-{time.time()}")
+        continue
     # EXTRA_<mode> ('@' written as '_'): more settings for that mode alone.
     own = dict(kv.split("=", 1) for kv in os.environ.get("EXTRA_" + m.replace("@", "_"), "").split())
     env[m] = dict(base, CLANG_HEADER_CACHE=daemons[m][1], CLANG_HEADER_CACHE_STATS=os.environ.get("LEVEL", "1"),
@@ -384,6 +451,9 @@ for k in range(1, PASSES + 1):
   if k > 1:
     passes.append({"T": T, "S": S, "W": W, "failed": failed, "I": I})
     for m in CM:
+        if is_server(m):
+            env[m]["CLANG_COMPILE_SERVER_BUILD"] = f"{proj}-{m}-pass{k}-{time.time()}"
+            continue
         env[m]["CLANG_HEADER_CACHE_BUILD"] = f"{proj}-{m}-pass{k}-{time.time()}"
     # CHANGE_CMD: run before each later pass, to change the sources the
     # rebuild reads (invalidation test); CHANGE_UNDO at the end.
@@ -397,14 +467,20 @@ for k in range(1, PASSES + 1):
         os.makedirs(os.path.dirname(obj), exist_ok=True)
         t = time.perf_counter()
         a = replay_args(args, obj)
-        if m == "plain" and not PLAIN_MODULES:
+        if (m == "plain" and not PLAIN_MODULES) or is_server(m):
             a = a[2:]
         r = subprocess.run(["taskset", "-c", CORE] + PERFC + [f"{binof(m)}/clang"] + a, cwd=cwd, env=env[m],
                            capture_output=True, text=True)
         T[m].append((time.perf_counter() - t) * 1000)
+        got = server_results(servers[m][0]) if is_server(m) else []
+        if is_server(m):
+            SV[m].append({"pass": k, "i": i, **{f: g.get(f) for g in got[-1:] for f in
+                          ("status", "error", "reused", "parsed", "instructions", "cpu_ms", "wall_ms", "parse_ms",
+                           "reset_ms", "sloc_bytes", "new_space", "spaces_replaced", "rss_kib", "restored_decls")},
+                          "requests": len(got)})
         if PERFC:
             g = re.search(r"instructions=(\d+)", r.stderr)
-            I[m].append(int(g[1]) if g else 0)
+            I[m].append((int(g[1]) if g else 0) + sum(x.get("instructions", 0) for x in got))
             r.stderr = "\n".join(l for l in r.stderr.splitlines() if "instructions=" not in l) + "\n"
         if r.returncode:
             failed.append((m, src, r.stderr[-600:]))
@@ -433,6 +509,13 @@ for m, (p, _) in daemons.items():
     if os.path.exists(p.region):
         os.remove(p.region)
     stored[m] = open(p.log).read()
+for m, (p, sock) in servers.items():
+    try:
+        quit_server(sock)
+        p.wait(timeout=60)
+    except Exception:
+        p.kill(); p.wait()
+    stored[m] = open(p.log).read()[-20000:]
 # Against plain clang's object from the same pass: cpython's getbuildinfo.c
 # records __TIME__.
 def differs(m, pre=""):
@@ -446,7 +529,7 @@ if KIND == "full":
         for k, P in enumerate(passes, 2):
             P["differ"] = dict(P.get("differ", {}), **{m: differs(m, f"pass{k}-")})
 json.dump({"cmds": [c[2] for c in CMDS], "modes": MODES, "T": T, "S": S, "W": W, "failed": failed, "differ": differ,
-           "daemon": stored, "passes": passes, "I": I, "I1": I1, "offline": offline}, open(out, "w"))
+           "daemon": stored, "passes": passes, "I": I, "I1": I1, "offline": offline, "server": SV}, open(out, "w"))
 # The trace keeps what the objects and the daemons' folders gave: they go,
 # as each run would leave 0.4-4.4 GB in /tmp. KEEP_OBJECTS=1 keeps the
 # objects, the differing ones only, to look into.
@@ -459,8 +542,15 @@ if os.environ.get("KEEP_OBJECTS") == "1":
     print(f"objects kept in {objdir}", flush=True)
 else:
     shutil.rmtree(objdir, ignore_errors=True)
-for p, _ in daemons.values():
+for p, _ in list(daemons.values()) + list(servers.values()):
     shutil.rmtree(os.path.dirname(p.log), ignore_errors=True)
+for m, rows in SV.items():
+    st = [r for r in rows if r.get("pass") == 1]
+    print(f"{proj} {KIND} {m}: {sum(1 for r in st if r.get('status') == 2)} refused, "
+          f"{sum(1 for r in st if r.get('requests') != 1)} compiles without exactly one request, "
+          f"{max((r.get('spaces_replaced') or 0) for r in st) if st else 0} memory spaces replaced, "
+          f"{sum(r.get('reused') or 0 for r in st)} fragments reused, {sum(r.get('parsed') or 0 for r in st)} parsed",
+          flush=True)
 tot = {m: sum(T[m]) / 1000 for m in MODES}
 nf = {m: sum(1 for f in failed if f[0] == m) for m in MODES}
 print(f"{proj} {KIND}: " + ", ".join(f"{m} {tot[m]:.2f} s ({tot['plain'] / tot[m]:.2f}x, {nf[m]} failed"

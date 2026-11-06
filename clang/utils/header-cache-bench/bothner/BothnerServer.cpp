@@ -91,8 +91,11 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/raw_socket_stream.h"
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <deque>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 using namespace clang;
@@ -222,6 +225,26 @@ double cpuMs() {
   timespec TS;
   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &TS);
   return TS.tv_sec * 1e3 + TS.tv_nsec / 1e6;
+}
+
+// The server's instructions, user and kernel, counted as perfc counts a
+// compile's (header-cache-bench/perf/perfc.c): a compile's work runs here,
+// not in the driver that the harness measures. 0 where the counter cannot
+// be opened.
+uint64_t instructions() {
+  static int Fd = [] {
+    perf_event_attr A;
+    memset(&A, 0, sizeof A);
+    A.size = sizeof A;
+    A.type = PERF_TYPE_HARDWARE;
+    A.config = PERF_COUNT_HW_INSTRUCTIONS;
+    A.inherit = 1;
+    return int(syscall(SYS_perf_event_open, &A, 0, -1, -1, 0));
+  }();
+  uint64_t V = 0;
+  if (Fd < 0 || ::read(Fd, &V, sizeof V) != sizeof V)
+    return 0;
+  return V;
 }
 
 uint64_t rssKiB() {
@@ -574,7 +597,9 @@ struct Version {
 
 // The fragments of one configuration.
 struct Store {
-  llvm::DenseMap<std::pair<const FileEntry *, unsigned>, unsigned> KeyOf;
+  // A key per (file, reading << 32 | offset): the reading is 0 unless
+  // keys=reading numbers a location's readings in a compile (decision 8).
+  llvm::DenseMap<std::pair<const FileEntry *, uint64_t>, unsigned> KeyOf;
   std::vector<std::unique_ptr<Version>> Latest; // per key
   // Who declared each binding: the version, or MainKey for the main file.
   llvm::DenseMap<const Decl *, Seen> Owner;
@@ -622,7 +647,8 @@ struct Config {
 // input, the output and the main file's name (2.1).
 struct CachedInvocation {
   std::shared_ptr<CompilerInvocation> Inv;
-  Config *Cfg = nullptr;
+  // Its configuration's key (configKey); the space is chosen per main file.
+  std::string ConfigKey;
 };
 
 // Every name a declaration's parse resolved to a declaration (Lookup):
@@ -765,6 +791,12 @@ public:
   // the conditionals the fragment opened are closed. InDefine is set from a
   // joined directive's start to its end.
   bool Option3 = false, Groups = false;
+  // Decision 8(b), keys=reading: the n-th reading of a location in this
+  // compile is a key of its own, as the model's occurrence keys (R2), so
+  // that bits/mathcalls.h read for double, float and long double keeps three
+  // versions instead of parsing the second and third readings as repeats.
+  bool PerReading = false;
+  llvm::DenseMap<std::pair<const FileEntry *, unsigned>, unsigned> Readings;
   bool InDefine = false;
   unsigned DefineAt = 0;
   bool DefineInArgs = false;
@@ -865,7 +897,9 @@ public:
 
   unsigned keyOf(FileID FID, unsigned Offset) {
     const FileEntry *FE = SM.getFileEntryForID(FID);
-    auto [It, New] = St.KeyOf.try_emplace({FE, Offset}, St.Latest.size());
+    uint64_t Reading = PerReading ? Readings[{FE, Offset}]++ : 0;
+    auto [It, New] =
+        St.KeyOf.try_emplace({FE, Reading << 32 | Offset}, St.Latest.size());
     if (New)
       St.Latest.emplace_back();
     return It->second;
@@ -2125,16 +2159,31 @@ std::string configKey(StringRef Cwd, const CompilerInvocation &Inv) {
 
 class Server {
   llvm::StringMap<CachedInvocation> Invocations;
-  llvm::StringMap<std::unique_ptr<Config>> Configs;
+  // Each configuration's memory spaces, side by side (user, 2026-11-06): a
+  // space is a configuration of its own, with its own source-location space
+  // and store.
+  llvm::StringMap<std::vector<std::unique_ptr<Config>>> Configs;
+  // The space a main file was first compiled in: it goes back there in later
+  // builds, to its own store.
+  llvm::StringMap<unsigned> SpaceOf;
   RawPCHContainerReader PCHReader;
 
-  Config &configFor(const std::string &Cwd, CompilerInvocation &Inv,
-                    bool &IsNew);
+  std::unique_ptr<Config> newConfig(const std::string &Cwd,
+                                    CompilerInvocation &Inv);
   void reset(Config &C);
   unsigned checkFiles(Config &C);
 
+  // The most source-location space one compile took so far, the spaces
+  // replaced because they ran low, and the next configuration's number.
+  uint64_t MaxCompileSpace = 0;
+  unsigned Spaces = 0, NextConfigId = 0;
+
 public:
-  bool Reuse = false, Option3 = false, Groups = false;
+  bool Reuse = false, Option3 = false, Groups = false, PerReading = false;
+  // space-share=<s>: a new main file goes to the newest space only while
+  // that space could take it within s of its 2 GiB; else a new space opens.
+  // 0.5 leaves each space room for the same compiles again.
+  double SpaceShare = 1.0;
   llvm::json::Object serve(const std::string &Cwd,
                            const std::vector<std::string> &Args,
                            const std::string &DumpPath,
@@ -2189,16 +2238,11 @@ unsigned Server::checkFiles(Config &C) {
   return Changed.size();
 }
 
-Config &Server::configFor(const std::string &Cwd, CompilerInvocation &Inv,
-                          bool &IsNew) {
-  std::string Key = configKey(Cwd, Inv);
-  std::unique_ptr<Config> &Slot = Configs[Key];
-  IsNew = !Slot;
-  if (Slot)
-    return *Slot;
-  Slot = std::make_unique<Config>();
+std::unique_ptr<Config> Server::newConfig(const std::string &Cwd,
+                                          CompilerInvocation &Inv) {
+  auto Slot = std::make_unique<Config>();
   Config &C = *Slot;
-  C.Id = Configs.size() - 1;
+  C.Id = NextConfigId++;
   C.Cwd = Cwd;
   C.LangOpts = Inv.getLangOpts();
   C.TargetOpts = Inv.getTargetOpts();
@@ -2218,7 +2262,7 @@ Config &Server::configFor(const std::string &Cwd, CompilerInvocation &Inv,
   C.Ctx = new ASTContext(C.LangOpts, *C.SourceMgr, C.Idents, C.Selectors,
                          C.Builtins, TU_Incremental);
   C.Ctx->InitBuiltinTypes(*C.Target, /*AuxTarget=*/nullptr);
-  return C;
+  return Slot;
 }
 
 // The per-compile resets of 2.3, and the undo of 2.8: what the previous
@@ -2289,6 +2333,7 @@ llvm::json::Object Server::serve(const std::string &Cwd,
                                  const std::string &Build) {
   auto Start = std::chrono::steady_clock::now();
   double Cpu0 = cpuMs();
+  uint64_t Instr0 = instructions();
   llvm::json::Object R;
   auto Fail = [&](StringRef Why) {
     R["status"] = 2;
@@ -2335,11 +2380,43 @@ llvm::json::Object Server::serve(const std::string &Cwd,
     if (Inv->getFrontendOpts().Inputs.size() != 1)
       return Fail("one input expected");
     CI.Inv = Inv;
-    CI.Cfg = &configFor(Cwd, *Inv, NewConfig);
-    CI.Cfg->Target->adjust(*CI.Cfg->Diags, Inv->getLangOpts(), nullptr);
+    CI.ConfigKey = configKey(Cwd, *Inv);
+  }
+  // Memory spaces side by side (user, 2026-11-06). A configuration's compiles
+  // are spread over spaces, each with its own 2 GiB of source locations and
+  // its own store. A main file always goes back to the space it was first
+  // compiled in, where its fragments are. A new main file goes to the newest
+  // space if that space could still take it within space-share of its 2 GiB
+  // (twice the most any compile took so far); else a new space opens. A
+  // space that cannot hold one more compile is replaced by an empty one, and
+  // the old one is freed: its declarations keep locations in its own space,
+  // so none of them can move. Only there is a store lost.
+  const uint64_t Limit = uint64_t(1) << 31;
+  auto Fits = [&](Config &S, double Share) {
+    return S.SourceMgr->getNextLocalOffset() + 2 * MaxCompileSpace <=
+           Share * double(Limit);
+  };
+  std::vector<std::unique_ptr<Config>> &Sp = Configs[CI.ConfigKey];
+  auto [SpaceIt, NewMain] =
+      SpaceOf.try_emplace(CI.ConfigKey + '\0' + Cwd + '\0' + Input, 0);
+  if (NewMain) {
+    if (Sp.empty() || !Fits(*Sp.back(), SpaceShare)) {
+      Sp.push_back(newConfig(Cwd, *CI.Inv));
+      NewConfig = true;
+    }
+    SpaceIt->second = Sp.size() - 1;
+  }
+  unsigned SpaceIdx = SpaceIt->second;
+  bool NewSpace = false;
+  if (!Fits(*Sp[SpaceIdx], 1.0)) {
+    Sp[SpaceIdx] = newConfig(Cwd, *CI.Inv);
+    NewSpace = true;
+    ++Spaces;
   }
   CompilerInvocation &Inv = *CI.Inv;
-  Config &C = *CI.Cfg;
+  Config &C = *Sp[SpaceIdx];
+  unsigned NumSpaces = Sp.size();
+  uint64_t SpaceBefore = C.SourceMgr->getNextLocalOffset();
   FrontendOptions &FEOpts = Inv.getFrontendOpts();
   FEOpts.Inputs[0] = FrontendInputFile(Input, FEOpts.Inputs[0].getKind());
   FEOpts.OutputFile = Output;
@@ -2448,6 +2525,7 @@ llvm::json::Object Server::serve(const std::string &Cwd,
     Frags = std::make_unique<Compile>(C.Fragments, Ctx, *PP);
     Frags->Option3 = Option3;
     Frags->Groups = Groups;
+    Frags->PerReading = PerReading;
     Frags->diagOptions(C.DiagOpts);
     PP->addPPCallbacks(std::make_unique<DiagPragmas>(*Frags));
     Watch->C = Frags.get();
@@ -2600,7 +2678,14 @@ llvm::json::Object Server::serve(const std::string &Cwd,
   R["teardown_ms"] = TeardownMs;
   R["wall_ms"] = msSince(Start);
   R["cpu_ms"] = cpuMs() - Cpu0;
-  R["sloc_bytes"] = uint64_t(C.SourceMgr->getNextLocalOffset());
+  R["instructions"] = instructions() - Instr0;
+  uint64_t SpaceAfter = C.SourceMgr->getNextLocalOffset();
+  MaxCompileSpace = std::max(MaxCompileSpace, SpaceAfter - SpaceBefore);
+  R["sloc_bytes"] = SpaceAfter;
+  R["new_space"] = NewSpace;
+  R["spaces_replaced"] = Spaces;
+  R["space"] = SpaceIdx;
+  R["spaces"] = NumSpaces;
   R["rss_kib"] = rssKiB();
   R["idents"] = uint64_t(C.Idents.size());
   if (Checked)
@@ -2617,7 +2702,8 @@ llvm::json::Object Server::serve(const std::string &Cwd,
 
 class ServerAction : public PluginASTAction {
   std::string Requests, Results, Socket;
-  bool Reuse = false, Option3 = false, Groups = false;
+  bool Reuse = false, Option3 = false, Groups = false, PerReading = false;
+  double SpaceShare = 1.0;
 
 protected:
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &,
@@ -2640,6 +2726,10 @@ protected:
         Option3 = true;
       else if (A == "groups=1")
         Groups = true;
+      else if (A == "keys=reading")
+        PerReading = true;
+      else if (A.consume_front("space-share="))
+        A.getAsDouble(SpaceShare);
     }
     if (Requests.empty() == Socket.empty() || Results.empty()) {
       llvm::errs() << "bothner-server: requests= or socket=, and results=, "
@@ -2671,6 +2761,8 @@ protected:
     Srv.Reuse = Reuse;
     Srv.Option3 = Option3;
     Srv.Groups = Groups;
+    Srv.PerReading = PerReading;
+    Srv.SpaceShare = SpaceShare;
     unsigned Index = 0;
     bool Quit = false;
     auto Handle = [&](StringRef Line) {

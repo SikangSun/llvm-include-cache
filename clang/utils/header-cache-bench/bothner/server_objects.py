@@ -18,7 +18,8 @@ env: BIN (default build_assert/bin of this checkout), SO, LOGS_DIR (holding
      log-<project>), BENCH_ROOT, SRC_ROOT, PASSES, CHUNK, JOBS, KEEP (keep
      the objects), VIA (requests or driver), OPTION (2, the default, or 3:
      #define and #undef lines join fragments, design 2.7), FRAGMENT_GROUPS
-     (1: conditionals join fragments while the parser is nested)
+     (1: conditionals join fragments while the parser is nested), KEYS
+     (reading: one key for each reading of a location, decision 8)
 """
 import concurrent.futures as cf, json, os, shlex, shutil, subprocess, sys, tempfile, time
 
@@ -32,7 +33,8 @@ CHUNK = int(os.environ.get("CHUNK", "0"))
 JOBS = int(os.environ.get("JOBS", "16"))
 VIA = os.environ.get("VIA", "requests")
 OPTION_ARGS = (["-plugin-arg-bothner-server", "option=3"] if os.environ.get("OPTION") == "3" else []) + \
-    (["-plugin-arg-bothner-server", "groups=1"] if os.environ.get("FRAGMENT_GROUPS") == "1" else [])
+    (["-plugin-arg-bothner-server", "groups=1"] if os.environ.get("FRAGMENT_GROUPS") == "1" else []) + \
+    (["-plugin-arg-bothner-server", "keys=reading"] if os.environ.get("KEYS") == "reading" else [])
 sys.path.insert(0, HERE)
 import diagtext  # noqa: E402
 
