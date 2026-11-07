@@ -2694,7 +2694,8 @@ public:
                  NamedDecl *>
       PinnedNameReferences;
   /// See setPartNameResolver.
-  std::function<NamedDecl *(ModuleFile &, IdentifierInfo &, bool)>
+  std::function<NamedDecl *(ModuleFile &, IdentifierInfo &, bool, unsigned &,
+                            SourceLocation &)>
       PartNameResolver;
 
 public:
@@ -2786,6 +2787,46 @@ public:
   NamedDecl *findInEveryModule(IdentifierInfo &II, bool Tag,
                                const serialization::ModuleFile *From);
 
+  /// Which declaration \p D is, as a header cache part's reference by name
+  /// records it: the name of its file, without the directories, and its
+  /// offset in the file. The same for the declaration in the text and in
+  /// a copy. Empty for one a macro made, or one with no file. For one
+  /// read from a module of \p Reader, placeInModule.
+  static std::pair<std::string, unsigned>
+  declarationPlace(const SourceManager &SM, ASTReader *Reader, const Decl *D);
+
+  /// declarationPlace of a location in a module, from the module's own
+  /// records. The source manager reads no module's file for it: the first
+  /// read of a header names it in this compile (postgres's simplehash.h,
+  /// in a __FILE__ of equivclass.c).
+  std::pair<std::string, unsigned> placeInModule(SourceLocation Loc);
+
+  /// declarationPlace of \p D, or, for a null \p D, of the declaration
+  /// \p ID, not read yet.
+  std::pair<std::string, unsigned> placeOf(const Decl *D, GlobalDeclID ID);
+
+  /// The typedef of \p II at \p Place (declarationPlace), or \p Found if
+  /// none is. The typedefs of a name all name one type, and debug
+  /// information tells them apart.
+  NamedDecl *typedefAtPlace(TypedefDecl &Found, IdentifierInfo &II,
+                            const std::pair<std::string, unsigned> &Place);
+
+  /// The latest typedef of \p II made before \p Before, by where each
+  /// entered the compile: a module's where it loaded. Of several that one
+  /// load brought, the one at \p Place, else \p Found. \p Found if there
+  /// is none.
+  NamedDecl *
+  latestTypedefBefore(TypedefDecl &Found, IdentifierInfo &II,
+                      SourceLocation Before,
+                      const std::pair<std::string, unsigned> &Place);
+
+  /// The declarations of \p II that wait to be read.
+  SmallVector<GlobalDeclID, 4> pendingOf(IdentifierInfo &II);
+
+  /// The code of the record of \p ID, a declaration not read yet; 0 if it
+  /// is read, or its record cannot be read.
+  unsigned peekDeclCode(GlobalDeclID ID);
+
   /// Whether the declaration \p ID, not read yet, can be one that a lookup
   /// in the tag name space (\p Tag), or in the ordinary one, finds. Its
   /// record's code says, in C, without reading the declaration.
@@ -2817,14 +2858,21 @@ public:
   /// reads it and no pinNameReference pin applies; null looks the name up.
   /// A hit's linked copies name declarations of the copies around them,
   /// which the name's lookup, made later, can pass over for a newer one.
+  /// The last arguments say where the hit's tree gives the name: 0 the copy
+  /// is in no tree, 1 the tree's copies declare it, 2 it comes from outside
+  /// the tree, which begins at the location.
   void setPartNameResolver(
-      std::function<NamedDecl *(ModuleFile &, IdentifierInfo &, bool)> R) {
+      std::function<NamedDecl *(ModuleFile &, IdentifierInfo &, bool,
+                                unsigned &, SourceLocation &)>
+          R) {
     PartNameResolver = std::move(R);
   }
 
   /// See setPartNameResolver.
-  NamedDecl *resolvePartName(ModuleFile &MF, IdentifierInfo &II, bool Tag) {
-    return PartNameResolver ? PartNameResolver(MF, II, Tag) : nullptr;
+  NamedDecl *resolvePartName(ModuleFile &MF, IdentifierInfo &II, bool Tag,
+                             unsigned &Where, SourceLocation &Begin) {
+    return PartNameResolver ? PartNameResolver(MF, II, Tag, Where, Begin)
+                            : nullptr;
   }
 
   /// The latest file-scope declaration of \p II, in the tag name space if

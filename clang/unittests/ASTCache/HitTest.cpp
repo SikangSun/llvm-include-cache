@@ -38,6 +38,7 @@
 #include "clang/Options/OptionUtils.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -5332,4 +5333,135 @@ TEST_F(ExportTest, AVariableACopyUsesIsUsedWhereTheCopyLoads) {
   EXPECT_FALSE(reads(Main, Timer)) << "timer.h's copy was not served";
   GenerateCode = false;
   EXPECT_TRUE(Generated) << "no code was generated";
+}
+
+TEST_F(ExportTest, ATypedefALinkGivesNamesTheLinksWhileItWaitsToBeRead) {
+  // iter.h and hooks.h both declare it_t. core.h's struct ce names iter.h's,
+  // which core.h includes; comp.h, included after core.h, includes hooks.h.
+  // Code generation reads ce's fields from core.h's copy when no lookup of
+  // it_t has run, so both typedefs still wait to be read. The field names
+  // iter.h's, as in the text (PHP's zend.h names zend_iterators.h's
+  // zend_object_iterator, not zend_property_hooks.h's, 2026-11-07).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Iter = write("iter.h", "#ifndef ITER_H\n#define ITER_H\n"
+                                     "typedef struct it it_t;\n"
+                                     "struct it { int n; };\n#endif\n");
+  std::string Hooks = write("hooks.h", "#ifndef HOOKS_H\n#define HOOKS_H\n"
+                                       "typedef struct it it_t;\n"
+                                       "int hook(it_t *x);\n#endif\n");
+  std::string Core =
+      write("core.h", "#ifndef CORE_H\n#define CORE_H\n#include \"" + Iter +
+                          "\"\nstruct ce { it_t *(*get)(void); int k; };\n"
+                          "#endif\n");
+  std::string Comp = write("comp.h", "#ifndef COMP_H\n#define COMP_H\n"
+                                     "#include \"" + Hooks + "\"\n#endif\n");
+  std::string Root =
+      write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n#include \"" + Core +
+                          "\"\n#include \"" + Comp + "\"\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Root + "\"\nstruct ce g;\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(Main, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Root)) << "nothing is stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Root)) << "root.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::DebugInfoFinder Found;
+  Found.processModule(*Generated);
+  std::vector<std::string> Files;
+  for (const llvm::DIType *T : Found.types())
+    if (auto *D = llvm::dyn_cast<llvm::DIDerivedType>(T);
+        D && D->getTag() == llvm::dwarf::DW_TAG_typedef &&
+        D->getName() == "it_t")
+      Files.push_back(llvm::sys::path::filename(D->getFilename()).str());
+  EXPECT_EQ(Files, std::vector<std::string>{"iter.h"})
+      << "it_t names another typedef than the text's";
+}
+
+TEST_F(ExportTest, EachReferenceToARepeatedTypedefNamesTheTextsDeclaration) {
+  // types.h and hooks.h both declare ce_t, and root.h includes both: its
+  // struct ce names types.h's typedef and its struct holder, after hooks.h,
+  // names hooks.h's. root.h's copy refers to both by name, and each names
+  // the typedef the text named where the reference is (PHP's zend.h names
+  // zend_types.h's zend_class_entry, then zend_property_hooks.h's,
+  // 2026-11-07).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Types = write("types.h", "#ifndef TYPES_H\n#define TYPES_H\n"
+                                       "typedef struct ce ce_t;\n#endif\n");
+  std::string Hooks = write("hooks.h", "#ifndef HOOKS_H\n#define HOOKS_H\n"
+                                       "typedef struct ce ce_t;\n"
+                                       "int hook(ce_t *x);\n#endif\n");
+  std::string Root =
+      write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n#include \"" + Types +
+                          "\"\nstruct ce { ce_t **interfaces; int n; };\n"
+                          "#include \"" + Hooks +
+                          "\"\nstruct holder { ce_t *cur; };\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Root +
+                                         "\"\nstruct ce g;\nstruct holder h;\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(Main, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Root)) << "nothing is stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Root)) << "root.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::DebugInfoFinder Found;
+  Found.processModule(*Generated);
+  std::set<std::string> Files;
+  for (const llvm::DIType *T : Found.types())
+    if (auto *D = llvm::dyn_cast<llvm::DIDerivedType>(T);
+        D && D->getTag() == llvm::dwarf::DW_TAG_typedef &&
+        D->getName() == "ce_t")
+      Files.insert(llvm::sys::path::filename(D->getFilename()).str());
+  EXPECT_EQ(Files, (std::set<std::string>{"types.h", "hooks.h"}))
+      << "a reference names another typedef than the text's";
+}
+
+TEST_F(ExportTest, ATypedefFromOutsideTheTreeIsTheLatestBeforeIt) {
+  // root.h's struct user names device_t, which neither root.h nor its link
+  // l.h declares. a.c writes root.h's copy after defs.h, the only typedef
+  // there; main.c includes qdev.h, which declares device_t again, before
+  // root.h. Where main.c loads the copy, the field names qdev.h's typedef,
+  // as the text does, not the one the compile that wrote the copy named
+  // (qemu's DeviceState in typedefs.h and in the headers after it).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Defs = write("defs.h", "#ifndef DEFS_H\n#define DEFS_H\n"
+                                     "typedef struct dev device_t;\n"
+                                     "struct dev { int id; };\n#endif\n");
+  std::string Qdev = write("qdev.h", "#ifndef QDEV_H\n#define QDEV_H\n"
+                                     "typedef struct dev device_t;\n#endif\n");
+  std::string L = write("l.h", "#ifndef L_H\n#define L_H\nint l(void);\n"
+                               "#endif\n");
+  std::string Root =
+      write("root.h", "#ifndef ROOT_H\n#define ROOT_H\n#include \"" + L +
+                          "\"\nstruct user { device_t *d; };\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Defs + "\"\n#include \"" +
+                                   Root + "\"\n");
+  std::string Main =
+      write("main.c", "#include \"" + Defs + "\"\n#include \"" + Qdev +
+                          "\"\n#include \"" + Root + "\"\nstruct user u;\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(A, Root)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Root)) << "nothing is stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Root)) << "root.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::DebugInfoFinder Found;
+  Found.processModule(*Generated);
+  std::set<std::string> Files;
+  for (const llvm::DIType *T : Found.types())
+    if (auto *D = llvm::dyn_cast<llvm::DIDerivedType>(T);
+        D && D->getTag() == llvm::dwarf::DW_TAG_typedef &&
+        D->getName() == "device_t")
+      Files.insert(llvm::sys::path::filename(D->getFilename()).str());
+  EXPECT_EQ(Files, (std::set<std::string>{"qdev.h"}))
+      << "device_t names another typedef than the text's";
 }

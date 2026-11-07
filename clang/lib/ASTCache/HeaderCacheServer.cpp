@@ -1548,6 +1548,8 @@ private:
       /// What the hit's check found for each name the tree takes from
       /// outside it ("t:" a tag, "o:" any other).
       llvm::StringMap<NamedDecl *> Outside;
+      /// The #include of the hit.
+      SourceLocation Begin;
     };
     std::deque<Tree> Trees;
     /// The tree and node of each copy a hit loaded the first time.
@@ -1592,12 +1594,14 @@ private:
     /// name from one of the copy's links, among that link's copies; one the
     /// tree around a linked copy gives, among the copies that give it; one
     /// from outside the tree, to what the hit's check found where the tree
-    /// begins.
+    /// begins. \p Where as ASTReader::setPartNameResolver says.
     NamedDecl *resolve(ASTReader &Reader, serialization::ModuleFile &MF,
-                       IdentifierInfo &II, bool Tag) {
+                       IdentifierInfo &II, bool Tag, unsigned &Where,
+                       SourceLocation &Begin) {
       auto P = NodeOf.find(&MF);
       if (P == NodeOf.end())
         return nullptr;
+      Where = 1;
       Tree &T = *P->second.first;
       int X = P->second.second;
       llvm::SmallString<64> K(Tag ? "t:" : "o:");
@@ -1619,6 +1623,8 @@ private:
                                           under(T, Up.Links[F->second]));
         return nullptr;
       }
+      Where = 2;
+      Begin = T.Begin;
       return T.Outside.lookup(K);
     }
   };
@@ -1947,6 +1953,7 @@ private:
   Module *loadTree(const MetadataView &Deps, llvm::StringRef Bytes,
                    llvm::StringRef ModuleName, SourceLocation Loc) {
     HitTrees::Tree &Tree = Hits->Trees.emplace_back();
+    Tree.Begin = Loc;
     std::vector<Fetched> &All = Tree.All;
     std::optional<llvm::TimeTraceScope> Step;
     Step.emplace("HeaderCache FetchLinks");
@@ -2097,8 +2104,9 @@ private:
       ASTReader *Reader = CI.getASTReader().get();
       Reader->setPartNameResolver(
           [Hits = Hits, Reader](serialization::ModuleFile &MF,
-                                IdentifierInfo &II, bool Tag) {
-            return Hits->resolve(*Reader, MF, II, Tag);
+                                IdentifierInfo &II, bool Tag,
+                                unsigned &Where, SourceLocation &Begin) {
+            return Hits->resolve(*Reader, MF, II, Tag, Where, Begin);
           });
     }
   }
