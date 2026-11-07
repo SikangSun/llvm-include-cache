@@ -48,6 +48,10 @@ ALL.update({
     "linkcut2000ma": dict(LINK, CLANG_HEADER_CACHE_MERGE="auto", CLANG_HEADER_CACHE_MERGE_WAIT="1"),
 })
 DAEMON_ARGS = {"linkcut2000ma": ["-ask-cutoff-us", "2000"]}
+# The run guide's versions, named as in modes_bench.py: top-level with
+# __COUNTER__ support, link everything, and linkc with the merge pick.
+ALL.update({"counter": dict(TOP, CLANG_HEADER_CACHE_COUNTER="1"), "linkcut0": LINK, "linkcp": LINK})
+DAEMON_ARGS.update({"linkcut0": ["-ask-cutoff-us", "0"], "linkcp": ["-merge-picks"]})
 CM = os.environ.get("MODES", "top").split()
 
 
@@ -135,8 +139,10 @@ for n, jobs in enumerate(JOBS):
             wall, res = build(CMDS, jobs, env, False, objdir)
             p.terminate(); p.wait()
             row[m] = {"daemon": open(f"{w}/daemon.log").read()[-2000:]}
-            if os.path.exists(region):
-                os.remove(region)
+            # -merge-picks writes its list and reasons beside the region.
+            for f in (region, region + ".picks", region + ".picks.log", region + ".picks.tmp"):
+                if os.path.exists(f):
+                    os.remove(f)
             shutil.rmtree(w, ignore_errors=True)
             # LEVEL=2 keeps every line (each request's outcome), and when each
             # compile ran.

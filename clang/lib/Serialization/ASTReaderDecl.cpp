@@ -4206,7 +4206,15 @@ Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
           Twine("header cache part ") + Loc.F->ModuleName +
           ": a declaration it refers to by name is not in this compile: " +
           Missing);
-    LoadedDecl(translateGlobalDeclIDToIndex(ID), Found);
+    // The lookup can read this same reference again, and that read records
+    // the declaration first: the lookup reads another copy's declaration of
+    // the name, that one's read resolves a reference by name of its own, and
+    // that lookup reads this copy's (git's refs/packed-backend.c, size_t).
+    // In each of git's cases, both reads found the same declaration.
+    unsigned Index = translateGlobalDeclIDToIndex(ID);
+    if (Decl *Earlier = DeclsLoaded[Index])
+      return Earlier;
+    LoadedDecl(Index, Found);
     return Found;
   }
   case DECL_TYPEDEF:
