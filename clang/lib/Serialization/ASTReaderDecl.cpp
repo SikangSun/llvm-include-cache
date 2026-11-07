@@ -3953,7 +3953,17 @@ void ASTDeclReader::attachLatestDecl(Decl *D, Decl *Latest) {
 
 template<typename DeclT>
 void ASTDeclReader::markIncompleteDeclChainImpl(Redeclarable<DeclT> *D) {
-  D->RedeclLink.markIncomplete();
+  // A declaration whose chain the read asked for can stop being the first
+  // of a chain before the read ends: a header cache copy's declaration
+  // whose first one a name reference gives (Linux's struct address_space
+  // of asm-generic/cacheflush.h, whose first one is mm_types.h's). The
+  // chain to complete is then that first one's.
+  if (!D->RedeclLink.isFirst())
+    D = D->getFirstDecl();
+  // A first one whose latest is not set yet completes its chain when one
+  // asks for it.
+  if (D->RedeclLink.isFirst() && D->RedeclLink.getLatestNotUpdated())
+    D->RedeclLink.markIncomplete();
 }
 
 void ASTDeclReader::markIncompleteDeclChainImpl(...) {
