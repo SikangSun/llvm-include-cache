@@ -648,6 +648,14 @@ void ASTStmtReader::VisitDeclRefExpr(DeclRefExpr *E) {
   E->D = readDeclAs<ValueDecl>();
   E->setLocation(readSourceLocation());
   E->DNLoc = Record.readDeclarationNameLoc(E->getDecl()->getDeclName());
+
+  // A header cache copy names a declaration outside it, and the name finds
+  // the loading compile's own declaration, which the copy's text never
+  // marked used. A use the text would mark marks it here, as Sema did in the
+  // compile that wrote the copy.
+  if (Record.isHeaderCachePart() && !E->isNonOdrUse() &&
+      isa<VarDecl, FunctionDecl>(E->getDecl()))
+    E->getDecl()->setIsUsed();
 }
 
 void ASTStmtReader::VisitIntegerLiteral(IntegerLiteral *E) {

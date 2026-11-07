@@ -3015,6 +3015,36 @@ When the reader refuses a tree load, the compile does not use that copy
 how often: in the first build, redis 43 before (bin-u71) and 43 after,
 cpython 70 and 70.
 
+### A copy's use of an outside declaration did not mark it used (found 2026-11-07)
+
+With LLVM assertions on (Release, `LLVM_ENABLE_ASSERTIONS=ON`), 9 of
+nginx's 126 full compiles crashed, with linked copies and with the merge
+pick, in both builds on one daemon. They crashed at `2dbecbd98` too, before
+the merge pick. The assertion is in `CodeGenFunction::EmitDeclRefLValue`
+(`CGExpr.cpp:3509`): "Should not use decl without marking it used!". It
+fired while code generation emitted `ngx_event_add_timer`, a static inline
+function in `ngx_event_timer.h`. Our release builds have assertions off,
+and they gave the same objects as plain clang, so no earlier check saw it.
+
+Sema marks a variable or function used where an expression names it in an
+evaluated context. A copy names a declaration outside it by name (§2.18),
+and the name finds the loading compile's own declaration. In the compile
+that wrote the copy, the mark went to that compile's declaration, and
+nothing carries it. The declaration's own copy can say unused too: it was
+written before the text that uses it, as `times.h`'s copy is written before
+`timer.h`'s inline function reads `now`.
+
+When the reader reads an expression from a copy that names a variable or
+function, and the use is not a non-odr use, it now marks the declaration
+used (`ASTStmtReader::VisitDeclRefExpr`, with
+`ASTRecordReader::isHeaderCachePart`), as Sema did where it parsed the
+text. Code generation reads a body before it emits it, so the mark is in
+place. On x86, the used mark matters for this assertion and for a few
+errors, such as an `asm` label after the first use. Unused warnings do not
+change: the exporter writes no copy that uses a main-file static that such
+a warning reports (`reportedIfUnused`). Test:
+`AVariableACopyUsesIsUsedWhereTheCopyLoads`, which failed before the fix.
+
 ## 4. Open
 
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider
