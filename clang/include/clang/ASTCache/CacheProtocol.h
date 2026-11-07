@@ -224,6 +224,34 @@ struct TimingReport {
   /// and the copies it links with one reader call, shared out by bytes.
   /// Path and Micros only.
   std::vector<HeaderTiming> Requests, Loads;
+  /// The five-counter merge pick (CacheDaemonOptions::MergePicks), when the
+  /// daemon asks for it (HelloReply::WantAsks): each cache request of the
+  /// compile, in order, by header; whether the .c file made it; and for a
+  /// hit, the copies it loaded besides its own (its links), the bytes of
+  /// all of them, and the time loading them took.
+  struct Ask {
+    std::string Path;
+    bool FromMain = false, Hit = false;
+    uint32_t Links = 0;
+    uint64_t Bytes = 0, LoadMicros = 0;
+  };
+  std::vector<Ask> Asks;
+  /// Which compile this is (HelloRequest::Compile), or empty; and the
+  /// headers it read without asking for a copy because the ask-list did not
+  /// have them. The daemon gives them back to the same compile in the next
+  /// build (HelloReply::NotListedBefore).
+  std::string Compile;
+  std::vector<std::string> NotListed;
+};
+
+/// What a compile sends when it connects: whether the daemon's offline step
+/// runs it; which compile it is -- its directory, main file and options --
+/// or empty; and the build it belongs to, as TimingReport::Build, 0 for
+/// none.
+struct HelloRequest {
+  bool Offline = false;
+  std::string Compile;
+  uint64_t Build = 0;
 };
 
 /// The daemon's answer to a client that has just connected: the region file
@@ -242,6 +270,15 @@ struct HelloReply {
   /// Where the compile records what the offline step reads
   /// (CLANG_HEADER_CACHE_RECORD's directory), or empty: no recording.
   std::string RecordDir;
+  /// The daemon picks headers to merge (CacheDaemonOptions::MergePicks):
+  /// the compile's timing report lists its requests (TimingReport::Asks).
+  bool WantAsks = false;
+  /// The headers the same compile (HelloRequest::Compile) read in its last
+  /// build without asking for a copy, because no compile had listed them yet
+  /// (TimingReport::NotListed). It reads them without asking again, so that
+  /// a build asks for the same headers as the one before (DECISIONS.md
+  /// 2.28). Empty for a compile the daemon has not seen.
+  std::vector<std::string> NotListedBefore;
 };
 
 /// CLANG_HEADER_CACHE_SECOND_MISS: a compile about to write the copy of
@@ -300,9 +337,10 @@ void encodePushAck(llvm::SmallVectorImpl<char> &Out);
 void encodeTimingReport(const TimingReport &Report,
                         llvm::SmallVectorImpl<char> &Out);
 void encodeTimingAck(llvm::SmallVectorImpl<char> &Out);
-/// \p Offline: the compile is one the daemon's offline step runs
+/// HelloRequest::Offline: the compile is one the daemon's offline step runs
 /// (CLANG_HEADER_CACHE_OFFLINE=1), which its lookups do not stop.
-void encodeHello(llvm::SmallVectorImpl<char> &Out, bool Offline = false);
+void encodeHello(llvm::SmallVectorImpl<char> &Out,
+                 const HelloRequest &Hello = {});
 void encodeHelloReply(const HelloReply &Reply,
                       llvm::SmallVectorImpl<char> &Out);
 void encodeSeenRequest(const SeenRequest &Req,
@@ -331,8 +369,7 @@ std::optional<LookupRequest> decodeLookupRequest(llvm::StringRef Body);
 std::optional<LookupResponse> decodeLookupResponse(llvm::StringRef Body);
 std::optional<ReceivedPush> decodePushRequest(llvm::StringRef Body);
 std::optional<TimingReport> decodeTimingReport(llvm::StringRef Body);
-/// The Hello's Offline flag.
-std::optional<bool> decodeHello(llvm::StringRef Body);
+std::optional<HelloRequest> decodeHello(llvm::StringRef Body);
 std::optional<HelloReply> decodeHelloReply(llvm::StringRef Body);
 std::optional<SeenRequest> decodeSeenRequest(llvm::StringRef Body);
 std::optional<bool> decodeSeenReply(llvm::StringRef Body);

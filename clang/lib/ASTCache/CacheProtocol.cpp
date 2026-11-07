@@ -168,6 +168,18 @@ void clang::ast_cache::encodeTimingReport(const TimingReport &Report,
         W.u64(H.Micros);
       }
     }
+    W.u32(static_cast<uint32_t>(Report.Asks.size()));
+    for (const TimingReport::Ask &A : Report.Asks) {
+      W.str(A.Path);
+      W.u8((A.FromMain ? 1 : 0) | (A.Hit ? 2 : 0));
+      W.u32(A.Links);
+      W.u64(A.Bytes);
+      W.u64(A.LoadMicros);
+    }
+    W.str(Report.Compile);
+    W.u32(static_cast<uint32_t>(Report.NotListed.size()));
+    for (const std::string &P : Report.NotListed)
+      W.str(P);
   });
 }
 
@@ -176,9 +188,12 @@ void clang::ast_cache::encodeTimingAck(llvm::SmallVectorImpl<char> &Out) {
 }
 
 void clang::ast_cache::encodeHello(llvm::SmallVectorImpl<char> &Out,
-                                   bool Offline) {
-  frame(Out, MessageKind::Hello,
-        [&](ByteWriter &W) { W.u8(Offline ? 1 : 0); });
+                                   const HelloRequest &Hello) {
+  frame(Out, MessageKind::Hello, [&](ByteWriter &W) {
+    W.u8(Hello.Offline ? 1 : 0);
+    W.str(Hello.Compile);
+    W.u64(Hello.Build);
+  });
 }
 
 void clang::ast_cache::encodeHelloReply(const HelloReply &Reply,
@@ -188,6 +203,10 @@ void clang::ast_cache::encodeHelloReply(const HelloReply &Reply,
     W.u64(Reply.InstanceId);
     W.str(Reply.DecisionsPath);
     W.str(Reply.RecordDir);
+    W.u8(Reply.WantAsks ? 1 : 0);
+    W.u32(static_cast<uint32_t>(Reply.NotListedBefore.size()));
+    for (const std::string &P : Reply.NotListedBefore)
+      W.str(P);
   });
 }
 
@@ -397,19 +416,40 @@ clang::ast_cache::decodeTimingReport(llvm::StringRef Body) {
       L->push_back(std::move(H));
     }
   }
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I) {
+    TimingReport::Ask A;
+    A.Path = R.str().str();
+    uint8_t Flags = R.u8();
+    A.FromMain = Flags & 1;
+    A.Hit = Flags & 2;
+    A.Links = R.u32();
+    A.Bytes = R.u64();
+    A.LoadMicros = R.u64();
+    if (Flags > 3)
+      return std::nullopt;
+    Report.Asks.push_back(std::move(A));
+  }
+  Report.Compile = R.str().str();
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I)
+    Report.NotListed.push_back(R.str().str());
   if (!R.ok() || !R.atEnd())
     return std::nullopt;
   return Report;
 }
 
-std::optional<bool> clang::ast_cache::decodeHello(llvm::StringRef Body) {
+std::optional<HelloRequest>
+clang::ast_cache::decodeHello(llvm::StringRef Body) {
   ByteReader R(Body);
   if (!expectKind(R, MessageKind::Hello))
     return std::nullopt;
+  HelloRequest Hello;
   uint8_t Offline = R.u8();
+  Hello.Offline = Offline == 1;
+  Hello.Compile = R.str().str();
+  Hello.Build = R.u64();
   if (!R.ok() || !R.atEnd() || Offline > 1)
     return std::nullopt;
-  return Offline == 1;
+  return Hello;
 }
 
 std::optional<HelloReply>
@@ -422,7 +462,11 @@ clang::ast_cache::decodeHelloReply(llvm::StringRef Body) {
   Reply.InstanceId = R.u64();
   Reply.DecisionsPath = R.str().str();
   Reply.RecordDir = R.str().str();
-  if (!R.ok() || !R.atEnd() || Reply.RegionPath.empty())
+  uint8_t WantAsks = R.u8();
+  Reply.WantAsks = WantAsks == 1;
+  for (uint32_t I = 0, N = R.count(); I < N && R.ok(); ++I)
+    Reply.NotListedBefore.push_back(R.str().str());
+  if (!R.ok() || !R.atEnd() || Reply.RegionPath.empty() || WantAsks > 1)
     return std::nullopt;
   return Reply;
 }

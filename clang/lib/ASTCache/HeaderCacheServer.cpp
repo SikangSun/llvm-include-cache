@@ -339,7 +339,8 @@ public:
     OS << "header cache: " << S.Hits << " hits / " << S.Lookups << " lookups, "
        << S.CandidatesRejected << " candidates rejected, " << SkippedAtBoundary
        << " not at a declaration boundary, " << NotListed
-       << " not on the ask-list, " << InsideWritten
+       << " not on the ask-list (" << NotListedBefore
+       << " listed, skipped as in the last build), " << InsideWritten
        << " inside a header being written\n";
     if (Decisions)
       OS << "header cache decisions: " << DecidedTop
@@ -568,9 +569,22 @@ public:
         PendingVersions.erase(It);
       }
     }
-    if (VersionOf.empty() && !Client->isListed(Path)) {
+    // A header this compile read without asking in its last build, because
+    // no compile had listed it yet, is read without asking again: the
+    // copies the compile wrote then are of the contexts it asked for, and a
+    // header listed since would only miss (DECISIONS.md 2.28).
+    bool SkippedBefore = VersionOf.empty() && Client->notListedBefore(Path);
+    if (VersionOf.empty() && (SkippedBefore || !Client->isListed(Path))) {
       ++NotListed;
       NextReason = "not-listed";
+      if (SkippedBefore && Client->isListed(Path)) {
+        ++NotListedBefore;
+        NextReason = "not-listed-before";
+      }
+      // CLANG_HEADER_CACHE_FIRST_READ writes a copy here for the next
+      // build to ask for.
+      if (!FirstReadCutoff)
+        NotListedHere.insert(Path);
       // CLANG_HEADER_CACHE_FIRST_READ: the compile that reads a header
       // before any compile has listed it records the header, and writes its
       // copy if the header turns out slow enough to be listed. Otherwise
@@ -749,6 +763,15 @@ public:
     // after it, with its share of the load by bytes.
     uint64_t RequestTook = Took - std::min(Took, HitLoadMicros);
     Timings.Requests.push_back({Path, RequestTook});
+    // The daemon's five-counter merge pick: the request, whether the .c
+    // file made it, and what its hit loaded, as the record's R and C lines
+    // give them.
+    if (Client->wantAsks())
+      Timings.Asks.push_back(
+          {Path, includerName() == "-", Target != nullptr,
+           Target ? static_cast<uint32_t>(HitLinks) : 0u,
+           Target ? static_cast<uint64_t>(HitBytes + HitLinkBytes) : 0u,
+           Target ? HitLoadMicros : 0u});
     if (Target) {
       HitUnits.insert(HitUnits.begin(), {Path, LastModuleName, HitBytes});
       uint64_t Total = 0;
@@ -1192,14 +1215,23 @@ public:
     for (const std::string &Line : HitLines)
       llvm::errs() << "header cache hit: " << Line << "\n";
     HitLines.clear();
+    // The headers read without asking, less any asked for at another
+    // include (the list grew meanwhile), for this compile's next build.
+    for (const HeaderTiming &R : Timings.Requests)
+      NotListedHere.erase(R.Path);
+    for (const auto &P : NotListedHere)
+      Timings.NotListed.push_back(P.getKey().str());
+    NotListedHere.clear();
     if (!Timings.Headers.empty() || !Timings.Hits.empty() ||
         !Timings.Requests.empty())
       Client->reportTimings(Timings);
+    Timings.NotListed.clear();
     Timings.Headers.clear();
     Timings.Hits.clear();
     Timings.Links.clear();
     Timings.Requests.clear();
     Timings.Loads.clear();
+    Timings.Asks.clear();
     appendRecord(RecordLines);
     RecordLines.clear();
   }
@@ -2575,6 +2607,12 @@ private:
   /// they were built with other compiler options.
   unsigned LoadsRefused = 0;
   unsigned NotListed = 0;
+  /// Of those, listed headers read without asking because this compile
+  /// read them so in its last build (CacheClient::notListedBefore).
+  unsigned NotListedBefore = 0;
+  /// The headers read without asking because they were not listed, for the
+  /// timing report (TimingReport::NotListed).
+  llvm::StringSet<> NotListedHere;
   /// Listed headers read as text because a header this compile will write
   /// was open.
   unsigned InsideWritten = 0;
@@ -3804,8 +3842,35 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
   if (!Socket || !*Socket)
     return;
 
+  // CLANG_HEADER_CACHE_SAME_ASKS=1: which compile this is, the same in
+  // every build: its directory, main file and options. The daemon gives it
+  // back the headers it read without asking last time (DECISIONS.md 2.28).
+  // Off, no compile is named, and the ask-list alone decides.
+  std::string Compile;
+  const char *SameAsks = std::getenv("CLANG_HEADER_CACHE_SAME_ASKS");
+  if (SameAsks && llvm::StringRef(SameAsks) == "1" &&
+      !CI.getFrontendOpts().Inputs.empty() &&
+      CI.getFrontendOpts().Inputs[0].isFile()) {
+    llvm::SmallString<256> Cwd;
+    if (!llvm::sys::fs::current_path(Cwd)) {
+      Compile = Cwd.str().str();
+      Compile += '\0';
+      Compile += CI.getFrontendOpts().Inputs[0].getFile();
+      Compile += '\0';
+      Compile += CI.getInvocation().getModuleHash();
+    }
+  }
+
+  // The build this compile belongs to: within one, the daemon shares what
+  // each copy's #include searches found (REPORT.md I9), and the five-counter
+  // merge pick runs in the first build only.
+  uint64_t Build = 0;
+  if (const char *B = std::getenv("CLANG_HEADER_CACHE_BUILD"))
+    if (*B)
+      Build = llvm::xxh3_64bits(llvm::StringRef(B)) | 1;
+
   llvm::Expected<std::unique_ptr<CacheClient>> Client =
-      CacheClient::connect(Socket);
+      CacheClient::connect(Socket, /*RegionPath=*/{}, Compile, Build);
   if (!Client) {
     // No daemon listening is ordinary: compile exactly as without a cache.
     llvm::consumeError(Client.takeError());
@@ -3815,12 +3880,6 @@ void clang::ast_cache::installHeaderCacheHook(CompilerInstance &CI) {
   // The daemon's offline step reads what compiles record until it decided.
   if (!(*Client)->recordDir().empty())
     setRecordDir((*Client)->recordDir());
-
-  // The build this compile belongs to: within one, the daemon shares what
-  // each copy's #include searches found (REPORT.md I9).
-  if (const char *Build = std::getenv("CLANG_HEADER_CACHE_BUILD"))
-    if (*Build)
-      (*Client)->setBuild(llvm::xxh3_64bits(llvm::StringRef(Build)) | 1);
 
   // 1 prints the counts when the main file ends; 2 also names what failed
   // for each rejected candidate.

@@ -8,14 +8,18 @@
 
 #include "clang/ASTCache/CacheDaemon.h"
 #include "clang/ASTCache/DependencySerialization.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_socket_stream.h"
 #include "llvm/Support/xxhash.h"
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <csignal>
+#include <functional>
 #include <sys/wait.h>
 #include <thread>
 
@@ -77,6 +81,13 @@ CacheDaemon::create(llvm::StringRef RegionPath, uint64_t RegionSize,
     for (const std::string &P : *D->Opts.FixedAskList)
       D->listLocked(P);
     D->publishLocked();
+  }
+  // The picks of an earlier daemon are not this build's.
+  if (D->Opts.MergePicks) {
+    if (D->Opts.PicksPath.empty())
+      D->Opts.PicksPath = D->RegionPath + ".picks";
+    llvm::sys::fs::remove(D->Opts.PicksPath);
+    llvm::sys::fs::remove(D->Opts.PicksPath + ".log");
   }
   return D;
 }
@@ -354,6 +365,8 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
       if (uint64_t R = RecordOf.lookup(C.Copy))
         Region.countCombo(R, C.Combo, /*Serves=*/1, C.Instructions);
     ++Counters.TimingReports;
+    if (!Report.Compile.empty())
+      NotListedBy[Report.Compile] = Report.NotListed;
     bool Changed = Opts.Fold && foldLocked(Report);
     if (Opts.MeasuredCutoff && !Opts.FixedAskList && !Opts.Fold)
       Changed |= cutoffLocked(Report);
@@ -382,20 +395,180 @@ CacheDaemon::handleTiming(const TimingReport &Report) {
     Counters.HeadersTimed = FirstTiming.size();
     if (Changed)
       publishLocked();
+    if (Opts.MergePicks &&
+        (!Report.Build || !PickBuild || Report.Build == PickBuild) &&
+        pickLocked(Report))
+      writePicksLocked();
   }
   llvm::SmallVector<char, 0> Ack;
   encodeTimingAck(Ack);
   return Ack;
 }
 
-llvm::SmallVector<char, 0> CacheDaemon::handleHello(uint64_t Conn,
-                                                    bool Offline) {
+/// The median of \p V, the mean of the two middle values for an even count;
+/// \p Empty for none.
+static double median(std::vector<double> &V, double Empty) {
+  if (V.empty())
+    return Empty;
+  size_t M = V.size() / 2;
+  std::nth_element(V.begin(), V.begin() + M, V.end());
+  double Hi = V[M];
+  if (V.size() % 2)
+    return Hi;
+  return (*std::max_element(V.begin(), V.begin() + M) + Hi) / 2;
+}
+
+bool CacheDaemon::pickLocked(const TimingReport &Report) {
+  ++PickReports;
+  llvm::StringSet<> Seen;
+  std::string First;
+  for (const TimingReport::Ask &A : Report.Asks) {
+    PickCounts &P = PickOf[A.Path];
+    ++P.Asks;
+    if (Seen.insert(A.Path).second)
+      ++P.Compiles;
+    if (A.FromMain && First.empty())
+      First = A.Path;
+    if (!A.Hit)
+      continue;
+    ++P.Hits;
+    P.Links += A.Links;
+    P.Bytes += A.Bytes;
+    P.LoadMicros += A.LoadMicros;
+    PickLinks += A.Links;
+    PickLoadMicros += A.LoadMicros;
+  }
+  if (!First.empty())
+    ++PickOf[First].First;
+
+  // The five counters of each header asked for so far: load-time share at
+  // hits, copies and bytes per hit over the median header's, share of
+  // compiles asking, share of its compiles where the .c file asked first.
+  std::vector<double> Trees, Bytes;
+  for (const auto &E : PickOf)
+    if (const PickCounts &P = E.second; P.Hits) {
+      Trees.push_back(double(P.Hits + P.Links) / double(P.Hits));
+      Bytes.push_back(double(P.Bytes) / double(P.Hits));
+    }
+  double MedTree = median(Trees, 1), MedBytes = median(Bytes, 1);
+  std::vector<std::pair<llvm::StringRef, std::array<double, 5>>> Rows;
+  for (const auto &E : PickOf) {
+    const PickCounts &P = E.second;
+    std::array<double, 5> V;
+    V[0] = PickLoadMicros ? double(P.LoadMicros) / double(PickLoadMicros) : 0;
+    V[1] = P.Hits && MedTree
+               ? double(P.Hits + P.Links) / double(P.Hits) / MedTree
+               : 0;
+    V[2] = P.Hits && MedBytes ? double(P.Bytes) / double(P.Hits) / MedBytes : 0;
+    V[3] = double(P.Compiles) / double(PickReports);
+    V[4] = P.Compiles ? double(P.First) / double(P.Compiles) : 0;
+    Rows.push_back({E.getKey(), V});
+  }
+  // Each counter's top value: the k-th highest, k the top PickTopPercent of
+  // the headers, at least one.
+  std::array<double, 5> Top{};
+  if (Rows.empty())
+    return false;
+  size_t K = std::max<size_t>(
+      1, size_t(double(Rows.size()) * Opts.PickTopPercent / 100));
+  K = std::min(K, Rows.size());
+  for (unsigned C = 0; C != 5; ++C) {
+    std::vector<double> Col;
+    Col.reserve(Rows.size());
+    for (const auto &R : Rows)
+      Col.push_back(R.second[C]);
+    std::nth_element(Col.begin(), Col.begin() + (K - 1), Col.end(),
+                     std::greater<double>());
+    Top[C] = Col[K - 1];
+  }
+  PickTops.push_back({PickReports, Top});
+  // Steady: every top value within PickDrift of its value when the build
+  // had 10% fewer compiles (PickTops is in the order of its counts).
+  bool Steady = PickReports >= Opts.PickMinCompiles;
+  if (Steady) {
+    auto After = llvm::partition_point(PickTops, [&](const auto &E) {
+      return double(E.first) <= 0.9 * double(PickReports);
+    });
+    Steady = After != PickTops.begin();
+    for (unsigned C = 0; Steady && C != 5; ++C)
+      Steady = std::abs(Top[C] - std::prev(After)->second[C]) <=
+               Opts.PickDrift * std::max(std::abs(Top[C]), 1e-12);
+  }
+  Counters.PickSteadyReports += Steady;
+  // While steady, the headers in the top on all five pass. By path, so that
+  // the list comes in one order in every run.
+  std::vector<std::pair<llvm::StringRef, std::array<double, 5>>> Now;
+  for (const auto &[Path, V] : Rows) {
+    bool All = Steady;
+    for (unsigned C = 0; All && C != 5; ++C)
+      All = V[C] >= Top[C] && V[C] > 0;
+    if (All)
+      Now.push_back({Path, V});
+  }
+  llvm::sort(Now,
+             [](const auto &A, const auto &B) { return A.first < B.first; });
+  std::vector<std::string> List;
+  for (const auto &[Path, V] : Now)
+    List.push_back(Path.str());
+  if (List == Passing)
+    return false;
+  // For measuring: when each header came on the list and why, and when it
+  // left.
+  std::error_code EC;
+  llvm::raw_fd_ostream Log(Opts.PicksPath + ".log", EC,
+                           llvm::sys::fs::OF_Append);
+  for (const auto &[Path, V] : Now) {
+    if (llvm::is_contained(Passing, Path))
+      continue;
+    EverPassed.insert(Path);
+    if (!EC) {
+      Log << "on\t" << PickReports << "\t" << Path;
+      for (unsigned C = 0; C != 5; ++C)
+        Log << "\t" << V[C] << "/" << Top[C];
+      Log << "\n";
+    }
+  }
+  for (const std::string &Path : Passing)
+    if (!EC && !llvm::is_contained(List, Path))
+      Log << "off\t" << PickReports << "\t" << Path << "\n";
+  Passing = std::move(List);
+  Counters.Picks = EverPassed.size();
+  return true;
+}
+
+void CacheDaemon::writePicksLocked() {
+  // Whole, under a new name, then renamed: a compile reads either the old
+  // list or the new one.
+  std::string Tmp = Opts.PicksPath + ".tmp";
+  {
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(Tmp, EC);
+    if (EC)
+      return;
+    for (const std::string &P : Passing)
+      if (P.find_first_of("\t\n") == std::string::npos)
+        OS << "merge-root\t" << P << "\n";
+  }
+  llvm::sys::fs::rename(Tmp, Opts.PicksPath);
+}
+
+llvm::SmallVector<char, 0>
+CacheDaemon::handleHello(uint64_t Conn, const HelloRequest &Hello) {
+  const bool Offline = Hello.Offline;
   HelloReply Reply{RegionPath, Region.instanceId()};
   // A compile the offline step runs records nothing, and takes the
   // decisions it is given.
   if (Offline) {
     std::lock_guard<std::mutex> Lock(Mutex);
     OfflineConns.insert(Conn);
+  }
+  // A compile built before skips the headers it skipped then, so that it
+  // asks for the same headers as then, and finds the copies it wrote.
+  if (!Hello.Compile.empty()) {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    auto It = NotListedBy.find(Hello.Compile);
+    if (It != NotListedBy.end())
+      Reply.NotListedBefore = It->second;
   }
   // Before the offline step wrote its decisions, compiles record what it
   // reads; after, they take the decisions.
@@ -404,6 +577,21 @@ llvm::SmallVector<char, 0> CacheDaemon::handleHello(uint64_t Conn,
       Reply.DecisionsPath = Opts.OfflineDecisions;
     else
       Reply.RecordDir = Opts.OfflineRecord;
+  }
+  // The five-counter merge pick: the compile lists its requests, and takes
+  // the headers that pass now, unless it has the offline step's decisions.
+  // Only in the first build a compile names (user 2026-11-06: the merge
+  // heuristic runs in the first build only); a compile that names none is
+  // taken to be of that build.
+  if (Opts.MergePicks && !Offline) {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (!PickBuild)
+      PickBuild = Hello.Build;
+    if (!Hello.Build || Hello.Build == PickBuild) {
+      Reply.WantAsks = true;
+      if (Reply.DecisionsPath.empty() && !Passing.empty())
+        Reply.DecisionsPath = Opts.PicksPath;
+    }
   }
   llvm::SmallVector<char, 0> Out;
   encodeHelloReply(Reply, Out);
@@ -802,8 +990,14 @@ llvm::SmallVector<char, 0> CacheDaemon::handleClaim(const ClaimRequest &Req,
       std::optional<uint64_t> At;
       if (Req.Release) {
         if (auto M = MergeOf.find(Conn);
-            M != MergeOf.end() && M->second.second == Req.Filename)
+            M != MergeOf.end() && M->second.second == Req.Filename) {
           MergeOf.erase(M);
+          // A declined merge leaves the header free to merge another
+          // combination.
+          MergedHeaders.erase(Req.Filename);
+        }
+      } else if (Opts.PickOneMerge && MergedHeaders.contains(Req.Filename)) {
+        ++Counters.MergesRefusedOnce;
       } else if (!R.getAsInteger(16, Record) && !C.getAsInteger(16, Combo)) {
         At = Region.claimMerge(Record, Combo);
       }
@@ -811,6 +1005,8 @@ llvm::SmallVector<char, 0> CacheDaemon::handleClaim(const ClaimRequest &Req,
       if (Granted) {
         MergeOf[Conn] = {*At, Req.Filename};
         ++Counters.MergesClaimed;
+        if (Opts.PickOneMerge)
+          MergedHeaders.insert(Req.Filename);
       }
       llvm::SmallVector<char, 0> Out;
       encodeClaimReply(Granted, Out);
@@ -903,8 +1099,8 @@ CacheDaemon::handleMessage(llvm::StringRef Body, uint64_t Conn) {
     }
     return std::nullopt;
   case MessageKind::Hello:
-    if (std::optional<bool> Offline = decodeHello(Body))
-      return handleHello(Conn, *Offline);
+    if (std::optional<HelloRequest> Hello = decodeHello(Body))
+      return handleHello(Conn, *Hello);
     return std::nullopt;
   case MessageKind::BuildHint:
     if (std::optional<BuildHint> Hint = decodeBuildHint(Body))

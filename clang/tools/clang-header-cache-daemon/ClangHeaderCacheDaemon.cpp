@@ -152,6 +152,45 @@ static cl::opt<std::string> OfflineDecisions(
              "compiles take their decisions from it"),
     cl::init(""), cl::cat(Category));
 
+static cl::opt<bool> MergePicks(
+    "merge-picks",
+    cl::desc("The five-counter merge pick: after each compile, list the "
+             "headers in the top -pick-top-percent of those asked for so far "
+             "on all five counters (load-time share at hits, copies and bytes "
+             "per hit over the median header's, share of compiles asking, "
+             "share of them where the .c file asked first), while each "
+             "counter's top value moved -pick-drift or less since the build "
+             "had 10% fewer compiles; in compiles that start later, a hit on "
+             "a listed header merges its tree (DECISIONS.md 2.26). In the "
+             "first build (CLANG_HEADER_CACHE_BUILD) only"),
+    cl::init(false), cl::cat(Category));
+static cl::opt<double>
+    PickTop("pick-top-percent",
+            cl::desc("The share of the headers asked for so far a counter "
+                     "calls high, in percent"),
+            cl::init(2), cl::cat(Category));
+static cl::opt<double>
+    PickDrift("pick-drift",
+              cl::desc("How far each counter's top value may have moved since "
+                       "the build had 10% fewer compiles, as a share of it"),
+              cl::init(0.2), cl::cat(Category));
+static cl::opt<unsigned> PickMin(
+    "pick-min-compiles",
+    cl::desc("The compiles before the first pick, so that a tenth of them is "
+             "at least one"),
+    cl::init(10), cl::cat(Category));
+static cl::opt<bool> PickOneMerge(
+    "pick-one-merge",
+    cl::desc("Measurement: with -merge-picks, a header merges its tree in "
+             "one combination of its links per build; merges of its other "
+             "combinations are refused"),
+    cl::init(false), cl::cat(Category));
+static cl::opt<std::string> PicksFile(
+    "picks-file",
+    cl::desc("Where the list of headers that pass goes, as decisions "
+             "(default: the region's path with .picks added)"),
+    cl::init(""), cl::cat(Category));
+
 static cl::opt<std::string> AskListLoad(
     "ask-list-load",
     cl::desc("Measurement: the ask-list is exactly the headers in this file, "
@@ -215,6 +254,12 @@ int main(int argc, char **argv) {
   }
   Opts.OfflineRecord = OfflineRecord;
   Opts.OfflineDecisions = OfflineDecisions;
+  Opts.MergePicks = MergePicks;
+  Opts.PickTopPercent = PickTop;
+  Opts.PickDrift = PickDrift;
+  Opts.PickMinCompiles = PickMin;
+  Opts.PickOneMerge = PickOneMerge;
+  Opts.PicksPath = PicksFile;
   if (!AskListLoad.empty()) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> List =
         MemoryBuffer::getFile(AskListLoad);
@@ -290,7 +335,8 @@ int main(int argc, char **argv) {
            << S.WaitsGated << " lookups the gate did not hold; claims "
            << S.ClaimsGranted << " granted, " << S.ClaimsRefused
            << " refused; merges " << S.MergesClaimed << " started, "
-           << S.MergesStored << " stored\n"
+           << S.MergesStored << " stored, " << S.MergesRefusedOnce
+           << " refused as their header merged once\n"
            << "offline " << S.BuildHints << " link hints; runs "
            << S.OfflineStarted << " started, " << S.OfflineFinished
            << " finished, " << S.OfflineFailed << " failed, "

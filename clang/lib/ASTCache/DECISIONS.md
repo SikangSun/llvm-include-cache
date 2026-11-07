@@ -1970,6 +1970,441 @@ that uses them (Zapcc caches generated code for this reason); not measured.
 Machine load: the front-end builds shared the machine with 17 others and
 the full builds with 7; alone, redis is 1.20x front end and 1.06x full.
 
+### 2.26 Merge the trees of headers that pass all five counters (built 2026-11-05, off)
+
+User, 2026-11-05: "I think the merging based on five creteria, which
+ensures conservatism against false positives, may work on some of the
+benchmarks. I think it's worht implementing." The first version needed only
+four of the five counters. The user then gave the rule: "we keep track of
+the distribution shift. On every hit, if the distribution shift of past is
+stable, we check all 5 creteria, and if they all past with a conservative
+threshold then we merge".
+
+**What it does.** With `-merge-picks`, the daemon keeps five counters for
+each header as the build goes, and lists the headers that pass all five. A
+hit on a listed header merges its tree. A tree is a copy and the copies it
+links. A merge reads the header as text, with the copies served inside it
+folded in, and writes one copy, in the compile's own thread
+(`CLANG_HEADER_CACHE_MERGE`, 2026-11-02).
+
+1. A compile lists its requests in its timing report
+   (`TimingReport::Asks`). Each request has the header, whether the `.c`
+   file asked, and whether it hit. A hit adds the links, the bytes and the
+   load time. It lists them only when the daemon's hello asks for them
+   (`HelloReply::WantAsks`).
+2. After each report the daemon computes five counters for each header
+   asked for so far:
+
+   | Counter | Value |
+   |---|---|
+   | Load share | the header's load time at its hits / all load time at hits |
+   | Copies per hit | (hits + links its hits loaded) / hits, over the median header's |
+   | Bytes per hit | the bytes its hits loaded / hits, over the median header's |
+   | Ask share | the compiles that asked for it / the compiles so far |
+   | First share | of those compiles, the share where it was the first header the `.c` file asked for |
+
+3. The distribution shift: the counters are steady when each counter's
+   top-2% value moved 20% or less since the build had 10% fewer compiles.
+   The first check is at the 10th compile, so that a tenth of the build is
+   at least one compile.
+4. The threshold: a counter calls a header high when the header is in that
+   counter's top 2% of the headers asked for so far. The top holds at least
+   one header, ties count, and the value must be above 0.
+5. While the counters are steady, the headers that all five counters call
+   high pass. Otherwise no header passes. After each report, the daemon
+   writes the headers that pass now as decisions, one `merge-root <header>`
+   line each, to `<region>.picks`: whole, under a new name, then renamed. A
+   header that stops passing leaves the list.
+6. The daemon's hello names the list (`HelloReply::DecisionsPath`) to each
+   compile that starts while the list holds a header. At every hit, the
+   compile checks the header against the list, and a hit on a listed
+   header merges its tree, as with `CLANG_HEADER_CACHE_MERGE=decided`. A
+   tree that a compile merged already is not merged again. A daemon with
+   `-offline-decisions` hands those decisions instead.
+
+The daemon learns of hits only from the compiles' reports. So at a hit, the
+list is the one from the reports before the compile started. In a build of
+one compile at a time, that is every report before the hit.
+
+The daemon's options are `-pick-top-percent` (2), `-pick-drift` (0.2),
+`-pick-min-compiles` (10) and `-picks-file`. `<picks file>.log` gets an
+`on` line each time a header comes on the list: the compile count, the
+header, and each counter's value over its top value. It gets an `off` line
+each time a header leaves the list.
+
+**Why all five, and 2%.** The first version needed 4 of the 5 counters. In
+its object check (below), it merged five headers that are not core units:
+one in git, two in cpython and two in ffmpeg. A core unit here is a header
+whose hits load 5% or more of all links. The user's rule was then run on
+the first-build records of six projects (`perhit.py`, 2026-11-05), at every
+hit, with the counters of the compiles before it:
+
+| Threshold: top (%) | nginx: core units merged | curl | redis | git | cpython | ffmpeg | Other headers merged, six projects |
+|---|---|---|---|---|---|---|---|
+| 0.5 | 1 of 3 | 1 of 3 | 0 of 1 | 1 of 3 | 1 of 2 | 0 of 4 | 0 |
+| 1 | 1 of 3 | 1 of 3 | 0 of 1 | 1 of 3 | 1 of 2 | 0 of 4 | 0 |
+| 2 | 1 of 3 | 1 of 3 | 1 of 1 | 2 of 3 | 1 of 2 | 0 of 4 | 0 |
+| 3 | 1 of 3 | 2 of 3 | 1 of 1 | 2 of 3 | 1 of 2 | 0 of 4 | 0 |
+| 5 | 1 of 3 | 1 of 3 | 1 of 1 | 2 of 3 | 1 of 2 | 0 of 4 | 3 |
+
+At 5%, redis merges `stdio.h` and `stdlib.h`, and git merges `config.h`.
+The worst project decides (user, 2026-11-01), so the threshold is one that
+merges no other header: 2% or 3%. At 3%, curl's one more core unit,
+`src/tool_setup.h`, comes on the list only at the build's last compile, and
+redis and git merge their core units later. So the threshold is 2%. Each
+merged header is one the `.c` files ask for first: `ngx_config.h`,
+`curl_setup.h`, `server.h`, `git-compat-util.h`, `builtin.h` and `Python.h`.
+A header that the `.c` file never asks for first, such as `ngx_core.h`,
+fails the first share and is never merged. FFmpeg merges nothing. At the
+steady checks, three of its four core units are never in the top 2% of the
+first share, and `intreadwrite.h` is never in the top 2% of copies per hit.
+
+| Project | Links loaded after the merges, top 2% (% of all links at hits) |
+|---|---|
+| nginx | 64 |
+| curl | 66 |
+| redis | 60 |
+| git | 53 |
+| cpython | 60 |
+| ffmpeg | 0 |
+
+These are links loaded, counts from the records, not times.
+
+**Checks.** Unit tests (`PickTest`): no list without the flag; a header on
+top of all five comes on the list at the 10th compile and stays while it
+passes; it leaves when a counter moves; nothing comes on while a counter
+moves; a header high on four counters does not pass. 314 header-cache unit
+tests pass.
+
+The object check (bin-u75, 2026-11-05) runs full builds with each
+project's own flags, in three modes: `plain`, `linkc`, and `linkcp`
+(`linkc` with `-merge-picks`). It compares each object with plain clang's.
+
+| Project | Compiles | Objects that differ: linkc / linkcp | Failed compiles | Headers ever on the list | Merges started / stored | Links loaded at hits: linkc / linkcp | Change (%) | Reports after which a header is on the list (% of the build) |
+|---|---|---|---|---|---|---|---|---|
+| redis | 117 | 0 / 0 | 0 | 1, `server.h` | 1 / 1 | 8,407 / 3,597 | -57 | 39 |
+| nginx | 126 | 0 / 0 | 0 | 1, `ngx_config.h` | 1 / 1 | 15,424 / 5,551 | -64 | 17 |
+| curl | 479 | 0 / 0 | 0 | 1, `curl_setup.h` | 2 / 2 | 35,489 / 12,540 | -65 | 4 |
+| git | 567 | 0 / 0 | 0 | 1, `git-compat-util.h` | 2 / 2 | 87,253 / 11,657 | -87 | 11 |
+| cpython | 401 | 0 / 0 | 0 | 1, `Python.h` | 4 / 4 | 68,911 / 35,753 | -48 | 16 |
+| ffmpeg | 2,102 | 0 / 0 | 0 | 0 | 0 / 0 | 116,147 / 115,916 | 0 | 0 |
+
+Links loaded is a count, not a time. The list changes often: 8 to 18 times
+in the five projects with a header on it. A header comes on while the
+counters are steady, and leaves while they are not. On the saved records
+(`flips.py`), the same rule changes the list 2 to 24 times per header, and
+in 71% to 100% of the reports where such a header is off, the counters are
+not steady. Each tree is merged once, at its first hit while its header is
+on the list, and later hits load the merged copy.
+
+**The first version** (4 of the 5 counters, a pick stayed picked, bin-u73)
+passed the same object check: no object differed in the six projects. It
+picked 17 headers, and 5 of them were not core units: `reftable/system.h`
+in git, `_remote_debugging.h` and `cjkcodecs.h` in cpython, `avfilter.h`
+and `avutil.h` in ffmpeg. Its 188 merges cut the links loaded at hits by
+17% (ffmpeg) to 88% (nginx). That check found the defect of section 3, "A
+merged copy needed a name that its own links declare".
+
+Not measured: wall time. The machine is shared until the user sorts out
+its use (2026-11-03), and merge modes stay out of benchmark runs (user,
+2026-10-31).
+
+**Wall time and the first build only (2026-11-06).** The user asked for
+the workbench against linkc. First builds, front end only, 3 repeats, the
+modes taking turns compile by compile (bin-u75):
+
+| Project | linkc | linkcp | linkcp time against linkc (%) |
+|---|---|---|---|
+| git | 3.32x | 3.78x | -12.1 (-14.3 to -10.6) |
+| cpython | 1.96x | 1.99x | -1.4 (-2.1 to -0.5) |
+| redis | 1.60x | 1.58x | +0.8 (+0.5 to +1.2) |
+| ffmpeg | 1.35x | 1.33x | +1.2 (-0.7 to +3.7), no header picked |
+
+Redis writes two merged copies of `server.h`, because each combination of
+a listed header's links merges at its first hit. `sort.c` includes
+`fast_float_strtod.h`, which includes `<stddef.h>`, before `server.h`. The
+first merged copy was written where `__STDDEF_H` was not defined, so
+`sort.c` rejects it and merges its own combination, which one later compile
+uses. A switch for one merge per header (`-pick-one-merge`, measurement,
+off) did not help: Redis stayed within noise, and git lost half its gain
+(-10.7% became -5.3%), as its second combination is common. Stricter
+thresholds (the top 1%, a drift of 10%, both) picked the same header in
+every project but one Redis run, so they cannot tell such merges apart.
+
+The user's rule: "merge heuristic should only happen in first build".
+Before, the daemon went on picking in a second build on the same daemon:
+Redis merged 4 more times there, and its second build took 5.92 s against
+linkc's 5.52 s. Now a compile names its build when it connects
+(`HelloRequest::Build`), and the daemon runs the pick for the first build a
+compile names only (`CacheDaemon::PickBuild`): a compile of a later build
+sends no requests and takes no list, and its report is not counted. The
+merged copies of the first build serve the second. bin-u78, each project
+built twice: no merge in any second build, 0 objects differ in either build
+(redis, nginx, curl, git), and in the second build linkcp takes 6% to 15%
+less time than linkc (redis, cpython, git).
+
+**Per version, in two stages (2026-11-06).** The user: "my intention was
+always to base it off the version", then "have a criteria for header, and
+checks even stricter once a header qualifies for the version, which may
+alleviate cost". A version is the tree one hit loads: its copy and the
+copies linked under it (`TimingReport::Ask::Combo`, the hash the merge
+records use). Per version, the five counters are its share of the load
+time at hits, its copies and bytes per hit over the median unit's, the
+share of compiles that hit it, and the share of those where the .c file
+asked first for its header. A header's hits with no links count as one
+unit. In two stages, the default: the counters judge headers, every
+request counting for its header, with the headers' steadiness; a version
+of a header that passes is listed if it is in the top of all versions on
+the five too, and versions are judged only while a header passes. Listed
+versions go in the picks file as `merge` lines.
+
+On first-build records with no merges in them (`perversion.py`), the rule
+per header merged 0 to 9 versions per project, some with no later hit; per
+version, 0 to 2, each with 10 or more later hits. Measured, bin-u80, one
+binary, first builds, front end only, 2 or 3 repeats:
+
+| Project | linkc | Per version: time against linkc (%) | Two stages: time against linkc (%) | Judging per build (ms), per version / two stages |
+|---|---|---|---|---|
+| git | 3.43x | -7.7 | -7.3 | 44-48 / 40-48 |
+| cpython | 2.01x | -4.4 | -3.9 | 27-35 / 31-33 |
+| redis | 1.49x | -2.3 | -1.7 | 4 / 6 |
+| ffmpeg | 1.42x | +1.4 | +1.2 | 417-418 / 172-175 |
+| nginx | 2.23x | -8.3 | -8.9 | 1 / 2 |
+| curl | 2.11x | -4.2 | -4.4 | 15-19 / 19-37 |
+
+Both listed as many versions, of the same header, in every run. A
+version's hash differs between daemons, so the runs cannot show that they
+are the same versions. On the first-build records (`twostage.py`), the two
+stages leave out one CPython version that the rule per version lists, at
+71% of the build with 10 later hits. The two stages cost nothing here and
+bound the judging where versions are many and no header passes.
+The geometric mean of the six: linkc 2.02x, per version 2.12x, two stages
+2.11x. ffmpeg lists no version in either, and its median compile took 0.1
+to 0.4 ms more than with linkc.
+
+**Not pushed: back to the pick per header (2026-11-06).** The user: "let's
+just not push this merge and return to the one that's good for git". The
+code is the pick per header again, with the first-build gate (bin-u78's
+code at `375920330`). In u75wall the pick per header took git's time 12.1%
+below linkc's (-10.6 to -14.3%), and in u80stage the two stages took it
+7.3% below (-2.8 to -10.7%). The two runs had different hours and host
+loads. The pick per version and the two stages are kept as a patch,
+`scratch/pick-per-version-2026-11-06.diff` (bin-u81's code), not in the
+tree. Then, 2026-11-07: "push the one with positive performance on git,
+so it can be ran on the same binary". The pick per header went to
+`header-cache` and to `apple-compile-server`, so that one build runs every
+mode and the compile server.
+
+### 2.27 Skipping a write, and folding as the build goes (analysis, 2026-11-05, neither built)
+
+User, 2026-11-05: "I think dynamic folding is probably too difficult given
+the risk-benefit ratio (you may be able to check this out). The last thing
+would be skip write heuristics. [...] We should profile just like the
+merging and see how we can guess these files. But remember, we technically
+have very high risk since a reparse is worse on a magnitude than just
+parsing." After the first profile: "I don't think you did this right. What
+went wrong? Give me the statistics first", and "for skip heuristic, we
+should focus mostly on linux, while making sure it doesn't bother the
+pattern of other benchmarks".
+
+Both parts use first-build records: six projects (nginx, curl, redis, git,
+cpython, ffmpeg) and a Linux sample (every 10th compile, 294 compiles,
+bin-u63). A copy is used when a later compile hits it or loads it as a
+link of a hit.
+
+**Skipping a write: the statistics** (`skipstats/stats.py`, `stats2.py`).
+
+| Project | Compiles | Copies written | Never used (% of copies) | Never used (% of write time) | Their write time (% of build) |
+|---|---|---|---|---|---|
+| nginx | 126 | 136 | 3 | 4 | 0.08 |
+| curl | 479 | 260 | 12 | 19 | 0.29 |
+| redis | 117 | 471 | 37 | 36 | 2.52 |
+| git | 567 | 1,223 | 43 | 46 | 2.09 |
+| cpython | 401 | 1,269 | 39 | 66 | 4.33 |
+| ffmpeg | 2,102 | 4,555 | 55 | 56 | 2.55 |
+| linux (sample) | 294 | 15,535 | 59 | 68 | 16.20 |
+
+What the header does after a never-used copy is written (% of the
+never-used write time):
+
+| Project | One compile in the build asks for the header | Earlier compiles asked, no later one asks | Later compiles ask, every request misses | Later compiles use other copies of the header |
+|---|---|---|---|---|
+| nginx | 68 | 0 | 0 | 32 |
+| curl | 16 | 8 | 0 | 76 |
+| redis | 8 | 5 | 2 | 85 |
+| git | 3 | 8 | 9 | 81 |
+| cpython | 62 | 2 | 6 | 30 |
+| ffmpeg | 3 | 5 | 8 | 84 |
+| linux (sample) | 2 | 5 | 9 | 85 |
+
+The last kind are headers with many contexts. Their median header has 3
+(curl) to 46 (Linux) copies, and 1 to 11 of them are used later. For a
+header with used and never-used copies, the per-header counters at the
+write have about the same medians for both outcomes (median, never-used /
+used):
+
+| Project | Share of compiles that asked | Hit rate | Earlier copies not used yet | Uses per earlier copy |
+|---|---|---|---|---|
+| curl | 0.22 / 0.59 | 0.81 / 0.92 | 0.00 / 0.00 | 31.4 / 26.5 |
+| redis | 0.67 / 0.57 | 0.25 / 0.00 | 0.62 / 1.00 | 1.60 / 0.00 |
+| git | 0.14 / 0.15 | 0.50 / 0.40 | 0.55 / 0.58 | 1.50 / 1.00 |
+| cpython | 0.47 / 0.75 | 0.66 / 0.67 | 0.40 / 0.33 | 6.74 / 20.4 |
+| ffmpeg | 0.26 / 0.29 | 0.48 / 0.45 | 0.56 / 0.56 | 3.40 / 2.67 |
+| linux (sample) | 0.73 / 0.80 | 0.12 / 0.14 | 0.69 / 0.64 | 1.52 / 1.81 |
+
+In Linux, the six headers with the most never-used write time are `mm.h`,
+`fs.h`, `netdevice.h`, `device.h`, `module.h` and `skbuff.h`. When a
+compile read one of them as text, 62% to 96% of the times the reason was
+"a macro's definedness differs".
+
+**The first profile was not right** (`coreunits/skipwrite.py`). It tried
+thresholds on eight counters and found no rule that gains with no loss on
+any project. What went wrong:
+- It made no statistics first. It took the counters from the merge
+  profile.
+- Its counters describe the header, but use belongs to the copy. In curl,
+  redis, git, ffmpeg and Linux, 76% to 85% of the never-used write time is
+  in headers whose other copies are used, and the counters do not tell
+  those copies apart (the table above).
+- It charged a wrong skip wrongly for a copy first used as a link. In
+  1,552 of 1,553 such copies in the six projects (4,026 of 4,026 in
+  Linux), the copy that links it was written in the same compile. A skip
+  changes that copy, and the script did not model the change. It charged a
+  full parse instead: 17% to 90% of all its charges (Linux 72%).
+- A script bug left the uses-per-copy counter with no data.
+
+So its rule results are not reliable, and they are not repeated here.
+
+**Skipping a write: what predicts a never-used copy** (2026-11-05, Linux
+first, as the merge profile of 2.26 was made). Each statistic is taken per
+copy, at its write. Scripts, tables and the per-copy rows are in
+`scratch/e2e/multi/results-2026-11-05/skipwrite/skipprof/`: `copies.py`
+makes one row per copy, and `profile.py`, `across.py`, `extremes.py` and
+`combos.py` make the tables. The records they read are in `records.tar.gz`
+in the folder above. Only the Linux run logged the failing check of
+each rejected candidate (LEVEL=2, `results-2026-11-03/costvar/linux-c.json`),
+so the dependency kinds are Linux only. At a miss, the compile checked
+every earlier version of the header (15,535 of 15,535 copies).
+
+No single statistic predicts a never-used copy with the precision a wrong
+skip needs. Three predict best: how many earlier versions the header has,
+the dependency kind that made those versions not fit, and how near the `.c`
+file the header is.
+
+When written, and how (Linux sample, 15,535 copies, 59% never used; median
+of never-used / used copies; AUC is the chance that a never-used copy has
+the higher value, 0.5 = no separation):
+
+| Statistic | Never used | Used | AUC |
+|---|---|---|---|
+| Place in the build (% of compiles) | 55 | 32 | 0.64 |
+| Versions of the header written before it (its miss checked and rejected all of them) | 19 | 7 | 0.66 |
+| Of those, versions not used yet | 12 | 4 | 0.66 |
+| Compiles that asked for the header before | 56 | 29 | 0.57 |
+| Copies the same compile wrote | 79 | 135 | 0.37 |
+| Include depth of the header | 5 | 7 | 0.40 |
+| Links in the copy | 2 | 1 | 0.60 |
+| Size (KiB) | 64 | 45 | 0.61 |
+| Write time (ms) | 4.1 | 2.7 | 0.63 |
+
+| Kind of copy (Linux) | Copies | Never used (% of copies) |
+|---|---|---|
+| Asked for by the `.c` file | 975 | 80 |
+| Asked for inside a header | 14,560 | 57 |
+
+The dependencies that made the earlier versions not fit, at the miss that
+wrote the copy (Linux):
+
+| Main kind of the rejections | Copies | Never used (% of copies) | Rejections at never-used / used copies' writes |
+|---|---|---|---|
+| Guard macro defined or not (a macro named like `_LINUX_RANDOM_H`: the headers came in another order) | 6,826 | 68 | 109,280 / 29,661 |
+| Warning flags or pragmas differ | 4,015 | 47 | 75,407 / 51,838 |
+| `__COUNTER__` starts at another value | 2,297 | 64 | 32,668 / 10,324 |
+| None: no earlier version to check | 1,451 | 31 | 0 / 0 |
+| An outside declaration differs | 504 | 64 | 9,921 / 2,743 |
+| A macro expands differently | 169 | 81 | 3,167 / 492 |
+
+Versions of one header, and how their uses spread (Linux):
+
+| Header | Versions | Never used | Uses, all versions | Top version's share of the uses (%) | Main kind at the writes (% of versions) |
+|---|---|---|---|---|---|
+| `mm.h` | 125 | 97 | 95 | 24 | guard macro (78) |
+| `fs.h` | 103 | 76 | 162 | 24 | guard macro (83) |
+| `device.h` | 132 | 94 | 333 | 38 | guard macro (78) |
+| `module.h` | 129 | 97 | 121 | 17 | guard macro (85) |
+| `skbuff.h` | 51 | 42 | 14 | 21 | guard macro (98) |
+
+| Version number (Linux) | 1 | 2-5 | 6-20 | 21-50 | 51+ |
+|---|---|---|---|---|---|
+| Never used (% of copies) | 31 | 47 | 57 | 70 | 77 |
+
+The same statistics in the other projects (AUC, except the last two rows):
+
+| Statistic | linux | nginx | curl | redis | git | cpython | ffmpeg |
+|---|---|---|---|---|---|---|---|
+| Versions written before it | 0.66 | 0.62 | 0.68 | 0.73 | 0.70 | 0.66 | 0.59 |
+| Links in the copy | 0.60 | 0.62 | 0.59 | 0.67 | 0.66 | 0.63 | 0.61 |
+| Copies the same compile wrote | 0.37 | 0.02 | 0.23 | 0.22 | 0.32 | 0.32 | 0.44 |
+| Never used when the `.c` file asked (% of copies) | 80 | 33 | 19 | 62 | 52 | 57 | 60 |
+| Never used when a header asked (% of copies) | 57 | 1 | 5 | 25 | 28 | 30 | 49 |
+
+If a wrong skip costs ten times the write, a rule must be at least 91%
+right, by write time. Rules with thresholds from Linux:
+
+| Rule | Linux: right / never-used write time covered (%) | Right in the others (%) |
+|---|---|---|
+| Best single statistic (bottom 10% of include depth) | 83 / 31 | no depth data |
+| 38 or more earlier versions, and the main kind is a guard macro | 92 / 15 | no kind data |
+| 55 KiB or more, and the `.c` file asked | 90 / 14 | nginx 0, curl 0, redis 55, git 58, cpython 89, ffmpeg 69 |
+| 2 or more links, and the `.c` file asked | 90 / 12 | nginx 0, curl 17, redis 56, git 59, cpython 58, ffmpeg 67 |
+
+Pairs of conditions reach 90% to 92% on Linux, but 0% to 89% on the other
+projects. Nothing is built. To check the rules that use the dependency kind
+on the other projects, their first builds need LEVEL=2 records (asked
+2026-11-05).
+
+**Folding as the build goes** (`fold.py`). A child header is folded into the
+parent copies written after the fold is decided. A later hit on such a
+parent then loads one copy fewer. A hit where the child is already included
+misses, and each fold reads the child as text instead of a hit at the
+parent's write. Rules, with k = 4 uses:
+- hindsight: the child has one copy all build
+- one-copy: the child had one copy at its k-th use and since
+- one-copy+: also, so far its link loads cost more than the text reads
+  the fold would add.
+
+| Project | Hindsight (% of build) | One-copy (% of build) | One-copy+ (% of build) |
+|---|---|---|---|
+| nginx | +8.37 | +0.00 | +0.00 |
+| curl | +4.04 | -0.07 | +0.15 |
+| redis | -4.72 | -0.65 | -0.05 |
+| git | +6.26 | -0.66 | -0.34 |
+| cpython | +0.31 | -1.19 | -0.13 |
+| ffmpeg | -0.19 | -1.11 | -0.06 |
+
+The rules a build can apply lose on four or five of the six projects, and
+gain at most 0.15%. Even hindsight loses on redis and ffmpeg. The user's
+reading holds, and nothing is built.
+
+### 2.28 The same asks as the last build (built 2026-11-06, off)
+
+The user asked that a build ask for the same headers as the build before
+it. With `CLANG_HEADER_CACHE_SAME_ASKS=1`, a compile names itself by its
+directory, main file and options (`HelloRequest::Compile`). Its timing
+report lists the headers it read without asking for a copy, because no
+compile had listed them yet (`TimingReport::NotListed`). In the next build,
+the daemon gives the same compile that list (`HelloReply::NotListedBefore`),
+and the compile reads those headers again without asking.
+
+In `results-2026-11-06/firstread` (redis, two builds on one daemon), the
+second build made 206 lookups that the first had not made. 144 of them hit
+and 62 missed. The setting reads all 206 as text, so it gives up those 144
+hits. It stays off, and no timed run used it. Tests:
+`ACompileGetsBackTheHeadersItReadWithoutAsking`,
+`ANamedCompileSkipsInItsNextBuildWhatItSkippedBefore`, and the protocol's
+`HelloNamesTheCompile`, `HelloReplyGivesTheHeadersSkippedLastBuild` and
+`TimingReportNamesTheCompileAndTheHeadersNotListed`.
+
 ## 3. Things that turned out to be wrong
 
 Kept because the reasoning that produced them is likely to recur.
@@ -2483,13 +2918,12 @@ Tests: `ANameDeclaredInACopyAndItsLinksNamesTheLatest`,
 
 ### A merged copy needed a name that its own links declare (found 2026-11-05)
 
-In redis, the daemon's merge pick (in progress, 2026-11-05) chose
-`server.h`, and two compiles merged its tree. Later compiles did not load
-the merged copies. There were 59 later hits with the merged tree's links.
-In each, the check rejected the merged copy with "an identifier classifies
-differently" (`size_t was a type, is not`). Every redis `.c` file includes
-`server.h` first. So nothing declares `size_t` where the merged copy
-begins.
+In redis, the merge pick (§2.26) chose `server.h`, and two compiles merged
+its tree. Later compiles did not load the merged copies. There were 59
+later hits with the merged tree's links. In each, the check rejected the
+merged copy with "an identifier classifies differently" (`size_t was a
+type, is not`). Every redis `.c` file includes `server.h` first. So
+nothing declares `size_t` where the merged copy begins.
 
 `server.h` includes `stream.h`, whose copy needs `size_t` to be a type:
 `server.h`'s earlier lines declare it. That copy links the copy of
@@ -2510,7 +2944,7 @@ range that a frame holds already. Test:
 redis did.
 
 After the fix, no object differs from plain clang's in first builds of six
-projects with the merge pick. The links loaded after the first pick fell 80% in redis,
+projects (§2.26). The links loaded after the first pick fell 80% in redis,
 against 8% before the fix. In cpython they fell 65%, against 3% more
 before the fix.
 

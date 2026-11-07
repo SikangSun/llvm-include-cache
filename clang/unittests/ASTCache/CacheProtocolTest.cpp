@@ -213,6 +213,27 @@ TEST(CacheProtocolTest, TimingReportCarriesWhatTheMeasuredCutoffReads) {
   EXPECT_EQ(Got->Loads[0].Micros, 40u);
 }
 
+TEST(CacheProtocolTest, TimingReportCarriesWhatTheMergePickReads) {
+  // Each request in order: whether the .c file made it, and for a hit the
+  // copies it loaded besides its own, their bytes, and the load time.
+  TimingReport Report;
+  Report.Asks = {{"/src/server.h", true, true, 31, 1611000, 2400},
+                 {"/src/sds.h", false, false, 0, 0, 0}};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  ASSERT_EQ(Got->Asks.size(), 2u);
+  EXPECT_EQ(Got->Asks[0].Path, "/src/server.h");
+  EXPECT_TRUE(Got->Asks[0].FromMain);
+  EXPECT_TRUE(Got->Asks[0].Hit);
+  EXPECT_EQ(Got->Asks[0].Links, 31u);
+  EXPECT_EQ(Got->Asks[0].Bytes, 1611000u);
+  EXPECT_EQ(Got->Asks[0].LoadMicros, 2400u);
+  EXPECT_FALSE(Got->Asks[1].FromMain);
+  EXPECT_FALSE(Got->Asks[1].Hit);
+}
+
 TEST(CacheProtocolTest, HelloReplyRoundTrips) {
   llvm::SmallVector<char, 0> Out;
   encodeHelloReply({"/dev/shm/x.region", 0x0123456789abcdefull}, Out);
@@ -238,6 +259,14 @@ TEST(CacheProtocolTest, HelloReplyRoundTrips) {
   ASSERT_TRUE(Got.has_value());
   EXPECT_EQ(Got->DecisionsPath, "");
   EXPECT_EQ(Got->RecordDir, "/dev/shm/x.record");
+  EXPECT_FALSE(Got->WantAsks);
+
+  // A daemon that picks headers to merge wants the compile's requests.
+  Out.clear();
+  encodeHelloReply({"/dev/shm/x.region", 2, "", "", true}, Out);
+  Got = decodeHelloReply(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_TRUE(Got->WantAsks);
 
   // A reply naming no file tells the client nothing it can attach to.
   Out.clear();
@@ -248,10 +277,60 @@ TEST(CacheProtocolTest, HelloReplyRoundTrips) {
 TEST(CacheProtocolTest, HelloSaysWhetherTheOfflineStepRunsTheCompile) {
   llvm::SmallVector<char, 0> Out;
   encodeHello(Out);
-  EXPECT_EQ(decodeHello(body(Out)), std::optional<bool>(false));
+  auto Got = decodeHello(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_FALSE(Got->Offline);
+  EXPECT_EQ(Got->Compile, "");
+  EXPECT_EQ(Got->Build, 0u);
   Out.clear();
-  encodeHello(Out, /*Offline=*/true);
-  EXPECT_EQ(decodeHello(body(Out)), std::optional<bool>(true));
+  encodeHello(Out, {/*Offline=*/true});
+  Got = decodeHello(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_TRUE(Got->Offline);
+}
+
+TEST(CacheProtocolTest, HelloNamesTheCompile) {
+  // Its directory, main file and options, with NUL bytes between them.
+  std::string Compile = std::string("/src/redis\0server.c\0", 20) + "4F2A";
+  llvm::SmallVector<char, 0> Out;
+  encodeHello(Out, {false, Compile, /*Build=*/0x77});
+  auto Got = decodeHello(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_FALSE(Got->Offline);
+  EXPECT_EQ(Got->Compile, Compile);
+  EXPECT_EQ(Got->Build, 0x77u);
+}
+
+TEST(CacheProtocolTest, HelloReplyGivesTheHeadersSkippedLastBuild) {
+  HelloReply Reply{"/dev/shm/x.region", 2};
+  Reply.NotListedBefore = {"/usr/include/pthread.h", "/src/config.h"};
+  llvm::SmallVector<char, 0> Out;
+  encodeHelloReply(Reply, Out);
+  auto Got = decodeHelloReply(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->NotListedBefore, Reply.NotListedBefore);
+}
+
+TEST(CacheProtocolTest, TimingReportNamesTheCompileAndTheHeadersNotListed) {
+  TimingReport Report;
+  Report.Headers = {{"/usr/include/pthread.h", 900}};
+  Report.Compile = std::string("/src/redis\0server.c\0h", 21);
+  Report.NotListed = {"/usr/include/pthread.h", "/src/config.h"};
+  llvm::SmallVector<char, 0> Out;
+  encodeTimingReport(Report, Out);
+  auto Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->Compile, Report.Compile);
+  EXPECT_EQ(Got->NotListed, Report.NotListed);
+  ASSERT_EQ(Got->Headers.size(), 1u);
+
+  // A report from a compile that names none carries neither.
+  Out.clear();
+  encodeTimingReport({{{"/src/a.h", 1}}}, Out);
+  Got = decodeTimingReport(body(Out));
+  ASSERT_TRUE(Got.has_value());
+  EXPECT_EQ(Got->Compile, "");
+  EXPECT_TRUE(Got->NotListed.empty());
 }
 
 TEST(CacheProtocolTest, BuildHintRoundTrips) {
@@ -634,6 +713,41 @@ TEST_F(DaemonTest, ASlowHeaderGoesOnTheAskList) {
   EXPECT_EQ(Daemon->stats().HeadersTimed, 3u);
 }
 
+TEST_F(DaemonTest, ACompileGetsBackTheHeadersItReadWithoutAsking) {
+  // CLANG_HEADER_CACHE_SAME_ASKS: the compile read pthread.h and config.h
+  // without asking, as nothing was listed yet. Its report lists pthread.h;
+  // in the next build the same compile is told to skip both again.
+  auto Hello = [&](llvm::StringRef Compile) {
+    llvm::SmallVector<char, 0> Msg;
+    encodeHello(Msg, {false, Compile.str()});
+    auto Reply = Daemon->handleMessage(body(Msg));
+    EXPECT_TRUE(Reply.has_value());
+    auto R = decodeHelloReply(body(*Reply));
+    EXPECT_TRUE(R.has_value());
+    return R.value_or(HelloReply{}).NotListedBefore;
+  };
+  using Names = std::vector<std::string>;
+  EXPECT_EQ(Hello("c1"), Names{}) << "a compile not seen before";
+  TimingReport Report;
+  Report.Headers = {{"/src/pthread.h", 5000}, {"/src/config.h", 40}};
+  Report.Compile = "c1";
+  Report.NotListed = {"/src/pthread.h", "/src/config.h"};
+  llvm::SmallVector<char, 0> Msg;
+  encodeTimingReport(Report, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+  EXPECT_EQ(askList(), Names{"/src/pthread.h"});
+  EXPECT_EQ(Hello("c1"), (Names{"/src/pthread.h", "/src/config.h"}));
+  EXPECT_EQ(Hello("c2"), Names{}) << "another compile";
+  EXPECT_EQ(Hello(""), Names{}) << "a compile that names none";
+
+  // The last build's report replaces the one before.
+  Report.NotListed = {"/src/config.h"};
+  Msg.clear();
+  encodeTimingReport(Report, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+  EXPECT_EQ(Hello("c1"), Names{"/src/config.h"});
+}
+
 TEST_F(DaemonTest, AHeadersFirstTimeIsTheOneKept) {
   // One observation predicts the rest well, and keeping the first makes
   // membership final: a header does not flicker on and off the list.
@@ -951,6 +1065,48 @@ TEST_F(DaemonTest, EachCombinationAHitLoadedIsCountedAndMergedOnce) {
   EXPECT_EQ(Second->Merged.load(), 1u);
 }
 
+TEST_F(DaemonTest, WithOneMergeAHeaderMergesOneCombination) {
+  // -pick-one-merge (measurement): once a merge of h.h is granted, a merge
+  // of another combination of its links is refused, until the granted one
+  // is given back.
+  CacheDaemon::Options O;
+  O.PickOneMerge = true;
+  useDaemon(O);
+  push("h.h", makeRecord("FEATURE", true), "AAA");
+  LookupResponse R = lookup("h.h");
+  ASSERT_EQ(R.Entries.size(), 1u);
+  uint64_t Copy = R.Entries[0].MetadataOffset;
+  TimingReport Report;
+  Report.Used = {Copy, Copy};
+  Report.Combos = {{Copy, 11, 1000}, {Copy, 22, 0}};
+  llvm::SmallVector<char, 0> Msg;
+  encodeTimingReport(Report, Msg);
+  ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+
+  auto Attached = SharedRegion::attach(RegionPath);
+  ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
+  uint64_t At = Attached->newestCopy("h.h");
+  auto Claim = [&](uint64_t Combo, uint64_t Conn, bool Release = false) {
+    llvm::SmallVector<char, 0> M;
+    encodeClaimRequest({"h.h", "merge:" + llvm::utohexstr(At) + ":" +
+                                   llvm::utohexstr(Combo),
+                        Release},
+                       M);
+    std::optional<llvm::SmallVector<char, 0>> Reply =
+        Daemon->handleMessage(body(M), Conn);
+    std::optional<bool> Granted =
+        Reply ? decodeClaimReply(body(*Reply)) : std::nullopt;
+    return Granted && *Granted;
+  };
+  EXPECT_TRUE(Claim(11, 7));
+  EXPECT_FALSE(Claim(22, 8)) << "h.h merged a second combination";
+  EXPECT_EQ(Daemon->stats().MergesRefusedOnce, 1u);
+  // The first merged copy was declined: h.h may merge another combination.
+  Claim(11, 7, /*Release=*/true);
+  EXPECT_TRUE(Claim(22, 8));
+  EXPECT_EQ(Daemon->stats().MergesClaimed, 2u);
+}
+
 TEST_F(DaemonTest, WhatACopysSearchesFoundIsInTheIndex) {
   // REPORT.md I9: within one build, what a copy's #include searches find
   // is shared between compiles. With no request, it is in the index.
@@ -986,6 +1142,151 @@ TEST_F(DaemonTest, ACopyTheIndexCannotHoldIsNotStored) {
   ASSERT_TRUE(bool(Attached)) << llvm::toString(Attached.takeError());
   EXPECT_EQ(Attached->newestCopy("h256.h"), 0u);
   EXPECT_NE(Attached->newestCopy("h255.h"), 0u);
+}
+
+/// The five-counter merge pick (CacheDaemonOptions::MergePicks).
+class PickTest : public DaemonTest {
+protected:
+  void usePicks() {
+    CacheDaemon::Options O;
+    O.MergePicks = true;
+    O.PicksPath = TestDir + "/picks";
+    useDaemon(O);
+  }
+  HelloReply hello(uint64_t Build = 0) {
+    llvm::SmallVector<char, 0> Msg;
+    encodeHello(Msg, {false, "", Build});
+    auto Reply = Daemon->handleMessage(body(Msg));
+    EXPECT_TRUE(Reply.has_value());
+    return decodeHelloReply(body(*Reply)).value_or(HelloReply{});
+  }
+  /// One compile's report: core.h first from the .c file, a hit loading
+  /// \p CoreLinks links, then 58 small headers from inside it, each a hit
+  /// with no links; with \p Big, big.h too, from inside, a hit that loads
+  /// more links and bytes than core.h but a ninth of its load time. With
+  /// \p CoreFirst false, core.h comes from inside a header, and the .c file
+  /// asks for no header.
+  void compile(uint32_t CoreLinks = 30, bool Big = false,
+               bool CoreFirst = true, uint64_t Build = 0) {
+    TimingReport R;
+    R.Build = Build;
+    R.Asks.push_back({"/src/core.h", CoreFirst, true, CoreLinks, 500000, 900});
+    if (Big)
+      R.Asks.push_back({"/src/big.h", false, true, 40, 900000, 100});
+    for (int I = 0; I != 58; ++I)
+      R.Asks.push_back(
+          {"/src/small" + std::to_string(I) + ".h", false, true, 0, 1000, 10});
+    llvm::SmallVector<char, 0> Msg;
+    encodeTimingReport(R, Msg);
+    ASSERT_TRUE(Daemon->handleMessage(body(Msg)).has_value());
+  }
+  std::string picks() {
+    auto F = llvm::MemoryBuffer::getFile(TestDir + "/picks");
+    return F ? (*F)->getBuffer().str() : "";
+  }
+};
+
+TEST_F(PickTest, PicksAreOffByDefault) {
+  // The default daemon wants no request lists and names no picks.
+  HelloReply H = hello();
+  EXPECT_FALSE(H.WantAsks);
+  for (int I = 0; I != 12; ++I)
+    compile();
+  EXPECT_EQ(Daemon->stats().Picks, 0u);
+  EXPECT_EQ(hello().DecisionsPath, "");
+}
+
+TEST_F(PickTest, AHeaderOnTopOfAllFiveIsListedWhileTheyAreSteady) {
+  // core.h tops all five counters: its hits take 61% of the load time
+  // (900 of 900 + 58 x 10 us), load 31 copies and 500 KB a hit against the
+  // median header's 1 copy and 1 KB, every compile asks for it, and the .c
+  // file asks for it first. The small headers are high only on the share
+  // of compiles asking, which every header shares. Every compile is alike,
+  // so the counters are steady from the first check, the 10th compile.
+  usePicks();
+  EXPECT_TRUE(hello().WantAsks);
+  for (int I = 0; I != 9; ++I)
+    compile();
+  EXPECT_EQ(Daemon->stats().Picks, 0u) << "before the 10th compile";
+  EXPECT_EQ(hello().DecisionsPath, "");
+  compile();
+  EXPECT_EQ(Daemon->stats().Picks, 1u);
+  EXPECT_EQ(picks(), "merge-root\t/src/core.h\n");
+  EXPECT_EQ(hello().DecisionsPath, TestDir + "/picks")
+      << "a hit on core.h in a compile that starts now merges its tree";
+  // It stays on the list while it passes.
+  compile();
+  EXPECT_EQ(Daemon->stats().Picks, 1u);
+  EXPECT_EQ(picks(), "merge-root\t/src/core.h\n");
+}
+
+TEST_F(PickTest, AHeaderLeavesTheListWhenACounterMoves) {
+  usePicks();
+  for (int I = 0; I != 10; ++I)
+    compile();
+  EXPECT_EQ(picks(), "merge-root\t/src/core.h\n");
+  // Then core.h's links double every compile. The top of copies per hit,
+  // core.h's own, moves by more than 20% over the last tenth of the build,
+  // so nothing passes.
+  for (unsigned K = 1; K != 5; ++K)
+    compile(/*CoreLinks=*/30u << K);
+  EXPECT_EQ(picks(), "");
+  EXPECT_EQ(hello().DecisionsPath, "") << "compiles that start now merge none";
+  EXPECT_EQ(Daemon->stats().Picks, 1u) << "headers that were ever on it";
+}
+
+TEST_F(PickTest, ThePickRunsInTheFirstBuildOnly) {
+  // User 2026-11-06: the merge heuristic runs in the first build only. The
+  // daemon takes the first build a compile names when it connects. A
+  // compile of a later build lists no requests and takes no list, and its
+  // report counts for nothing: core.h's links double in each compile of
+  // build 9, which in build 5 takes it off the list
+  // (AHeaderLeavesTheListWhenACounterMoves).
+  usePicks();
+  EXPECT_TRUE(hello(5).WantAsks);
+  for (int I = 0; I != 10; ++I)
+    compile(30, false, true, /*Build=*/5);
+  EXPECT_EQ(picks(), "merge-root\t/src/core.h\n");
+  EXPECT_EQ(hello(5).DecisionsPath, TestDir + "/picks");
+  HelloReply Next = hello(9);
+  EXPECT_FALSE(Next.WantAsks);
+  EXPECT_EQ(Next.DecisionsPath, "") << "a hit in build 9 merges nothing";
+  for (unsigned K = 1; K != 5; ++K)
+    compile(/*CoreLinks=*/30u << K, false, true, /*Build=*/9);
+  EXPECT_EQ(picks(), "merge-root\t/src/core.h\n");
+  // A compile that names no build is taken to be of build 5.
+  EXPECT_TRUE(hello().WantAsks);
+}
+
+TEST_F(PickTest, NothingIsListedWhileACounterMoves) {
+  // core.h's links double every compile, so the top of copies per hit
+  // moves by far more than 20% over each last tenth of the build.
+  usePicks();
+  for (int I = 0; I != 14; ++I)
+    compile(/*CoreLinks=*/1u << I);
+  EXPECT_EQ(Daemon->stats().Picks, 0u);
+  EXPECT_EQ(Daemon->stats().PickSteadyReports, 0u);
+  EXPECT_EQ(picks(), "");
+}
+
+TEST_F(PickTest, AllFiveCountersMustCallAHeaderHigh) {
+  // core.h tops four counters, but the .c file asks for no header first,
+  // so no header is high on the first-request share. Nothing passes,
+  // though the counters are steady.
+  usePicks();
+  for (int I = 0; I != 12; ++I)
+    compile(30, /*Big=*/false, /*CoreFirst=*/false);
+  EXPECT_EQ(Daemon->stats().Picks, 0u);
+  EXPECT_GT(Daemon->stats().PickSteadyReports, 0u);
+  EXPECT_EQ(picks(), "");
+  // big.h tops copies and bytes per hit; core.h tops the load-time share
+  // and the .c file's first request; both share the top of compiles
+  // asking. Each is high on three counters, so neither passes.
+  usePicks();
+  for (int I = 0; I != 12; ++I)
+    compile(30, /*Big=*/true);
+  EXPECT_EQ(Daemon->stats().Picks, 0u);
+  EXPECT_EQ(picks(), "");
 }
 
 /// The daemon's offline step, with a shell script for offline.py: run after
@@ -1092,7 +1393,7 @@ TEST_F(OfflineTest, TheStepsOwnCompilesNeitherStopItNorRecord) {
       [&] { return llvm::sys::fs::exists(TestDir + "/record/go"); }));
   const uint64_t Own = 7;
   llvm::SmallVector<char, 0> Msg;
-  encodeHello(Msg, /*Offline=*/true);
+  encodeHello(Msg, {/*Offline=*/true});
   auto Reply = Daemon->handleMessage(body(Msg), Own);
   ASSERT_TRUE(Reply.has_value());
   auto Hello = decodeHelloReply(body(*Reply));

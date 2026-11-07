@@ -293,10 +293,14 @@ public:
   /// instance (HelloReply), or nothing the daemon says about offsets can be
   /// trusted and connecting fails. Fails too if no daemon is running, which
   /// is an ordinary condition: the compiler then behaves exactly as it would
-  /// without a cache.
+  /// without a cache. A non-empty \p Compile names the compile, the same in
+  /// every build: the daemon then says which headers it read without asking
+  /// last time (notListedBefore), and keeps what this compile reports.
+  /// \p Build is the build the compile belongs to (setBuild), 0 for none.
   static llvm::Expected<std::unique_ptr<CacheClient>>
   connect(llvm::StringRef SocketPath = DefaultSocketPath,
-          llvm::StringRef RegionPath = {});
+          llvm::StringRef RegionPath = {}, llvm::StringRef Compile = {},
+          uint64_t Build = 0);
 
   /// Tells the daemon at \p SocketPath that a link of \p Output succeeded
   /// (BuildHint), for its offline step. False if no daemon took it, which
@@ -348,6 +352,9 @@ public:
   /// Where the daemon asked this compile to record (HelloReply::RecordDir),
   /// or empty.
   llvm::StringRef recordDir() const { return RecordDir; }
+  /// Whether the daemon picks headers to merge, so that the timing report
+  /// lists the compile's requests (HelloReply::WantAsks).
+  bool wantAsks() const { return WantAsks; }
 
   /// The stored result for \p Filename that applies to this compile, or an
   /// empty StringRef if there is none. The returned bytes live in the shared
@@ -434,6 +441,13 @@ public:
   /// from the shared region, with no socket traffic; the parsed list is kept
   /// until the daemon publishes a new one.
   bool isListed(llvm::StringRef Path);
+  /// Whether this compile (connect's \p Compile) read \p Path in its last
+  /// build without asking for a copy, because the ask-list did not have it
+  /// then. Its copies are of the contexts it asked for, so it asks for the
+  /// same headers again (DECISIONS.md 2.28).
+  bool notListedBefore(llvm::StringRef Path) const {
+    return NotListedBefore.contains(Path);
+  }
 
   /// Sends the times this compile took to read its headers. Blocks until the
   /// daemon acknowledges, which is one round trip at the end of the main file.
@@ -588,6 +602,7 @@ private:
   SharedRegion Region;
   Stats Counters;
   std::string SocketPath, DecisionsPath, RecordDir;
+  bool WantAsks = false;
   /// Tells this compile's writing apart from other compiles' at the daemon.
   uint64_t ClientId = 0;
   bool SendThread = false, WaitMode = false, LastWaited = false;
@@ -650,6 +665,9 @@ private:
   /// The ask-list as last parsed, and the version it was parsed from.
   llvm::StringSet<> AskList;
   uint64_t AskListVersion = 0;
+  /// See connect and notListedBefore.
+  std::string Compile;
+  llvm::StringSet<> NotListedBefore;
   /// See setBuild. The searches' outcomes this compile found, by where the
   /// copy's metadata is and the search key, and those not yet sent to the
   /// daemon.
