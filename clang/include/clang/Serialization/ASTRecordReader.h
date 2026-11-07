@@ -54,6 +54,9 @@ public:
   /// Is this a module file for a module (rather than a PCH or similar).
   bool isModule() const { return F->isModule(); }
 
+  /// Whether this record is in a header cache copy.
+  bool isHeaderCachePart() const { return F->IsHeaderCachePart; }
+
   /// Retrieve the AST context that this AST reader supplements.
   ASTContext &getContext() { return Reader->getContext(); }
 

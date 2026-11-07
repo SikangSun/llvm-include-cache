@@ -5290,3 +5290,46 @@ TEST_F(ExportTest, AFileChangedIsCaughtByTheNextBuild) {
   Build = 8;
   EXPECT_TRUE(reads(Main, H)) << "a copy of the old h.h was served";
 }
+
+TEST_F(ExportTest, AVariableACopyUsesIsUsedWhereTheCopyLoads) {
+  // timer.h's inline function reads now, which times.h declares. times.h's
+  // copy is written at timers, before the text of later uses now, and
+  // timer.h's copy names now from outside. Where both copies load, reading
+  // later's body marks now used, as the text would: code generation asserts
+  // that a variable it emits a use of is used (nginx's ngx_event_add_timer,
+  // with assertions on, 2026-11-07).
+  std::string Times =
+      write("times.h", "#ifndef TIMES_H\n#define TIMES_H\n"
+                       "extern volatile unsigned long now;\n#endif\n");
+  std::string Timer =
+      write("timer.h", "#ifndef TIMER_H\n#define TIMER_H\nint timers(void);\n"
+                       "static inline unsigned long later(unsigned long t) {\n"
+                       "  return now + t;\n}\n#endif\n");
+  std::string Main =
+      write("main.c", "#include \"" + Times + "\"\n#include \"" + Timer +
+                          "\"\nunsigned long f(void) { return later(1); }\n");
+  EXPECT_TRUE(reads(Main, Timer)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(Main, Timer)) << "nothing is stored yet";
+  bool Found = false, Used = false;
+  AtEnd = [&](ASTContext &Ctx) {
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("later")))
+      if (auto *F = dyn_cast<FunctionDecl>(D))
+        F->getBody();
+    for (NamedDecl *D :
+         Ctx.getTranslationUnitDecl()->lookup(&Ctx.Idents.get("now")))
+      if (auto *V = dyn_cast<VarDecl>(D)) {
+        Found = true;
+        Used = V->isUsed(/*CheckUsedAttr=*/false);
+      }
+  };
+  EXPECT_FALSE(reads(Main, Timer)) << "timer.h's copy was not served";
+  EXPECT_FALSE(reads(Main, Times)) << "times.h's copy was not served";
+  AtEnd = nullptr;
+  ASSERT_TRUE(Found) << "now is not declared";
+  ASSERT_TRUE(Used) << "now is not used after later's body was read";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Timer)) << "timer.h's copy was not served";
+  GenerateCode = false;
+  EXPECT_TRUE(Generated) << "no code was generated";
+}
