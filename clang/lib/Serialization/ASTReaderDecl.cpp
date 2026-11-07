@@ -4003,9 +4003,14 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
                             : "")
                  : Twine()));
     if (!Parent) {
+      std::pair<std::string, unsigned> Place;
+      Place.first = Record.readString();
+      Place.second = Record.readInt();
       Found = Reader.getPinnedNameReference(F, *II, Tag);
+      unsigned Where = 0;
+      SourceLocation Begin;
       if (!Found)
-        Found = Reader.resolvePartName(F, *II, Tag);
+        Found = Reader.resolvePartName(F, *II, Tag, Where, Begin);
       if (!Found)
         if (Sema *S = Reader.getSema())
           Found = ASTReader::lookupAtFileScope(*S, *II, Tag,
@@ -4015,6 +4020,18 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
       // from.
       if (!Found)
         Found = Reader.findInEveryModule(*II, Tag, &F);
+      // A typedef the tree gives. The text names, of the tree's, the one at
+      // the reference's place: PHP's zend.h names zend_types.h's
+      // zend_class_entry, then, after zend_property_hooks.h declares it
+      // again, that one; debug information tells them apart. From outside
+      // the tree, it names the latest before the tree, which the compile
+      // that wrote the copy can have lacked (qemu's DeviceState).
+      if (auto *TD = dyn_cast_or_null<TypedefDecl>(Found); TD && !Tag) {
+        if (Where == 1 && !Place.first.empty())
+          Found = Reader.typedefAtPlace(*TD, *II, Place);
+        else if (Where == 2)
+          Found = Reader.latestTypedefBefore(*TD, *II, Begin, Place);
+      }
       if (!Found && getenv("DEBUG_LINK"))
         llvm::errs() << "NAMEREF missing " << (Tag ? "tag " : "") << II->getName()
                      << " in " << F.ModuleName << "\n";

@@ -3069,8 +3069,106 @@ what it did before, as it wrote the same declaration twice. We made no
 unit test: the case needs three copies that one hit loads, and we did not
 find a small one.
 
+### A typedef declared again names the text's declaration (found 2026-11-07)
+
+PHP declares typedefs again in several headers: `zval` in zend_types.h,
+zend_frameless_function.h and zend_property_hooks.h, `zend_string` in
+zend_types.h, zend_map_ptr.h and zend_smart_str_public.h. qemu does the same
+with macros (`OBJECT_DECLARE_TYPE`). The typedefs of one name name one type,
+so the code is the same. Debug information names the typedef that each use
+found. With linked copies, 191 to 224 of PHP's 570 objects differed in debug
+information only (the final check of 4960c724b, each build).
+
+A copy names a typedef outside it by name (§2.18), and the reader's lookup
+can find another typedef of the name than the text found. The writer now
+records, with each reference by name, the file and the offset of the
+declaration it named (`ASTReader::declarationPlace`). The reader computes the
+same for each typedef of the name that the compile has. For a typedef from a
+copy, it reads the copy's own source records (`placeInModule`) and no header.
+A header read early gave PostgreSQL's equivclass.c another `__FILE__`
+spelling of simplehash.h. Then:
+
+- A name that the hit's tree gives names the typedef at the recorded place
+  (`typedefAtPlace`).
+- A name from outside the tree names the latest typedef that entered the
+  compile before the tree (`latestTypedefBefore`, qemu's `DeviceState`).
+- The candidates are the found typedef's chain, the same chain from its
+  newest declaration read (`getMostRecentExistingDecl` reads nothing), the
+  typedefs of Sema's resolver, and those that wait to be read.
+
+Limit: the recorded place is what the compile that wrote the copy saw. Where
+that compile read other headers before the copy, a later compile's text can
+name a later typedef. qemu's target/arm headers name typedefs.h's `ArchCPU`
+where the text names cpu-qom.h's (made by `OBJECT_DECLARE_CPU_TYPE`). Two other
+rules failed on samples:
+
+- The order of the hit's tree (bin-u90). A copy's links are not in include
+  order, and no record holds the position of an `#include`. PHP: 43 of 190
+  objects differed, qemu 48 of 687.
+- The recorded place for a name from the copy's own links only (bin-u91).
+  For a name that the tree around the copy gives, the found typedef. PHP: 39
+  of 190, qemu 0.
+- The latest typedef before the tree where the recorded one entered the
+  compile before the tree (bin-u92). The same counts as this change.
+
+Samples (every 3rd compile, qemu every 8th, the versions `counter` and
+`linkc`, one build). All differences are in debug information only:
+
+| Project | Compiles | Differing objects, 4960c724b | Differing objects, this change |
+|---|---|---|---|
+| PHP | 190 | 56 | 1 |
+| qemu | 687 | 0 | 4 |
+| PostgreSQL | 447 | 0 | 0 |
+| FFmpeg | 701 | 0 | 0 |
+| git | 567 | 0 | 0 |
+
+The counts change between runs of one binary: with `linkc` alone, PHP gave
+38 differing objects where `counter` and `linkc` gave 1. Tests:
+`ATypedefALinkGivesNamesTheLinksWhileItWaitsToBeRead` and
+`EachReferenceToARepeatedTypedefNamesTheTextsDeclaration`, which failed
+before the change, and `ATypedefFromOutsideTheTreeIsTheLatestBeforeIt`, which
+passed before it too.
+
+### The final check of 4960c724b (2026-11-07)
+
+The check ran the server branch at b471917d1 (the same cache code), Release
+with assertions on. It built each project twice on one daemon, in the five
+versions of the run guide (`counter`, `linkc`, `linkcut0`, `linkcp`,
+`linkco`), and Linux and qemu on every 4th compile. It compared each object
+with plain clang's from the same build (results-2026-11-07/final3, table.py).
+
+| Project | Compiles | Result in all five versions and both builds |
+|---|---|---|
+| CPython, curl, FFmpeg, git, nginx, OpenSSL, PostgreSQL, Redis, SQLite | 102 to 2,102 | the same objects as plain clang, no compile failed |
+| PHP | 570 | 191 to 224 objects per build differ in debug information only |
+| qemu | 1,373 | 2 to 81 in debug information only, 3 in data order only, 1 compile that fails in plain clang too |
+| Linux | 735 | 28 in `__COUNTER__` names only, 7 in data order only, up to 10 compiles per build that fail at an assertion (§4) |
+
+"Data order only": qemu's target/mips/tcg/translate.c lays out its 383 static
+`helper_info` structs and their name strings in another order. The
+instructions are the same. Each data symbol has the same bytes and
+relocations, and each code relocation names the same symbol and offset
+(ordercmp.py). The compile
+server, front end only, built nginx, Redis, curl, git, CPython and FFmpeg
+twice with no failed compile.
+
 ## 4. Open
 
+- Linux with assertions on: a copy's `__counted_by` type names a
+  declaration that is not a value (found 2026-11-07, open). The final checks
+  of 07b37ae2c and b471917d1 ran the server branch with assertions on. Up to
+  10 of 735 Linux compiles in each build failed at the assertion of
+  `cast_if_present<ValueDecl>`. Each linked version failed 4 in the first
+  build and 4 to 10 in the second, and `counter` failed 1 in its second
+  build. The stack: `declarationFingerprint` hashes an inline function
+  (`ODRHash::AddFunctionDecl`), reads its body from a copy, and a type in it
+  (`readTypeCoupledDeclRefInfo`) names a declaration of another kind. A
+  candidate is `struct request_queue`'s `queue_hw_ctx
+  __counted_by_ptr(nr_hw_queues)` in include/linux/blkdev.h:517, used in
+  block/. The failure comes and goes. On the 41 compiles of block/, two runs
+  failed 2 compiles in the first build and 7 to 12 in the second. A third
+  run of the same binary with a log failed none. Release builds give the same Linux objects as plain clang
+  except `__COUNTER__` names. No other project failed.
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider
   using something other than PCM. This format is giving me more headaches
   than help. Keep the problem we will deal with it later"). Deferred. What

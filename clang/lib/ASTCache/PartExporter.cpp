@@ -4503,6 +4503,9 @@ private:
         [&](const IdentifierInfo *II) { return Poisons.contains(II); });
     Writer.setPartOutside(Named,
                           [&](const Decl *D) { return madeAfter(P, D); });
+    Writer.setPartPlace([&](const Decl *D) {
+      return ASTReader::declarationPlace(SM, CI.getASTReader().get(), D);
+    });
     if (!P.OwnerOf.empty())
       Writer.setPartOwner(
           [&, Begin = SourceLocation::UIntTy(1), End = SourceLocation::UIntTy(0),

@@ -5,7 +5,7 @@ rotated; each cache mode with its own fresh daemon, build ID and per-copy dump
 compares each mode's objects with plain clang's.
 usage: modes_bench.py <project> <out.json>
 env: KIND, CORE, DCORES (comma list, one per cache mode), BIN, LEVEL, DUMP, MODES,
-SRC_ROOT, PLAIN_MODULES, PASSES, CHANGE_CMD, CHANGE_UNDO, INSTR, PERFC, SAMPLE,
+SRC_ROOT, PLAIN_MODULES, PASSES, CHANGE_CMD, CHANGE_UNDO, INSTR, PERFC, SAMPLE, FILTER,
 REGION_SIZE, EXTRA, EXTRA_<mode>.
 env, required: BIN (a release build's bin directory), BENCH_LOGS, BENCH_ROOT
 (see record_builds.sh).
@@ -358,8 +358,11 @@ def run_offline():
 
 offline = {}
 CMDS = commands()
-# SAMPLE=N: every Nth compile only.
+# SAMPLE=N: every Nth compile only. FILTER=<regex>: only the compiles of
+# the files it finds.
 CMDS = CMDS[::int(os.environ.get("SAMPLE", "1"))]
+if os.environ.get("FILTER"):
+    CMDS = [c for c in CMDS if re.search(os.environ["FILTER"], c[2])]
 print(f"{proj} {KIND}: {len(CMDS)} compiles, modes {' '.join(MODES)}", flush=True)
 objdir = tempfile.mkdtemp(prefix=f"mbo-{proj}-")
 DUMP = os.environ.get("DUMP")
@@ -413,7 +416,9 @@ for k in range(1, PASSES + 1):
             I[m].append(int(g[1]) if g else 0)
             r.stderr = "\n".join(l for l in r.stderr.splitlines() if "instructions=" not in l) + "\n"
         if r.returncode:
-            failed.append((m, src, r.stderr[-600:]))
+            # The start says why (an assertion), the end where.
+            err = r.stderr if len(r.stderr) <= 7000 else r.stderr[:6400] + "\n...\n" + r.stderr[-600:]
+            failed.append((m, src, err))
         W[m].append("\n".join(l for l in r.stderr.splitlines() if "header cache" not in l and not l.startswith("  ")))
         if m != "plain":
             S[m].append(r.stderr if os.environ.get("LEVEL", "1") != "1" else

@@ -261,6 +261,8 @@ private:
 
   /// The Sema of the compile being written, while writing a part.
   Sema *PartSema = nullptr;
+  /// See setPartPlace.
+  std::function<std::pair<std::string, unsigned>(const Decl *)> PartPlace;
 
   std::vector<PartCrossReference> PartCrossRefs;
 
@@ -1152,6 +1154,12 @@ public:
   /// are (REPORT.md T17).
   void setPartOwner(std::function<Module *(SourceLocation)> Owner) {
     PartOwner = std::move(Owner);
+  }
+  /// Which declaration a reference by name names
+  /// (ASTReader::declarationPlace); none records nothing.
+  void setPartPlace(
+      std::function<std::pair<std::string, unsigned>(const Decl *)> Place) {
+    PartPlace = std::move(Place);
   }
   /// The submodule a declaration or macro at \p L belongs to, null for the
   /// part's own module.

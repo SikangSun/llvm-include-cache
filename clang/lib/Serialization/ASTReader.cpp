@@ -8933,31 +8933,240 @@ NamedDecl *ASTReader::findInEveryModule(IdentifierInfo &II, bool Tag,
   return Found;
 }
 
-bool ASTReader::mayBeInNameSpace(GlobalDeclID ID, bool Tag) {
-  if (PP.getLangOpts().CPlusPlus || ID < NUM_PREDEF_DECL_IDS)
-    return true;
+std::pair<std::string, unsigned>
+ASTReader::declarationPlace(const SourceManager &SM, ASTReader *Reader,
+                            const Decl *D) {
+  SourceLocation Loc = D->getLocation();
+  if (Loc.isInvalid())
+    return {};
+  if (SM.isLoadedSourceLocation(Loc))
+    return Reader ? Reader->placeInModule(Loc)
+                  : std::pair<std::string, unsigned>();
+  Loc = SM.getFileLoc(Loc);
+  if (SM.isLoadedSourceLocation(Loc))
+    return {};
+  auto [FID, Offset] = SM.getDecomposedLoc(Loc);
+  OptionalFileEntryRef FE = SM.getFileEntryRefForID(FID);
+  if (!FE)
+    return {};
+  return {llvm::sys::path::filename(FE->getName()).str(), Offset};
+}
+
+std::pair<std::string, unsigned>
+ASTReader::placeInModule(SourceLocation Loc) {
+  if (Loc.isInvalid() || Loc.isMacroID())
+    return {};
+  SourceLocation::UIntTy Offset = Loc.getOffset();
+  auto MI =
+      GlobalSLocOffsetMap.find(SourceManager::MaxLoadedOffset - Offset - 1);
+  if (MI == GlobalSLocOffsetMap.end())
+    return {};
+  ModuleFile &M = *MI->second;
+  // The last of the module's entries that starts at or before Offset.
+  unsigned Lo = 0, Hi = M.LocalNumSLocEntries;
+  while (Lo < Hi) {
+    unsigned Mid = Lo + (Hi - Lo) / 2;
+    Expected<SourceLocation::UIntTy> Start = readSLocOffset(&M, Mid);
+    if (!Start) {
+      consumeError(Start.takeError());
+      return {};
+    }
+    if (*Start <= Offset)
+      Lo = Mid + 1;
+    else
+      Hi = Mid;
+  }
+  if (Lo == 0)
+    return {};
+  BitstreamCursor &Cursor = M.SLocEntryCursor;
+  SavedStreamPosition SavedPosition(Cursor);
+  if (llvm::Error Err = Cursor.JumpToBit(M.SLocEntryOffsetsBase +
+                                         M.SLocEntryOffsets[Lo - 1])) {
+    consumeError(std::move(Err));
+    return {};
+  }
+  Expected<llvm::BitstreamEntry> Entry = Cursor.advance();
+  if (!Entry) {
+    consumeError(Entry.takeError());
+    return {};
+  }
+  if (Entry->Kind != llvm::BitstreamEntry::Record)
+    return {};
+  RecordData Record;
+  StringRef Blob;
+  Expected<unsigned> Code = Cursor.readRecord(Entry->ID, Record, &Blob);
+  if (!Code) {
+    consumeError(Code.takeError());
+    return {};
+  }
+  if (*Code != SM_SLOC_FILE_ENTRY || Record.size() < 5)
+    return {};
+  InputFileInfo FI = getInputFileInfo(M, Record[4]);
+  if (!FI.isValid())
+    return {};
+  return {llvm::sys::path::filename(FI.UnresolvedImportedFilename).str(),
+          unsigned(Offset - (M.SLocEntryBaseOffset + Record[0]))};
+}
+
+std::pair<std::string, unsigned> ASTReader::placeOf(const Decl *D,
+                                                   GlobalDeclID ID) {
+  if (D)
+    return declarationPlace(getSourceManager(), this, D);
+  SourceLocation Loc;
+  DeclCursorForID(ID, Loc);
+  return placeInModule(Loc);
+}
+
+namespace {
+/// A typedef of a name: read, or by its ID, waiting to be read.
+struct TypedefOfName {
+  Decl *D = nullptr;
+  GlobalDeclID ID;
+};
+} // namespace
+
+/// The typedefs of \p II the compile has: \p Found, its earlier
+/// redeclarations, those of the chain from its newest one read so far,
+/// those Sema's resolver holds, and those that wait to be read, unread.
+/// The chain is not completed: in the middle of a read that would read
+/// more. One read in the chain after \p Found can be left out of
+/// \p Found's earlier ones, as the reader adds a module's declaration
+/// after the first of the chain until the read ends (PHP's zend_string:
+/// zend_map_ptr.h's after zend_smart_str_public.h's).
+static SmallVector<TypedefOfName, 8>
+typedefsOf(ASTReader &Reader, TypedefDecl &Found, Decl *Newest,
+           IdentifierInfo &II, ArrayRef<GlobalDeclID> Pending) {
+  SmallVector<TypedefOfName, 8> Out;
+  for (Decl *R = &Found; R; R = R->getPreviousDecl())
+    Out.push_back({R, {}});
+  if (Newest && Newest != &Found)
+    for (Decl *R = Newest; R; R = R->getPreviousDecl())
+      Out.push_back({R, {}});
+  if (Sema *S = Reader.getSema())
+    for (auto I = S->IdResolver.begin(&II), E = S->IdResolver.end(); I != E;
+         ++I)
+      if (isa<TypedefDecl>(*I) && (*I)->getDeclContext()->isFileContext())
+        Out.push_back({*I, {}});
+  for (GlobalDeclID ID : Pending)
+    if (Reader.peekDeclCode(ID) == serialization::DECL_TYPEDEF)
+      Out.push_back({nullptr, ID});
+  return Out;
+}
+
+SmallVector<GlobalDeclID, 4> ASTReader::pendingOf(IdentifierInfo &II) {
+  auto It = PendingIdentifierInfos.find(&II);
+  if (It == PendingIdentifierInfos.end())
+    return {};
+  return It->second;
+}
+
+NamedDecl *
+ASTReader::typedefAtPlace(TypedefDecl &Found, IdentifierInfo &II,
+                          const std::pair<std::string, unsigned> &Place) {
+  SmallVector<TypedefOfName, 8> All = typedefsOf(
+      *this, Found, getMostRecentExistingDecl(&Found), II, pendingOf(II));
+  if (llvm::all_of(All, [&](const TypedefOfName &T) { return T.D == &Found; }))
+    return &Found;
+  for (const TypedefOfName &T : All)
+    if (placeOf(T.D, T.ID) == Place)
+      if (auto *D = dyn_cast_or_null<TypedefDecl>(T.D ? T.D : GetDecl(T.ID)))
+        if (D->getDeclContext()->isFileContext())
+          return D;
+  return &Found;
+}
+
+NamedDecl *ASTReader::latestTypedefBefore(
+    TypedefDecl &Found, IdentifierInfo &II, SourceLocation Before,
+    const std::pair<std::string, unsigned> &Place) {
+  SourceManager &SM = getSourceManager();
+  if (Before.isInvalid() || SM.isLoadedSourceLocation(Before))
+    return &Found;
+  // Where each entered the compile: a module's declarations where the
+  // module loaded, the compile's own where they are.
+  auto Entry = [&](const TypedefOfName &T) -> SourceLocation {
+    if (T.D && !T.D->isFromASTFile()) {
+      SourceLocation L = SM.getFileLoc(T.D->getLocation());
+      return SM.isLoadedSourceLocation(L) ? SourceLocation() : L;
+    }
+    ModuleFile *M = T.D ? getOwningModuleFile(T.D) : getOwningModuleFile(T.ID);
+    if (!M || M->ImportLoc.isInvalid() ||
+        SM.isLoadedSourceLocation(M->ImportLoc))
+      return SourceLocation();
+    return M->ImportLoc;
+  };
+  SmallVector<TypedefOfName, 8> All = typedefsOf(
+      *this, Found, getMostRecentExistingDecl(&Found), II, pendingOf(II));
+  SmallVector<std::pair<TypedefOfName, SourceLocation>, 8> Earlier;
+  for (const TypedefOfName &T : All) {
+    SourceLocation At = Entry(T);
+    if (At.isValid() && SM.isBeforeInTranslationUnit(At, Before))
+      Earlier.push_back({T, At});
+  }
+  SourceLocation LatestAt;
+  for (auto &[T, At] : Earlier)
+    if (LatestAt.isInvalid() || SM.isBeforeInTranslationUnit(LatestAt, At))
+      LatestAt = At;
+  SmallVector<TypedefOfName, 4> Latest;
+  for (auto &[T, At] : Earlier)
+    if (At == LatestAt && llvm::none_of(Latest, [&](const TypedefOfName &L) {
+          return T.D ? L.D == T.D : L.ID == T.ID;
+        }))
+      Latest.push_back(T);
+  if (Latest.empty())
+    return &Found;
+  // Of several one load brought, the recorded one, else the found one.
+  const TypedefOfName *Pick = &Latest.front();
+  if (Latest.size() > 1) {
+    const TypedefOfName *AtPlace = nullptr, *IsFound = nullptr;
+    for (const TypedefOfName &T : Latest) {
+      if (!AtPlace && !Place.first.empty() && placeOf(T.D, T.ID) == Place)
+        AtPlace = &T;
+      if (T.D == &Found)
+        IsFound = &T;
+    }
+    Pick = AtPlace ? AtPlace : IsFound ? IsFound : Pick;
+  }
+  if (auto *D = dyn_cast_or_null<TypedefDecl>(Pick->D ? Pick->D
+                                                       : GetDecl(Pick->ID)))
+    if (D->getDeclContext()->isFileContext())
+      return D;
+  return &Found;
+}
+
+unsigned ASTReader::peekDeclCode(GlobalDeclID ID) {
+  if (ID < NUM_PREDEF_DECL_IDS)
+    return 0;
   unsigned Index = translateGlobalDeclIDToIndex(ID);
   if (Index >= DeclsLoaded.size() || DeclsLoaded[Index])
-    return true;
+    return 0;
   SourceLocation Loc;
   RecordLocation RL = DeclCursorForID(ID, Loc);
   llvm::BitstreamCursor &Cursor = RL.F->DeclsCursor;
   SavedStreamPosition SavedPosition(Cursor);
   if (llvm::Error Err = Cursor.JumpToBit(RL.Offset)) {
     consumeError(std::move(Err));
-    return true;
+    return 0;
   }
   Expected<unsigned> Abbrev = Cursor.ReadCode();
   if (!Abbrev) {
     consumeError(Abbrev.takeError());
-    return true;
+    return 0;
   }
   Expected<unsigned> Code = Cursor.skipRecord(*Abbrev);
   if (!Code) {
     consumeError(Code.takeError());
-    return true;
+    return 0;
   }
-  switch (*Code) {
+  return *Code;
+}
+
+bool ASTReader::mayBeInNameSpace(GlobalDeclID ID, bool Tag) {
+  if (PP.getLangOpts().CPlusPlus)
+    return true;
+  switch (peekDeclCode(ID)) {
+  // Read already, or the record cannot be read.
+  case 0:
+    return true;
   case DECL_RECORD:
   case DECL_ENUM:
     return Tag;

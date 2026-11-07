@@ -3196,6 +3196,11 @@ uint64_t ASTWriter::WritePartNameReference(ASTContext &Context, const Decl *D) {
     W.AddDeclRef(nullptr);
     W.push_back(Tag);
     W.AddIdentifierRef(II);
+    // Which of the name's declarations (ASTReader::declarationPlace).
+    auto [Place, Offset] = PartPlace ? PartPlace(ND)
+                                     : std::pair<std::string, unsigned>();
+    W.AddString(Place);
+    W.push_back(Offset);
     PartNameReferences.push_back(ND);
     return W.Emit(DECL_NAME_REFERENCE);
   }
