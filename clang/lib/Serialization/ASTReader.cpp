@@ -10860,7 +10860,12 @@ DeclarationNameInfo ASTRecordReader::readDeclarationNameInfo() {
 }
 
 TypeCoupledDeclRefInfo ASTRecordReader::readTypeCoupledDeclRefInfo() {
-  return TypeCoupledDeclRefInfo(readDeclAs<ValueDecl>(), readBool());
+  // In the order the writer wrote them: the arguments of a call are read in
+  // no set order, and GCC reads the flag first, then takes it for a
+  // declaration ID (1 is the translation unit).
+  ValueDecl *D = readDeclAs<ValueDecl>();
+  bool IsDeref = readBool();
+  return TypeCoupledDeclRefInfo(D, IsDeref);
 }
 
 SpirvOperand ASTRecordReader::readHLSLSpirvOperand() {
