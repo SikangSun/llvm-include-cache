@@ -133,6 +133,11 @@ ALL = {
     # pass 2 takes its decisions and its merged copies.
     "linkco": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                "CLANG_HEADER_CACHE_LINK": "1"},
+    # linkc whose daemon picks headers by five counters in the first build
+    # (-merge-picks, DECISIONS.md 2.26). A compile that starts after a pick
+    # merges the tree of a picked header at its next hit.
+    "linkcp": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+               "CLANG_HEADER_CACHE_LINK": "1"},
     # linkc whose daemon hands its compiles the decisions in DECISIONS
     # (-offline-decisions): folds, tops and merges, no variable set.
     "linkcd": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
@@ -280,6 +285,7 @@ DAEMON_ARGS.update({"linkfol": ["-fold", "-fold-list=own", "-fold-budget=1e15"]}
 DAEMON_ARGS.update({f"linkfi{b}": ["-fold", "-fold-list=inclusive", f"-fold-budget={b}"] for b in (6, 12)})
 DAEMON_ARGS.update({f"linkfo{b}": ["-fold", "-fold-list=own", f"-fold-budget={b}"] for b in (4, 16)})
 DAEMON_ARGS.update({m: ["-measured-cutoff"] for m in ("linkcm", "linkcmr", "linkcmd")})
+DAEMON_ARGS.update({"linkcp": ["-merge-picks"]})
 OFFLINE_PY = os.environ.get("OFFLINE_PY", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "header-cache",
                                                        "offline", "offline.py"))
 DAEMON_ARGS.update({"linkco": ["-offline", f"{sys.executable} -I {OFFLINE_PY}", "-offline-record", os.environ.get("RECORD_DIR", ""),
@@ -427,12 +433,19 @@ if PASSES > 1:
     passes = passes[1:]
 if PASSES == 1:
     run_offline()
-stored = {}
+stored, picks = {}, {}
 for m, (p, _) in daemons.items():
     p.terminate(); p.wait()
     if os.path.exists(p.region):
         os.remove(p.region)
     stored[m] = open(p.log).read()
+    # -merge-picks: the picks and why each was picked, beside the region.
+    if os.path.exists(p.region + ".picks.log"):
+        picks[m] = {"log": open(p.region + ".picks.log").read(),
+                    "picks": open(p.region + ".picks").read() if os.path.exists(p.region + ".picks") else ""}
+    for f in (p.region + ".picks", p.region + ".picks.log", p.region + ".picks.tmp"):
+        if os.path.exists(f):
+            os.remove(f)
 # Against plain clang's object from the same pass: cpython's getbuildinfo.c
 # records __TIME__.
 def differs(m, pre=""):
@@ -446,7 +459,7 @@ if KIND == "full":
         for k, P in enumerate(passes, 2):
             P["differ"] = dict(P.get("differ", {}), **{m: differs(m, f"pass{k}-")})
 json.dump({"cmds": [c[2] for c in CMDS], "modes": MODES, "T": T, "S": S, "W": W, "failed": failed, "differ": differ,
-           "daemon": stored, "passes": passes, "I": I, "I1": I1, "offline": offline}, open(out, "w"))
+           "daemon": stored, "passes": passes, "I": I, "I1": I1, "offline": offline, "picks": picks}, open(out, "w"))
 # The trace keeps what the objects and the daemons' folders gave: they go,
 # as each run would leave 0.4-4.4 GB in /tmp. KEEP_OBJECTS=1 keeps the
 # objects, the differing ones only, to look into.

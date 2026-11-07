@@ -227,8 +227,8 @@ protected:
     llvm::sys::fs::remove_directories(Dir);
   }
 
-  std::unique_ptr<CacheClient> client() {
-    auto C = CacheClient::connect(SocketPath, RegionPath);
+  std::unique_ptr<CacheClient> client(llvm::StringRef Compile = {}) {
+    auto C = CacheClient::connect(SocketPath, RegionPath, Compile);
     EXPECT_TRUE(bool(C)) << llvm::toString(C.takeError());
     return C ? std::move(*C) : nullptr;
   }
@@ -294,7 +294,7 @@ protected:
 
     Emitted.clear();
     Handed.clear();
-    std::unique_ptr<CacheClient> C = client();
+    std::unique_ptr<CacheClient> C = client(CompileName);
     if (C)
       C->setBuild(Build);
     if (GenerateCode) {
@@ -335,6 +335,9 @@ protected:
   }
 
   std::string Dir, SocketPath, RegionPath;
+  /// The name compiles give the daemon (CacheClient::connect's Compile),
+  /// as CLANG_HEADER_CACHE_SAME_ASKS=1 names them; empty, none.
+  std::string CompileName;
   /// Flags added to every compile, before the file.
   std::vector<std::string> ExtraArgs;
   /// When set, compiles export each listed header they read (PartExporter).
@@ -1007,6 +1010,26 @@ TEST_F(AskListTest, AStoredHeaderIsServedOnlyOnceACompileHasTimedIt) {
   // Asked about, in the region's index, and served: the compile's report
   // gives the hit.
   EXPECT_FALSE(reads(Main, Use));
+  EXPECT_EQ(Daemon->stats().HitsTimed, 1u);
+}
+
+TEST_F(AskListTest, ANamedCompileSkipsInItsNextBuildWhatItSkippedBefore) {
+  // CLANG_HEADER_CACHE_SAME_ASKS=1 (DECISIONS.md 2.28): main.c read use.h
+  // before any compile listed it, so its next build reads use.h without
+  // asking too, though use.h is listed now and a copy fits. A compile the
+  // daemon has not seen asks, and is served.
+  std::string Use = write("use.h", "#ifndef USE_H\n#define USE_H\n"
+                                   "int used(void);\n#endif\n");
+  std::string Main = write("main.c", "#include \"" + Use + "\"\n");
+  ASSERT_NO_FATAL_FAILURE(store(Use));
+  CompileName = "main";
+  EXPECT_TRUE(reads(Main, Use));
+  EXPECT_EQ(Daemon->stats().HeadersListed, 1u);
+  EXPECT_TRUE(reads(Main, Use)) << "skipped as in its last build";
+  EXPECT_TRUE(reads(Main, Use)) << "and in the build after";
+  EXPECT_EQ(Daemon->stats().Lookups, 0u);
+  CompileName = "other";
+  EXPECT_FALSE(reads(Main, Use)) << "another compile asks";
   EXPECT_EQ(Daemon->stats().HitsTimed, 1u);
 }
 

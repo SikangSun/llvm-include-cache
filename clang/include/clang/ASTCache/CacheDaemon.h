@@ -37,6 +37,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -127,6 +128,38 @@ struct CacheDaemonOptions {
   /// alone hands an earlier build's decisions to compiles.
   std::vector<std::string> OfflineCommand;
   std::string OfflineRecord, OfflineDecisions;
+  /// The five-counter merge pick (-merge-picks, user 2026-11-05). After each
+  /// compile's report, the daemon computes five counters for every header
+  /// asked for so far, each relative to the build so far:
+  ///   - the share of the build's load time at hits that its hits took;
+  ///   - copies loaded per hit, and bytes loaded per hit, each over the
+  ///     median header's;
+  ///   - the share of compiles that asked for it;
+  ///   - the share of those compiles where it was the first header the .c
+  ///     file asked for.
+  /// The user's rule (2026-11-05): while the distributions are steady, a
+  /// hit merges its header's tree when the header passes all five, each
+  /// with a conservative threshold. Steady: each counter's top value moved
+  /// PickDrift or less since the build had 10% fewer compiles, from the
+  /// PickMinCompiles-th compile on (a tenth of the compiles is then at least
+  /// one). Pass: the header is in the top PickTopPercent of the headers
+  /// asked for so far. The numbers are the ones the first-build records
+  /// chose, by the worst project (DECISIONS.md 2.26). After each report the
+  /// daemon lists the headers that pass now, as decisions ("merge-root"
+  /// lines), in PicksPath. HelloReply names the list to compiles that start
+  /// later when there are no offline decisions, and each of their hits on a
+  /// header in it merges the tree, as with CLANG_HEADER_CACHE_MERGE=decided.
+  /// All of it in the first build only (PickBuild).
+  bool MergePicks = false;
+  double PickTopPercent = 2, PickDrift = 0.2;
+  unsigned PickMinCompiles = 10;
+  /// Measurement (user 2026-11-06: "Does redis do better with a single
+  /// merge?"): a header merges its tree in one combination of its links per
+  /// build. Once a merge of a header is granted, merges of its other
+  /// combinations are refused, unless the granted one is given back.
+  bool PickOneMerge = false;
+  /// Where the list goes; empty: the region's path with ".picks" added.
+  std::string PicksPath;
 };
 
 /// What the daemon's offline step did; shared with the thread that waits
@@ -202,13 +235,17 @@ public:
     /// CLANG_HEADER_CACHE_CLAIM: claims granted, and refused because another
     /// compile claimed or pushed that copy.
     uint64_t ClaimsGranted = 0, ClaimsRefused = 0;
-    /// CLANG_HEADER_CACHE_MERGE: merges granted, and merged copies stored.
-    uint64_t MergesClaimed = 0, MergesStored = 0;
+    /// CLANG_HEADER_CACHE_MERGE: merges granted, merged copies stored, and
+    /// merges refused because their header merged once (PickOneMerge).
+    uint64_t MergesClaimed = 0, MergesStored = 0, MergesRefusedOnce = 0;
     /// The offline step: hints received; runs started, finished (exit 0
     /// with the decisions written), failed, and stopped by a lookup or a
     /// later hint; the last finished run's wall time.
     uint64_t BuildHints = 0, OfflineStarted = 0, OfflineFinished = 0,
              OfflineFailed = 0, OfflineStopped = 0, OfflineMicros = 0;
+    /// The five-counter merge pick: headers that were ever on the list, and
+    /// the reports it judged with steady counters.
+    uint64_t Picks = 0, PickSteadyReports = 0;
   };
   Stats stats() const;
 
@@ -257,7 +294,8 @@ private:
   llvm::SmallVector<char, 0> handleClaim(const ClaimRequest &Req,
                                          uint64_t Conn);
   llvm::SmallVector<char, 0> handleTiming(const TimingReport &Report);
-  llvm::SmallVector<char, 0> handleHello(uint64_t Conn, bool Offline);
+  llvm::SmallVector<char, 0> handleHello(uint64_t Conn,
+                                         const HelloRequest &Hello);
   llvm::SmallVector<char, 0> handleBuildHint(const BuildHint &Hint);
   /// Stops the offline run in flight, if any, because of \p Why.
   void stopOffline(llvm::StringRef Why);
@@ -328,7 +366,34 @@ private:
   /// that header it pushes next is the merged one. A compile that merges in
   /// its own thread pushes copies of other headers too.
   llvm::DenseMap<uint64_t, std::pair<uint64_t, std::string>> MergeOf;
+  /// Options::PickOneMerge: the headers a merge was granted for.
+  llvm::StringSet<> MergedHeaders;
   llvm::StringSet<> PushedNames;
+
+  /// The five-counter merge pick (Options::MergePicks): per header asked
+  /// for, its requests, the compiles that made one, the compiles where the
+  /// .c file asked for it first, its hits, the links, bytes and load time
+  /// they loaded; the reports counted, and the build's links and load time
+  /// at hits; each report's five top values, by reports counted; the
+  /// headers that pass now, by path, and every header that ever did.
+  struct PickCounts {
+    uint64_t Asks = 0, Compiles = 0, First = 0, Hits = 0, Links = 0;
+    uint64_t Bytes = 0, LoadMicros = 0;
+  };
+  llvm::StringMap<PickCounts> PickOf;
+  uint64_t PickReports = 0, PickLinks = 0, PickLoadMicros = 0;
+  std::vector<std::pair<uint64_t, std::array<double, 5>>> PickTops;
+  std::vector<std::string> Passing;
+  llvm::StringSet<> EverPassed;
+  /// The build the pick runs in: the first a compile named when it
+  /// connected (HelloRequest::Build). A compile of a later build neither
+  /// lists its requests nor takes the list, and its report is not counted.
+  uint64_t PickBuild = 0;
+  /// Counts \p Report and lists the headers that pass now; true if the list
+  /// changed. Mutex held.
+  bool pickLocked(const TimingReport &Report);
+  /// Writes the list to Options::PicksPath. Mutex held.
+  void writePicksLocked();
 
   /// Adds \p Path to the ask-list; true if it was not on it. Mutex held.
   bool listLocked(llvm::StringRef Path);
@@ -365,6 +430,10 @@ private:
   llvm::StringMap<std::pair<uint64_t, uint64_t>> HitCosts;
   /// Headers dropped from the ask-list. Dropping is final, as listing is.
   llvm::StringSet<> Dropped;
+  /// For each compile (HelloRequest::Compile), the headers it read without
+  /// asking in its last build because the ask-list did not have them; its
+  /// next build gets them in the HelloReply (DECISIONS.md 2.28).
+  llvm::StringMap<std::vector<std::string>> NotListedBy;
   /// The fold rule's record of each header: its first read's own time and
   /// children, its gain so far, and the reads that made it.
   struct FoldState {

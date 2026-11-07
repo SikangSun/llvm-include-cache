@@ -1143,7 +1143,8 @@ uint64_t microsSince(std::chrono::steady_clock::time_point Start) {
 } // namespace
 
 llvm::Expected<std::unique_ptr<CacheClient>>
-CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
+CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath,
+                     llvm::StringRef Compile, uint64_t Build) {
   auto Start = std::chrono::steady_clock::now();
   if (llvm::Error E = checkSocketPath(SocketPath))
     return std::move(E);
@@ -1154,7 +1155,8 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
 
   llvm::SmallVector<char, 0> Hello;
   const char *Offline = std::getenv("CLANG_HEADER_CACHE_OFFLINE");
-  encodeHello(Hello, Offline && llvm::StringRef(Offline) == "1");
+  encodeHello(Hello, {Offline && llvm::StringRef(Offline) == "1",
+                      Compile.str(), Build});
   std::optional<HelloReply> Reply;
   if (sendMessage(**S, Hello))
     if (std::optional<std::string> Body = receiveMessage(**S))
@@ -1180,6 +1182,11 @@ CacheClient::connect(llvm::StringRef SocketPath, llvm::StringRef RegionPath) {
   C->SocketPath = SocketPath.str();
   C->DecisionsPath = std::move(Reply->DecisionsPath);
   C->RecordDir = std::move(Reply->RecordDir);
+  C->WantAsks = Reply->WantAsks;
+  C->Compile = Compile.str();
+  C->Build = Build;
+  for (const std::string &P : Reply->NotListedBefore)
+    C->NotListedBefore.insert(P);
   // Unique among the compiles one daemon serves at once: the process, and
   // the client within it (tests run several in one process).
   uint64_t Seed[3] = {static_cast<uint64_t>(::getpid()),
@@ -1969,6 +1976,7 @@ bool CacheClient::reportTimings(const TimingReport &Report) {
   WithSearches.Learned = std::move(Learned);
   WithSearches.Used = std::move(Used);
   WithSearches.Combos = std::move(Combos);
+  WithSearches.Compile = Compile;
   Learned.clear();
   Used.clear();
   Combos.clear();
