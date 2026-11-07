@@ -5465,3 +5465,49 @@ TEST_F(ExportTest, ATypedefFromOutsideTheTreeIsTheLatestBeforeIt) {
   EXPECT_EQ(Files, (std::set<std::string>{"qdev.h"}))
       << "device_t names another typedef than the text's";
 }
+
+TEST_F(ExportTest, ATypedefTheTreeDeclaresAgainHidesTheOneTheCopyRecorded) {
+  // common.h's struct user names arch_t. a.c writes common.h's copy after
+  // defs.h, the only typedef there, and the copy records defs.h's. cpu.h
+  // includes qom.h, which declares arch_t again, then common.h. Where
+  // main.c loads cpu.h's copy, which links common.h's, the field names
+  // qom.h's typedef, as the text does, not the one the copy recorded
+  // (qemu's ArchCPU in typedefs.h and cpu-qom.h, 2026-11-07).
+  setenv("CLANG_HEADER_CACHE_LINK", "1", 1);
+  auto Unset =
+      llvm::make_scope_exit([] { unsetenv("CLANG_HEADER_CACHE_LINK"); });
+  std::string Defs = write("defs.h", "#ifndef DEFS_H\n#define DEFS_H\n"
+                                     "typedef struct arch arch_t;\n"
+                                     "struct arch { int id; };\n#endif\n");
+  std::string Qom = write("qom.h", "#ifndef QOM_H\n#define QOM_H\n"
+                                   "typedef struct arch arch_t;\n#endif\n");
+  std::string Common =
+      write("common.h", "#ifndef COMMON_H\n#define COMMON_H\n"
+                        "struct user { arch_t *a; };\n#endif\n");
+  std::string Cpu = write("cpu.h", "#ifndef CPU_H\n#define CPU_H\n#include \"" +
+                                       Qom + "\"\n#include \"" + Common +
+                                       "\"\n#endif\n");
+  std::string A = write("a.c", "#include \"" + Defs + "\"\n#include \"" +
+                                   Common + "\"\n");
+  std::string Main = write("main.c", "#include \"" + Defs + "\"\n#include \"" +
+                                         Cpu + "\"\nstruct user u;\n");
+  ExtraArgs = {"-g"};
+  EXPECT_TRUE(reads(A, Common)) << "nothing is listed yet";
+  EXPECT_TRUE(reads(A, Common)) << "nothing is stored yet";
+  EXPECT_TRUE(reads(Main, Cpu)) << "cpu.h is not listed yet";
+  EXPECT_TRUE(reads(Main, Cpu)) << "cpu.h is not stored yet";
+  GenerateCode = true;
+  EXPECT_FALSE(reads(Main, Cpu)) << "cpu.h's copy was not served";
+  GenerateCode = false;
+  ASSERT_TRUE(Generated) << "no code was generated";
+  llvm::DebugInfoFinder Found;
+  Found.processModule(*Generated);
+  std::set<std::string> Files;
+  for (const llvm::DIType *T : Found.types())
+    if (auto *D = llvm::dyn_cast<llvm::DIDerivedType>(T);
+        D && D->getTag() == llvm::dwarf::DW_TAG_typedef &&
+        D->getName() == "arch_t")
+      Files.insert(llvm::sys::path::filename(D->getFilename()).str());
+  EXPECT_EQ(Files, (std::set<std::string>{"qom.h"}))
+      << "arch_t names another typedef than the text's";
+}

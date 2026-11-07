@@ -1599,6 +1599,7 @@ private:
         return nullptr;
       Where = 1;
       Tree &T = *P->second.first;
+      Begin = T.Begin;
       int X = P->second.second;
       llvm::SmallString<64> K(Tag ? "t:" : "o:");
       K += II.getName();
@@ -1620,7 +1621,6 @@ private:
         return nullptr;
       }
       Where = 2;
-      Begin = T.Begin;
       return T.Outside.lookup(K);
     }
   };

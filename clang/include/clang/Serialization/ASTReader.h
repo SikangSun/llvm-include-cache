@@ -2805,11 +2805,18 @@ public:
   /// \p ID, not read yet.
   std::pair<std::string, unsigned> placeOf(const Decl *D, GlobalDeclID ID);
 
-  /// The typedef of \p II at \p Place (declarationPlace), or \p Found if
-  /// none is. The typedefs of a name all name one type, and debug
-  /// information tells them apart.
+  /// Where \p D, or, for a null \p D, the declaration \p ID, entered the
+  /// compile: a module's where the module loaded, the compile's own where
+  /// it is. Invalid if not known.
+  SourceLocation entryOf(const Decl *D, GlobalDeclID ID);
+
+  /// The typedef of \p II at \p Place (declarationPlace), of those that
+  /// entered the compile at \p Begin or later, or \p Found if none is.
+  /// The typedefs of a name all name one type, and debug information
+  /// tells them apart.
   NamedDecl *typedefAtPlace(TypedefDecl &Found, IdentifierInfo &II,
-                            const std::pair<std::string, unsigned> &Place);
+                            const std::pair<std::string, unsigned> &Place,
+                            SourceLocation Begin);
 
   /// The latest typedef of \p II made before \p Before, by where each
   /// entered the compile: a module's where it loaded. Of several that one
