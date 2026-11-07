@@ -4028,7 +4028,7 @@ static NamedDecl *resolveNameReference(ASTReader &Reader, ModuleFile &F,
       // that wrote the copy can have lacked (qemu's DeviceState).
       if (auto *TD = dyn_cast_or_null<TypedefDecl>(Found); TD && !Tag) {
         if (Where == 1 && !Place.first.empty())
-          Found = Reader.typedefAtPlace(*TD, *II, Place);
+          Found = Reader.typedefAtPlace(*TD, *II, Place, Begin);
         else if (Where == 2)
           Found = Reader.latestTypedefBefore(*TD, *II, Begin, Place);
       }

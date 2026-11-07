@@ -9060,18 +9060,44 @@ SmallVector<GlobalDeclID, 4> ASTReader::pendingOf(IdentifierInfo &II) {
   return It->second;
 }
 
+SourceLocation ASTReader::entryOf(const Decl *D, GlobalDeclID ID) {
+  SourceManager &SM = getSourceManager();
+  if (D && !D->isFromASTFile()) {
+    SourceLocation L = SM.getFileLoc(D->getLocation());
+    return SM.isLoadedSourceLocation(L) ? SourceLocation() : L;
+  }
+  ModuleFile *M = D ? getOwningModuleFile(D) : getOwningModuleFile(ID);
+  if (!M || M->ImportLoc.isInvalid() || SM.isLoadedSourceLocation(M->ImportLoc))
+    return SourceLocation();
+  return M->ImportLoc;
+}
+
 NamedDecl *
 ASTReader::typedefAtPlace(TypedefDecl &Found, IdentifierInfo &II,
-                          const std::pair<std::string, unsigned> &Place) {
+                          const std::pair<std::string, unsigned> &Place,
+                          SourceLocation Begin) {
   SmallVector<TypedefOfName, 8> All = typedefsOf(
       *this, Found, getMostRecentExistingDecl(&Found), II, pendingOf(II));
   if (llvm::all_of(All, [&](const TypedefOfName &T) { return T.D == &Found; }))
     return &Found;
-  for (const TypedefOfName &T : All)
+  SourceManager &SM = getSourceManager();
+  bool Tree = Begin.isValid() && !SM.isLoadedSourceLocation(Begin);
+  for (const TypedefOfName &T : All) {
+    // Only one the tree brought. The place says what the compile that
+    // wrote the copy named, and one from before the tree can be hidden
+    // here by a later one: qemu's cpu-common.h names typedefs.h's ArchCPU
+    // where it was the only one, and the tree's cpu-qom.h declares it
+    // again.
+    if (Tree) {
+      SourceLocation At = entryOf(T.D, T.ID);
+      if (At.isInvalid() || SM.isBeforeInTranslationUnit(At, Begin))
+        continue;
+    }
     if (placeOf(T.D, T.ID) == Place)
       if (auto *D = dyn_cast_or_null<TypedefDecl>(T.D ? T.D : GetDecl(T.ID)))
         if (D->getDeclContext()->isFileContext())
           return D;
+  }
   return &Found;
 }
 
@@ -9081,24 +9107,11 @@ NamedDecl *ASTReader::latestTypedefBefore(
   SourceManager &SM = getSourceManager();
   if (Before.isInvalid() || SM.isLoadedSourceLocation(Before))
     return &Found;
-  // Where each entered the compile: a module's declarations where the
-  // module loaded, the compile's own where they are.
-  auto Entry = [&](const TypedefOfName &T) -> SourceLocation {
-    if (T.D && !T.D->isFromASTFile()) {
-      SourceLocation L = SM.getFileLoc(T.D->getLocation());
-      return SM.isLoadedSourceLocation(L) ? SourceLocation() : L;
-    }
-    ModuleFile *M = T.D ? getOwningModuleFile(T.D) : getOwningModuleFile(T.ID);
-    if (!M || M->ImportLoc.isInvalid() ||
-        SM.isLoadedSourceLocation(M->ImportLoc))
-      return SourceLocation();
-    return M->ImportLoc;
-  };
   SmallVector<TypedefOfName, 8> All = typedefsOf(
       *this, Found, getMostRecentExistingDecl(&Found), II, pendingOf(II));
   SmallVector<std::pair<TypedefOfName, SourceLocation>, 8> Earlier;
   for (const TypedefOfName &T : All) {
-    SourceLocation At = Entry(T);
+    SourceLocation At = entryOf(T.D, T.ID);
     if (At.isValid() && SM.isBeforeInTranslationUnit(At, Before))
       Earlier.push_back({T, At});
   }
