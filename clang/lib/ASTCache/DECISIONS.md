@@ -3045,6 +3045,30 @@ change: the exporter writes no copy that uses a main-file static that such
 a warning reports (`reportedIfUnused`). Test:
 `AVariableACopyUsesIsUsedWhereTheCopyLoads`, which failed before the fix.
 
+### A copy's reference by name was read twice (found 2026-11-07)
+
+With assertions on, git's full compiles crashed with linked copies
+(`linkc`, `linkcp` and `linkco`): 3 of 567 in the first build and 8 in the
+second. Top-level copies and link everything passed. The assertion is in
+`ASTReader::LoadedDecl`: "Decl loaded twice?". Release builds have
+assertions off, and they gave the same objects as plain clang.
+
+A copy names a declaration outside it by name (§2.18), and the reader
+looks the name up when it reads the reference (`resolveNameReference`).
+That lookup can read the same reference again. In git's
+`refs/packed-backend.c`, the lookup of `size_t` (`findInEveryModule`) read
+another copy's typedef of `size_t`. That read resolved a reference by name
+of its own, and its lookup read the first copy's reference. The inner read
+recorded the declaration it found, and then the outer read recorded it a
+second time. In all 11 compiles, both reads found the same typedef (a run
+that printed both, bin-u84d).
+
+The outer read now returns what the inner read recorded
+(`ASTReader::ReadDeclRecord`, `DECL_NAME_REFERENCE`). A release build does
+what it did before, as it wrote the same declaration twice. We made no
+unit test: the case needs three copies that one hit loads, and we did not
+find a small one.
+
 ## 4. Open
 
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider

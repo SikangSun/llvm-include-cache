@@ -462,9 +462,11 @@ json.dump({"cmds": [c[2] for c in CMDS], "modes": MODES, "T": T, "S": S, "W": W,
            "daemon": stored, "passes": passes, "I": I, "I1": I1, "offline": offline, "picks": picks}, open(out, "w"))
 # The trace keeps what the objects and the daemons' folders gave: they go,
 # as each run would leave 0.4-4.4 GB in /tmp. KEEP_OBJECTS=1 keeps the
-# objects, the differing ones only, to look into.
+# objects, the differing ones only, to look into: of every pass, a compile
+# whose object differs in any of them.
 if os.environ.get("KEEP_OBJECTS") == "1":
-    keep = {i for i, c in enumerate(CMDS) if any(c[2] in v for v in differ.values())}
+    keep = {i for i, c in enumerate(CMDS)
+            if any(c[2] in v for d in [differ] + [P.get("differ", {}) for P in passes] for v in d.values())}
     for m in MODES:
         for f in os.listdir(f"{objdir}/{m}") if os.path.isdir(f"{objdir}/{m}") else []:
             if int(f.split(".")[0].split("-")[-1]) not in keep:
