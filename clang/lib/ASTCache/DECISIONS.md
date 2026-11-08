@@ -3089,18 +3089,26 @@ A header read early gave PostgreSQL's equivclass.c another `__FILE__`
 spelling of simplehash.h. Then:
 
 - A name that the hit's tree gives names the typedef at the recorded place
-  (`typedefAtPlace`).
+  (`typedefAtPlace`). The candidates are those that entered the compile
+  with the tree or after it (`entryOf`: a module's where it loaded). A typedef from
+  before the tree is not a candidate, and the found one stays (9c33f67ca).
+  The compile that wrote the copy can have lacked a later typedef that the
+  tree declares. qemu's cpu-common.h names typedefs.h's `ArchCPU` where a
+  compile wrote it with no other. target/i386/cpu.h's tree has cpu-qom.h,
+  which declares `ArchCPU` again before cpu-common.h, and the text names
+  that one. Without this, 32 qemu objects of `linkc` differed, 22 of them
+  in `ArchCPU`.
 - A name from outside the tree names the latest typedef that entered the
   compile before the tree (`latestTypedefBefore`, qemu's `DeviceState`).
-- The candidates are the found typedef's chain, the same chain from its
-  newest declaration read (`getMostRecentExistingDecl` reads nothing), the
-  typedefs of Sema's resolver, and those that wait to be read.
+- The typedefs of the name come from the found typedef's chain and the
+  same chain from its newest declaration read (`getMostRecentExistingDecl`
+  reads nothing). Also Sema's resolver, and those that wait to be read.
 
 Limit: the recorded place is what the compile that wrote the copy saw. Where
-that compile read other headers before the copy, a later compile's text can
-name a later typedef. qemu's target/arm headers name typedefs.h's `ArchCPU`
-where the text names cpu-qom.h's (made by `OBJECT_DECLARE_CPU_TYPE`). Two other
-rules failed on samples:
+that compile read the tree's headers in another order, a later compile's
+text can name another typedef of the tree. PHP's `zend_string`, `zval` and
+`zend_file_handle` stay (231 objects of `linkc`, both builds), and qemu's
+`TypeInfo` in `linkco` (52). Three other rules failed on samples:
 
 - The order of the hit's tree (bin-u90). A copy's links are not in include
   order, and no record holds the position of an `#include`. PHP: 43 of 190
@@ -3126,49 +3134,76 @@ The counts change between runs of one binary: with `linkc` alone, PHP gave
 38 differing objects where `counter` and `linkc` gave 1. Tests:
 `ATypedefALinkGivesNamesTheLinksWhileItWaitsToBeRead` and
 `EachReferenceToARepeatedTypedefNamesTheTextsDeclaration`, which failed
-before the change, and `ATypedefFromOutsideTheTreeIsTheLatestBeforeIt`, which
-passed before it too.
+before the change, `ATypedefFromOutsideTheTreeIsTheLatestBeforeIt`, which
+passed before it too, and
+`ATypedefTheTreeDeclaresAgainHidesTheOneTheCopyRecorded`, which fails with
+72e2a0832 (`arch_t` names defs.h's typedef).
 
-### The final check of 4960c724b (2026-11-07)
+Objects that differ in debug information only, in the final checks (both
+builds, all of them a typedef declared again):
 
-The check ran the server branch at b471917d1 (the same cache code), Release
+| Project, version | 4960c724b | 72e2a0832 | fd6691bea |
+|---|---|---|---|
+| PHP, `linkc` | 412 | 242 | 243 |
+| qemu, `linkc` | 2 | 44 | 2 |
+| qemu, `linkco` | 81 | 110 | 80 |
+
+### Two Linux assertions (found 2026-11-07)
+
+With assertions on, up to 10 of 735 Linux compiles per build stopped at an
+assertion in the final checks of 4960c724b and 72e2a0832. The same files
+failed in each check. A rerun of one compile does not show the second
+failure: the failed compile's misses change what the daemon serves next.
+The diagnosis kept the daemon alive after the build (a copy of
+modes_bench.py with a hold) and logged the failing compile in the build.
+
+- `markIncomplete`'s cast (fs/iomap/buffered-io.c, block/blk-ioprio.c,
+  drivers/md/dm-io.c). A copy's `struct address_space`
+  (asm-generic/cacheflush.h:10) has a first declaration that a name
+  reference gives, mm_types.h's. Reading that one reads more, and that read
+  asks for the chain of the copy's declaration, still the first of its own
+  chain. The reader notes it in `PendingIncompleteDeclChains`. Then
+  `VisitRedeclarable` joins it to mm_types.h's chain, and the end of the read
+  marks a declaration that is not the first of a chain. The reader now marks
+  the chain of its first declaration (8fe51a6e2).
+- `cast_if_present<ValueDecl>` in `readTypeCoupledDeclRefInfo`
+  (block/blk-stat.c and others, also in `counter`). The reader read the
+  declaration and the flag of a `__counted_by` type as the two arguments of
+  one call, which C++ reads in no set order. GCC 13 reads the flag first and
+  takes it for the declaration's ID: 1 is the translation unit. A log that
+  read them in order hid the failure, which showed the cause. The reader
+  now reads the declaration, then the flag (fd6691bea, a fix of Clang's
+  own reader).
+
+A release build does neither check. On block/ (2026-11-07), its Linux
+objects were the same as plain clang's except `__COUNTER__` names.
+
+### The final check of fd6691bea (2026-11-08)
+
+The check ran the server branch at 70526dbbf (the same cache code), Release
 with assertions on. It built each project twice on one daemon, in the five
 versions of the run guide (`counter`, `linkc`, `linkcut0`, `linkcp`,
 `linkco`), and Linux and qemu on every 4th compile. It compared each object
-with plain clang's from the same build (results-2026-11-07/final3, table.py).
+with plain clang's from the same build (results-2026-11-07/final5, table.py).
 
 | Project | Compiles | Result in all five versions and both builds |
 |---|---|---|
 | CPython, curl, FFmpeg, git, nginx, OpenSSL, PostgreSQL, Redis, SQLite | 102 to 2,102 | the same objects as plain clang, no compile failed |
-| PHP | 570 | 191 to 224 objects per build differ in debug information only |
-| qemu | 1,373 | 2 to 81 in debug information only, 3 in data order only, 1 compile that fails in plain clang too |
-| Linux | 735 | 28 in `__COUNTER__` names only, 7 in data order only, up to 10 compiles per build that fail at an assertion (§4) |
+| PHP | 570 | 117 to 128 objects per build differ in debug information only |
+| qemu | 1,373 | 2 to 80 in debug information only, 3 in data order only, 1 compile that fails in plain clang too |
+| Linux | 735 | 28 or 29 in `__COUNTER__` names only, 7 in data order only (`linkco`), no compile failed |
 
 "Data order only": qemu's target/mips/tcg/translate.c lays out its 383 static
 `helper_info` structs and their name strings in another order. The
 instructions are the same. Each data symbol has the same bytes and
 relocations, and each code relocation names the same symbol and offset
-(ordercmp.py). The compile
-server, front end only, built nginx, Redis, curl, git, CPython and FFmpeg
-twice with no failed compile.
+(ordercmp.py). Linux's 7 pass the same check. The compile server, front
+end only, built nginx, Redis, curl, git, CPython and FFmpeg twice with no
+failed compile. The header-cache release binary (bin-u94) built nginx and
+Redis in all five versions with the same objects as plain clang.
 
 ## 4. Open
 
-- Linux with assertions on: a copy's `__counted_by` type names a
-  declaration that is not a value (found 2026-11-07, open). The final checks
-  of 07b37ae2c and b471917d1 ran the server branch with assertions on. Up to
-  10 of 735 Linux compiles in each build failed at the assertion of
-  `cast_if_present<ValueDecl>`. Each linked version failed 4 in the first
-  build and 4 to 10 in the second, and `counter` failed 1 in its second
-  build. The stack: `declarationFingerprint` hashes an inline function
-  (`ODRHash::AddFunctionDecl`), reads its body from a copy, and a type in it
-  (`readTypeCoupledDeclRefInfo`) names a declaration of another kind. A
-  candidate is `struct request_queue`'s `queue_hw_ctx
-  __counted_by_ptr(nr_hw_queues)` in include/linux/blkdev.h:517, used in
-  block/. The failure comes and goes. On the 41 compiles of block/, two runs
-  failed 2 compiles in the first build and 7 to 12 in the second. A third
-  run of the same binary with a log failed none. Release builds give the same Linux objects as plain clang
-  except `__COUNTER__` names. No other project failed.
 - PCM as the format (user, 2026-10-06: "I'm really starting to consider
   using something other than PCM. This format is giving me more headaches
   than help. Keep the problem we will deal with it later"). Deferred. What
