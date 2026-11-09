@@ -6,7 +6,9 @@ compares each mode's objects with plain clang's.
 usage: modes_bench.py <project> <out.json>
 env: KIND, CORE, DCORES (comma list, one per cache mode), BIN, LEVEL, DUMP, MODES,
 SRC_ROOT, PLAIN_MODULES, PASSES, CHANGE_CMD, CHANGE_UNDO, INSTR, PERFC, SAMPLE, FILTER,
-REGION_SIZE, EXTRA, EXTRA_<mode>.
+REGION_SIZE, EXTRA, EXTRA_<mode>, and RECORD_DIR and DECISIONS for the modes
+with the offline step (linkco, and linkcof, linkcom, linkcon with its folding
+or merging off; see OFFLINE_MODES) and for linkcd.
 env, required: BIN (a release build's bin directory), BENCH_LOGS, BENCH_ROOT
 (see record_builds.sh).
 
@@ -133,6 +135,14 @@ ALL = {
     # pass 2 takes its decisions and its merged copies.
     "linkco": {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
                "CLANG_HEADER_CACHE_LINK": "1"},
+    # linkco with the step's folding or merging switched off (offline.py
+    # --no-folds, --no-merges; OFFLINE_MODES): linkcof folds and does not
+    # merge, linkcom merges and does not fold, linkcon does neither (the
+    # step still runs, and writes an empty decisions file). Each records to
+    # RECORD_DIR-<mode> and writes DECISIONS-<mode>, so any of the four run
+    # side by side; linkco keeps RECORD_DIR and DECISIONS.
+    **{m: {"CLANG_HEADER_CACHE_NO_SUBMODULES": "1", "CLANG_HEADER_CACHE_COUNTER": "1",
+           "CLANG_HEADER_CACHE_LINK": "1"} for m in ("linkcof", "linkcom", "linkcon")},
     # linkc whose daemon picks headers by five counters in the first build
     # (-merge-picks, DECISIONS.md 2.26). A compile that starts after a pick
     # merges the tree of a picked header at its next hit.
@@ -306,9 +316,21 @@ DAEMON_ARGS.update({m: ["-measured-cutoff"] for m in ("linkcm", "linkcmr", "link
 DAEMON_ARGS.update({"linkcp": ["-merge-picks"]})
 OFFLINE_PY = os.environ.get("OFFLINE_PY", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "header-cache",
                                                        "offline", "offline.py"))
-DAEMON_ARGS.update({"linkco": ["-offline", f"{sys.executable} -I {OFFLINE_PY}", "-offline-record", os.environ.get("RECORD_DIR", ""),
-                               "-offline-decisions", os.environ.get("DECISIONS", "")],
-                    "linkcd": ["-offline-decisions", os.environ.get("DECISIONS", "")]})
+# The modes whose daemon runs the offline step, and the switches it runs with.
+OFFLINE_MODES = {"linkco": [], "linkcof": ["--no-merges"], "linkcom": ["--no-folds"],
+                 "linkcon": ["--no-folds", "--no-merges"]}
+
+
+def offline_paths(m):
+    """The record directory and the decisions file of offline mode \\p m."""
+    suffix = "" if m == "linkco" else "-" + m
+    return os.environ.get("RECORD_DIR", "") + suffix, os.environ.get("DECISIONS", "") + suffix
+
+
+DAEMON_ARGS.update({m: ["-offline", " ".join([sys.executable, "-I", OFFLINE_PY] + flags),
+                        "-offline-record", offline_paths(m)[0], "-offline-decisions", offline_paths(m)[1]]
+                    for m, flags in OFFLINE_MODES.items()})
+DAEMON_ARGS.update({"linkcd": ["-offline-decisions", os.environ.get("DECISIONS", "")]})
 DAEMON_ARGS.update({m + "n": DAEMON_ARGS[m] + ["-fold-link-us=0"]
                     for m in ("linkfi2", "linkfi4", "linkfi8", "linkfi16", "linkfi32", "linkf8", "linkf32", "linkfo8", "linkfo32",
                               "linkfi6", "linkfi12", "linkfo4", "linkfo16")})
@@ -329,13 +351,15 @@ def daemon(core, dump, mode=None):
     return p, f"{w}/sock"
 
 
-if "linkco" in CM or "linkcd" in CM:
+OFFLINE_IN_RUN = [m for m in CM if m in OFFLINE_MODES]
+if OFFLINE_IN_RUN or "linkcd" in CM:
     assert os.environ.get("DECISIONS") and not ("linkco" in CM and "linkcd" in CM), "linkco/linkcd: DECISIONS, one of them"
-if "linkco" in CM:
+for m in OFFLINE_IN_RUN:
     # The step runs while its decisions file is missing, on this build's record.
-    assert os.environ.get("RECORD_DIR"), "linkco: RECORD_DIR"
-    subprocess.run(["rm", "-rf", os.environ["RECORD_DIR"]], check=True)
-    for f in (os.environ["DECISIONS"], os.environ["DECISIONS"] + ".log"):
+    assert os.environ.get("RECORD_DIR"), f"{m}: RECORD_DIR"
+    record, decisions = offline_paths(m)
+    subprocess.run(["rm", "-rf", record], check=True)
+    for f in (decisions, decisions + ".log"):
         if os.path.exists(f):
             os.remove(f)
 if "linkcd" in CM:
@@ -367,7 +391,7 @@ def run_offline():
             if g:
                 break
             time.sleep(0.05)
-        log = os.environ["DECISIONS"] + ".log"
+        log = offline_paths(basemode(m))[1] + ".log"
         offline[m] = {"hint": ok, "status": g[1] if g else "none", "ms": int(g[2]) if g else None,
                       "log": open(log).read() if os.path.exists(log) else ""}
         print(f"{proj} {KIND} offline: {m} {offline[m]['status']} in {offline[m]['ms']} ms: "
